@@ -1,0 +1,881 @@
+<p>Esta é a ronda de código em que quase ninguém falha por não saber a estrutura e quase toda a gente falha por não a reconhecer a tempo. Hashing, listas ligadas, pilhas e filas cobrem, à vontade, metade dos exercícios de 45 minutos de um loop de backend sénior, e o que o entrevistador mede não é se o candidato sabe que existe um <code>HashMap</code>: é se traduz o enunciado no invariante certo em menos de cinco minutos, se justifica O(1) amortizado em vez de o recitar, e se sabe onde é que o custo real diverge da complexidade assintótica. Onde os candidatos caem é em três sítios repetidos — usam <code>contains</code> sobre uma lista dentro de um ciclo e chamam-lhe O(n); escrevem inversão de lista ligada com recursão e não mencionam a pilha de chamadas; e desenham uma cache LRU sem sentinelas, gastando metade do tempo a depurar casos de fronteira que dois nós falsos eliminam. Este capítulo dá o mecanismo, os números do OpenJDK, sete laboratórios com solução de referência compilável e a grelha com que a resposta é pontuada.</p>
+
+<h2 id="sec-24-1" class="h2"><span class="secnum">24.1</span> Tabelas de hash: colisões, custo real e chaves compostas<a class="anchor" href="#sec-24-1" aria-label="ligação">#</a></h2>
+
+<p>Uma tabela de hash troca memória por tempo: converte a chave num inteiro, usa esse inteiro para escolher um balde e paga O(1) esperado em vez de O(n). No OpenJDK, o <code>HashMap</code> parte de 16 baldes, mantém a tabela sempre com uma potência de dois e escolhe o balde com <code>hash &amp; (n - 1)</code> — uma máscara de bits, não um módulo, porque a máscara custa um ciclo e o módulo inteiro custa dezenas. O preço dessa escolha é que só os bits baixos do <code>hashCode</code> contam, e é por isso que existe a função de dispersão <code>h ^ (h &gt;&gt;&gt; 16)</code>: mistura os 16 bits altos nos baixos para que chaves cujo <code>hashCode</code> difere apenas na metade alta não colidam sistematicamente.</p>
+
+<p>O factor de carga por omissão é 0,75. Quando o número de entradas ultrapassa <code>0,75 × baldes</code>, a tabela duplica e todas as entradas são redistribuídas. Redimensionar é O(n) e, num mapa de um milhão de entradas, significa alocar um array de dois milhões de referências e voltar a percorrer tudo — num serviço com orçamento de latência de 50 ms no p99, esse resize aparece no gráfico. A defesa é dimensionar à entrada, e desde o Java 19 existe a fábrica correcta para isso: <code>HashMap.newHashMap(n)</code> recebe o número de entradas previsto e não a capacidade interna, ao contrário do construtor.</p>
+
+<p>Quando um balde acumula colisões, o OpenJDK começa por manter uma lista ligada. A partir de 8 nós no mesmo balde — e apenas se a tabela já tiver 64 baldes ou mais, caso contrário limita-se a redimensionar — converte o balde numa árvore rubro-negra, ordenada pelo hash e, em empate, pelo <code>Comparable</code> das chaves se existir. O pior caso passa assim de O(n) para O(log n). Isto é uma mitigação contra chaves adversariais, não uma licença para escrever <code>hashCode</code> pobres: uma árvore de 8 nós ocupa mais memória e é mais lenta a percorrer do que um balde com uma entrada.</p>
+
+<figure class="listing java" id="lst-24-1"><div class="lhead"><span class="lnum">Listagem 24.1</span>
+<span class="lcap">Dispersão, escolha de balde e dimensionamento correcto de um HashMap.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Como o HashMap distribui a chave por baldes (OpenJDK, na essência):
+static int spread(Object key) {
+    int h = key.hashCode();
+    return h ^ (h &gt;&gt;&gt; 16);              // mistura os 16 bits altos nos baixos
+}
+static int bucketOf(int spread, int tableLength) {
+    return spread &amp; (tableLength - 1);  // tableLength é sempre potência de 2
+}
+
+// Dimensionamento: desde o Java 19 há uma fábrica que recebe o número de
+// entradas previsto, e não a capacidade interna da tabela.
+Map&lt;OrderKey, Order&gt; byKey = HashMap.newHashMap(50_000);
+
+// Porque é que o construtor não serve:
+//   new HashMap&lt;&gt;(50_000)  -&gt; tabela arredondada para 65 536 baldes,
+//                              limiar de resize = 0,75 * 65 536 = 49 152.
+//   Ou seja, ainda há um resize (e a cópia de 65 536 referências) antes de a
+//   última entrada caber. newHashMap(50_000) pede 50 000 / 0,75 = 66 667,
+//   arredonda para 131 072 baldes e nunca redimensiona.
+</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Capacidade inicial 16, factor de carga 0,75, duplicação da tabela em cada resize, conversão do balde em árvore a partir de 8 nós (e de 64 baldes na tabela), reversão para lista a 6 nós. Uma entrada de <code>HashMap</code> custa cerca de 32 bytes de nó, mais a chave e o valor; um <code>HashMap&lt;Integer, Integer&gt;</code> com um milhão de entradas anda pelos 80 MB, contra 8 MB de dois <code>int[]</code> do mesmo tamanho. É o argumento a ter na ponta da língua quando o entrevistador perguntar se a solução escala.</p></aside>
+
+<p>As chaves compostas são o segundo eixo desta secção e o sítio onde os erros são silenciosos. A regra é simples e o candidato tem de a enunciar sem hesitar: se dois objectos são iguais por <code>equals</code>, os seus <code>hashCode</code> têm de ser iguais; o inverso não é exigido. Um <code>record</code> resolve isto de graça, gerando ambos sobre todos os componentes. O que não é gerado de graça é a imutabilidade profunda: um <code>record</code> com um campo <code>List</code> mutável continua a ser uma chave perigosa, porque o <code>hashCode</code> da lista muda quando o conteúdo muda.</p>
+
+<figure class="listing java" id="lst-24-2"><div class="lhead"><span class="lnum">Listagem 24.2</span>
+<span class="lcap">Chave composta correcta e as três armadilhas que aparecem em code review.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Chave composta correcta: o record gera equals/hashCode sobre todos os campos.
+public record TenantScopedKey(String tenantId, long entityId) {
+    public TenantScopedKey {
+        Objects.requireNonNull(tenantId, &quot;tenantId&quot;);
+    }
+}
+
+// Armadilha 1 — chave mutável. Mudar o campo muda o hashCode e a entrada fica
+// inalcançável: ocupa memória e nunca mais é encontrada nem removida.
+var key = new MutableKey(&quot;A&quot;);
+map.put(key, value);
+key.setName(&quot;B&quot;);
+map.get(key);      // null: procura no balde de hash(&quot;B&quot;), a entrada está no de hash(&quot;A&quot;)
+map.remove(key);   // não remove nada; fuga de memória silenciosa
+
+// Armadilha 2 — hashCode constante. É legal (respeita o contrato) e destrói o
+// custo: tudo cai no mesmo balde. Até 8 nós é lista ligada, O(n); a partir daí,
+// com a tabela já em 64 baldes, vira árvore rubro-negra e o pior caso é O(log n).
+@Override public int hashCode() { return 42; }
+
+// Armadilha 3 — equals com == em double e hashCode por cast para int.
+// Usar Double.compare / Double.hashCode, ou simplesmente um record.
+</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Usar uma entidade JPA como chave de <code>HashMap</code> antes de ela ter identificador. O <code>hashCode</code> baseado no <code>id</code> devolve um valor com o <code>id</code> a <code>null</code>, a entidade é persistida, o <code>id</code> passa a existir e a entrada fica órfã no balde antigo. A convenção que sobrevive a revisão é: <code>hashCode</code> constante por classe e <code>equals</code> por identificador de negócio, ou nunca pôr entidades geridas em colecções baseadas em hash.</p></aside>
+
+<div class="qa" id="q-24-1" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Diz que a pesquisa no <code>HashMap</code> é O(1). O(1) em que condições, e o que é preciso acontecer para deixar de ser?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É O(1) <em>amortizado</em> e <em>esperado</em>, sob duas hipóteses: que a função de dispersão espalhe as chaves de forma aproximadamente uniforme pelos baldes, e que o factor de carga se mantenha limitado. Nenhuma das duas é garantida pela linguagem — são propriedades do código de quem escreve o <code>hashCode</code> e de quem dimensiona o mapa.</p>
+      <p>O mecanismo: a chave produz um <code>hashCode</code>, o <code>HashMap</code> aplica <code>h ^ (h &gt;&gt;&gt; 16)</code> e escolhe o balde com <code>hash &amp; (n - 1)</code>. Com dispersão uniforme e factor de carga 0,75, o balde médio tem menos de um elemento e a pesquisa é uma indexação de array mais uma ou duas comparações de <code>equals</code>. O «amortizado» vem do resize: cada duplicação é O(n), mas ocorre com frequência geométrica, logo o custo médio por inserção continua constante.</p>
+      <p>Deixa de ser O(1) em três cenários concretos. Primeiro, <code>hashCode</code> degenerado — no limite, constante: todas as chaves num balde. Até 8 nós é uma lista ligada, O(n); a partir de 8 nós e com a tabela já com 64 baldes, o OpenJDK converte o balde em árvore rubro-negra e o pior caso fica O(log n). Segundo, <code>equals</code> caro: o mapa pode encontrar o balde em O(1) e gastar o tempo todo a comparar strings longas ou objectos com colecções lá dentro. Terceiro, ataque de colisões: se as chaves vêm do exterior — cabeçalhos HTTP, campos de JSON — um adversário pode construir chaves que colidem e transformar o mapa em lista; a árvore mitiga, e é por isso que ela existe.</p>
+      <p>O <em>trade-off</em> a nomear é memória contra tempo. Um <code>HashMap&lt;Integer, Integer&gt;</code> com um milhão de entradas ocupa cerca de dez vezes mais do que dois <code>int[]</code> equivalentes, porque paga nó, boxing e referências. Quando o domínio das chaves é denso e inteiro — identificadores de 0 a N — a escolha certa deixa de ser o mapa e passa a ser o array indexado, que é O(1) verdadeiro e cabe na cache.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É O(1) porque usa hash.» Não distingue esperado de pior caso e não sabe o que é o factor de carga.</td></tr>
+        <tr><td>Mid</td><td>Fala de colisões e de listas ligadas no balde, sabe que há resize, mas não sabe os limiares nem menciona <code>equals</code>.</td></tr>
+        <tr><td>Sénior</td><td>Separa esperado de amortizado de pior caso, dá 0,75 e a treeificação a 8, e nomeia <code>equals</code> caro e chaves adversariais como causas reais de degradação.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo de memória com números, quando substituir por array ou por estrutura primitiva, e o efeito do resize num p99 com orçamento de latência.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a tabela é uma potência de dois e não um número primo?»</li>
+      <li>«O que acontece se dois threads fizerem <code>put</code> no mesmo <code>HashMap</code> durante um resize?»</li>
+      <li>«Quando é que um <code>ConcurrentHashMap</code> não chega e é preciso outra coisa?»</li>
+      <li>«Como dimensionaria o mapa se soubesse que vai ter 50 000 entradas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que o pior caso do <code>HashMap</code> moderno continua a ser O(n) sem qualificar (é O(log n) desde a treeificação).</li>
+      <li>Confundir capacidade com número de entradas ao dimensionar.</li>
+      <li>Dizer que <code>hashCode</code> tem de ser único — confunde o contrato com uma função injectiva.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-24-2" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos um cache com chave composta por <code>tenantId</code> e <code>entityId</code>. Um colega implementou a chave como classe com <em>setters</em>. Que problemas antecipa e como reescrevia?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O problema imediato é a fuga de memória silenciosa: se alguém mutar a chave depois de a inserir, o <code>hashCode</code> muda, o mapa passa a procurar noutro balde e a entrada torna-se inalcançável — <code>get</code> devolve <code>null</code>, <code>remove</code> não remove, e a entrada nunca é libertada enquanto o mapa viver. Num cache de longa duração, isto manifesta-se como crescimento lento da <em>heap</em> antiga e nunca como excepção.</p>
+      <p>A reescrita é um <code>record TenantScopedKey(String tenantId, long entityId)</code>. O <code>record</code> dá campos finais, <code>equals</code> e <code>hashCode</code> gerados sobre todos os componentes, e <code>toString</code> útil em logs. O construtor compacto valida os invariantes uma vez, no ponto de entrada.</p>
+      <p>Há dois pontos que separam a resposta sénior. Primeiro, a imutabilidade do <code>record</code> é superficial: se um componente for uma <code>List</code> ou um array, o conteúdo continua mutável e a chave continua perigosa; a defesa é copiar defensivamente no construtor compacto, com <code>List.copyOf</code>. Segundo, o custo: cada <code>get</code> aloca uma chave nova. São objectos de vida muito curta, apanhados na <em>young generation</em> por uma colecta de escape barata, e em muitos casos escapam à alocação por <em>scalar replacement</em> do JIT — mas se o caminho for de 100 000 chamadas por segundo vale a pena medir antes de assumir.</p>
+      <p>Quando é que a escolha contrária ganha: se o par couber em 64 bits — por exemplo, <code>tenantId</code> de 16 bits e <code>entityId</code> de 48 — a chave pode ser um <code>long</code> empacotado num <code>Long2ObjectMap</code> primitivo, o que elimina a alocação e uma indirecção. Faz-se isso quando o perfil mostra a alocação da chave no topo, e não por antecipação.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Falta implementar <code>equals</code>» e nada mais; não vê a mutabilidade como problema.</td></tr>
+        <tr><td>Mid</td><td>Propõe <code>record</code> e sabe que o <code>hashCode</code> muda com a mutação, mas não descreve a consequência (entrada órfã, fuga de memória).</td></tr>
+        <tr><td>Sénior</td><td>Descreve a entrada inalcançável, propõe <code>record</code> imutável, aponta a imutabilidade superficial dos componentes de colecção e valida no construtor compacto.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo de alocação por consulta, quando compensa empacotar em <code>long</code>, e propõe um teste que falha hoje: mutar a chave e assertar que <code>remove</code> não limpa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um <code>record</code> com um campo <code>List</code> é seguro como chave?»</li>
+      <li>«Como escreveria o teste que apanha esta classe de bug?»</li>
+      <li>«E se a chave tiver de ser serializada para Redis — muda alguma coisa?»</li>
+      <li>«Qual é o efeito de um <code>hashCode</code> que ignora o <code>tenantId</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Concatenar os campos numa <code>String</code> como chave e não ver a ambiguidade («ab»+«c» colide com «a»+«bc»).</li>
+      <li>Implementar <code>equals</code> sem <code>hashCode</code>, ou <code>hashCode</code> com um subconjunto dos campos de <code>equals</code>.</li>
+      <li>Assumir que <code>record</code> significa profundamente imutável.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-24-2" class="h2"><span class="secnum">24.2</span> Listas ligadas: ciclos, inversão e ponteiro rápido/lento<a class="anchor" href="#sec-24-2" aria-label="ligação">#</a></h2>
+
+<p>Em produção, uma lista ligada é quase sempre a escolha errada: percorrer <code>n</code> nós dispersos na <em>heap</em> custa <code>n</code> falhas de cache, enquanto percorrer um <code>ArrayList</code> do mesmo tamanho custa <code>n/16</code> linhas de cache lidas em sequência, com o <em>prefetcher</em> a trabalhar a favor. A diferença medida em <em>benchmarks</em> honestos é de cinco a dez vezes em travessia pura. Em entrevista, porém, a lista ligada é o veículo ideal para testar manipulação de ponteiros sob restrição de memória O(1) — que é exactamente o que o entrevistador quer ver.</p>
+
+<p>Duas técnicas cobrem a maior parte dos exercícios. A primeira é o par de ponteiros a velocidades diferentes: um avança um nó por passo, o outro dois. Se existir ciclo, a distância entre eles dentro do ciclo diminui uma unidade por passo módulo o comprimento do ciclo, logo chega necessariamente a zero e eles encontram-se — em O(n) passos e com memória O(1), contra o <code>HashSet</code> de nós visitados, que também é O(n) em tempo mas gasta O(n) de memória. A segunda é o nó sentinela: um nó falso antes da cabeça elimina o caso especial «alterar o primeiro elemento», que é onde nascem metade dos erros de fronteira num quadro branco.</p>
+
+<p>Para a entrada do ciclo, o argumento tem de ser dito e não decorado. Se houver <code>m</code> nós antes do ciclo e o ciclo tiver comprimento <code>L</code>, no momento do encontro o lento percorreu <code>m + k</code> nós, com <code>k</code> a posição do encontro dentro do ciclo, e o rápido percorreu o dobro; a diferença é um múltiplo de <code>L</code>. Daí resulta que a distância do encontro à entrada, percorrendo o ciclo, é congruente com <code>m</code> módulo <code>L</code>. Andar um ponteiro desde a cabeça e outro desde o encontro, ambos a um nó por passo, faz com que se cruzem exactamente na entrada.</p>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>A inversão recursiva de uma lista ligada tem 4 linhas contra 6 da iterativa, e paga O(n) de pilha de chamadas. Com a pilha por omissão de 512 KB a 1 MB e um <em>frame</em> de 40 a 60 bytes, o <code>StackOverflowError</code> chega algures entre 10 000 e 20 000 nós — abaixo do tamanho de muitos casos de teste. A versão iterativa é O(1) de memória e é a que se entrega; a recursiva menciona-se como variante mais legível para listas comprovadamente curtas.</p></aside>
+
+<div class="qa" id="q-24-3" data-box="qa" data-area="dsa" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Convença-me de que o ponteiro rápido e o lento se encontram sempre quando há ciclo, e explique porque é que reiniciar um deles na cabeça dá o nó de entrada.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O encontro é garantido por um argumento de distância módulo o comprimento do ciclo. Depois de ambos os ponteiros estarem dentro do ciclo — o que acontece ao fim de no máximo <code>m</code> passos, com <code>m</code> o número de nós antes do ciclo — mede-se a distância do rápido ao lento ao longo do sentido de marcha. Em cada passo o rápido avança 2 e o lento 1, logo essa distância diminui exactamente 1, módulo <code>L</code>. Uma quantidade inteira em <code>{0, …, L-1}</code> que decresce uma unidade por passo atinge 0 em menos de <code>L</code> passos. Zero significa mesmo nó: encontram-se. Total: no máximo <code>m + L ≤ n</code> passos.</p>
+      <p>É por isso que o passo tem de ser 1 e 2, e não 2 e 3: com 2 e 3 a distância também decresce 1 por passo, e funciona; com 2 e 4 decresce 2 e pode saltar por cima do zero quando <code>L</code> é ímpar. O invariante que interessa é «a diferença de velocidades divide o passo com que a distância se fecha».</p>
+      <p>Para a entrada: no encontro, o lento andou <code>m + k</code> e o rápido <code>2(m + k)</code>, sendo <code>k</code> a distância da entrada ao ponto de encontro dentro do ciclo. Como o rápido andou exactamente um número inteiro de voltas a mais, <code>2(m + k) - (m + k) = m + k ≡ 0 (mod L)</code>, ou seja <code>m ≡ -k (mod L)</code>. A distância do ponto de encontro até à entrada, no sentido de marcha, é <code>L - k</code>, que é congruente com <code>m</code>. Portanto, andando um ponteiro desde a cabeça e outro desde o encontro, um nó de cada vez, ambos chegam à entrada ao fim de <code>m</code> passos — e como o ponteiro que vem da cabeça só entra no ciclo na entrada, o primeiro encontro dos dois é lá.</p>
+      <p>O <em>trade-off</em> face à alternativa: um <code>HashSet</code> de nós visitados resolve o mesmo em O(n) de tempo, é trivial de escrever e é a resposta que se dá se o entrevistador não impuser memória constante. Custa O(n) de memória e uma alocação por nó — inaceitável se a lista for a estrutura de um <em>parser</em> com milhões de nós, irrelevante num teste unitário.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Sabe que «existe o algoritmo da lebre e da tartaruga» mas não justifica nada; ou propõe marcar os nós visitados alterando a lista.</td></tr>
+        <tr><td>Mid</td><td>Escreve o código correcto e sabe que a segunda fase «funciona», mas apresenta-a como facto memorizado.</td></tr>
+        <tr><td>Sénior</td><td>Dá o argumento de distância decrescente módulo <code>L</code>, deriva a segunda fase e diz o limite de passos e a memória O(1).</td></tr>
+        <tr><td>Staff</td><td>Acrescenta porque é que outras razões de velocidade funcionam ou falham, quando o <code>HashSet</code> é a escolha certa, e como testaria (ciclo de comprimento 1, ciclo que começa na cabeça, lista de um nó).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se as velocidades forem 1 e 3?»</li>
+      <li>«Como calcula o comprimento do ciclo depois do encontro?»</li>
+      <li>«Adapte isto para detectar repetição numa sequência gerada por <code>x = f(x)</code>.»</li>
+      <li>«Onde é que este algoritmo aparece fora de listas ligadas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Comparar nós com <code>equals</code> em vez de <code>==</code>: dois nós com o mesmo valor não são o mesmo nó.</li>
+      <li>Não verificar <code>fast != null &amp;&amp; fast.next != null</code> antes de dois saltos.</li>
+      <li>Modificar a lista (marcar nós) numa estrutura que o chamador ainda vai usar.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.1 — Detectar ciclo e devolver o nó de entrada</span>
+    <div class="labpills"><span class="qpill">Alvo O(n) tempo, O(1) memória</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dada a cabeça de uma lista simplesmente ligada, determinar se existe ciclo; em caso afirmativo devolver o nó onde o ciclo começa e o seu comprimento, e <code>null</code> caso contrário. Restrições: memória adicional O(1) — não é permitido <code>HashSet</code> nem marcar os nós; a lista não pode ser modificada, porque o chamador continua a usá-la; a implementação tem de aguentar uma lista vazia, de um só nó, e um nó que aponta para si próprio. Exemplo: nós <code>1 → 2 → 3 → 4 → 5</code> em que o <code>next</code> do nó 5 aponta para o nó 3; a saída esperada é o nó de valor 3 e comprimento 3. Contra-exemplo: <code>1 → 2 → 3 → null</code> devolve <code>null</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-3"><div class="lhead"><span class="lnum">Listagem 24.3</span>
+        <span class="lcap">Ciclo de Floyd em duas fases: encontro e localização da entrada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>/** Nó mínimo, tal como aparece no enunciado. */
+final class ListNode {
+    final int val;
+    ListNode next;
+    ListNode(int val) { this.val = val; }
+}
+
+final class CycleDetection {
+
+    /** Entrada do ciclo e o seu comprimento. */
+    record Cycle(ListNode entry, int length) {}
+
+    /** @return o ciclo, ou null se a lista for acíclica. O(n) tempo, O(1) memória. */
+    static Cycle detect(ListNode head) {
+        ListNode slow = head, fast = head;
+
+        // Fase 1 — encontro. Dentro do ciclo, a distância do rápido ao lento
+        // decresce exactamente 1 por passo, módulo L: chega a 0 em menos de L passos.
+        while (fast != null &amp;&amp; fast.next != null) {
+            slow = slow.next;
+            fast = fast.next.next;
+            if (slow == fast) {                       // identidade de nó, nunca equals
+                return new Cycle(entryOf(head, slow), lengthOf(slow));
+            }
+        }
+        return null;                                  // fast chegou ao fim: acíclica
+    }
+
+    // Fase 2 — entrada. Com m nós antes do ciclo e k a posição do encontro dentro
+    // dele, m + k ≡ 0 (mod L). Logo a distância do encontro à entrada é ≡ m:
+    // dois ponteiros a 1 nó por passo, um da cabeça e outro do encontro, cruzam-se lá.
+    private static ListNode entryOf(ListNode head, ListNode meeting) {
+        ListNode fromHead = head, fromMeeting = meeting;
+        while (fromHead != fromMeeting) {
+            fromHead = fromHead.next;
+            fromMeeting = fromMeeting.next;
+        }
+        return fromHead;
+    }
+
+    private static int lengthOf(ListNode meeting) {
+        int length = 1;
+        for (ListNode p = meeting.next; p != meeting; p = p.next) length++;
+        return length;
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Tempo: no máximo <code>m + L</code> passos na fase 1 e <code>m</code> na fase 2, logo O(n). Memória: três referências, O(1).</li>
+        <li>Casos limite obrigatórios: <code>head == null</code> (a guarda do <code>while</code> resolve), lista de um nó sem ciclo, nó único com <code>next</code> a apontar para si (ciclo de comprimento 1, entrada = cabeça), ciclo que começa no primeiro nó (<code>m = 0</code>, os dois ponteiros da fase 2 já estão iguais e o ciclo não corre).</li>
+        <li>A guarda tem de ser <code>fast != null &amp;&amp; fast.next != null</code> e nesta ordem: com a ordem trocada há <code>NullPointerException</code> em listas de comprimento par.</li>
+        <li>Sinais que o entrevistador procura: usar <code>==</code> e não <code>equals</code>; justificar o encontro em vez de o recitar; oferecer a alternativa com <code>HashSet</code> e dizer explicitamente qual é o seu custo; devolver um tipo com significado (<code>record Cycle</code>) em vez de um <code>boolean</code> e um <code>out parameter</code>.</li>
+        <li>Se o entrevistador levantar a restrição de memória, a resposta pragmática é o <code>HashSet&lt;ListNode&gt;</code> com identidade — mas nesse caso é preciso <code>IdentityHashMap</code> ou nós sem <code>equals</code> redefinido, senão dois nós iguais em valor são tratados como o mesmo.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-2" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.2 — Inverter a lista, e inverter em blocos de k</span>
+    <div class="labpills"><span class="qpill">Alvo O(n) tempo, O(1) memória</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: inverter uma lista simplesmente ligada, devolvendo a nova cabeça. Depois, generalizar: inverter os nós em blocos consecutivos de <code>k</code>, deixando o resto final na ordem original quando sobram menos de <code>k</code> nós. Restrições: os nós têm de ser reaproveitados — proibido alocar nós novos ou copiar valores; a primeira variante tem de ser O(1) de memória adicional; <code>k &gt;= 1</code>, com <code>k</code> maior do que o comprimento a devolver a lista intacta. Exemplo: <code>1 → 2 → 3 → 4 → 5</code> invertida dá <code>5 → 4 → 3 → 2 → 1</code>; com <code>k = 2</code> dá <code>2 → 1 → 4 → 3 → 5</code>; com <code>k = 3</code> dá <code>3 → 2 → 1 → 4 → 5</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-4"><div class="lhead"><span class="lnum">Listagem 24.4</span>
+        <span class="lcap">Inversão iterativa em memória constante e inversão em blocos de k.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class Reversal {
+
+    /** Inversão iterativa: O(n) tempo, O(1) memória, sem recursão. */
+    static ListNode reverse(ListNode head) {
+        ListNode prev = null, cur = head;
+        while (cur != null) {
+            ListNode next = cur.next;   // guardar antes de destruir a ligação
+            cur.next = prev;            // vira o ponteiro
+            prev = cur;                 // invariante: prev é a cabeça do já invertido
+            cur = next;
+        }
+        return prev;                    // prev é o antigo último nó
+    }
+
+    /**
+     * Inverte blocos consecutivos de k; um resto com menos de k nós fica intacto.
+     * O(n) tempo; O(n/k) de pilha de chamadas — ver a nota sobre a variante iterativa.
+     */
+    static ListNode reverseInGroups(ListNode head, int k) {
+        if (k &lt; 1) throw new IllegalArgumentException(&quot;k tem de ser &gt;= 1&quot;);
+        if (k == 1 || head == null) return head;
+
+        // 1. Confirmar que há k nós antes de mexer em ponteiros.
+        ListNode probe = head;
+        for (int i = 0; i &lt; k; i++) {
+            if (probe == null) return head;   // bloco incompleto: devolve intacto
+            probe = probe.next;
+        }
+
+        // 2. A cauda a partir do (k+1)-ésimo nó já vem invertida por blocos.
+        ListNode rest = reverseInGroups(probe, k);
+
+        // 3. Inverter os k nós deste bloco, ligando o último ao resto.
+        ListNode prev = rest, cur = head;
+        for (int i = 0; i &lt; k; i++) {
+            ListNode next = cur.next;
+            cur.next = prev;
+            prev = cur;
+            cur = next;
+        }
+        return prev;                          // nova cabeça do bloco
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Inversão simples: O(n) tempo, O(1) memória, três referências vivas. Cada nó é tocado uma vez.</li>
+        <li>Blocos de <code>k</code>: O(n) tempo — cada nó é contado uma vez na sondagem e invertido uma vez — e O(n/k) de pilha. Para <code>k = 1</code> isso seria O(n) de <em>frames</em>; o atalho <code>k == 1</code> no início evita-o, e a versão totalmente iterativa com um nó sentinela remove a recursão por completo.</li>
+        <li>Casos limite: lista vazia, um só nó, <code>k</code> maior do que o comprimento (devolve intacta), <code>k</code> exactamente igual ao comprimento, <code>k = 1</code> (identidade).</li>
+        <li>O erro clássico é não guardar <code>cur.next</code> antes de o sobrescrever: perde-se o resto da lista e o resultado é uma lista de dois nós sem que nada estoire.</li>
+        <li>Sinais que o entrevistador procura: nomear o invariante em voz alta («<code>prev</code> é a cabeça da parte já invertida»); validar <code>k</code>; verificar que existem <code>k</code> nós <em>antes</em> de começar a inverter, em vez de inverter e desfazer; e mencionar a pilha de chamadas sem ser perguntado.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-24-3" class="h2"><span class="secnum">24.3</span> Pilhas: parênteses, next greater element e histogramas<a class="anchor" href="#sec-24-3" aria-label="ligação">#</a></h2>
+
+<p>Uma pilha resolve uma família muito concreta de problemas: aqueles em que um elemento fica pendente até aparecer o elemento que o resolve, e em que a ordem de resolução é a inversa da ordem de chegada. Correspondência de parênteses é o caso puro. A generalização com nome é a <em>pilha monótona</em>: mantém-se a pilha ordenada — crescente ou decrescente — e, sempre que o elemento novo viola a ordem, desempilha-se tudo o que a viola, resolvendo cada elemento no momento em que sai. Como cada índice entra e sai no máximo uma vez, o custo total é O(n) apesar do ciclo interior.</p>
+
+<p>Reconhecer o padrão é metade do exercício. O sinal no enunciado é uma pergunta da forma «para cada elemento, qual é o primeiro à direita (ou à esquerda) que é maior (ou menor)». Aparece disfarçada em temperaturas diárias, em preços de acções, em quantas barras se vêem de um edifício e no maior rectângulo num histograma. Quem reconhece o padrão escreve a solução O(n) em oito minutos; quem não reconhece escreve o duplo ciclo O(n²), e o entrevistador passa os restantes trinta minutos a pedir-lhe que o melhore.</p>
+
+<p>Em Java há uma escolha de API a justificar. <code>java.util.Stack</code> herda de <code>Vector</code>, é sincronizada em todos os métodos e itera na ordem errada — do fundo para o topo. A recomendação da própria documentação é <code>ArrayDeque</code>, que é um <em>array</em> circular sem sincronização e cerca de duas a três vezes mais rápido em <em>push/pop</em>. Quando os elementos são primitivos e o tamanho máximo é conhecido, a resposta melhor ainda é um <code>int[]</code> com um índice de topo: zero <em>boxing</em>, zero indirecção, dados contíguos.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>ArrayDeque</code> não aceita <code>null</code> — lança <code>NullPointerException</code> no <code>push</code>. Quem usa <code>poll()</code> a devolver <code>null</code> como sinal de «pilha vazia» está a apoiar-se num contrato que só existe porque <code>null</code> não é um valor válido; funciona, mas <code>isEmpty()</code> antes de <code>pop()</code> lê melhor e falha mais cedo. E <code>ArrayDeque.push</code> insere na <em>cabeça</em>, enquanto <code>add</code> insere na cauda: misturar os dois na mesma estrutura é a origem de metade dos bugs de pilha em código real.</p></aside>
+
+<div class="qa" id="q-24-4" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O que é uma pilha monótona, como se reconhece o padrão num enunciado, e porque é que um algoritmo com um <code>while</code> dentro de um <code>for</code> continua a ser O(n)?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Uma pilha monótona é uma pilha cujo conteúdo se mantém ordenado por construção: antes de empilhar um elemento, desempilha-se tudo o que quebraria a ordem. O que a torna útil é que o acto de desempilhar <em>é</em> a resposta: o elemento que força a saída é, por definição, o primeiro à direita que é maior (ou menor) do que o que sai.</p>
+      <p>O custo é O(n) por análise amortizada, não por contagem de ciclos aninhados. Cada índice é empilhado exactamente uma vez e desempilhado no máximo uma vez ao longo de toda a execução; o corpo do <code>while</code> executa, somando todas as iterações do <code>for</code>, no máximo <code>n</code> vezes. O total de operações é <code>2n</code>, logo O(n). O argumento correcto é este, e é o que distingue quem percebe de quem memorizou: nomear a quantidade que se conserva — o número de entradas na pilha — e mostrar que cada operação a altera em uma unidade.</p>
+      <p>O sinal no enunciado é sempre o mesmo: «para cada posição, o primeiro elemento à direita/esquerda que é maior/menor». Temperaturas até ao próximo dia mais quente, span de preços de acções, maior rectângulo num histograma, água acumulada entre barras, remover <code>k</code> dígitos para obter o menor número. Um segundo sinal é «o resultado de cada elemento só se conhece depois de ver um elemento futuro» — que é a definição operacional de pendência.</p>
+      <p>Detalhes que separam níveis: guardar <em>índices</em> e não valores, porque as distâncias fazem parte da resposta em quase todas as variantes; decidir conscientemente entre <code>&lt;</code> e <code>&lt;=</code> na condição de saída, que é o que determina o tratamento de duplicados; e usar uma sentinela no fim (um valor menor que todos, ou uma segunda passagem) para forçar o esvaziamento da pilha sem duplicar o código de resolução. Quando não usar: se a pergunta for por intervalos arbitrários e não por «o primeiro à direita», a estrutura certa deixa de ser a pilha e passa a ser uma árvore de segmentos ou uma <em>sparse table</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não conhece o padrão; propõe o duplo ciclo O(n²) e diz que «na prática é rápido».</td></tr>
+        <tr><td>Mid</td><td>Sabe escrever a pilha monótona num problema que já viu, mas justifica O(n) com «o <code>while</code> raramente corre».</td></tr>
+        <tr><td>Sénior</td><td>Define a invariante, dá o argumento amortizado com o total de <code>2n</code> operações, guarda índices e discute <code>&lt;</code> contra <code>&lt;=</code> para duplicados.</td></tr>
+        <tr><td>Staff</td><td>Generaliza a família de problemas, nomeia a sentinela como técnica para eliminar código duplicado e diz quando a pilha deixa de servir (consultas por intervalo arbitrário).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Mude a condição de <code>&lt;</code> para <code>&lt;=</code>: o que passa a acontecer com valores repetidos?»</li>
+      <li>«Adapte para o próximo <em>menor</em> à esquerda.»</li>
+      <li>«Como resolve a mesma pergunta se o array for circular?»</li>
+      <li>«E se as consultas forem por intervalo arbitrário <code>[i, j]</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Justificar O(n) por intuição em vez de análise amortizada.</li>
+      <li>Guardar valores em vez de índices e depois não conseguir dar a distância.</li>
+      <li>Usar <code>java.util.Stack</code> sem saber que é sincronizada e que itera do fundo para o topo.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-3" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.3 — Parênteses equilibrados e uma pilha com min() em O(1)</span>
+    <div class="labpills"><span class="qpill">Alvo O(n) e O(1)</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado em duas partes, como é dado no aquecimento de uma ronda de código. Parte A: dada uma <code>String</code> composta apenas por <code>()</code>, <code>[]</code> e <code>{}</code>, dizer se está equilibrada — cada fecho corresponde ao último aberto por fechar. Parte B: implementar uma pilha de inteiros com <code>push</code>, <code>pop</code>, <code>top</code> e <code>min</code>, <em>todas</em> em O(1) no pior caso. Restrições: na parte A, um caracter fora do alfabeto é erro do chamador e não «falso»; a parte B não pode usar <code>PriorityQueue</code> nem ordenar, e <code>min</code> não pode ser O(n); operações sobre pilha vazia lançam excepção, não devolvem valor sentinela. Exemplos: <code>&quot;{[()]}&quot;</code> é verdadeiro, <code>&quot;([)]&quot;</code> é falso, <code>&quot;(&quot;</code> é falso; para a parte B, <code>push(5), push(2), push(7)</code> dá <code>min() == 2</code>, e depois de dois <code>pop()</code> dá <code>min() == 5</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-5"><div class="lhead"><span class="lnum">Listagem 24.5</span>
+        <span class="lcap">Pilha primitiva sem boxing para parênteses e mínimo prefixo para o MinStack.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class BracketMatching {
+
+    /** O(n) tempo; O(n) memória no pior caso. Pilha primitiva: zero boxing. */
+    static boolean isBalanced(String s) {
+        if ((s.length() &amp; 1) == 1) return false;   // comprimento ímpar nunca fecha
+        char[] stack = new char[s.length()];
+        int top = 0;
+        for (int i = 0; i &lt; s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '(', '[', '{' -&gt; stack[top++] = c;
+                case ')' -&gt; { if (top == 0 || stack[--top] != '(') return false; }
+                case ']' -&gt; { if (top == 0 || stack[--top] != '[') return false; }
+                case '}' -&gt; { if (top == 0 || stack[--top] != '{') return false; }
+                default  -&gt; throw new IllegalArgumentException(&quot;caracter inesperado: &quot; + c);
+            }
+        }
+        return top == 0;                           // sobrou algo aberto -&gt; falso
+    }
+}
+
+/** Pilha com min() em O(1): o mínimo do prefixo viaja ao lado de cada valor. */
+final class MinStack {
+    private int[] values = new int[16];
+    private int[] mins   = new int[16];   // invariante: mins[i] == min(values[0..i])
+    private int size;
+
+    void push(int v) {
+        if (size == values.length) {      // crescimento geométrico: O(1) amortizado
+            values = Arrays.copyOf(values, size &lt;&lt; 1);
+            mins   = Arrays.copyOf(mins,   size &lt;&lt; 1);
+        }
+        mins[size]     = (size == 0) ? v : Math.min(mins[size - 1], v);
+        values[size++] = v;
+    }
+
+    int pop()  { requireNonEmpty(); return values[--size]; }
+    int top()  { requireNonEmpty(); return values[size - 1]; }
+    int min()  { requireNonEmpty(); return mins[size - 1]; }
+    boolean isEmpty() { return size == 0; }
+
+    private void requireNonEmpty() {
+        if (size == 0) throw new NoSuchElementException(&quot;pilha vazia&quot;);
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Parte A: O(n) tempo, O(n) memória no pior caso (<code>&quot;(((((&quot;</code>). O teste de paridade corta metade das entradas inválidas com uma instrução.</li>
+        <li>Parte B: todas as operações em O(1) — <code>push</code> amortizado por causa do crescimento geométrico do array. Memória 8 bytes por elemento, o dobro de uma pilha simples. A variante que só empilha o mínimo quando <code>v &lt;= min</code> corrente poupa memória em dados com poucos mínimos novos, mas exige uma segunda pilha e cuidado com os duplicados: tem de ser <code>&lt;=</code> e não <code>&lt;</code>, senão o <code>pop</code> de um valor igual ao mínimo perde-o.</li>
+        <li>Casos limite: string vazia (verdadeiro), só fechos, fechos a mais no fim, <code>Integer.MIN_VALUE</code> no <code>MinStack</code> (a codificação aritmética alternativa <code>2v - min</code> transborda aqui — mais um argumento para o array paralelo).</li>
+        <li>Sinais que o entrevistador procura: escolher <code>char[]</code> em vez de <code>Deque&lt;Character&gt;</code> e saber porquê; distinguir «entrada inválida» de «resultado falso»; lançar <code>NoSuchElementException</code> em vez de devolver <code>-1</code>; e enunciar o invariante do <code>MinStack</code> antes de escrever o código.</li>
+        <li>Extensão comum como follow-up: suportar <code>&lt;</code> e <code>&gt;</code> como um quarto par, ou aceitar texto arbitrário entre delimitadores — a resposta é ignorar o que não é delimitador, o que altera o ramo <code>default</code>.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-4" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.4 — Next greater element num array circular</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dado um <code>int[]</code> tratado como circular — depois do último elemento vem outra vez o primeiro — devolver, para cada posição, o primeiro valor estritamente maior encontrado ao avançar para a direita, ou <code>-1</code> quando não existe nenhum. Restrições: uma única solução O(n) em tempo e O(n) em memória; não é permitido concatenar o array consigo próprio e duplicar a memória de dados; os valores podem repetir-se e podem ser negativos. Exemplo: <code>[3, 8, 4, 1, 2]</code> devolve <code>[8, -1, 8, 2, 3]</code> — repare-se que a posição do <code>1</code> encontra o <code>2</code> à sua direita e a posição do <code>2</code> só encontra resposta ao dar a volta e chegar ao <code>3</code>. Para <code>[5, 5, 5]</code> a saída é <code>[-1, -1, -1]</code>, porque «maior» é estrito.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-6"><div class="lhead"><span class="lnum">Listagem 24.6</span>
+        <span class="lcap">Pilha monótona decrescente de índices com passagem dupla módulo n.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class NextGreater {
+
+    /**
+     * Para cada posição, o primeiro valor estritamente maior à direita, com o
+     * array tratado como circular; -1 quando não existe.
+     * O(n) tempo (cada índice entra e sai da pilha uma vez), O(n) memória.
+     */
+    static int[] nextGreaterCircular(int[] nums) {
+        int n = nums.length;
+        int[] result = new int[n];
+        Arrays.fill(result, -1);                 // o valor por omissão é a resposta &quot;não existe&quot;
+
+        int[] stack = new int[n];                // índices; valores estritamente decrescentes
+        int top = 0;
+
+        // Duas voltas lógicas sem duplicar o array: o índice real é i módulo n.
+        for (int i = 0; i &lt; 2 * n; i++) {
+            int idx = (i &lt; n) ? i : i - n;
+            int value = nums[idx];
+
+            // Tudo o que está pendente e é menor que o valor actual encontrou aqui
+            // o seu próximo maior: resolve-se e sai definitivamente.
+            while (top &gt; 0 &amp;&amp; nums[stack[top - 1]] &lt; value) {
+                result[stack[--top]] = value;
+            }
+
+            // A segunda volta serve só para resolver pendências; empilhar outra vez
+            // criaria respostas que dão mais de uma volta completa.
+            if (i &lt; n) stack[top++] = idx;
+        }
+        return result;
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Tempo O(n): o <code>for</code> corre <code>2n</code> vezes e o corpo do <code>while</code> executa, no total, no máximo <code>n</code> vezes, porque só há <code>n</code> empilhamentos. Memória O(n) para a pilha e para o resultado; o array de entrada não é copiado.</li>
+        <li>A condição é <code>&lt;</code> e não <code>&lt;=</code> porque o enunciado pede estritamente maior. Com <code>&lt;=</code>, um valor igual passaria a resolver o pendente e <code>[5, 5, 5]</code> devolveria <code>[5, 5, 5]</code>.</li>
+        <li>Casos limite: array vazio (devolve vazio), um só elemento (<code>[-1]</code>), todos iguais, sequência estritamente decrescente (a pilha chega a <code>n</code> e só esvazia na segunda volta), valores negativos — repare-se que <code>-1</code> como sentinela é ambíguo se <code>-1</code> puder ser um valor legítimo; num contexto real devolve-se <code>OptionalInt</code> ou um array de índices com <code>-1</code>.</li>
+        <li>Sinais que o entrevistador procura: guardar índices e não valores; perceber que só se empilha na primeira volta; escrever o <code>i - n</code> em vez de <code>i % n</code> e saber que é a mesma coisa por metade do custo; e apontar a ambiguidade da sentinela sem ser questionado.</li>
+        <li>Variantes que costumam vir a seguir: devolver a <em>distância</em> em vez do valor (basta guardar <code>idx - stack[top]</code>), próximo <em>menor</em> à esquerda (inverte-se a ordem da pilha e o sentido da passagem), e a versão não circular, que é este código sem a segunda volta.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<p>O maior rectângulo num histograma é a variante que mais separa candidatos, porque a resposta O(n) exige duas ideias em simultâneo: a pilha monótona crescente dá, para cada barra, o primeiro índice mais baixo à esquerda e à direita; e uma sentinela de altura zero no fim força o esvaziamento sem duplicar código.</p>
+
+<figure class="listing java" id="lst-24-7"><div class="lhead"><span class="lnum">Listagem 24.7</span>
+<span class="lcap">Maior rectângulo num histograma em O(n) com sentinela final.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>/** O(n) tempo, O(n) memória. best é long: 10^5 barras de altura 10^9 transbordam int. */
+static long largestRectangle(int[] heights) {
+    int n = heights.length;
+    int[] stack = new int[n + 1];       // índices com alturas crescentes
+    int top = 0;
+    long best = 0;
+
+    for (int i = 0; i &lt;= n; i++) {
+        int h = (i == n) ? 0 : heights[i];   // sentinela: altura 0 esvazia a pilha
+
+        // Ao aparecer uma barra mais baixa, todas as barras mais altas pendentes
+        // ficam limitadas à direita por i e à esquerda pelo índice abaixo delas.
+        while (top &gt; 0 &amp;&amp; heights[stack[top - 1]] &gt;= h) {
+            int height = heights[stack[--top]];
+            int left   = (top == 0) ? -1 : stack[top - 1];
+            long width = i - left - 1;
+            best = Math.max(best, height * width);
+        }
+        stack[top++] = i;
+    }
+    return best;
+}
+</code></pre></figure>
+
+<h2 id="sec-24-4" class="h2"><span class="secnum">24.4</span> Filas, deques e janelas máximas<a class="anchor" href="#sec-24-4" aria-label="ligação">#</a></h2>
+
+<p>A fila é a estrutura da ordem de chegada, e o <em>deque</em> — fila de duas pontas — é a estrutura das janelas deslizantes. Em Java, <code>ArrayDeque</code> implementa simultaneamente <code>Queue</code> e <code>Deque</code> sobre um <em>array</em> circular com capacidade potência de dois: inserir e remover em qualquer das pontas é O(1) amortizado, os dados são contíguos e não há nó por elemento. <code>LinkedList</code> também implementa <code>Deque</code>, mas paga 24 a 40 bytes de nó por elemento e uma falha de cache por travessia; é a escolha errada em praticamente todos os casos, e dizê-lo com o número ao lado é um sinal forte.</p>
+
+<p>O padrão da janela deslizante com máximo é onde se vê se o candidato pensa em invariantes. A ideia é manter no <em>deque</em> apenas os índices que ainda podem vir a ser o máximo de alguma janela futura. Um índice deixa de poder sê-lo por duas razões, e só por duas: ou já saiu pela esquerda da janela, e remove-se pela cabeça; ou entrou à direita um valor maior ou igual, e então tudo o que é menor ou igual atrás dele é irrelevante para sempre, e remove-se pela cauda. O que sobra é uma sequência de valores estritamente decrescente cuja cabeça é o máximo da janela corrente — resposta em O(1) por posição, O(n) no total, contra O(n·k) da força bruta e O(n log k) de um <code>TreeMap</code> de contagens.</p>
+
+<p>A fila de prioridade é a outra face desta secção. <code>PriorityQueue</code> é um <em>heap</em> binário sobre <em>array</em>: <code>offer</code> e <code>poll</code> em O(log n), <code>peek</code> em O(1), e — detalhe que apanha muita gente — a iteração <em>não</em> é por ordem de prioridade, é pela ordem física do <em>array</em>. Serve o padrão «juntar k fontes ordenadas» com um <em>heap</em> de tamanho k, que é exactamente o exercício de fusão de listas.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 24.1</span> Custo das operações que aparecem nesta ronda, e o que mudar quando o custo dói.</div>
+<div class="tscroll"><table><thead><tr><th>Estrutura</th><th>Operações O(1)</th><th>Operações O(log n)</th><th>Custo por elemento</th><th>Quando não usar</th></tr></thead>
+<tbody>
+<tr><td><code>HashMap</code></td><td><code>get</code>, <code>put</code>, <code>remove</code> (esperado)</td><td>pior caso no balde treeificado</td><td>≈ 32 B de nó + chave + valor</td><td>Chaves inteiras densas: usar array indexado</td></tr>
+<tr><td><code>LinkedHashMap</code></td><td>o mesmo, com ordem de inserção ou de acesso</td><td>—</td><td>≈ 40 B de nó (dois ponteiros extra)</td><td>Quando a ordem não é usada: paga ponteiros a mais</td></tr>
+<tr><td><code>TreeMap</code></td><td>—</td><td><code>get</code>, <code>put</code>, <code>floorKey</code>, <code>ceilingKey</code></td><td>≈ 40 B de nó</td><td>Sem consultas por ordem ou por intervalo</td></tr>
+<tr><td><code>ArrayDeque</code></td><td>ambas as pontas, amortizado</td><td>—</td><td>4 a 8 B de referência, contíguo</td><td>Acesso por índice no meio</td></tr>
+<tr><td><code>LinkedList</code></td><td>ambas as pontas, e remoção com iterador</td><td>—</td><td>≈ 24 a 40 B de nó</td><td>Quase sempre: <code>ArrayDeque</code> ou <code>ArrayList</code></td></tr>
+<tr><td><code>PriorityQueue</code></td><td><code>peek</code></td><td><code>offer</code>, <code>poll</code></td><td>4 a 8 B, array contíguo</td><td>Quando é preciso iterar por ordem ou remover por chave</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa janela de <code>k = 10 000</code> sobre <code>n = 1 000 000</code> elementos: força bruta faz 10<sup>10</sup> comparações — minutos; <code>TreeMap</code> de contagens faz <code>n log k</code> ≈ 1,3 × 10<sup>7</sup> operações com alocação de nó por inserção — centenas de milissegundos; o <em>deque</em> monótono faz no máximo <code>2n</code> = 2 × 10<sup>6</sup> operações sobre um <em>array</em> contíguo — poucos milissegundos. É a diferença entre três ordens de grandeza, e é o argumento que se dá quando perguntam «isso vale mesmo a pena?».</p></aside>
+
+<div class="qa" id="q-24-5" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Preciso de uma fila em Java. Percorra-me as opções — <code>ArrayDeque</code>, <code>LinkedList</code>, <code>Stack</code>, <code>ArrayBlockingQueue</code>, <code>ConcurrentLinkedQueue</code> — e diga-me qual escolhe em cada caso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A primeira pergunta de volta é se há mais do que um <em>thread</em>, porque isso parte a decisão em duas metades que não se misturam. Num só <em>thread</em>, a escolha por omissão é <code>ArrayDeque</code>: <em>array</em> circular de capacidade potência de dois, O(1) amortizado nas duas pontas, sem nó por elemento, dados contíguos e amigos da cache. Serve de fila e de pilha, e é o que a documentação recomenda em vez de <code>Stack</code>.</p>
+      <p><code>LinkedList</code> só ganha quando é preciso remover pelo meio com um iterador já posicionado, ou quando se guardam referências aos nós — o que a API não permite fazer. Paga 24 a 40 bytes de nó por elemento e uma falha de cache por salto. <code>Stack</code> herda de <code>Vector</code>, tem todos os métodos sincronizados (custo que não desaparece mesmo sem contenção, embora o <em>biased locking</em> tenha deixado de existir nas JVM recentes) e itera do fundo para o topo, ao contrário da ordem de <em>pop</em>: é uma classe de compatibilidade, não uma escolha.</p>
+      <p>Com concorrência, a pergunta seguinte é se é preciso <em>backpressure</em>. Se sim — e num consumidor/produtor quase sempre é —, <code>ArrayBlockingQueue</code> com capacidade fixa: bloqueia o produtor quando enche, o que é a forma mais simples e mais robusta de impedir que uma fila em memória cresça até ao <code>OutOfMemoryError</code>. Usa um único <code>ReentrantLock</code> com duas condições, logo o débito máximo é limitado por esse <em>lock</em>. <code>LinkedBlockingQueue</code> tem <em>locks</em> separados para as duas pontas e escala melhor com muitos produtores e consumidores, mas por omissão é ilimitada — e uma fila ilimitada é uma fuga de memória à espera de acontecer; dá-se-lhe sempre capacidade.</p>
+      <p><code>ConcurrentLinkedQueue</code> é não-bloqueante, baseada em <em>compare-and-swap</em>, ilimitada e sem operação de espera: usa-se quando o consumidor faz <em>polling</em> e nunca deve bloquear, e o produtor tem outra forma de travar. Note-se que o seu <code>size()</code> é O(n) e não é um instantâneo consistente — usá-lo numa métrica exportada a cada segundo é um erro que se paga em CPU. Para trabalho paralelo com roubo de tarefas, a escolha é <code>ConcurrentLinkedDeque</code> ou o próprio <code>ForkJoinPool</code>; para transferência directa sem armazenamento, <code>SynchronousQueue</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Usa <code>LinkedList</code> para tudo, ou <code>Stack</code> sem saber que é legado.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>ArrayDeque</code> é preferível a <code>Stack</code> e conhece <code>BlockingQueue</code>, mas não distingue limitada de ilimitada.</td></tr>
+        <tr><td>Sénior</td><td>Separa a decisão por concorrência e por <em>backpressure</em>, exige capacidade explícita nas filas bloqueantes e justifica <code>ArrayDeque</code> pela localidade de memória.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo do <code>size()</code> O(n) em <code>ConcurrentLinkedQueue</code>, a diferença de contenção entre <code>ArrayBlockingQueue</code> e <code>LinkedBlockingQueue</code>, e liga a escolha à política de rejeição de um <code>ThreadPoolExecutor</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece a um <code>ThreadPoolExecutor</code> com <code>LinkedBlockingQueue</code> ilimitada e <code>maximumPoolSize</code> de 50?»</li>
+      <li>«Precisa de ordem FIFO estrita entre produtores. Qual escolhe?»</li>
+      <li>«Como implementaria <em>backpressure</em> se a fila tivesse de ser não-bloqueante?»</li>
+      <li>«<code>ArrayDeque</code> aceita <code>null</code>? Porque não?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <code>Collections.synchronizedList</code> como fila concorrente.</li>
+      <li>Fila ilimitada em memória entre um produtor rápido e um consumidor lento, sem mencionar o risco.</li>
+      <li>Assumir que <code>ConcurrentLinkedQueue</code> é mais rápida em todos os cenários por ser «sem locks».</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-5" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.5 — Máximo de cada janela deslizante com um deque</span>
+    <div class="labpills"><span class="qpill">Alvo O(n) tempo, O(k) memória</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dado um <code>int[] nums</code> e um inteiro <code>k</code>, devolver um array com o máximo de cada janela contígua de comprimento <code>k</code>, da esquerda para a direita. Restrições: O(n) em tempo — a solução O(n log k) com <code>TreeMap</code> ou <em>heap</em> é aceite como primeira aproximação mas não como resposta final; O(k) em memória adicional; <code>k</code> fora de <code>[1, n]</code> é erro do chamador; os valores podem repetir-se e ser negativos. Exemplo: <code>nums = [1, 3, -1, -3, 5, 3, 6, 7]</code> com <code>k = 3</code> devolve <code>[3, 3, 5, 5, 6, 7]</code>. Para <code>nums = [9, 8, 7]</code> com <code>k = 1</code> a saída é o próprio array.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-8"><div class="lhead"><span class="lnum">Listagem 24.8</span>
+        <span class="lcap">Deque monótono de índices: expirar pela cabeça, dominar pela cauda.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class SlidingWindowMaximum {
+
+    /**
+     * Máximo de cada janela de comprimento k. O(n) tempo, O(k) memória.
+     * Invariante: o deque contém índices da janela corrente cujos valores são
+     * estritamente decrescentes, logo a cabeça é sempre o máximo da janela.
+     */
+    static int[] maxSlidingWindow(int[] nums, int k) {
+        Objects.requireNonNull(nums, &quot;nums&quot;);
+        if (k &lt; 1 || k &gt; nums.length)
+            throw new IllegalArgumentException(&quot;k fora de [1, n]: &quot; + k);
+
+        int n = nums.length;
+        int[] out = new int[n - k + 1];
+        Deque&lt;Integer&gt; window = new ArrayDeque&lt;&gt;(k);   // índices, não valores
+
+        for (int i = 0; i &lt; n; i++) {
+            // 1. Expirar o que já saiu pela esquerda da janela.
+            while (!window.isEmpty() &amp;&amp; window.peekFirst() &lt;= i - k) {
+                window.pollFirst();
+            }
+            // 2. Quem é menor ou igual ao novo valor nunca mais pode ser máximo:
+            //    o novo é maior e sai mais tarde da janela. Sai pela cauda.
+            while (!window.isEmpty() &amp;&amp; nums[window.peekLast()] &lt;= nums[i]) {
+                window.pollLast();
+            }
+            window.addLast(i);
+
+            // 3. A partir do índice k-1 há janela completa; a cabeça é a resposta.
+            if (i &gt;= k - 1) out[i - k + 1] = nums[window.peekFirst()];
+        }
+        return out;
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Tempo O(n): cada índice é adicionado uma vez e removido no máximo uma vez, logo os dois <code>while</code> somam no máximo <code>n</code> remoções em toda a execução. Memória O(k): o <em>deque</em> nunca contém índices fora da janela.</li>
+        <li>A condição do passo 2 é <code>&lt;=</code> e não <code>&lt;</code>. Com <code>&lt;</code>, índices de valores iguais acumulam-se: o resultado continua correcto, mas a memória deixa de ser O(k) garantida em entradas com muitos repetidos. Vale a pena dizê-lo em voz alta.</li>
+        <li>Guardar índices e não valores é obrigatório: só com o índice é possível saber se um candidato já expirou pela esquerda.</li>
+        <li>Casos limite: <code>k = 1</code> (saída igual à entrada), <code>k = n</code> (um único máximo), array estritamente decrescente (o <em>deque</em> cresce até <code>k</code> e cada passo remove um pela cabeça), todos os valores iguais, valores negativos, <code>nums</code> vazio com qualquer <code>k</code> (excepção).</li>
+        <li>Sinais que o entrevistador procura: enunciar o invariante antes de codificar; explicar porque é que a força bruta O(n·k) não serve com números concretos; propor <code>int[]</code> com dois índices em vez de <code>ArrayDeque&lt;Integer&gt;</code> quando o desempenho importa, eliminando o <em>boxing</em>; e validar <code>k</code> em vez de devolver um array vazio silenciosamente.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-6" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.6 — Fundir k listas ordenadas</span>
+    <div class="labpills"><span class="qpill">Alvo O(N log k)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dado um array de <code>k</code> cabeças de listas ligadas, cada uma já ordenada por ordem crescente, produzir uma única lista ordenada. Restrições: os nós têm de ser reaproveitados — proibido criar nós novos ou copiar valores para uma colecção intermédia e ordenar; o array pode conter posições a <code>null</code>; <code>k</code> pode ser 0. Complexidade alvo O(N log k), com <code>N</code> o número total de nós, e memória adicional O(k). Exemplo: <code>[1 → 4 → 5, 1 → 3 → 4, 2 → 6]</code> devolve <code>1 → 1 → 2 → 3 → 4 → 4 → 5 → 6</code>. Casos a tratar: array vazio devolve <code>null</code>, array com uma única lista devolve-a como está.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-9"><div class="lhead"><span class="lnum">Listagem 24.9</span>
+        <span class="lcap">Heap de tamanho k sobre as cabeças, com nó sentinela para a ligação inicial.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class MergeSortedLists {
+
+    /**
+     * O(N log k) em tempo e O(k) em memória: o heap contém no máximo uma cabeça
+     * por lista, e cada um dos N nós entra e sai dele exactamente uma vez.
+     */
+    static ListNode mergeK(ListNode[] lists) {
+        Objects.requireNonNull(lists, &quot;lists&quot;);
+        PriorityQueue&lt;ListNode&gt; heap = new PriorityQueue&lt;&gt;(
+                Math.max(1, lists.length), Comparator.comparingInt(node -&gt; node.val));
+
+        for (ListNode list : lists) {
+            if (list != null) heap.add(list);      // só as cabeças: o heap nunca passa de k
+        }
+
+        ListNode sentinel = new ListNode(0);       // elimina o caso especial da 1.ª ligação
+        ListNode tail = sentinel;
+        while (!heap.isEmpty()) {
+            ListNode min = heap.poll();
+            if (min.next != null) heap.add(min.next);  // repor antes de reescrever ligações
+
+            tail.next = min;                       // reaproveita o nó: zero alocação por elemento
+            tail = min;
+        }
+        tail.next = null;                          // corta a cauda antiga do último nó
+        return sentinel.next;
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Tempo O(N log k): cada nó é inserido e retirado uma vez de um <em>heap</em> com no máximo <code>k</code> elementos. Memória O(k) — o <em>heap</em> —, mais um nó sentinela. Juntar tudo num array e ordenar seria O(N log N) e O(N) de memória: pior nas duas dimensões quando <code>k</code> é pequeno face a <code>N</code>.</li>
+        <li>A alternativa sem <em>heap</em> é a fusão par a par em rondas (fundir listas 1 com 2, 3 com 4, etc., repetindo <code>log k</code> vezes): mesma complexidade assintótica, constantes melhores por não haver comparador nem estrutura auxiliar, e O(1) de memória. É a resposta que impressiona como segunda solução.</li>
+        <li><code>tail.next = null</code> no fim não é decorativo: o último nó retirado ainda aponta para o seu sucessor original, que já foi consumido; sem esta linha a lista pode conter um ciclo.</li>
+        <li>Casos limite: <code>lists.length == 0</code> (devolve <code>null</code> porque <code>sentinel.next</code> é <code>null</code>), todas as posições a <code>null</code>, uma só lista, listas de tamanhos muito desiguais, valores repetidos entre listas.</li>
+        <li>Sinais que o entrevistador procura: usar sentinela; repor a cabeça seguinte no <em>heap</em> antes de alterar <code>tail.next</code>; dimensionar o <em>heap</em> com <code>Math.max(1, k)</code> porque <code>PriorityQueue</code> rejeita capacidade inicial menor que 1; e saber que a iteração de uma <code>PriorityQueue</code> não é ordenada, caso alguém sugira percorrê-la.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-24-5" class="h2"><span class="secnum">24.5</span> Estruturas compostas: LRU e LFU<a class="anchor" href="#sec-24-5" aria-label="ligação">#</a></h2>
+
+<p>A cache LRU é o exercício de estruturas compostas por excelência, porque nenhuma estrutura isolada resolve o problema: é preciso O(1) para encontrar por chave — o que exige uma tabela de hash — e O(1) para reordenar por recência — o que exige uma lista duplamente ligada com acesso directo ao nó. A composição é a resposta: o mapa aponta para o nó, o nó conhece os seus vizinhos, e mover um nó para a frente é desligá-lo e religá-lo em quatro atribuições de ponteiro, sem percorrer nada.</p>
+
+<p>Dois detalhes de implementação valem mais do que o resto. Primeiro, os nós sentinela: uma cabeça falsa e uma cauda falsa, ligadas uma à outra na construção, eliminam todos os testes de <code>null</code> em <code>unlink</code> e <code>linkFront</code>. Sem eles, cada método precisa de três ramos e é aí que aparecem os erros num quadro branco. Segundo, a remoção tem de limpar o mapa <em>e</em> a lista, usando a chave guardada no nó — é por isso que o nó guarda a chave e não só o valor; quem só guarda o valor descobre, a meio do exercício, que não consegue remover a entrada do mapa em O(1).</p>
+
+<p>A LFU é a variante que aparece como pergunta de seguimento e que muitos candidatos declaram impossível em O(1). É possível: mantém-se um mapa de chave para nó, e um segundo mapa de frequência para uma lista ligada de nós com essa frequência, mais uma variável com a frequência mínima corrente. Promover é mover o nó do balde <code>f</code> para o <code>f+1</code>; despejar é tirar o mais antigo do balde <code>minFreq</code>; <code>minFreq</code> sobe apenas quando o seu balde esvazia por promoção, e volta a 1 em cada inserção. O desempate dentro do balde é por recência, o que faz da LFU uma LRU aninhada.</p>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Em produção, escrever a LRU à mão é quase sempre a escolha errada. O <code>Caffeine</code> usa a política <em>W-TinyLFU</em>, com um esboço de frequência probabilístico e uma janela de admissão, e mede-se com taxas de acerto 5 a 15 pontos percentuais acima de uma LRU pura nos padrões de acesso típicos de <em>web</em>; traz ainda expiração por tempo, carregamento assíncrono e métricas. A LRU manual justifica-se quando a política tem de ser exactamente reproduzível para efeitos de teste, quando a dependência é proibida, ou quando o objecto guardado exige um <em>hook</em> de libertação de recursos que a biblioteca não expõe.</p></aside>
+
+<div class="qa" id="q-24-6" data-box="qa" data-area="dsa" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Escreveu a LRU no quadro. Agora ela vai para um serviço com 50 000 pedidos por segundo e 16 <em>threads</em>. O que muda?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Muda tudo, porque a LRU do quadro tem um defeito estrutural sob concorrência: <em>toda</em> a leitura é uma escrita. Cada <code>get</code> move um nó para a frente da lista, portanto 50 000 leituras por segundo são 50 000 mutações da mesma lista ligada, e um <code>synchronized</code> global transforma a cache no ponto mais contendido do serviço. Não é um problema de correcção que se resolve com um <em>lock</em> — é o <em>lock</em> que é o problema.</p>
+      <p>As saídas, por ordem de esforço. Primeira: usar <code>Caffeine</code>. Regista os acessos num anel de <em>buffers</em> por <em>thread</em> e aplica-os à estrutura de recência em lote, fora do caminho crítico, com <code>ConcurrentHashMap</code> por baixo; as leituras deixam de contender. Segunda: se a dependência for proibida, particionar — <code>N</code> caches independentes, escolhidas por <code>hash(key) &amp; (N - 1)</code>, com <code>N</code> entre 16 e 64. A contenção divide-se por <code>N</code> e o custo é uma política de despejo aproximada, porque cada partição só conhece a sua recência. Terceira: aceitar recência aproximada — só mover o nó se ele não estiver já entre os primeiros elementos, ou marcar um bit de acesso e reordenar periodicamente, que é essencialmente o algoritmo do relógio.</p>
+      <p>Há três dimensões que a versão de entrevista ignora e que produção exige. Dimensionamento por peso e não por número de entradas: 10 000 entradas de 2 KB e 10 000 de 2 MB são coisas diferentes, e a segunda é um <code>OutOfMemoryError</code>; usa-se <code>maximumWeight</code> com um pesador. Expiração por tempo além do despejo por capacidade, porque uma entrada correcta mas velha é frequentemente pior do que um <em>miss</em>. E protecção contra <em>cache stampede</em>: com carregamento por <code>get</code> ingénuo, a expiração de uma chave quente lança 16 carregamentos simultâneos para a base de dados; a defesa é carregamento coalescido — <code>ConcurrentHashMap.computeIfAbsent</code> ou o <code>LoadingCache</code>, que garante uma única execução por chave.</p>
+      <p>Por fim, as métricas: taxa de acerto, taxa de despejo, tamanho e latência de carregamento. Uma cache sem taxa de acerto exportada é uma cache que ninguém sabe se está a funcionar; abaixo de 70 a 80% de acertos, na maior parte dos casos, a cache está a custar mais memória do que poupa em latência e o problema é a chave ou o tamanho, não a política.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ponho <code>synchronized</code> nos métodos» e fica por aí; ou diz que <code>ConcurrentHashMap</code> resolve, sem ver a lista de recência.</td></tr>
+        <tr><td>Mid</td><td>Reconhece a contenção e propõe <code>ConcurrentHashMap</code> mais um <em>lock</em> para a lista, sem quantificar nem propor alternativa.</td></tr>
+        <tr><td>Sénior</td><td>Identifica «leitura é escrita» como a causa, propõe biblioteca ou particionamento com número concreto, e nomeia expiração, peso e <em>stampede</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta recência aproximada com <em>buffers</em> por <em>thread</em>, discute a taxa de acerto como critério de decisão sobre existir cache, e diz o que mediria antes e depois.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas partições e porquê esse número?»</li>
+      <li>«Como evita que a expiração de uma chave quente derrube a base de dados?»</li>
+      <li>«A cache é local a cada instância ou partilhada em Redis? O que muda na invalidação?»</li>
+      <li>«Que taxa de acerto justifica manter esta cache?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não ver que o <code>get</code> muta a estrutura e por isso não é paralelizável de graça.</li>
+      <li>Dimensionar a cache por número de entradas quando os valores têm tamanho muito variável.</li>
+      <li>Propor cache distribuída sem falar de invalidação nem de custo de rede por acerto.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-24-7" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 24.7 — Cache LRU com HashMap e lista duplamente ligada</span>
+    <div class="labpills"><span class="qpill">Alvo O(1) por operação</span><span class="qpill">30 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: implementar <code>LruCache&lt;K, V&gt;</code> com capacidade fixa, oferecendo <code>get(K)</code> e <code>put(K, V)</code>, ambos em O(1) no caso esperado. Um <code>get</code> com sucesso e um <code>put</code> — de inserção ou de actualização — tornam a chave a mais recente. Ao atingir a capacidade, a inserção de uma chave nova despeja a entrada menos recentemente usada. Restrições: capacidade tem de ser positiva, validada no construtor; proibido usar <code>LinkedHashMap</code> com <code>accessOrder</code> — o objectivo é a estrutura composta; <code>get</code> de chave ausente devolve <code>null</code> sem alterar a ordem; não pode haver percurso da lista em nenhuma operação. Exemplo com capacidade 2: <code>put(1,&quot;a&quot;), put(2,&quot;b&quot;), get(1) → &quot;a&quot;, put(3,&quot;c&quot;)</code> despeja a chave 2, e <code>get(2)</code> devolve <code>null</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-24-10"><div class="lhead"><span class="lnum">Listagem 24.10</span>
+        <span class="lcap">Índice de hash sobre nós de uma lista dupla com sentinelas de cabeça e cauda.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public final class LruCache&lt;K, V&gt; {
+
+    /** O nó guarda a chave: sem ela não é possível remover do índice em O(1). */
+    private static final class Node&lt;K, V&gt; {
+        final K key;
+        V value;
+        Node&lt;K, V&gt; prev, next;
+        Node(K key, V value) { this.key = key; this.value = value; }
+    }
+
+    private final int capacity;
+    private final Map&lt;K, Node&lt;K, V&gt;&gt; index;
+    private final Node&lt;K, V&gt; head = new Node&lt;&gt;(null, null);  // sentinela: lado recente
+    private final Node&lt;K, V&gt; tail = new Node&lt;&gt;(null, null);  // sentinela: lado antigo
+
+    public LruCache(int capacity) {
+        if (capacity &lt;= 0) throw new IllegalArgumentException(&quot;capacidade tem de ser &gt; 0&quot;);
+        this.capacity = capacity;
+        this.index = HashMap.newHashMap(capacity);   // dimensionado: nunca redimensiona
+        head.next = tail;                            // lista vazia mas sempre bem formada
+        tail.prev = head;
+    }
+
+    /** O(1) esperado. Devolve null se ausente, sem alterar a ordem de recência. */
+    public V get(K key) {
+        Node&lt;K, V&gt; node = index.get(key);
+        if (node == null) return null;
+        moveToFront(node);
+        return node.value;
+    }
+
+    /** O(1) esperado. Insere ou actualiza, e promove a chave a mais recente. */
+    public V put(K key, V value) {
+        Node&lt;K, V&gt; existing = index.get(key);
+        if (existing != null) {
+            V previous = existing.value;
+            existing.value = value;
+            moveToFront(existing);
+            return previous;
+        }
+        if (index.size() == capacity) evictOldest();
+        Node&lt;K, V&gt; fresh = new Node&lt;&gt;(key, value);
+        index.put(key, fresh);
+        linkFront(fresh);
+        return null;
+    }
+
+    public int size() { return index.size(); }
+
+    private void evictOldest() {
+        Node&lt;K, V&gt; oldest = tail.prev;               // graças à sentinela, nunca é null
+        unlink(oldest);
+        index.remove(oldest.key);                    // é aqui que a chave no nó é indispensável
+        oldest.prev = oldest.next = null;            // corta referências: ajuda o GC
+    }
+
+    private void moveToFront(Node&lt;K, V&gt; node) { unlink(node); linkFront(node); }
+
+    // Sem sentinelas, estes dois métodos precisariam de três ramos cada um.
+    private void unlink(Node&lt;K, V&gt; node) {
+        node.prev.next = node.next;
+        node.next.prev = node.prev;
+    }
+
+    private void linkFront(Node&lt;K, V&gt; node) {
+        node.next = head.next;
+        node.prev = head;
+        head.next.prev = node;
+        head.next = node;
+    }
+}
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li><code>get</code> e <code>put</code> em O(1) esperado: uma consulta de hash mais um número fixo de atribuições de ponteiro. Memória: um nó de cerca de 40 bytes por entrada, além do nó do próprio <code>HashMap</code>.</li>
+        <li>Casos limite obrigatórios: capacidade 1 (inserir a segunda chave despeja a primeira, e a ordem das operações em <code>put</code> tem de garantir que não se despeja a chave que se acabou de inserir); <code>put</code> repetido da mesma chave não deve despejar nada; <code>get</code> de chave ausente não altera a lista; e a inserção depois de uma remoção tem de encontrar a lista bem formada.</li>
+        <li>O despejo tem de ocorrer <em>antes</em> da inserção e só quando a chave é nova. A ordem trocada — inserir e depois despejar o mais antigo — remove a entrada acabada de inserir quando a capacidade é 1.</li>
+        <li>Sinais que o entrevistador procura: sentinelas na construção, e dizê-lo como decisão deliberada; a chave dentro do nó; <code>HashMap.newHashMap</code> em vez do construtor por capacidade; e reconhecer, sem ser perguntado, que a classe não é segura para acesso concorrente porque <em>toda</em> a leitura muta a lista.</li>
+        <li>Follow-up quase garantido: «e a LFU?» — ver a listagem seguinte. O segundo follow-up é a versão com <code>LinkedHashMap</code> em seis linhas, que se deve saber de cor e apresentar como o que se escreveria em produção se a política pura bastasse.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-24-11"><div class="lhead"><span class="lnum">Listagem 24.11</span>
+<span class="lcap">A mesma política em seis linhas com LinkedHashMap, e o esqueleto de uma LFU em O(1).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// accessOrder = true faz o get mover a entrada para o fim da ordem de iteração.
+// removeEldestEntry é consultado depois de cada inserção.
+Map&lt;SessionId, Session&gt; cache = new LinkedHashMap&lt;&gt;(1024, 0.75f, true) {
+    @Override protected boolean removeEldestEntry(Map.Entry&lt;SessionId, Session&gt; eldest) {
+        return size() &gt; 1_000;
+    }
+};
+// Não é seguro para acesso concorrente: envolver em Collections.synchronizedMap
+// não chega se houver iteração, e não resolve a contenção de 50 000 leituras/s.
+
+// LFU em O(1): índice de chave, baldes por frequência e a frequência mínima corrente.
+final class LfuCache&lt;K, V&gt; {
+    private final Map&lt;K, Node&lt;K, V&gt;&gt; index = new HashMap&lt;&gt;();
+    private final Map&lt;Integer, LinkedHashSet&lt;Node&lt;K, V&gt;&gt;&gt; buckets = new HashMap&lt;&gt;();
+    private int minFreq;
+
+    // get(k)  -&gt; promote(node): tira do balde freq, põe no balde freq + 1;
+    //            se o balde de minFreq ficou vazio, minFreq++.
+    // put(k)  -&gt; se cheio, remove o primeiro elemento de buckets.get(minFreq)
+    //            (desempate por recência, porque LinkedHashSet mantém a ordem);
+    //            insere com freq = 1 e faz minFreq = 1.
+}
+</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 24.2</span> Reconhecer o padrão a partir da frase do enunciado.</div>
+<div class="tscroll"><table><thead><tr><th>Sinal no enunciado</th><th>Estrutura</th><th>Complexidade alvo</th></tr></thead>
+<tbody>
+<tr><td>«já apareceu antes?», «conte ocorrências», «pares que somam X»</td><td><code>HashMap</code> ou <code>HashSet</code></td><td>O(n) tempo, O(n) memória</td></tr>
+<tr><td>«soma de um subarray igual a K»</td><td>Prefixos acumulados num <code>HashMap</code></td><td>O(n)</td></tr>
+<tr><td>«memória constante numa lista ligada»</td><td>Ponteiros rápido e lento</td><td>O(n) tempo, O(1) memória</td></tr>
+<tr><td>«o primeiro maior/menor à direita ou à esquerda»</td><td>Pilha monótona de índices</td><td>O(n) amortizado</td></tr>
+<tr><td>«máximo/mínimo de cada janela de comprimento k»</td><td><em>Deque</em> monótono de índices</td><td>O(n) tempo, O(k) memória</td></tr>
+<tr><td>«os k melhores» ou «fundir k fontes ordenadas»</td><td><code>PriorityQueue</code> de tamanho k</td><td>O(N log k)</td></tr>
+<tr><td>«O(1) para procurar e O(1) para reordenar»</td><td><code>HashMap</code> + lista duplamente ligada</td><td>O(1) esperado</td></tr>
+</tbody></table></div></div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Numa ronda de 45 minutos, a ordem que maximiza a nota é: 4 minutos a clarificar o contrato e a fixar dois exemplos (um normal e um degenerado), 3 minutos a enunciar a abordagem e a complexidade <em>antes</em> de escrever, 20 a 25 minutos a codificar em voz alta, 5 minutos a executar o código à mão sobre o exemplo degenerado, e os últimos 5 a listar os casos limite e a variante que se escolheria em produção. Um candidato que começa a escrever ao minuto um perde a oportunidade de ser corrigido a tempo.</p></aside>
+
+<h2 id="sec-24-6" class="h2"><span class="secnum">24.6</span> Resumo e checklist<a class="anchor" href="#sec-24-6" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, em forma utilizável no minuto três de uma ronda de código.</p>
+
+<ul class="lst">
+  <li>O(1) do <code>HashMap</code> é esperado e amortizado, não garantido: depende de dispersão razoável, de factor de carga limitado (0,75 por omissão) e de um <code>equals</code> barato. O pior caso moderno é O(log n), por causa da treeificação do balde a partir de 8 nós e 64 baldes.</li>
+  <li>Chaves compostas são <code>record</code> imutáveis. Uma chave mutada depois do <code>put</code> torna a entrada inalcançável — não é excepção, é fuga de memória.</li>
+  <li>Ponteiro rápido e lento resolve ciclo, meio da lista e n-ésimo a contar do fim em O(n) tempo e O(1) memória. O argumento do encontro é a distância a decrescer uma unidade por passo módulo o comprimento do ciclo.</li>
+  <li>Nós sentinela eliminam os casos especiais de fronteira em listas ligadas e em caches LRU. Custam dois objectos e poupam metade dos bugs.</li>
+  <li>Pilha monótona é o padrão de «o primeiro maior/menor à direita»; o custo O(n) prova-se por análise amortizada — <code>n</code> empilhamentos, no máximo <code>n</code> desempilhamentos —, nunca por intuição.</li>
+  <li><em>Deque</em> monótono de índices dá o máximo de cada janela em O(n) e O(k), contra O(n·k) da força bruta e O(n log k) de um <code>TreeMap</code>.</li>
+  <li><code>ArrayDeque</code> substitui <code>Stack</code> e <code>LinkedList</code> em quase todos os casos: contíguo, sem sincronização, sem nó por elemento. Não aceita <code>null</code>.</li>
+  <li>LRU é <code>HashMap</code> mais lista duplamente ligada, com a chave dentro do nó. Sob concorrência, o problema não é o <em>lock</em> — é que toda a leitura muta a estrutura.</li>
+  <li>Anunciar sempre a complexidade antes de codificar, e nomear o invariante em voz alta: é o que distingue uma solução explicada de uma solução adivinhada.</li>
+</ul>
+
+<h3>Checklist antes da ronda de código</h3>
+
+<ul class="lst">
+  <li>Sei enunciar o contrato do <code>hashCode</code>/<code>equals</code> e o que acontece quando é violado, com a consequência concreta (entrada órfã).</li>
+  <li>Escrevo a detecção de ciclo de Floyd e a localização da entrada sem consultar nada, e justifico as duas fases.</li>
+  <li>Escrevo a inversão iterativa de uma lista em memória constante e sei porque é que a recursiva estoira aos ~10 000 nós.</li>
+  <li>Reconheço «o primeiro maior à direita» e escrevo a pilha monótona com índices em menos de dez minutos.</li>
+  <li>Escrevo a janela deslizante com <em>deque</em> e explico porque é que a condição de saída pela cauda é <code>&lt;=</code>.</li>
+  <li>Sei quando escolher <code>ArrayBlockingQueue</code> em vez de <code>LinkedBlockingQueue</code> e porque é que uma fila ilimitada é um risco.</li>
+  <li>Escrevo a LRU com sentinelas, com a chave no nó, e despejo antes da inserção; e sei a versão de seis linhas com <code>LinkedHashMap</code>.</li>
+  <li>Para cada solução, tenho preparada a frase «em produção usaria X porque Y», com <code>Caffeine</code>, <code>ArrayDeque</code> ou um array primitivo no lugar de X.</li>
+  <li>Testo mentalmente, em todos os exercícios, os mesmos cinco casos: vazio, um elemento, todos iguais, extremos do tipo, e o caso degenerado que quebra a estrutura escolhida.</li>
+</ul>

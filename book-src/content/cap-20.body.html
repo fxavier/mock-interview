@@ -1,0 +1,903 @@
+<p>A ronda de SQL numa entrevista de backend sénior não testa sintaxe exótica: testa se o candidato traduz uma pergunta de negócio ambígua num conjunto de resultados correcto e sabe dizer, antes de correr, que plano espera. As três coisas que separam quem passa de quem não passa são sempre as mesmas — <em>NULL</em>, duplicados e empates — e são exactamente as três que o enunciado não menciona. O erro mais comum não é sintáctico: é escrever um <code>JOIN</code> que multiplica linhas e agregar por cima dele sem reparar que o <code>sum</code> ficou inflacionado. Este capítulo cobre a semântica que o entrevistador está a sondar, os seis exercícios que aparecem repetidamente, e um método de cinco passos para escrever SQL num editor partilhado sem base de dados por baixo.</p>
+
+<h2 id="sec-20-1" class="h2"><span class="secnum">20.1</span> Joins e a semântica de NULL<a class="anchor" href="#sec-20-1" aria-label="ligação">#</a></h2>
+
+<p>Há quatro joins com sintaxe própria — <code>INNER</code>, <code>LEFT</code>/<code>RIGHT</code>, <code>FULL</code> e <code>CROSS</code> — e dois que não têm: o <em>semi-join</em> e o <em>anti-join</em>, que se escrevem com <code>EXISTS</code> e <code>NOT EXISTS</code>. A distinção é a que mais rende numa entrevista, porque um <code>INNER JOIN</code> não filtra linhas, multiplica-as: se cada cliente tem em média 3,4 encomendas, o produto do join tem 3,4 vezes as linhas da tabela de clientes e qualquer <code>sum(c.limite_credito)</code> sobre esse resultado devolve um valor 3,4 vezes maior do que o real. O semi-join com <code>EXISTS</code> devolve no máximo uma linha por linha da esquerda e é a resposta correcta quando a pergunta é «quais», e não «quantas vezes».</p>
+
+<p>NULL não é um valor: é a marca de informação ausente, e a lógica é ternária. <code>NULL = NULL</code> não é falso, é NULL, e o <code>WHERE</code> só deixa passar TRUE — logo <code>x = NULL</code> nunca devolve linha alguma. Há um conjunto de contextos que fogem a esta regra e que o candidato tem de saber enumerar: <code>DISTINCT</code>, <code>GROUP BY</code>, <code>UNION</code> e <code>ORDER BY</code> tratam NULLs como iguais entre si; um índice <code>UNIQUE</code> clássico permite N linhas com NULL na coluna indexada, e só em PostgreSQL 15 ou superior é que <code>UNIQUE NULLS NOT DISTINCT</code> passa a proibi-lo; e <code>IS NOT DISTINCT FROM</code> é o operador que compara duas expressões com semântica de igualdade, incluindo o caso NULL contra NULL.</p>
+
+<p>Dois erros mecânicos aparecem em quase todas as entrevistas. O primeiro: pôr um predicado sobre a tabela da direita no <code>WHERE</code> de um <code>LEFT JOIN</code>. As linhas sem correspondência são estendidas com NULL, o predicado avalia NULL, e o resultado é um <code>INNER JOIN</code> disfarçado. O segundo: <code>NOT IN</code> sobre uma subconsulta cuja coluna admite NULL. Basta um NULL no conjunto para que a expressão nunca seja TRUE e a consulta devolva zero linhas, sem erro e sem aviso.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.1</span> Semântica de NULL: o que o entrevistador espera ouvir de cor.</div>
+<div class="tscroll"><table><thead><tr><th>Expressão</th><th>Resultado</th><th>Consequência prática</th></tr></thead><tbody>
+<tr><td><code>NULL = NULL</code></td><td>NULL (não FALSE)</td><td>O <code>WHERE</code> descarta a linha; comparar chaves anuláveis num <code>ON</code> perde correspondências.</td></tr>
+<tr><td><code>NULL IS NOT DISTINCT FROM NULL</code></td><td>TRUE</td><td>Único operador de igualdade seguro para colunas anuláveis; não usa índice B-tree simples.</td></tr>
+<tr><td><code>x NOT IN (1, NULL)</code></td><td>FALSE ou NULL, nunca TRUE</td><td>Conjunto vazio silencioso. Substituir por <code>NOT EXISTS</code>.</td></tr>
+<tr><td><code>count(*)</code> vs <code>count(coluna)</code></td><td>Linhas vs valores não nulos</td><td>Depois de um <code>LEFT JOIN</code>, <code>count(*)</code> conta 1 para o cliente sem encomendas.</td></tr>
+<tr><td><code>sum(x)</code> sobre zero linhas</td><td>NULL</td><td><code>coalesce(sum(x), 0)</code> quando o resultado alimenta um relatório.</td></tr>
+<tr><td><code>ORDER BY x DESC</code></td><td>NULLS FIRST por defeito</td><td>O «maior valor» de uma coluna anulável é NULL num <code>DESC</code>; usar <code>NULLS LAST</code>.</td></tr>
+<tr><td><code>UNIQUE (x)</code></td><td>Aceita N linhas com NULL</td><td>Chave de idempotência anulável não garante unicidade nenhuma.</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-20-1" data-box="qa" data-area="sql" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tenho um <code>LEFT JOIN</code> de clientes para encomendas e quero contar só as encomendas de 2025. Se eu acrescentar <code>e.criada_em &gt;= DATE '2025-01-01'</code> ao <code>WHERE</code>, o que muda no resultado?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Passa a ser um <code>INNER JOIN</code>: os clientes sem encomendas desaparecem do resultado. O mecanismo é a ordem de avaliação. O join produz primeiro as linhas com correspondência e depois acrescenta as linhas da esquerda que não encontraram par, estendidas com NULL em todas as colunas da direita. Só depois o <code>WHERE</code> corre. Para essas linhas, <code>NULL &gt;= DATE '2025-01-01'</code> avalia NULL, o <code>WHERE</code> exige TRUE, e a linha cai.</p>
+      <p>A correcção é mover o predicado para o <code>ON</code>: <code>LEFT JOIN encomenda e ON e.cliente_id = c.id AND e.criada_em &gt;= DATE '2025-01-01'</code>. Aí o predicado participa na decisão de emparelhamento e o cliente sem encomendas de 2025 continua a aparecer com colunas a NULL. Num <code>INNER JOIN</code> a distinção não existe: as duas formas são logicamente equivalentes e o planeador do PostgreSQL trata-as do mesmo modo.</p>
+      <p>Há um caso em que o predicado no <code>WHERE</code> é intencional: o padrão de anti-join <code>LEFT JOIN … WHERE e.id IS NULL</code>, que devolve exactamente os clientes sem encomenda. É a mesma mecânica usada de propósito, e o candidato deve nomeá-la para mostrar que percebeu a regra em vez de a ter decorado.</p>
+      <p>O <em>trade-off</em> aparece na contagem: com o predicado no <code>ON</code>, o cliente sem encomendas dá <code>count(*) = 1</code> e <code>count(e.id) = 0</code>. A resposta certa é quase sempre <code>count(e.id)</code>, e é onde o entrevistador vai bater a seguir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É igual, o <code>WHERE</code> e o <code>ON</code> dão o mesmo.»</td></tr>
+        <tr><td>Mid</td><td>Sabe que perde linhas, mas explica por «o filtro não deixa passar» sem falar de extensão com NULL.</td></tr>
+        <tr><td>Sénior</td><td>Explica a extensão com NULL e a ordem join→WHERE, corrige movendo para o <code>ON</code> e nota a diferença entre <code>count(*)</code> e <code>count(e.id)</code>.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais o caso deliberado do anti-join, a equivalência em <code>INNER JOIN</code> e o efeito de índice parcial ou composto no predicado movido para o <code>ON</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E num <code>FULL JOIN</code>, onde é que o predicado tem de estar?»</li>
+      <li>«Como é que devolve só a última encomenda de cada cliente sem duplicar linhas?»</li>
+      <li>«Que índice cria para que o predicado no <code>ON</code> não force uma leitura sequencial?»</li>
+      <li>«Se o <code>count</code> tem de contar clientes e não encomendas, o que muda?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Trocar para <code>INNER JOIN</code> «porque é mais rápido», sem notar que o resultado muda.</li>
+      <li>Não distinguir <code>count(*)</code> de <code>count(coluna)</code> depois de um <code>LEFT JOIN</code>.</li>
+      <li>Corrigir com <code>coalesce(e.criada_em, DATE '1900-01-01')</code>, matando qualquer uso de índice.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-2" data-box="qa" data-area="sql" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Para listar clientes sem encomendas há três escritas: <code>NOT IN</code>, <code>NOT EXISTS</code> e <code>LEFT JOIN … IS NULL</code>. Qual escolhe e o que muda no plano?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>NOT EXISTS</code>, por defeito. É a única das três que é correcta na presença de NULL e é a que o planeador do PostgreSQL converte directamente num <em>anti-join</em> (aparece no plano como <code>Hash Anti Join</code> ou <code>Nested Loop Anti Join</code>), fazendo uma única passagem sobre cada lado.</p>
+      <p><code>NOT IN</code> quebra quando a coluna da subconsulta admite NULL: se um único valor for NULL, a expressão nunca chega a TRUE e o resultado é o conjunto vazio, sem erro. Além da correcção, há um custo de plano: por causa dessa semântica o planeador não pode transformar <code>NOT IN</code> em anti-join e recorre a um <code>SubPlan</code> com tabela de dispersão, que não pode terminar cedo. <code>NOT IN</code> continua a ser legítimo com uma lista literal ou com uma coluna declarada <code>NOT NULL</code>.</p>
+      <p><code>LEFT JOIN … WHERE e.id IS NULL</code> é correcto e, no PostgreSQL, produz habitualmente o mesmo <code>Hash Anti Join</code>. Perde em legibilidade e é frágil: se alguém mais tarde acrescentar uma coluna da direita ao <code>SELECT</code> ou trocar a coluna testada por uma anulável, o resultado passa a estar errado sem qualquer sinal.</p>
+      <p>Em ordens de grandeza: com 1 milhão de clientes e 5 milhões de encomendas, o anti-join por dispersão é O(n+m) com uma tabela de dispersão do lado menor; a variante com <code>SubPlan</code> não anti-join tem de materializar o conjunto inteiro antes de decidir a primeira linha, o que é a diferença entre centenas de milissegundos e dezenas de segundos quando o lado interno não cabe em <code>work_mem</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe <code>NOT IN</code> «porque é mais legível» e não conhece o problema do NULL.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>NOT IN</code> «tem problemas com NULL» mas não explica que o resultado é vazio nem porquê.</td></tr>
+        <tr><td>Sénior</td><td>Explica a lógica ternária, escolhe <code>NOT EXISTS</code>, nomeia o anti-join no plano e diz quando <code>NOT IN</code> ainda serve.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito em <code>work_mem</code>, o custo do <code>SubPlan</code> hashed e a fragilidade de manutenção da variante com <code>LEFT JOIN</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se declarar a coluna <code>NOT NULL</code>, o plano muda?»</li>
+      <li>«E se a pergunta for “clientes sem encomendas nos últimos 90 dias”?»</li>
+      <li>«Como confirma no <code>EXPLAIN</code> que ficou um anti-join?»</li>
+      <li>«<code>EXCEPT</code> resolveria isto? Que diferença tem?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Garantir que as três formas são equivalentes.</li>
+      <li>Propor <code>NOT IN (SELECT coalesce(cliente_id, -1) …)</code> como solução geral.</li>
+      <li>Não saber ler um plano de execução para verificar a afirmação.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>NOT IN</code> com uma subconsulta que devolve NULL não dá erro nem aviso: devolve zero linhas. Em produção isto passa nos testes (os dados de teste não têm NULL), passa na revisão de código e falha em silêncio no primeiro dia em que alguém insere uma encomenda de convidado com <code>cliente_id</code> nulo. O relatório de reconciliação deixa de encontrar divergências e a equipa conclui que está tudo bem.</p></aside>
+
+<div class="lab" id="lab-20-1" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.1 — Clientes sem encomendas, com um NULL escondido</span>
+    <div class="labpills"><span class="qpill">Anti-join</span><span class="qpill">10 min</span></div></div>
+  <div class="labbody">
+    <p>Esquema e dados de exemplo. Repare que <code>encomenda.cliente_id</code> é anulável, porque a loja aceita compras de convidado.</p>
+    <figure class="listing sql" id="lst-20-1"><div class="lhead"><span class="lnum">Listagem 20.1</span>
+      <span class="lcap">Esquema e dados do exercício 20.1</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE cliente (
+  id    bigint PRIMARY KEY,
+  nome  text    NOT NULL,
+  pais  char(2) NOT NULL
+);
+
+CREATE TABLE encomenda (
+  id          bigint PRIMARY KEY,
+  cliente_id  bigint REFERENCES cliente(id),   -- anulavel: compra de convidado
+  criada_em   timestamptz NOT NULL,
+  total_cents bigint NOT NULL
+);
+
+INSERT INTO cliente VALUES
+  (1, 'Ana', 'PT'), (2, 'Bruno', 'PT'), (3, 'Carla', 'ES'), (4, 'Diogo', 'FR');
+
+INSERT INTO encomenda VALUES
+  (10, 1,    '2025-03-01 10:00+00', 4500),
+  (11, 1,    '2025-03-04 11:00+00', 1200),
+  (12, 3,    '2025-02-11 09:30+00', 9900),
+  (13, NULL, '2025-03-07 18:45+00',  700);</code></pre></figure>
+    <p>Enunciado, tal como é dado: «Devolva os clientes que nunca fizeram uma encomenda, ordenados por id. Depois diga-me quantas linhas devolve a mesma consulta escrita com <code>NOT IN</code> e porquê.» Saída esperada: duas linhas — <code>(2, Bruno)</code> e <code>(4, Diogo)</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-2"><div class="lhead"><span class="lnum">Listagem 20.2</span>
+        <span class="lcap">Anti-join correcto e a variante que devolve zero linhas</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>-- Correcto: anti-join. Imune a NULL, converte para Hash Anti Join.
+SELECT c.id, c.nome
+FROM cliente c
+WHERE NOT EXISTS (
+  SELECT 1 FROM encomenda e WHERE e.cliente_id = c.id
+)
+ORDER BY c.id;
+
+-- Equivalente, mais frageis de manter:
+SELECT c.id, c.nome
+FROM cliente c
+LEFT JOIN encomenda e ON e.cliente_id = c.id
+WHERE e.id IS NULL
+ORDER BY c.id;
+
+-- ERRADO com dados reais: devolve 0 linhas por causa da encomenda 13.
+SELECT c.id, c.nome
+FROM cliente c
+WHERE c.id NOT IN (SELECT e.cliente_id FROM encomenda e);
+
+-- Se tiver mesmo de usar NOT IN, filtre a fonte:
+SELECT c.id, c.nome
+FROM cliente c
+WHERE c.id NOT IN (
+  SELECT e.cliente_id FROM encomenda e WHERE e.cliente_id IS NOT NULL
+);</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado: <code>Hash Anti Join</code> com <code>Seq Scan</code> sobre <code>cliente</code> e construção da tabela de dispersão sobre <code>encomenda.cliente_id</code>; O(n+m) com uma passagem por lado. Com <code>cliente</code> grande e <code>encomenda</code> pequena, o planeador pode escolher <code>Nested Loop Anti Join</code> apoiado no índice de <code>encomenda(cliente_id)</code>.</li>
+        <li>Índice a propor: <code>CREATE INDEX ON encomenda (cliente_id);</code> — sem ele, a chave estrangeira não tem índice do lado filho, o que também torna lentos os <code>DELETE</code> em <code>cliente</code>.</li>
+        <li>Armadilha do NULL: a linha 13 basta para que a versão com <code>NOT IN</code> devolva zero linhas. É o ponto do exercício e é onde metade dos candidatos cai.</li>
+        <li>Armadilha dos duplicados: quem escrever <code>LEFT JOIN</code> sem o <code>IS NULL</code> e depois <code>DISTINCT</code> por cima obtém o resultado certo por acidente e paga uma ordenação ou dispersão adicional.</li>
+        <li>Empates: não se aplicam aqui, mas o entrevistador vai perguntar como muda a resposta se a pergunta for «sem encomendas nos últimos 90 dias» — o predicado de data vai dentro do <code>NOT EXISTS</code>, nunca no <code>WHERE</code> exterior.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-20-2" class="h2"><span class="secnum">20.2</span> Agregação, HAVING e a armadilha do GROUP BY<a class="anchor" href="#sec-20-2" aria-label="ligação">#</a></h2>
+
+<p>O <code>WHERE</code> filtra linhas antes da agregação; o <code>HAVING</code> filtra grupos depois. A consequência prática é que pôr um predicado no sítio errado não dá erro, dá outro resultado: <code>WHERE estado = 'PAGA'</code> antes de agregar torna impossível contar, na mesma consulta, quantas foram canceladas. A ferramenta certa para isso é a agregação condicional. Em PostgreSQL escreve-se com a cláusula padrão <code>FILTER</code> — <code>count(*) FILTER (WHERE estado = 'PAGA')</code> — que é mais legível e ligeiramente mais barata do que <code>sum(CASE WHEN estado = 'PAGA' THEN 1 ELSE 0 END)</code> porque não constrói a expressão condicional para cada linha descartada.</p>
+
+<p>Todas as funções de agregação, excepto <code>count(*)</code>, ignoram NULL. Daí decorrem três resultados que o entrevistador testa em quinze segundos: <code>avg(x)</code> divide pela contagem de valores não nulos, não pelo número de linhas, de modo que 30% de NULLs sobem a média em vez de a baixar; <code>sum(x)</code> sobre zero linhas devolve NULL e não 0; e <code>count(coluna)</code> depois de um <code>LEFT JOIN</code> é a forma correcta de contar correspondências. O PostgreSQL permite ainda agrupar apenas pela chave primária e seleccionar as restantes colunas da mesma tabela, por dependência funcional — algo que MySQL faz com regras mais frouxas e que Oracle rejeita.</p>
+
+<p>Duas extensões pagam bem quando aparecem espontaneamente: <code>GROUPING SETS</code>, <code>ROLLUP</code> e <code>CUBE</code>, que produzem subtotais numa só passagem em vez de N consultas unidas por <code>UNION ALL</code>, e <code>count(DISTINCT x)</code>, cuja factura é a ordenação ou a tabela de dispersão sobre os valores distintos. Em tabelas de centenas de milhões de linhas, um <code>count(DISTINCT utilizador_id)</code> exacto pode custar minutos; a alternativa aceite é uma estimativa por HyperLogLog, e o candidato deve dizer explicitamente que troca exactidão por tempo.</p>
+
+<div class="qa" id="q-20-3" data-box="qa" data-area="sql" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quero, por cliente e numa só linha, o número de encomendas pagas e o número de canceladas, mas só para clientes com mais de cinco pagas. Onde é que cada condição entra?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Nenhuma das condições de estado entra no <code>WHERE</code>: as duas contagens precisam das duas populações na mesma passagem. O estado entra em cláusulas <code>FILTER</code> dentro das agregações, e a condição «mais de cinco pagas» entra no <code>HAVING</code>, repetindo a mesma expressão agregada.</p>
+      <p>A consulta é <code>SELECT cliente_id, count(*) FILTER (WHERE estado = 'PAGA') AS pagas, count(*) FILTER (WHERE estado = 'CANCELADA') AS canceladas FROM encomenda GROUP BY cliente_id HAVING count(*) FILTER (WHERE estado = 'PAGA') &gt; 5</code>. Não é possível referir o <em>alias</em> <code>pagas</code> no <code>HAVING</code> em SQL padrão nem em PostgreSQL, porque o <code>HAVING</code> é avaliado antes da projecção do <code>SELECT</code>; ou se repete a expressão, ou se envolve tudo numa subconsulta e se filtra no exterior.</p>
+      <p>O <code>WHERE</code> continua a ter trabalho: tudo o que reduza a população total antes de agregar deve estar lá, tipicamente a janela temporal <code>criada_em &gt;= DATE '2025-01-01'</code>. Filtrar 40 milhões de linhas para 3 milhões antes do <code>HashAggregate</code> é a diferença entre um agregado que cabe em <code>work_mem</code> e um que derrama para disco.</p>
+      <p>Alternativa quando os estados são muitos e variáveis: agregar por <code>(cliente_id, estado)</code> e pivotar na aplicação, ou usar <code>GROUPING SETS</code>. A agregação condicional só é boa escolha enquanto o conjunto de colunas for fixo e conhecido em tempo de escrita da consulta.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Põe <code>estado = 'PAGA'</code> no <code>WHERE</code> e não repara que perdeu as canceladas.</td></tr>
+        <tr><td>Mid</td><td>Usa <code>sum(CASE WHEN …)</code> correctamente e o <code>HAVING</code>, mas tenta referir o alias no <code>HAVING</code>.</td></tr>
+        <tr><td>Sénior</td><td>Usa <code>FILTER</code>, explica a ordem WHERE→GROUP BY→HAVING→SELECT e mantém no <code>WHERE</code> o filtro temporal que reduz a população.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito em <code>work_mem</code> e no derrame do <code>HashAggregate</code>, e diz quando trocaria a agregação condicional por <code>GROUPING SETS</code> ou por pivot na aplicação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que não pode usar o alias no <code>HAVING</code> mas pode no <code>ORDER BY</code>?»</li>
+      <li>«E se quiser também a percentagem de canceladas por cliente?»</li>
+      <li>«Como acrescenta uma linha de total geral sem uma segunda consulta?»</li>
+      <li>«Que índice serve esta consulta?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Duas consultas unidas por <code>JOIN</code> só para obter duas contagens da mesma tabela.</li>
+      <li>Filtrar no <code>HAVING</code> aquilo que pertence ao <code>WHERE</code>, agregando dez vezes mais linhas do que o necessário.</li>
+      <li>Não saber que <code>count(*)</code> conta linhas e <code>count(coluna)</code> conta não nulos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-4" data-box="qa" data-area="sql" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Numa tabela de avaliações, 30% da coluna <code>nota</code> está a NULL. O que devolvem <code>count(*)</code>, <code>count(nota)</code>, <code>count(DISTINCT nota)</code> e <code>avg(nota)</code>, e qual é o custo de cada um?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>count(*)</code> devolve o número de linhas, incluindo as de nota nula. <code>count(nota)</code> devolve 70% desse número. <code>count(DISTINCT nota)</code> devolve o número de valores distintos não nulos — NULL nunca conta como valor distinto. <code>avg(nota)</code> soma as notas presentes e divide por <code>count(nota)</code>, não por <code>count(*)</code>.</p>
+      <p>A consequência é que a média é a média dos respondentes, não a da população. Se a regra de negócio for tratar a ausência de nota como zero, tem de se escrever <code>avg(coalesce(nota, 0))</code> e o resultado desce cerca de 30%. Escolher entre as duas não é uma questão de SQL: é uma pergunta a fazer ao entrevistador, e fazê-la conta pontos.</p>
+      <p>Nos custos: <code>count(*)</code> e <code>count(nota)</code> são uma passagem linear, cabendo num <code>Parallel Seq Scan</code> ou, quando existe índice adequado e a tabela está bem aspirada, num <code>Index Only Scan</code>. <code>count(DISTINCT nota)</code> obriga a materializar os valores distintos: com poucos valores é uma tabela de dispersão barata, com muitos é uma ordenação que derrama para disco quando excede <code>work_mem</code>.</p>
+      <p>Dois pormenores que separam o sénior: <code>sum</code> sobre um conjunto vazio devolve NULL (daí <code>coalesce(sum(x), 0)</code> em qualquer relatório) e, em PostgreSQL, <code>count(*)</code> não é uma constante lida de metadados como em MyISAM — percorre sempre linhas visíveis para a transacção actual, por causa do MVCC.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que <code>avg</code> divide pelo número de linhas e que <code>count(coluna)</code> é igual a <code>count(*)</code>.</td></tr>
+        <tr><td>Mid</td><td>Acerta nas três contagens, mas não relaciona a média com a regra de negócio nem com <code>coalesce</code>.</td></tr>
+        <tr><td>Sénior</td><td>Acerta em tudo, pergunta qual é a semântica pretendida para os ausentes e refere o custo do <code>DISTINCT</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o derrame de <code>work_mem</code>, a alternativa de estimativa por HyperLogLog em cardinalidades altas e a razão MVCC para <code>count(*)</code> ser linear.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como calcula a mediana em PostgreSQL?»</li>
+      <li>«Quer contar utilizadores distintos em mil milhões de linhas por dia. Como faz?»</li>
+      <li>«<code>count(1)</code> é mais rápido do que <code>count(*)</code>?»</li>
+      <li>«Que valor devolve <code>avg</code> sobre um grupo em que todas as notas são NULL?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que NULL «conta como zero» na média.</li>
+      <li>Usar <code>count(DISTINCT …)</code> num painel de tempo real sobre uma tabela de eventos sem falar do custo.</li>
+      <li>Não notar que <code>sum</code> devolve NULL e não 0 quando não há linhas.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-20-2" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.2 — Detectar e eliminar duplicados</span>
+    <div class="labpills"><span class="qpill">GROUP BY + janela</span><span class="qpill">15 min</span></div></div>
+  <div class="labbody">
+    <p>Um consumidor de Kafka sem idempotência inseriu pagamentos repetidos. A tabela não tem restrição de unicidade sobre a referência.</p>
+    <figure class="listing sql" id="lst-20-3"><div class="lhead"><span class="lnum">Listagem 20.3</span>
+      <span class="lcap">Esquema e dados do exercício 20.2</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE pagamento (
+  id          bigserial PRIMARY KEY,
+  referencia  text   NOT NULL,
+  cliente_id  bigint NOT NULL,
+  valor_cents bigint NOT NULL,
+  recebido_em timestamptz NOT NULL
+);
+
+INSERT INTO pagamento (referencia, cliente_id, valor_cents, recebido_em) VALUES
+  ('REF-1', 1, 1000, '2025-05-01 08:00:00+00'),
+  ('REF-1', 1, 1000, '2025-05-01 08:00:02+00'),
+  ('REF-1', 1, 1000, '2025-05-01 08:00:02+00'),
+  ('REF-2', 2, 2500, '2025-05-01 09:10:00+00'),
+  ('REF-3', 1,  500, '2025-05-02 07:00:00+00');</code></pre></figure>
+    <p>Enunciado: «Primeiro, mostre-me as referências duplicadas com a contagem e as datas da primeira e da última ocorrência. Depois apague os duplicados num único comando, mantendo a ocorrência mais antiga. Por fim, diga-me como impede que volte a acontecer.» Saída esperada da primeira consulta: uma linha, <code>REF-1</code> com <code>n = 3</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-4"><div class="lhead"><span class="lnum">Listagem 20.4</span>
+        <span class="lcap">Diagnóstico, remoção determinística e prevenção</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>-- (a) Diagnostico.
+SELECT referencia,
+       count(*)         AS n,
+       min(id)          AS id_mais_antigo,
+       min(recebido_em) AS primeira,
+       max(recebido_em) AS ultima
+FROM pagamento
+GROUP BY referencia
+HAVING count(*) &gt; 1
+ORDER BY n DESC, referencia;
+
+-- (b) Remocao num so comando, mantendo a ocorrencia mais antiga.
+--     O par (recebido_em, id) e um criterio total: sem o id, o empate
+--     das duas linhas com 08:00:02 tornaria o resultado nao determinista.
+DELETE FROM pagamento p
+USING (
+  SELECT id,
+         row_number() OVER (PARTITION BY referencia
+                            ORDER BY recebido_em, id) AS rn
+  FROM pagamento
+) d
+WHERE d.id = p.id
+  AND d.rn &gt; 1;
+
+-- (c) Prevencao. CONCURRENTLY nao pode correr dentro de uma transaccao.
+CREATE UNIQUE INDEX CONCURRENTLY pagamento_referencia_uq
+  ON pagamento (referencia);
+
+-- E o consumidor passa a escrever de forma idempotente:
+INSERT INTO pagamento (referencia, cliente_id, valor_cents, recebido_em)
+VALUES ('REF-9', 1, 100, now())
+ON CONFLICT (referencia) DO NOTHING;</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado em (a): <code>HashAggregate</code> sobre <code>Seq Scan</code>, uma passagem, com o <code>HAVING</code> aplicado como filtro sobre os grupos. Em (b): <code>WindowAgg</code> sobre um <code>Sort</code> por <code>(referencia, recebido_em, id)</code>, seguido de <code>Hash Join</code> com a tabela pelo <code>id</code>.</li>
+        <li>Empates: sem o <code>id</code> como segundo critério de ordenação, as duas linhas com o mesmo <code>recebido_em</code> podem trocar de posição entre execuções e o <code>DELETE</code> apaga uma linha diferente de cada vez. É o ponto mais avaliado do exercício.</li>
+        <li>Sem chave primária, o mesmo padrão faz-se com <code>ctid</code> em vez de <code>id</code>; é a única situação em que se deve usar essa coluna de sistema, e nunca a guardar.</li>
+        <li>Armadilha do NULL: se a coluna de deduplicação fosse anulável, <code>PARTITION BY</code> agruparia todos os NULLs num só grupo — comportamento oposto ao do índice <code>UNIQUE</code>, que os trata como distintos antes do PostgreSQL 15.</li>
+        <li>Volume: num <code>DELETE</code> de milhões de linhas, faz-se por lotes com <code>LIMIT</code> num <code>CTE</code> e <code>commit</code> entre lotes, para não segurar um <em>snapshot</em> longo nem inchar o WAL.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-20-3" class="h2"><span class="secnum">20.3</span> Subconsultas, CTEs e recursão<a class="anchor" href="#sec-20-3" aria-label="ligação">#</a></h2>
+
+<p>Uma subconsulta escalar correlacionada é conceptualmente um ciclo: para cada linha do exterior, avalia-se o interior. O planeador do PostgreSQL desfaz muitas dessas correlações transformando-as em joins, mas não todas — subconsultas na lista do <code>SELECT</code> com funções voláteis, ou com <code>LIMIT</code> lá dentro, ficam como <code>SubPlan</code> e executam mesmo uma vez por linha. A alternativa idiomática é <code>LATERAL</code>, que permite ao lado direito de um join referir colunas do lado esquerdo e é a forma limpa de responder a «a última encomenda de cada cliente» com um <code>ORDER BY … LIMIT 1</code> por cliente.</p>
+
+<p>Sobre <em>Common Table Expressions</em>: até ao PostgreSQL 11, uma CTE era sempre uma barreira de optimização — materializava-se e nenhum predicado exterior era empurrado para dentro. Desde o PostgreSQL 12, uma CTE não recursiva, sem efeitos secundários e referida exactamente uma vez é integrada na consulta por defeito; se for referida duas ou mais vezes, continua a ser materializada. As palavras-chave <code>MATERIALIZED</code> e <code>NOT MATERIALIZED</code> forçam qualquer dos comportamentos. Isto muda planos de forma dramática: uma CTE que faz uma leitura completa de uma tabela de 200 milhões de linhas e é filtrada no exterior passa a usar índice quando é integrada, e continua a fazer leitura sequencial quando é materializada.</p>
+
+<p>A recursão faz-se com <code>WITH RECURSIVE</code>: um termo âncora, <code>UNION ALL</code> ou <code>UNION</code>, e um termo recursivo que se refere à própria CTE. Com <code>UNION ALL</code> não há deduplicação e um ciclo no grafo produz um ciclo infinito; com <code>UNION</code> há deduplicação a cada iteração, o que protege contra ciclos ao custo de uma operação de unicidade por passo. Em PostgreSQL 14 ou superior existe a cláusula <code>CYCLE</code>, que detecta ciclos declarativamente; em versões anteriores acumula-se um <em>array</em> de identificadores visitados. Um limite de profundidade explícito é sempre boa prática defensiva.</p>
+
+<figure class="listing sql" id="lst-20-5"><div class="lhead"><span class="lnum">Listagem 20.5</span>
+<span class="lcap">Subárvore de categorias com profundidade, caminho e detecção de ciclos</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>WITH RECURSIVE subarvore AS (
+  -- ancora: a raiz pedida
+  SELECT c.id, c.nome, c.parent_id, 0 AS profundidade
+  FROM categoria c
+  WHERE c.id = 42
+
+  UNION ALL
+
+  -- termo recursivo: filhos do nivel anterior
+  SELECT f.id, f.nome, f.parent_id, s.profundidade + 1
+  FROM categoria f
+  JOIN subarvore s ON f.parent_id = s.id
+  WHERE s.profundidade &lt; 20        -- guarda defensiva contra arvores patologicas
+)
+CYCLE id SET em_ciclo USING caminho   -- PostgreSQL 14+
+SELECT id, nome, profundidade, caminho
+FROM subarvore
+ORDER BY profundidade, nome;</code></pre></figure>
+
+<div class="qa" id="q-20-5" data-box="qa" data-area="sql" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Uso CTEs para tornar as consultas legíveis. Em PostgreSQL 17, isso muda o plano de execução em relação a escrever as mesmas subconsultas em linha?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Depende de quantas vezes a CTE é referida. Desde o PostgreSQL 12, uma CTE não recursiva, sem <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> lá dentro e referida uma única vez é integrada na consulta exterior, e o plano é o mesmo de uma subconsulta em linha: predicados e limites são empurrados para dentro. Referida duas ou mais vezes, é materializada num nó <code>CTE Scan</code> e deixa de aceitar predicados vindos de fora.</p>
+      <p>Em versões até à 11 a materialização era incondicional, e esse é o motivo pelo qual muito código antigo usa CTEs como barreira de optimização deliberada. Quem migrou para a 12 ou superior e viu consultas mudar de comportamento sabe exactamente porquê.</p>
+      <p>O controlo é explícito: <code>WITH x AS MATERIALIZED (…)</code> força a materialização, <code>NOT MATERIALIZED</code> força a integração. Materializar vale a pena quando o interior é caro e reutilizado — uma agregação sobre milhões de linhas usada em três sítios — ou quando contém uma função volátil que não deve ser reavaliada. Integrar vale a pena quando o filtro exterior é selectivo e há índice para o suportar.</p>
+      <p>Ordem de grandeza típica: numa tabela de 200 milhões de linhas em que o filtro exterior selecciona 5 000, a versão integrada usa o índice e devolve em poucos milissegundos; a versão materializada faz leitura sequencial da tabela inteira e demora dezenas de segundos. A legibilidade não custa nada, mas a decisão de materializar tem de ser consciente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«CTEs são só açúcar sintáctico, o plano é sempre igual.»</td></tr>
+        <tr><td>Mid</td><td>Sabe que «antigamente as CTEs eram uma barreira» mas não sabe a regra actual nem as palavras-chave.</td></tr>
+        <tr><td>Sénior</td><td>Enuncia a regra do PostgreSQL 12 (não recursiva, sem efeitos secundários, uma só referência), nomeia <code>MATERIALIZED</code>/<code>NOT MATERIALIZED</code> e o nó <code>CTE Scan</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta quando quer mesmo a barreira, o efeito de funções voláteis e o contraste com outros motores onde a CTE é sempre integrada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E uma CTE recursiva, pode ser integrada?»</li>
+      <li>«Como confirma no <code>EXPLAIN</code> que a CTE foi materializada?»</li>
+      <li>«Quando prefere uma tabela temporária a uma CTE materializada?»</li>
+      <li>«Uma CTE com <code>INSERT … RETURNING</code>: quantas vezes executa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar categoricamente que CTEs são sempre lentas, ou sempre gratuitas.</li>
+      <li>Não distinguir a versão do motor ao dar a resposta.</li>
+      <li>Reescrever tudo com subconsultas aninhadas ilegíveis «por causa da performance», sem medir.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-6" data-box="qa" data-area="sql" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Tenho uma tabela <code>categoria(id, nome, parent_id)</code> com meio milhão de nós. Devolva toda a subárvore de uma categoria, com a profundidade de cada nó, e diga-me o que acontece se os dados tiverem um ciclo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Resolve-se com <code>WITH RECURSIVE</code>, como na Listagem 20.5: o termo âncora selecciona a raiz com profundidade 0, o termo recursivo junta os filhos dos nós já encontrados e incrementa a profundidade. A execução é iterativa — em cada passo, o motor junta a tabela contra a <em>working table</em> do passo anterior e pára quando essa tabela fica vazia.</p>
+      <p>O custo depende inteiramente do índice: sem <code>CREATE INDEX ON categoria (parent_id)</code>, cada iteração faz uma leitura sequencial de meio milhão de linhas, e uma árvore com 12 níveis de profundidade faz 12 leituras completas. Com o índice, cada iteração é um <code>Index Scan</code> proporcional ao número de filhos.</p>
+      <p>Com um ciclo nos dados e <code>UNION ALL</code>, a consulta não termina — cresce até esgotar disco temporário ou até o <code>statement_timeout</code> disparar. Há três defesas, por ordem de preferência: a cláusula <code>CYCLE</code> do PostgreSQL 14 ou superior, que marca a linha e corta a expansão; <code>UNION</code> em vez de <code>UNION ALL</code>, que deduplica a cada iteração e trava o ciclo ao custo de uma operação de unicidade por passo; e um limite explícito de profundidade, que é barato e deve existir de qualquer forma.</p>
+      <p>O <em>trade-off</em> de modelo: se a árvore é lida muitas vezes e alterada raramente, a recursão em cada leitura é desperdício. Uma tabela de fecho transitivo, ou o tipo <code>ltree</code>, resolvem a leitura com um único <code>Index Scan</code> à custa de escrita amplificada — mover uma subárvore de 10 000 nós reescreve 10 000 linhas. A recursão fica melhor quando a escrita é frequente e a leitura da árvore inteira é rara.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe um ciclo na aplicação com N consultas, uma por nível, sem notar o custo de ida e volta.</td></tr>
+        <tr><td>Mid</td><td>Escreve a CTE recursiva correcta mas não fala de índice, de ciclos nem de limite de profundidade.</td></tr>
+        <tr><td>Sénior</td><td>Escreve a CTE, exige índice em <code>parent_id</code>, trata ciclos e explica <code>UNION</code> contra <code>UNION ALL</code>.</td></tr>
+        <tr><td>Staff</td><td>Compara com tabela de fecho e <code>ltree</code> quantificando a amplificação de escrita, e escolhe pelo rácio leitura/escrita real.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como devolve o caminho completo desde a raiz, como texto?»</li>
+      <li>«E se a pergunta for a soma de um valor em toda a subárvore?»</li>
+      <li>«Que <code>statement_timeout</code> põe nesta consulta e porquê?»</li>
+      <li>«Como paginaria este resultado de forma estável?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não perceber que o termo recursivo se refere à própria CTE e escrever um <code>JOIN</code> à tabela base.</li>
+      <li>Ignorar completamente a hipótese de ciclo quando o esquema não a impede.</li>
+      <li>Propor recursão em cada pedido HTTP de uma página muito lida sem qualquer cache.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-20-3" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.3 — Segundo salário mais alto por departamento</span>
+    <div class="labpills"><span class="qpill">Clássico</span><span class="qpill">15 min</span></div></div>
+  <div class="labbody">
+    <p>O exercício de SQL mais pedido em entrevistas, e o que mais candidatos falha — não pela consulta, mas pelos casos limite: empates no topo, departamentos com um só empregado e salários a NULL.</p>
+    <figure class="listing sql" id="lst-20-6"><div class="lhead"><span class="lnum">Listagem 20.6</span>
+      <span class="lcap">Esquema e dados do exercício 20.3</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE departamento (
+  id   int PRIMARY KEY,
+  nome text NOT NULL
+);
+
+CREATE TABLE empregado (
+  id            int  PRIMARY KEY,
+  nome          text NOT NULL,
+  dep_id        int  NOT NULL REFERENCES departamento(id),
+  salario_cents bigint          -- anulavel: contratado ainda sem escalao
+);
+
+INSERT INTO departamento VALUES (1, 'Engenharia'), (2, 'Vendas'), (3, 'Legal');
+
+INSERT INTO empregado VALUES
+  (1, 'Ana',   1, 500000),
+  (2, 'Bruno', 1, 500000),   -- empate no topo
+  (3, 'Carla', 1, 420000),
+  (4, 'Diogo', 1, 300000),
+  (5, 'Eva',   2, 380000),   -- unico com salario em Vendas
+  (6, 'Fabio', 2, NULL),
+  (7, 'Gil',   3, 250000);   -- departamento com um so empregado</code></pre></figure>
+    <p>Enunciado: «Para cada departamento, devolva o segundo salário mais alto <em>distinto</em>. Se não existir, devolva NULL, mas o departamento tem de aparecer na mesma. Ordene por nome do departamento.» Saída esperada: <code>Engenharia → 420000</code>, <code>Legal → NULL</code>, <code>Vendas → NULL</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-7"><div class="lhead"><span class="lnum">Listagem 20.7</span>
+        <span class="lcap">Duas escritas: dense_rank e subconsulta correlacionada</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>-- Versao 1: dense_rank. "Distinto" mapeia exactamente em dense_rank;
+-- rank() daria 3 para a Carla (dois empatados em 1.o) e row_number()
+-- devolveria o Bruno, que tem o MESMO salario do topo.
+SELECT d.nome AS departamento, s.salario_cents AS segundo_maior
+FROM departamento d
+LEFT JOIN (
+  SELECT dep_id,
+         salario_cents,
+         dense_rank() OVER (PARTITION BY dep_id
+                            ORDER BY salario_cents DESC) AS dr
+  FROM empregado
+  WHERE salario_cents IS NOT NULL     -- sem isto, DESC poe NULL em primeiro
+) s ON s.dep_id = d.id AND s.dr = 2
+ORDER BY d.nome;
+
+-- Versao 2: sem funcoes de janela, para quando o entrevistador as proibe.
+SELECT d.nome AS departamento,
+       (SELECT max(e.salario_cents)
+        FROM empregado e
+        WHERE e.dep_id = d.id
+          AND e.salario_cents &lt; (SELECT max(e2.salario_cents)
+                                 FROM empregado e2
+                                 WHERE e2.dep_id = d.id)) AS segundo_maior
+FROM departamento d
+ORDER BY d.nome;</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado na versão 1: <code>WindowAgg</code> sobre um <code>Sort</code> por <code>(dep_id, salario_cents DESC)</code> — ou <code>Incremental Sort</code>, se existir índice em <code>empregado(dep_id, salario_cents DESC)</code> — seguido de <code>Hash Left Join</code> contra <code>departamento</code>. Custo dominado pela ordenação, O(n log n).</li>
+        <li>Plano da versão 2: <code>SubPlan</code> correlacionado executado uma vez por departamento, e um segundo aninhado lá dentro. Com poucos departamentos é aceitável; com dezenas de milhares degrada rapidamente e é o argumento para a versão 1.</li>
+        <li>Armadilha dos empates: o enunciado diz «distinto», logo <code>dense_rank</code>. Se dissesse «o segundo empregado mais bem pago», seria <code>row_number()</code> com um critério de desempate determinístico. Perguntar qual das duas é a interpretação correcta é o comportamento avaliado.</li>
+        <li>Armadilha do NULL: em PostgreSQL, <code>ORDER BY … DESC</code> ordena com <code>NULLS FIRST</code>, portanto o Fábio ficaria em primeiro lugar em Vendas. Ou se filtra <code>IS NOT NULL</code>, ou se escreve <code>DESC NULLS LAST</code>.</li>
+        <li>Armadilha do departamento vazio: um <code>INNER JOIN</code> faria desaparecer Legal e Vendas do resultado. O <code>LEFT JOIN</code> a partir de <code>departamento</code> é o que satisfaz o enunciado.</li>
+        <li>Variante frequente: «e o N-ésimo?» — troca-se <code>s.dr = 2</code> por um parâmetro; a versão com subconsultas aninhadas não generaliza.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-20-4" class="h2"><span class="secnum">20.4</span> Funções de janela: ranking, running totals e gaps<a class="anchor" href="#sec-20-4" aria-label="ligação">#</a></h2>
+
+<p>Uma função de janela calcula um valor por linha olhando para um conjunto de linhas relacionadas, sem colapsar o resultado como faz o <code>GROUP BY</code>. A cláusula <code>OVER</code> tem três partes: <code>PARTITION BY</code>, que define os grupos independentes; <code>ORDER BY</code>, que define a sequência dentro de cada grupo; e o <em>frame</em>, que define quais das linhas ordenadas entram no cálculo desta linha. A terceira é a que quase ninguém domina e a que produz os erros silenciosos.</p>
+
+<p>A ordem de avaliação lógica é <code>FROM</code> → <code>WHERE</code> → <code>GROUP BY</code> → <code>HAVING</code> → funções de janela → <code>SELECT</code> → <code>DISTINCT</code> → <code>ORDER BY</code> → <code>LIMIT</code>. Por isso não se pode filtrar por uma função de janela no <code>WHERE</code>: no momento em que o <code>WHERE</code> corre, o <code>rank()</code> ainda não existe. É preciso uma subconsulta ou CTE e filtrar no nível de cima. Alguns motores oferecem <code>QUALIFY</code> para o fazer numa só cláusula; o PostgreSQL 17 não tem essa palavra-chave e nomear a diferença mostra que o candidato conhece mais de um dialecto.</p>
+
+<p>O <em>frame</em> por defeito, quando há <code>ORDER BY</code> e não se escreve nada, é <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. RANGE trabalha por <em>valor</em>: todas as linhas com o mesmo valor de ordenação — os «pares» — entram juntas. Se houver várias linhas por dia, um «total acumulado» escrito assim mostra, em todas as linhas do mesmo dia, o total já incluindo esse dia inteiro. A correcção é <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>, que trabalha por posição. Sem <code>ORDER BY</code>, o <em>frame</em> é a partição completa, o que é exactamente o que se quer para calcular percentagens do total.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.2</span> Funções de ranking sobre os salários 500, 500, 420, 300 de um departamento.</div>
+<div class="tscroll"><table><thead><tr><th>Função</th><th>Resultado</th><th>Quando é a certa</th></tr></thead><tbody>
+<tr><td><code>row_number()</code></td><td>1, 2, 3, 4</td><td>Deduplicação e paginação; exige critério de desempate determinístico.</td></tr>
+<tr><td><code>rank()</code></td><td>1, 1, 3, 4</td><td>Classificações desportivas: empatados partilham o lugar e o seguinte salta.</td></tr>
+<tr><td><code>dense_rank()</code></td><td>1, 1, 2, 3</td><td>«O N-ésimo valor distinto», como o segundo salário mais alto.</td></tr>
+<tr><td><code>percent_rank()</code></td><td>0, 0, 0,67, 1</td><td>Posição relativa normalizada; base para percentis de negócio.</td></tr>
+<tr><td><code>ntile(4)</code></td><td>1, 2, 3, 4</td><td>Quartis de população; distribui desigualmente quando N não divide as linhas.</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-20-7" data-box="qa" data-area="sql" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Escrevi <code>SELECT … FROM venda WHERE rank() OVER (PARTITION BY categoria ORDER BY total DESC) &lt;= 3</code> e o PostgreSQL rejeita. Porquê, e qual é a diferença entre <code>rank</code>, <code>dense_rank</code> e <code>row_number</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque as funções de janela são avaliadas depois do <code>WHERE</code>. A ordem lógica é <code>FROM</code>, <code>WHERE</code>, <code>GROUP BY</code>, <code>HAVING</code>, janelas, <code>SELECT</code>, <code>ORDER BY</code>, <code>LIMIT</code>: quando o <code>WHERE</code> executa, o valor de <code>rank()</code> ainda não foi calculado, e o motor não pode sequer determinar a que conjunto de linhas ele se refere. A solução é calcular a janela numa subconsulta ou CTE e filtrar no nível seguinte.</p>
+      <p>As três funções diferem no tratamento de empates. Sobre os valores 500, 500, 420, 300: <code>row_number()</code> dá 1, 2, 3, 4 e escolhe arbitrariamente qual dos empatados é o primeiro; <code>rank()</code> dá 1, 1, 3, 4, saltando posições; <code>dense_rank()</code> dá 1, 1, 2, 3, sem saltos. Escolher entre elas não é estético — é ler a regra de negócio. «Os três melhores produtos» com <code>row_number()</code> corta arbitrariamente um empate no terceiro lugar; com <code>rank()</code> devolve quatro linhas quando há empate, o que costuma ser o que o negócio quer.</p>
+      <p><code>row_number()</code> exige um critério de ordenação total. Com <code>ORDER BY total DESC</code> apenas, duas linhas com o mesmo total podem trocar entre execuções, o que torna a paginação por <em>offset</em> não determinística e faz aparecer ou desaparecer registos entre páginas. Acrescentar a chave primária como último critério resolve, e é o hábito que distingue quem já apanhou o problema em produção.</p>
+      <p>Sobre dialectos: Snowflake, BigQuery e DuckDB têm <code>QUALIFY</code>, que filtra por funções de janela sem subconsulta. O PostgreSQL 17 não tem, e a subconsulta não custa nada em plano — o nó <code>WindowAgg</code> é o mesmo, apenas com um <code>Filter</code> por cima.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe porque falha e tenta corrigir movendo a expressão para o <code>HAVING</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é preciso uma subconsulta, mas confunde <code>rank</code> com <code>dense_rank</code> e não fala de empates.</td></tr>
+        <tr><td>Sénior</td><td>Explica a ordem de avaliação, distingue as três funções com um exemplo numérico e liga a escolha à regra de negócio.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o determinismo do <code>ORDER BY</code> na paginação, o <code>QUALIFY</code> de outros dialectos e o custo real (nenhum) da subconsulta.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se houver empate no terceiro lugar, quantas linhas quer devolver?»</li>
+      <li>«Como pagina 50 linhas de cada vez sem <code>OFFSET</code>?»</li>
+      <li>«Que índice remove o <code>Sort</code> antes do <code>WindowAgg</code>?»</li>
+      <li>«E se quiser o top 3 por categoria com apenas 20 categorias e 100 milhões de vendas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar sempre <code>row_number()</code> sem perguntar o que fazer com empates.</li>
+      <li>Achar que a subconsulta acrescenta uma passagem sobre os dados.</li>
+      <li>Paginar com <code>ORDER BY</code> não determinístico e não ver problema nisso.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-8" data-box="qa" data-area="sql" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Escrevi <code>sum(valor) OVER (ORDER BY dia)</code> para um total acumulado e os números do relatório não batem certo com a soma manual. Qual é a janela por defeito e onde está o erro?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A janela por defeito, quando há <code>ORDER BY</code> e nenhum <em>frame</em> escrito, é <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. RANGE opera sobre valores, não sobre posições: todas as linhas com o mesmo <code>dia</code> são pares e entram no cálculo umas das outras. Se a tabela tem várias transacções por dia, cada linha desse dia mostra o acumulado já com o dia inteiro incluído — logo, as linhas do mesmo dia repetem o mesmo valor e o «acumulado» salta em degraus.</p>
+      <p>A correcção para um acumulado linha a linha é explicitar <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. Se o requisito for mesmo por dia, o correcto é agregar primeiro por dia numa CTE e só depois aplicar a janela — o que também torna o resultado independente da ordem interna das linhas do mesmo dia.</p>
+      <p>Há um terceiro modo, <code>GROUPS</code>, disponível desde o PostgreSQL 11, que conta grupos de pares em vez de linhas ou valores; é a escolha certa para «os três dias anteriores, independentemente de quantas transacções tiveram». E, quando o <code>ORDER BY</code> é sobre uma data ou <em>timestamp</em>, <code>RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW</code> dá uma média móvel de sete dias de calendário — que é diferente de sete linhas quando há dias sem registo.</p>
+      <p>Sem <code>ORDER BY</code>, o <em>frame</em> é a partição inteira. É por isso que <code>sum(valor) OVER (PARTITION BY categoria)</code> devolve o total da categoria em todas as linhas, e é a forma idiomática de calcular a quota de cada linha no total sem um segundo <em>scan</em> nem um <em>self-join</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe que existe um <em>frame</em> e culpa os dados.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>ROWS</code> e <code>RANGE</code> são diferentes, mas não sabe qual é o defeito nem o que são pares.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia o <em>frame</em> por defeito, explica o comportamento de pares e corrige com <code>ROWS</code> ou com pré-agregação por dia.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>GROUPS</code>, o <code>RANGE</code> com <code>INTERVAL</code> para médias móveis de calendário e o caso sem <code>ORDER BY</code> para quotas do total.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Média móvel de sete dias com dias sem vendas: como garante que não salta dias?»</li>
+      <li>«Qual é a diferença entre <code>lag(x, 1)</code> e um <em>frame</em> de uma linha para trás?»</li>
+      <li>«Como calcula a quota de cada produto no total da categoria numa só passagem?»</li>
+      <li>«O <code>WindowAgg</code> ordena os dados quantas vezes se tiver três janelas diferentes?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Nunca ter escrito um <em>frame</em> explícito e assumir que o defeito é <code>ROWS</code>.</li>
+      <li>Corrigir com <code>DISTINCT</code> por cima, escondendo o erro em vez de o resolver.</li>
+      <li>Não perguntar se o requisito é por linha ou por dia antes de escrever.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O <em>frame</em> por defeito é <code>RANGE</code>, não <code>ROWS</code>. Com uma chave de ordenação única a diferença é invisível; com duplicados na chave, o total acumulado fica errado em todas as linhas dos dias repetidos e ninguém nota até alguém somar à mão. Escrever sempre o <em>frame</em> explicitamente custa nove palavras e elimina a classe inteira de erro.</p></aside>
+
+<div class="lab" id="lab-20-4" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.4 — Top 3 produtos por categoria, com empates</span>
+    <div class="labpills"><span class="qpill">Janela + LATERAL</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>O exercício aparece quase sempre com o enunciado deliberadamente ambíguo quanto a empates. Perguntar antes de escrever é parte da avaliação.</p>
+    <figure class="listing sql" id="lst-20-8"><div class="lhead"><span class="lnum">Listagem 20.8</span>
+      <span class="lcap">Esquema e dados do exercício 20.4</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE produto (
+  id        int  PRIMARY KEY,
+  nome      text NOT NULL,
+  categoria text NOT NULL
+);
+
+CREATE TABLE venda (
+  id         bigserial PRIMARY KEY,
+  produto_id int  NOT NULL REFERENCES produto(id),
+  dia        date NOT NULL,
+  unidades   int  NOT NULL
+);
+
+INSERT INTO produto VALUES
+  (1,'Teclado','periferico'), (2,'Rato','periferico'), (3,'Monitor','periferico'),
+  (4,'Cabo','periferico'),    (5,'SSD','armazenamento'), (6,'HDD','armazenamento');
+
+INSERT INTO venda (produto_id, dia, unidades) VALUES
+  (1,'2025-02-03',40), (1,'2025-07-11',20),   -- Teclado: 60
+  (2,'2025-03-09',60),                        -- Rato: 60  (empate)
+  (3,'2025-04-02',55),                        -- Monitor: 55
+  (4,'2025-05-05',10),                        -- Cabo: 10
+  (5,'2025-06-01',30), (6,'2024-12-30',99);   -- HDD fora do ano de 2025</code></pre></figure>
+    <p>Enunciado: «Devolva, por categoria, os três produtos com mais unidades vendidas em 2025. Empatados ocupam o mesmo lugar e nenhum é cortado arbitrariamente. Produtos sem vendas em 2025 não aparecem.» Saída esperada: em <code>periferico</code>, Rato e Teclado em 1.º com 60 e Monitor em 3.º com 55; em <code>armazenamento</code>, apenas o SSD.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-9"><div class="lhead"><span class="lnum">Listagem 20.9</span>
+        <span class="lcap">Top-N por grupo: janela e a variante com LATERAL</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>-- Versao 1: agregar, ordenar por categoria, filtrar acima da janela.
+WITH totais AS (
+  SELECT p.categoria, p.nome, sum(v.unidades) AS unidades
+  FROM venda v
+  JOIN produto p ON p.id = v.produto_id
+  WHERE v.dia &gt;= DATE '2025-01-01'
+    AND v.dia &lt;  DATE '2026-01-01'     -- meio aberto: usa indice, imune a fuso
+  GROUP BY p.categoria, p.nome
+),
+ordenado AS (
+  SELECT t.*,
+         rank() OVER (PARTITION BY t.categoria
+                      ORDER BY t.unidades DESC) AS posicao
+  FROM totais t
+)
+SELECT categoria, posicao, nome, unidades
+FROM ordenado
+WHERE posicao &lt;= 3
+ORDER BY categoria, posicao, nome;
+
+-- Versao 2: LATERAL. Melhor quando ha poucas categorias, muitas vendas
+-- e um indice em venda (produto_id, dia) que suporta o LIMIT por grupo.
+SELECT c.categoria, t.nome, t.unidades
+FROM (SELECT DISTINCT categoria FROM produto) c
+CROSS JOIN LATERAL (
+  SELECT p.nome, sum(v.unidades) AS unidades
+  FROM produto p
+  JOIN venda v ON v.produto_id = p.id
+  WHERE p.categoria = c.categoria
+    AND v.dia &gt;= DATE '2025-01-01'
+    AND v.dia &lt;  DATE '2026-01-01'
+  GROUP BY p.nome
+  ORDER BY unidades DESC
+  LIMIT 3
+) t
+ORDER BY c.categoria, t.unidades DESC, t.nome;</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado na versão 1: <code>Hash Join</code> entre <code>venda</code> filtrada e <code>produto</code>, <code>HashAggregate</code>, <code>Sort</code> por <code>(categoria, unidades DESC)</code>, <code>WindowAgg</code> e um <code>Filter</code> por cima. O custo é dominado pela agregação sobre todas as vendas do ano.</li>
+        <li>Plano da versão 2: <code>Nested Loop</code> com o lado interno a executar uma vez por categoria. Com 20 categorias e 100 milhões de vendas indexadas por <code>(produto_id, dia)</code>, faz 20 sondagens em vez de uma agregação global — habitualmente uma ou duas ordens de grandeza mais rápida.</li>
+        <li>Empates: <code>rank()</code> devolve quatro linhas se houver empate no terceiro lugar; <code>row_number()</code> devolveria três e cortaria um dos empatados sem critério. A versão com <code>LIMIT 3</code> tem o mesmo defeito do <code>row_number()</code> e deve ser assinalada como tal.</li>
+        <li>Armadilha da data: <code>extract(year FROM v.dia) = 2025</code> impede o uso do índice em <code>dia</code>; o intervalo meio aberto <code>&gt;= '2025-01-01' AND &lt; '2026-01-01'</code> mantém-no e é imune a limites de fuso horário quando a coluna for <code>timestamptz</code>.</li>
+        <li>Armadilha dos produtos sem vendas: o <code>JOIN</code> interno já os exclui, como o enunciado pede. Se o requisito fosse mostrá-los com zero, seria <code>LEFT JOIN</code> a partir de <code>produto</code> com <code>coalesce(sum(v.unidades), 0)</code>.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-20-5" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.5 — Acumulado e média móvel de sete dias</span>
+    <div class="labpills"><span class="qpill">Frames</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>O exercício testa duas coisas ao mesmo tempo: dominar o <em>frame</em> e reparar que a série tem buracos.</p>
+    <figure class="listing sql" id="lst-20-10"><div class="lhead"><span class="lnum">Listagem 20.10</span>
+      <span class="lcap">Esquema e dados do exercício 20.5</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE receita_diaria (
+  dia         date PRIMARY KEY,
+  valor_cents bigint NOT NULL
+);
+
+INSERT INTO receita_diaria VALUES
+  ('2025-06-01', 10000),
+  ('2025-06-02', 12000),
+  -- 03 e 04 sem registo: a loja esteve fechada
+  ('2025-06-05',  8000),
+  ('2025-06-06', 15000),
+  ('2025-06-07',  9000),
+  ('2025-06-08', 11000),
+  ('2025-06-09', 13000);</code></pre></figure>
+    <p>Enunciado: «Para cada dia de Junho de 2025, devolva o valor do dia, o acumulado desde o dia 1 e a média móvel dos últimos sete dias de calendário. Os dias sem registo têm de aparecer com zero.»</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-11"><div class="lhead"><span class="lnum">Listagem 20.11</span>
+        <span class="lcap">Calendário denso, acumulado por ROWS e média móvel por RANGE com INTERVAL</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>WITH dias AS (
+  SELECT g::date AS dia
+  FROM generate_series(DATE '2025-06-01', DATE '2025-06-30', INTERVAL '1 day') AS g
+),
+serie AS (
+  SELECT d.dia, coalesce(r.valor_cents, 0) AS valor_cents
+  FROM dias d
+  LEFT JOIN receita_diaria r ON r.dia = d.dia
+)
+SELECT dia,
+       valor_cents,
+       sum(valor_cents) OVER (ORDER BY dia
+                              ROWS BETWEEN UNBOUNDED PRECEDING
+                                       AND CURRENT ROW) AS acumulado,
+       round(avg(valor_cents) OVER (ORDER BY dia
+                                    RANGE BETWEEN INTERVAL '6 days' PRECEDING
+                                              AND CURRENT ROW), 2) AS media_7d
+FROM serie
+ORDER BY dia;</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado: <code>Function Scan</code> sobre <code>generate_series</code>, <code>Hash Left Join</code> ou <code>Merge Left Join</code> com <code>receita_diaria</code>, um <code>Sort</code> por <code>dia</code> e um único <code>WindowAgg</code> — as duas janelas partilham a mesma ordenação, por isso não há segundo <code>Sort</code>. Custo O(n log n) dominado pela ordenação, e nulo se a leitura já vier ordenada pelo índice da chave primária.</li>
+        <li>Armadilha dos buracos: sem o calendário denso, «sete dias» com <code>ROWS 6 PRECEDING</code> conta sete <em>linhas</em>, que aqui abrangeriam nove dias de calendário. Com <code>RANGE</code> e <code>INTERVAL</code>, a média está certa mesmo sem preencher os dias — mas o enunciado exige as linhas em falta, o que obriga ao <code>generate_series</code>.</li>
+        <li>Armadilha do <em>frame</em> por defeito: escrever <code>sum(valor_cents) OVER (ORDER BY dia)</code> funcionaria aqui só porque <code>dia</code> é chave primária e não há pares. Numa tabela de transacções individuais, o mesmo código estaria errado.</li>
+        <li>Armadilha do NULL: <code>avg</code> ignora NULL, por isso substituir o <code>coalesce</code> por NULL mudaria o denominador da média — a média deixaria de ser sobre sete dias e passaria a ser sobre os dias com registo.</li>
+        <li>Divisão da média: <code>avg</code> sobre <code>bigint</code> devolve <code>numeric</code>, logo <code>round(x, 2)</code> aplica-se directamente. Sobre <code>double precision</code> não haveria a versão de dois argumentos e seria preciso um <em>cast</em>.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Funções de janela contra <em>self-joins</em>: a janela faz uma ordenação e uma passagem, O(n log n), e lê-se em três linhas; o <em>self-join</em> correlacionado é O(n·k) e, sem índice, degrada quadraticamente. Em contrapartida, o <code>WindowAgg</code> precisa de ter toda a partição ordenada em <code>work_mem</code> — com partições de milhões de linhas e <code>work_mem</code> a 4 MB, a ordenação derrama para disco e a janela perde para uma pré-agregação materializada. A regra prática: janela até dezenas de milhões de linhas por consulta; vista materializada com refrescamento incremental acima disso.</p></aside>
+
+<h2 id="sec-20-5" class="h2"><span class="secnum">20.5</span> Padrões clássicos de exercício de SQL<a class="anchor" href="#sec-20-5" aria-label="ligação">#</a></h2>
+
+<p>O repertório de exercícios de SQL em entrevista é surpreendentemente pequeno: seis ou sete padrões cobrem quase tudo o que aparece. Segundo maior valor (<code>dense_rank</code>); top-N por grupo (<code>rank</code> ou <code>LATERAL</code>); deduplicação (<code>row_number</code> com critério total); <em>gaps and islands</em>, de que a sessionização é o caso mais frequente; total acumulado e média móvel (<em>frames</em>); pivot de linhas para colunas (agregação condicional); e o cálculo de percentis com <code>percentile_cont</code>. Reconhecer o padrão nos primeiros trinta segundos liberta o resto do tempo para os casos limite, que é onde a avaliação acontece.</p>
+
+<p><em>Gaps and islands</em> é o padrão que mais impressiona quando sai fluente. A ideia tem duas linhas: marcar com 1 as linhas que iniciam um novo bloco — porque a diferença para a anterior excede o limiar, ou porque não há anterior — e depois fazer um <code>sum()</code> acumulado dessa marca, que produz um identificador constante dentro de cada bloco. Serve para sessões de utilizador, para períodos contínuos de subscrição, para detectar buracos numa sequência de números de factura e para agrupar dias consecutivos de indisponibilidade.</p>
+
+<p>O pivot é o padrão em que o candidato deve nomear a limitação em vez de a contornar: SQL não produz colunas dinâmicas, porque o conjunto de colunas do resultado tem de ser conhecido no momento do planeamento. Ou as colunas são fixas e escrevem-se com <code>FILTER</code>, ou se usa <code>crosstab</code> da extensão <code>tablefunc</code> declarando na mesma a lista de colunas, ou se devolve o formato longo e se pivota na aplicação ou na ferramenta de relatório. Dizer isto claramente vale mais do que qualquer truque.</p>
+
+<div class="lab" id="lab-20-6" data-box="lab" data-lang="sql">
+  <div class="labhead"><span class="labttl">Exercício 20.6 — Sessões de utilizador com intervalo de 30 minutos</span>
+    <div class="labpills"><span class="qpill">Gaps and islands</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>O exercício de SQL mais discriminante que cabe em 25 minutos. Quem já o fez resolve-o em duas CTEs; quem nunca o viu tende a propor um cursor ou um ciclo na aplicação.</p>
+    <figure class="listing sql" id="lst-20-12"><div class="lhead"><span class="lnum">Listagem 20.12</span>
+      <span class="lcap">Esquema e dados do exercício 20.6</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="sql"><code>CREATE TABLE evento (
+  id            bigserial PRIMARY KEY,
+  utilizador_id bigint NOT NULL,
+  ocorrido_em   timestamptz NOT NULL,
+  tipo          text NOT NULL
+);
+
+CREATE INDEX ON evento (utilizador_id, ocorrido_em);
+
+INSERT INTO evento (utilizador_id, ocorrido_em, tipo) VALUES
+  (1, '2025-04-01 09:00:00+00', 'view'),
+  (1, '2025-04-01 09:12:00+00', 'view'),
+  (1, '2025-04-01 09:35:00+00', 'add'),    -- 23 min: mesma sessao
+  (1, '2025-04-01 11:20:00+00', 'view'),   -- 105 min: nova sessao
+  (1, '2025-04-01 11:25:00+00', 'buy'),
+  (2, '2025-04-01 09:05:00+00', 'view'),
+  (2, '2025-04-01 10:30:00+00', 'view');   -- 85 min: nova sessao</code></pre></figure>
+    <p>Enunciado: «Agrupe os eventos em sessões por utilizador. Uma sessão termina quando passam mais de 30 minutos sem eventos. Devolva, por sessão, o utilizador, o instante inicial, o final, a duração e o número de eventos.» Saída esperada: três sessões — duas do utilizador 1 (com 3 e 2 eventos) e duas do utilizador 2 (com 1 evento cada), num total de quatro linhas.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing sql" id="lst-20-13"><div class="lhead"><span class="lnum">Listagem 20.13</span>
+        <span class="lcap">Sessionização em duas CTEs: marcar a fronteira, somar a marca</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>WITH marcado AS (
+  SELECT e.utilizador_id,
+         e.ocorrido_em,
+         CASE
+           WHEN lag(e.ocorrido_em) OVER w IS NULL                       THEN 1
+           WHEN e.ocorrido_em - lag(e.ocorrido_em) OVER w
+                &gt; INTERVAL '30 minutes'                                 THEN 1
+           ELSE 0
+         END AS nova_sessao
+  FROM evento e
+  WINDOW w AS (PARTITION BY e.utilizador_id ORDER BY e.ocorrido_em)
+),
+numerado AS (
+  SELECT m.*,
+         sum(m.nova_sessao) OVER (PARTITION BY m.utilizador_id
+                                  ORDER BY m.ocorrido_em
+                                  ROWS UNBOUNDED PRECEDING) AS sessao_id
+  FROM marcado m
+)
+SELECT utilizador_id,
+       sessao_id,
+       min(ocorrido_em)                    AS inicio,
+       max(ocorrido_em)                    AS fim,
+       max(ocorrido_em) - min(ocorrido_em) AS duracao,
+       count(*)                            AS eventos
+FROM numerado
+GROUP BY utilizador_id, sessao_id
+ORDER BY utilizador_id, inicio;</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Plano esperado: <code>Index Scan</code> sobre <code>evento (utilizador_id, ocorrido_em)</code>, que já entrega a ordem exigida pelas duas janelas e elimina o <code>Sort</code>; dois <code>WindowAgg</code> encadeados e um <code>GroupAggregate</code> final. Uma passagem, O(n) depois da leitura ordenada — e é por isso que o índice composto é a primeira coisa a propor.</li>
+        <li>O <code>ROWS UNBOUNDED PRECEDING</code> no segundo <code>sum</code> não é decorativo: com o <code>RANGE</code> por defeito, dois eventos com o mesmo <em>timestamp</em> seriam pares e partilhariam o valor acumulado, o que ainda funciona por acaso aqui, mas quebra a lógica assim que o limiar for calculado a partir de outra coluna.</li>
+        <li>Armadilha dos empates: dois eventos exactamente no mesmo instante fazem <code>lag</code> devolver uma diferença de zero — que é menor do que 30 minutos, logo mesma sessão. Correcto, mas convém dizer que a ordem entre eles é arbitrária sem o <code>id</code> como segundo critério.</li>
+        <li>Armadilha do NULL: o primeiro evento de cada utilizador tem <code>lag</code> a NULL, e <code>NULL &gt; INTERVAL '30 minutes'</code> é NULL, não TRUE. Sem o primeiro ramo do <code>CASE</code>, a marca ficaria a 0 e a primeira sessão de cada utilizador teria <code>sessao_id = 0</code> — aqui inofensivo, mas fatal se o identificador fosse usado como chave.</li>
+        <li>Variante frequente: em vez de <code>sum</code> acumulado, agrupar por <code>ocorrido_em - (row_number() OVER …) * INTERVAL '1 day'</code> resolve o caso de dias exactamente consecutivos, que é a versão «ilhas de datas» do mesmo padrão.</li>
+        <li>Volume: em tabelas particionadas por dia, uma sessão que atravessa a meia-noite exige alargar a leitura à partição anterior, ou a última sessão do dia fica cortada.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<figure class="listing sql" id="lst-20-14"><div class="lhead"><span class="lnum">Listagem 20.14</span>
+<span class="lcap">Pivot de meses com agregação condicional: colunas fixas, uma só passagem</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>SELECT p.categoria,
+       coalesce(sum(v.unidades) FILTER (WHERE v.dia &gt;= DATE '2025-01-01'
+                                          AND v.dia &lt;  DATE '2025-02-01'), 0) AS jan,
+       coalesce(sum(v.unidades) FILTER (WHERE v.dia &gt;= DATE '2025-02-01'
+                                          AND v.dia &lt;  DATE '2025-03-01'), 0) AS fev,
+       coalesce(sum(v.unidades) FILTER (WHERE v.dia &gt;= DATE '2025-03-01'
+                                          AND v.dia &lt;  DATE '2025-04-01'), 0) AS mar,
+       sum(v.unidades)                                                        AS trimestre
+FROM produto p
+JOIN venda v ON v.produto_id = p.id
+WHERE v.dia &gt;= DATE '2025-01-01' AND v.dia &lt; DATE '2025-04-01'
+GROUP BY p.categoria
+ORDER BY p.categoria;</code></pre></figure>
+
+<div class="qa" id="q-20-9" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Esta consulta com uma função de janela sobre 200 milhões de linhas demora 40 segundos e o painel tem um orçamento de 2 segundos. O que faz, por que ordem?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro medir, e medir a coisa certa: <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Numa consulta com <code>WindowAgg</code>, o suspeito habitual é o nó <code>Sort</code> imediatamente abaixo. Se a linha do plano disser <code>Sort Method: external merge  Disk: 4 200 000 kB</code>, a ordenação está a derramar para disco e é aí que estão os 40 segundos, não na janela.</p>
+      <p>Depois, por ordem de retorno decrescente. Um, reduzir a entrada: um predicado selectivo suportado por índice antes da janela vale mais do que qualquer afinação — ordenar 2 milhões de linhas em vez de 200 milhões é um factor de cem. Dois, fornecer a ordem: um índice em <code>(chave_de_particao, chave_de_ordenacao)</code> permite que o <code>WindowAgg</code> consuma dados já ordenados e o nó <code>Sort</code> desaparece; quando o índice cobre apenas um prefixo, o <code>Incremental Sort</code> do PostgreSQL 13 ou superior ordena só dentro de cada grupo. Três, dar memória: <code>SET LOCAL work_mem = '256MB'</code> na sessão do relatório transforma a fusão externa numa ordenação em memória, com a ressalva de que o limite é por operação de ordenação e por processo paralelo, não por sessão.</p>
+      <p>Se nada disto chegar aos 2 segundos, o problema é de arquitectura e não de consulta: pré-agrega-se numa vista materializada com <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code>, ou numa tabela de sumário mantida incrementalmente. Um painel que lê 200 milhões de linhas em cada visita está a pedir a mesma resposta muitas vezes; a resposta certa é calculá-la uma vez.</p>
+      <p>O que se perde: a vista materializada introduz latência de dados. Com refrescamento de cinco em cinco minutos, o painel mostra números até cinco minutos antigos, e isso tem de ser acordado com quem o usa — não é uma decisão técnica.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Sugere «acrescentar índices» sem olhar para o plano, ou culpa o hardware.</td></tr>
+        <tr><td>Mid</td><td>Corre <code>EXPLAIN</code> mas lê só o custo estimado; não distingue o <code>Sort</code> do <code>WindowAgg</code>.</td></tr>
+        <tr><td>Sénior</td><td>Usa <code>EXPLAIN (ANALYZE, BUFFERS)</code>, identifica o derrame da ordenação, reduz a entrada e propõe o índice composto que fornece a ordem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>work_mem</code> por operação, <code>Incremental Sort</code>, e escala para vista materializada declarando explicitamente a latência de dados que isso custa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que <code>work_mem</code> alto para toda a instância é perigoso?»</li>
+      <li>«O que muda se a consulta correr com paralelismo de quatro trabalhadores?»</li>
+      <li>«Como refresca a vista materializada sem bloquear leituras?»</li>
+      <li>«Que diferença faz <code>BUFFERS</code> mostrar leituras partilhadas contra leituras locais?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Optimizar sem plano de execução, por intuição.</li>
+      <li>Subir <code>work_mem</code> globalmente para 1 GB sem multiplicar pelo número de ligações concorrentes.</li>
+      <li>Propor uma cache de aplicação sem discutir invalidação nem latência aceitável.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza para calibrar respostas: uma leitura sequencial de uma tabela de 10 GB em disco NVMe local ronda 10 a 20 segundos; uma ordenação em memória de 5 milhões de linhas com <code>work_mem</code> a 256 MB fica abaixo de 3 segundos; a mesma ordenação com 4 MB derrama para disco e passa facilmente de 30 segundos. Um <code>Index Only Scan</code> sobre um índice de 200 MB devolve milhares de linhas em poucos milissegundos. <code>work_mem</code> é por operação de ordenação ou dispersão e por processo paralelo: 100 ligações com três ordenações cada e 256 MB configurados podem reservar dezenas de gigabytes.</p></aside>
+
+<h2 id="sec-20-6" class="h2"><span class="secnum">20.6</span> Escrever SQL sob pressão: método em cinco passos<a class="anchor" href="#sec-20-6" aria-label="ligação">#</a></h2>
+
+<p>Num editor partilhado, sem base de dados por baixo, a correcção não vem de executar: vem de um procedimento. O primeiro passo é clarificar o esquema e a cardinalidade em voz alta — «um cliente tem N encomendas, cada encomenda tem M linhas; se juntar as três tabelas, cada cliente aparece N×M vezes, logo qualquer soma de um valor do cliente fica inflacionada». Nesse mesmo passo pergunta-se o que é anulável e o que fazer com empates. Trinta segundos de perguntas eliminam metade dos erros possíveis.</p>
+
+<p>O segundo passo é escrever à mão o resultado esperado para seis a oito linhas de entrada, incluindo deliberadamente um NULL, um duplicado e um empate. É o teste unitário do exercício, custa dois minutos e dá ao entrevistador a evidência de que o candidato pensa em casos limite antes de escrever, e não depois de falhar. O terceiro passo é construir por camadas com CTEs, dizendo em voz alta o que cada uma devolve e quantas linhas espera: primeiro o filtro, depois a agregação, depois a janela, depois a projecção final.</p>
+
+<p>O quarto passo é enunciar o plano esperado antes que perguntem — que nós, que índice, onde está a ordenação — porque é o sinal que distingue quem escreve SQL de quem opera bases de dados. O quinto é reler a consulta contra a lista de armadilhas: NULL na comparação e na ordenação, duplicados vindos do join, empates no ranking, fronteiras de data meio abertas, agregados sobre conjuntos vazios. Fazer esta passagem em voz alta é a última oportunidade de apanhar o erro antes de o entrevistador o apanhar.</p>
+
+<div class="qa" id="q-20-10" data-box="qa" data-area="sql" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SQL</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Não temos aqui base de dados nenhuma para correr isto. Como é que sabe que a consulta que acabou de escrever está correcta?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Executando-a à mão sobre um conjunto pequeno construído de propósito para partir. Seis a oito linhas chegam, desde que incluam um NULL na coluna que é comparada, duas linhas duplicadas na chave de agrupamento e um empate no valor que ordena o ranking. Percorre-se cada CTE por ordem, dizendo quantas linhas entram e quantas saem.</p>
+      <p>A verificação de cardinalidade é a mais rentável e faz-se antes de escrever: se cada cliente tem em média 3,4 encomendas e cada encomenda 2,1 linhas, o join das três tabelas produz cerca de 7,1 linhas por cliente, e qualquer <code>sum</code> de um valor que pertença ao cliente fica sete vezes maior. O sinal de que a resposta está errada é o número de linhas do resultado não corresponder ao que se anunciou.</p>
+      <p>Depois há uma lista fixa que se percorre em voz alta: comparações com colunas anuláveis; <code>NOT IN</code>; posição dos NULLs no <code>ORDER BY</code>; <em>frame</em> explícito em todas as janelas; intervalos de data meio abertos em vez de <code>BETWEEN</code> com o limite superior inclusivo; <code>coalesce</code> nos agregados que podem ver conjuntos vazios; e um critério de desempate determinístico em qualquer <code>row_number()</code>.</p>
+      <p>Por fim, o plano. Dizer «espero um <code>Index Scan</code> sobre <code>(utilizador_id, ocorrido_em)</code>, sem <code>Sort</code>, porque o índice já entrega a ordem que a janela precisa» é uma afirmação falsificável, que o entrevistador pode confirmar depois, e é o que separa o candidato que escreve SQL do que responde por ele em produção.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Parece-me bem» ou «testava depois»; não propõe nenhuma forma de verificação.</td></tr>
+        <tr><td>Mid</td><td>Relê a consulta e verifica a sintaxe, mas não constrói dados de exemplo nem pensa em NULL ou empates.</td></tr>
+        <tr><td>Sénior</td><td>Constrói um conjunto pequeno com NULL, duplicado e empate, percorre CTE a CTE e verifica a cardinalidade esperada.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a previsão do plano e do índice, e nomeia à cabeça a classe de erros que o exercício está desenhado para provocar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Dê-me a linha de entrada que parte a sua consulta.»</li>
+      <li>«Quantas linhas espera no resultado para estes dados?»</li>
+      <li>«Se eu duplicar uma linha da tabela da direita, o que muda no total?»</li>
+      <li>«Como testaria isto num pipeline de integração contínua?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Escrever a consulta inteira sem uma única pergunta sobre o esquema.</li>
+      <li>Não conseguir dizer quantas linhas o resultado deve ter.</li>
+      <li>Corrigir por tentativa e erro até «parecer bem», sem explicar a causa de cada correcção.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Vale a pena declarar o dialecto no início da ronda: «vou escrever em PostgreSQL; se preferir MySQL, digo-lhe onde muda». As diferenças que importam num exercício típico são poucas mas decisivas — <code>FILTER</code> e a cláusula <code>CYCLE</code> não existem em MySQL, o MySQL 8 tem funções de janela mas ordena NULLs no fim em <code>DESC</code>, e o Oracle exige <code>FROM dual</code> e não aceita <code>LIMIT</code>. Declarar o dialecto evita que uma diferença de sintaxe seja lida como erro de conhecimento.</p></aside>
+
+<h2 id="sec-20-7" class="h2"><span class="secnum">20.7</span> Resumo e checklist<a class="anchor" href="#sec-20-7" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, por ordem de frequência com que aparece numa ronda de SQL:</p>
+
+<ul class="lst">
+  <li>Um join não filtra, multiplica. Antes de agregar sobre um join, dizer em voz alta quantas linhas cada lado contribui e escolher <code>count(coluna)</code> em vez de <code>count(*)</code> quando o que se conta são correspondências.</li>
+  <li>NULL faz comparações devolverem NULL, não FALSE. <code>NOT IN</code> sobre uma coluna anulável devolve zero linhas em silêncio; <code>NOT EXISTS</code> é a escolha por defeito e converte em anti-join.</li>
+  <li>Um predicado sobre a tabela da direita no <code>WHERE</code> transforma um <code>LEFT JOIN</code> em <code>INNER JOIN</code>. Se for intencional, é o padrão de anti-join; se não for, é um erro invisível.</li>
+  <li><code>WHERE</code> antes de agregar, <code>HAVING</code> depois, e agregação condicional com <code>FILTER</code> quando a mesma passagem precisa de várias populações. Agregados ignoram NULL — <code>avg</code> divide por <code>count(coluna)</code>.</li>
+  <li>Em PostgreSQL 12 ou superior, uma CTE não recursiva referida uma vez é integrada; referida duas ou mais vezes, é materializada. <code>MATERIALIZED</code> e <code>NOT MATERIALIZED</code> tornam a decisão explícita.</li>
+  <li>Funções de janela avaliam-se depois do <code>WHERE</code>: filtrar por elas exige subconsulta. <code>row_number</code>, <code>rank</code> e <code>dense_rank</code> diferem apenas em empates, e a escolha vem da regra de negócio.</li>
+  <li>O <em>frame</em> por defeito é <code>RANGE UNBOUNDED PRECEDING</code>, que inclui todos os pares. Escrever sempre o <em>frame</em>: <code>ROWS</code> para acumulados por linha, <code>RANGE</code> com <code>INTERVAL</code> para janelas de calendário.</li>
+  <li>Seis padrões cobrem quase todos os exercícios: segundo maior, top-N por grupo, deduplicação, <em>gaps and islands</em>, acumulado e média móvel, pivot com colunas fixas.</li>
+  <li>O plano faz parte da resposta. Nomear o nó esperado, o índice que fornece a ordem e o sítio onde a ordenação pode derramar para disco é o que distingue nível sénior de nível mid.</li>
+</ul>
+
+<p>Checklist para usar antes de declarar uma consulta terminada, na entrevista e em revisão de código:</p>
+
+<ul class="lst">
+  <li>Perguntei a cardinalidade de cada join e disse quantas linhas espero no resultado.</li>
+  <li>Identifiquei todas as colunas anuláveis usadas em comparações, <code>ORDER BY</code> ou <code>PARTITION BY</code>.</li>
+  <li>Não há <code>NOT IN</code> sobre subconsulta; onde havia, está <code>NOT EXISTS</code>.</li>
+  <li>Os predicados sobre tabelas da direita de um <code>LEFT JOIN</code> estão no <code>ON</code>, excepto o <code>IS NULL</code> deliberado do anti-join.</li>
+  <li>Todas as funções de janela têm <em>frame</em> explícito e um <code>ORDER BY</code> determinístico, com desempate por chave primária onde é preciso.</li>
+  <li>A regra de empates está acordada: <code>row_number</code>, <code>rank</code> ou <code>dense_rank</code>, com justificação de negócio.</li>
+  <li>Os intervalos de data são meio abertos (<code>&gt;= início AND &lt; fim</code>) e não escondem funções sobre a coluna indexada.</li>
+  <li>Os agregados que podem ver conjuntos vazios estão protegidos com <code>coalesce</code>.</li>
+  <li>Enunciei o plano esperado e o índice que o suporta, e sei que linha do <code>EXPLAIN</code> confirmaria a previsão.</li>
+</ul>

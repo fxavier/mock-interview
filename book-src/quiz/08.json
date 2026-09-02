@@ -1,0 +1,46 @@
+{"chapter": 8, "questions": [
+  {"q": "Um serviço em Java 25 com threads virtuais activadas executa, dentro de cada pedido, um ciclo de cálculo de 400 ms sem qualquer chamada bloqueante. A máquina tem 8 núcleos. Com 500 pedidos em voo, o que se observa?",
+   "options": [
+    "A vazão fica limitada a cerca de 8 cálculos em paralelo, porque o escalonador não é preemptivo e a continuação só se desmonta em pontos de bloqueio.",
+    "O escalonador interrompe cada continuação ao fim de um quantum e reparte o tempo pelos 500 pedidos.",
+    "O número de transportadores cresce automaticamente até 500 para acompanhar a carga.",
+    "As continuações são desmontadas a cada iteração do ciclo, mantendo os 8 núcleos ocupados de forma justa."],
+   "answer": 0,
+   "explain": "O escalonador de threads virtuais é cooperativo: a desmontagem só acontece em operações que a plataforma intercepta (I/O, LockSupport.park). Código puramente de CPU ocupa o transportador até terminar, logo o paralelismo efectivo é o paralelismo do escalonador, por omissão o número de núcleos. Não há preempção por quantum nem crescimento do pool para acompanhar tarefas que não bloqueiam."},
+
+  {"q": "Depois de activar `spring.threads.virtual.enabled=true`, uma equipa subiu `maximum-pool-size` do HikariCP de 20 para 400 «porque agora há muito mais threads». O PostgreSQL 17 tem `max_connections` a 200 e o serviço corre em 12 réplicas. Qual é a consequência mais provável?",
+   "options": [
+    "A latência das consultas melhora proporcionalmente, porque desaparece a espera por ligação.",
+    "As réplicas passam a pedir até 4 800 ligações a um servidor que aceita 200: aparecem erros de recusa de ligação e a contenção no servidor degrada a latência de todos.",
+    "O Hikari limita-se automaticamente ao que o servidor aceita, pelo que o efeito é neutro.",
+    "O gargalo passa para o número de transportadores do escalonador de threads virtuais."],
+   "answer": 1,
+   "explain": "O limite de ligações é uma propriedade do servidor de base de dados, não da aplicação: 12 réplicas × 400 excede largamente as 200 ligações aceites, produzindo recusas e contenção de buffers e locks no servidor. O Hikari não negoceia o limite com o servidor. Manter o pool pequeno e encurtar o connection-timeout trata a espera como sinal de sobrecarga, que é o comportamento desejado."},
+
+  {"q": "Em Java 25, qual destas situações continua a fixar (pin) uma thread virtual ao seu transportador?",
+   "options": [
+    "Bloquear à espera de um monitor dentro de um bloco `synchronized`.",
+    "Esperar numa `ArrayBlockingQueue` com `take()`.",
+    "Bloquear com um frame nativo (JNI) no topo da pilha.",
+    "Esperar num `ReentrantLock` contendido."],
+   "answer": 2,
+   "explain": "Java 24 eliminou o pinning causado por monitores geridos pela JVM, pelo que `synchronized` deixou de fixar; `ReentrantLock` e as filas bloqueantes do java.util.concurrent sempre desmontaram porque assentam em LockSupport.park. O que a JVM não controla — um frame nativo de JNI ou FFM no topo da pilha — impede a captura da continuação e continua a fixar o transportador."},
+
+  {"q": "Numa cadeia Reactor, `fonte.flatMap(this::gravar)` é aplicado sobre um `Flux` de Kafka a 12 000 mensagens por segundo, sendo que cada gravação demora 8 ms. Não foi passado nenhum argumento de concorrência. O que acontece?",
+   "options": [
+    "O `flatMap` usa concorrência 1 e serializa as gravações, limitando o consumo a 125 por segundo.",
+    "O `flatMap` usa a concorrência máxima por omissão (256), pelo que podem ficar 256 gravações em voo sem que ninguém o tenha decidido, saturando o pool de ligações.",
+    "O `flatMap` deduz a concorrência a partir da capacidade do subscritor final.",
+    "O `flatMap` propaga `request(1)` à fonte, garantindo backpressure elemento a elemento."],
+   "answer": 1,
+   "explain": "A sobrecarga de `flatMap` sem argumento usa a concorrência máxima por omissão de 256, o mesmo valor de prefetch usado pela maioria dos operadores. Isso significa até 256 operações simultâneas contra a base de dados — um limite implícito que ninguém escolheu e que costuma exceder o pool de ligações. A forma correcta é passar explicitamente a concorrência que a dependência aguenta (32 × 1/0,008 = 4 000 por segundo)."},
+
+  {"q": "Um filtro liga `ScopedValue.where(TENANT, t).run(...)` e, mais abaixo, um método guarda uma lambda numa fila para execução posterior por um executor de vida longa. Essa lambda chama `TENANT.get()`. O que acontece?",
+   "options": [
+    "Lê o valor `t`, porque os ScopedValue são copiados para a lambda no momento da criação.",
+    "Lê `null`, tal como um `ThreadLocal` não inicializado.",
+    "Lança excepção quando executada fora do âmbito, porque um ScopedValue só existe enquanto o bloco que o ligou estiver activo.",
+    "Lê o valor do último tenant ligado em qualquer thread, por ser uma variável estática."],
+   "answer": 2,
+   "explain": "O tempo de vida de um ScopedValue é o do bloco que o ligou; a herança acontece por estrutura para as sub-tarefas de um StructuredTaskScope, não por cópia para lambdas que sobrevivem ao âmbito. Ler fora do âmbito falha com excepção em vez de devolver null, o que é uma vantagem de correcção: expõe o erro em vez de propagar um contexto vazio ou o de outro tenant. Trabalho diferido precisa de receber o tenant como parâmetro explícito."}
+]}

@@ -1,0 +1,565 @@
+<p>Esta é a área em que o entrevistador descobre se o candidato percebe o que a plataforma passou a fazer por ele ou se apenas leu o anúncio das <em>threads</em> virtuais. Java 21 tornou finais as <em>threads</em> virtuais e, com isso, mudou o critério de dimensionamento de um serviço backend: deixou de ser o número de <em>threads</em> e passou a ser a capacidade dos sistemas a jusante. Onde os candidatos caem é em três sítios — explicam a montagem e desmontagem de continuações mas não sabem dizer o que continua a fixar a <em>thread</em> ao transportador, migram um serviço e ficam surpreendidos quando o gargalo salta para um <em>pool</em> de 10 ligações de base de dados, e defendem <em>reactive</em> com o argumento do desempenho em vez do argumento do <em>backpressure</em>. Este capítulo trata o modelo de execução, a migração real de um serviço bloqueante, concorrência estruturada, <em>backpressure</em> em Reactor e a comparação honesta entre os três modelos que ainda coexistem em 2026.</p>
+
+<h2 id="sec-8-1" class="h2"><span class="secnum">8.1</span> Threads virtuais: modelo, pinning e limites<a class="anchor" href="#sec-8-1" aria-label="ligação">#</a></h2>
+
+<p>Uma <em>thread</em> virtual é uma continuação com um escalonador. O corpo da tarefa corre numa pilha guardada no <em>heap</em>, em segmentos que crescem e encolhem conforme a profundidade real das chamadas; quando a tarefa bloqueia numa operação que a plataforma sabe interceptar, a continuação é <em>desmontada</em> do transportador (<em>carrier thread</em>), a pilha fica no <em>heap</em> e o transportador vai buscar outra tarefa. Os transportadores são <em>threads</em> de plataforma de um <code>ForkJoinPool</code> dedicado em modo FIFO, com paralelismo por omissão igual ao número de processadores disponíveis e ajustável por <code>jdk.virtualThreadScheduler.parallelism</code> e <code>jdk.virtualThreadScheduler.maxPoolSize</code>.</p>
+
+<p>A ordem de grandeza é o que interessa numa entrevista. Uma <em>thread</em> de plataforma reserva por omissão cerca de 1 MB de pilha (<code>-Xss</code>) e custa dezenas de microssegundos a criar; uma <em>thread</em> virtual parada custa centenas de <em>bytes</em> a poucos KB no <em>heap</em> e cria-se em cerca de 1 µs. Uma troca de contexto do núcleo entre <em>threads</em> de plataforma anda em 1 a 5 µs; a desmontagem e montagem de uma continuação anda na ordem das centenas de nanossegundos. Daí a única promessa correcta: as <em>threads</em> virtuais aumentam a <strong>vazão</strong> de código bloqueante limitado por espera de I/O; não reduzem a latência de um pedido individual e não ajudam nada em carga limitada por CPU, onde o paralelismo continua a ser o número de núcleos.</p>
+
+<p>Continua a haver casos em que a continuação não pode ser desmontada e a <em>thread</em> virtual fica presa ao transportador — <em>pinning</em>. Até Java 23, o caso dominante era bloquear dentro de um bloco <code>synchronized</code>: o monitor está associado à <em>thread</em> de plataforma, logo a continuação não pode migrar. Java 24 eliminou esse caso para os monitores geridos pela JVM, o que remove de um golpe a maior fonte de <em>pinning</em> em código legado e em bibliotecas de acesso a dados antigas. O que continua a fixar em Java 25 é o que a JVM não controla: um <em>frame</em> nativo no topo da pilha (JNI, algumas chamadas de <code>FFM</code>) e um inicializador de classe em curso. O sintoma é sempre o mesmo — a vazão fica presa num tecto igual ao paralelismo do escalonador, tipicamente 8 ou 16 pedidos em voo, com CPU a 15%.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 8.1</span> Causas de <em>pinning</em>, versão em que deixaram de contar e o que fazer.</div>
+<div class="tscroll"><table><thead><tr><th>Causa</th><th>Estado em Java 25</th><th>Acção</th></tr></thead><tbody>
+<tr><td>Bloquear dentro de <code>synchronized</code></td><td>Já não fixa (mudança de Java 24)</td><td>Em Java 21-23, trocar por <code>ReentrantLock</code> nos caminhos que bloqueiam</td></tr>
+<tr><td><em>Frame</em> nativo na pilha (JNI, FFM)</td><td>Continua a fixar</td><td>Isolar a chamada num <em>pool</em> pequeno de <em>threads</em> de plataforma</td></tr>
+<tr><td>Inicializador de classe em curso</td><td>Continua a fixar</td><td>Pré-aquecer a classe no arranque</td></tr>
+<tr><td>Espera activa em <code>while</code> sem bloqueio</td><td>Nunca desmonta</td><td>Substituir por bloqueio real; o escalonador não é preemptivo</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing shell" id="lst-8-1"><div class="lhead"><span class="lnum">Listagem 8.1</span>
+<span class="lcap">Detectar <em>pinning</em> em produção sem parar o serviço.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># Java 21-23: rasto imediato no stdout, com a pilha do sítio que fixou
+java -Djdk.tracePinnedThreads=full -jar servico.jar
+
+# Qualquer versao com JFR: gravacao curta e contagem por sitio de fixacao
+jcmd $(pgrep -f servico.jar) JFR.start name=pin settings=profile duration=120s filename=pin.jfr
+jfr summary pin.jfr | grep -i VirtualThreadPinned
+jfr print --events jdk.VirtualThreadPinned pin.jfr | head -60
+
+# Sinal indirecto barato: threads virtuais em voo muito acima da vazao util
+curl -s localhost:8080/actuator/metrics/executor.active</code></pre></figure>
+
+<div class="qa" id="q-8-1" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique-me o que acontece, passo a passo, quando uma <em>thread</em> virtual executa <code>socket.read()</code> e não há dados. E diga-me em que é que isso é diferente de uma <em>thread</em> de plataforma.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A diferença é quem espera. Numa <em>thread</em> de plataforma, a chamada desce ao núcleo, a <em>thread</em> do sistema operativo fica bloqueada e o seu 1 MB de pilha e a entrada no escalonador do núcleo ficam ocupados até haver dados. Numa <em>thread</em> virtual, a biblioteca de I/O do JDK registou o descritor num <em>selector</em> não bloqueante interno; quando a leitura não pode progredir, o código chama <code>LockSupport.park()</code>, a continuação captura a pilha actual para o <em>heap</em>, é desmontada do transportador e o transportador fica livre em algumas centenas de nanossegundos. Quando o <em>poller</em> vê o descritor pronto, a continuação é submetida ao <code>ForkJoinPool</code> do escalonador, montada num transportador — possivelmente outro — e retoma exactamente na instrução seguinte.</p>
+      <p>O que muda no dimensionamento é a unidade escassa. Com <em>threads</em> de plataforma, a concorrência máxima é o tamanho do <em>pool</em>: 200 <em>threads</em> de Tomcat com 250 ms por pedido dão, pela lei de Little, 200 ÷ 0,25 = 800 pedidos por segundo, independentemente de a CPU estar a 10%. Com <em>threads</em> virtuais, 20 000 pedidos em voo custam <em>heap</em>, não pilhas do núcleo, e o tecto passa a ser o serviço a jusante, o <em>pool</em> de ligações ou o próprio <em>heap</em>.</p>
+      <p>O que não muda: a latência de um pedido isolado é igual ou marginalmente pior, porque há mais uma indirecção; o paralelismo de CPU continua a ser o número de núcleos; e o modelo de programação continua a ser bloqueante, o que é precisamente a vantagem — a pilha de chamadas é a pilha real, o <em>debugger</em> pára onde se espera e o <em>stack trace</em> de uma excepção é útil.</p>
+      <p>O <em>trade-off</em> está no perfil de carga. Para tarefas com 5 ms de I/O e 50 ms de CPU, as <em>threads</em> virtuais não trazem nada e acrescentam risco de sobrecarga do <em>heap</em>; nesse caso um <em>pool</em> de plataforma dimensionado a núcleos + 1 é a escolha certa e continua a sê-lo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São <em>threads</em> mais leves e mais rápidas»; não distingue bloqueio do núcleo de desmontagem de continuação.</td></tr>
+        <tr><td>Mid</td><td>Descreve montagem e desmontagem correctamente, mas não sabe dizer onde passa a estar o gargalo depois da migração.</td></tr>
+        <tr><td>Sénior</td><td>Continuação, <em>park</em>, transportador, escalonador FIFO; aplica a lei de Little com números; separa vazão de latência.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo de <em>heap</em> por pedido em voo, o efeito na recolha de lixo e quando o modelo bloqueante deixa de compensar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas <em>threads</em> virtuais cabem em 4 GB de <em>heap</em> e o que determina isso?»</li>
+      <li>«A pilha vai para o <em>heap</em> — que impacto tem no colector de lixo?»</li>
+      <li>«O que acontece se a tarefa fizer um ciclo de cálculo de 2 segundos sem bloquear?»</li>
+      <li>«Como muda o número de transportadores e porque é que raramente se deve mudar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Dizer que as <em>threads</em> virtuais tornam o código mais rápido em carga de CPU.</li>
+      <li>Confundir o escalonador de <em>threads</em> virtuais com o <code>ForkJoinPool.commonPool</code> das <em>streams</em> paralelas.</li>
+      <li>Afirmar que o escalonador é preemptivo e que um ciclo apertado é interrompido.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um serviço com 2 000 pedidos por segundo e 250 ms de latência tem, pela lei de Little, 500 pedidos em voo em permanência. Com <em>threads</em> de plataforma a 1 MB de pilha reservada, são 500 MB de espaço de endereçamento e 500 entradas no escalonador do núcleo; com <em>threads</em> virtuais e 20 KB de estado por pedido, são 10 MB de <em>heap</em>. O tecto de 800 pedidos por segundo imposto por um <em>pool</em> de 200 <em>threads</em> desaparece — e o tecto seguinte passa a ser o <em>pool</em> de ligações, que por omissão no HikariCP tem 10.</p></aside>
+
+<div class="qa" id="q-8-2" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Activámos <em>threads</em> virtuais num serviço em Java 21. A vazão ficou igual, a CPU está a 12% e temos 6 000 pedidos em voo. Onde é que procura, por que ordem?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Vazão presa com CPU baixa e muitos pedidos em voo tem três causas plausíveis, e há uma ordem de diagnóstico que as separa em minutos. Primeira hipótese, <em>pinning</em>: em Java 21 basta bloquear dentro de um <code>synchronized</code> para fixar o transportador, e com 8 núcleos isso limita tudo a 8 operações simultâneas. Confirma-se com <code>-Djdk.tracePinnedThreads=full</code> num nó ou com o evento <code>jdk.VirtualThreadPinned</code> numa gravação JFR de dois minutos; se o culpado for uma biblioteca antiga de <em>driver</em> ou de <em>cache</em>, a correcção imediata é actualizar para Java 24 ou superior, onde os monitores deixaram de fixar, e a correcção local é trocar por <code>ReentrantLock</code>.</p>
+      <p>Segunda hipótese, semáforo escondido a jusante. O caso clássico é o <em>pool</em> de ligações: com <code>maximum-pool-size</code> a 10 e 15 ms por consulta, o tecto é 10 ÷ 0,015 ≈ 667 consultas por segundo, e as restantes 5 990 <em>threads</em> virtuais estão à espera de uma ligação. Vê-se em <code>hikaricp.connections.pending</code> e no tempo de aquisição no percentil 99. O mesmo padrão aparece em clientes HTTP com limite de ligações por rota — o <code>PoolingHttpClientConnectionManager</code> do Apache tem por omissão 5 por rota, um número que passa despercebido durante anos porque antes havia só 200 <em>threads</em>.</p>
+      <p>Terceira hipótese, o serviço a jusante. Se ele atende 400 pedidos por segundo e passámos a atirar-lhe 6 000 em voo, a única coisa que se conseguiu foi transformar rejeição rápida em filas de espera longas e latência no percentil 99 pior. Aqui a correcção não é técnica de <em>threads</em>, é de controlo de admissão: limitar a concorrência com um <code>Semaphore</code> por dependência, com <code>tryAcquire</code> temporizado para rejeitar depressa em vez de acumular.</p>
+      <p>O <em>trade-off</em> a nomear em voz alta: as <em>threads</em> virtuais retiram o limitador implícito que o <em>pool</em> de <em>threads</em> fornecia de graça. Quem migra sem repor limites explícitos troca um sistema que rejeitava carga por um sistema que a absorve toda e degrada em conjunto — e o modo de falha passa de erros 503 rápidos para timeouts em cascata.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Sugere aumentar o paralelismo do escalonador de <em>threads</em> virtuais e fica por aí.</td></tr>
+        <tr><td>Mid</td><td>Aponta <em>pinning</em>, mas não sabe medi-lo nem considera o <em>pool</em> de ligações.</td></tr>
+        <tr><td>Sénior</td><td>Ordem de diagnóstico com ferramenta por hipótese, aritmética do <em>pool</em> de ligações e limites explícitos a jusante.</td></tr>
+        <tr><td>Staff</td><td>Reenquadra como controlo de admissão e modo de falha do sistema; propõe orçamento de concorrência por dependência e degradação parcial.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que métrica é que serve de alarme para <em>pinning</em> em permanência?»</li>
+      <li>«Aumentar o <em>pool</em> do Hikari para 200 resolve? O que é que parte primeiro?»</li>
+      <li>«Como decide o valor do semáforo por dependência?»</li>
+      <li>«Se a causa fosse JNI, o que faria?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Dimensionar o <em>pool</em> de ligações pelo número de pedidos em voo em vez de pela capacidade da base de dados.</li>
+      <li>Assumir <em>pinning</em> sem medir e reescrever código a esmo.</li>
+      <li>Não perceber que absorver toda a carga é uma decisão, não uma melhoria.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-8-3" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Vi num <em>pull request</em> <code>Executors.newFixedThreadPool(400, Thread.ofVirtual().factory())</code>. Diga-me se aceita e, se não aceitar, o que propõe em vez disso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não se aceita, por duas razões independentes. A primeira é que agrupar <em>threads</em> virtuais não faz sentido: existem para serem descartáveis, custam cerca de 1 µs a criar e não guardam recurso do sistema operativo. Um <em>pool</em> reintroduz exactamente o que se queria eliminar — uma fila ilimitada à frente de 400 trabalhadores, com tarefas a esperar por um lugar em vez de esperarem pelo recurso de que precisam. Pior, o <em>pool</em> reutiliza <em>threads</em>, portanto os <code>ThreadLocal</code> de uma tarefa sobrevivem para a seguinte, que é a origem clássica de fugas de contexto de segurança e de <em>tenant</em>.</p>
+      <p>A segunda razão é que o limite está no sítio errado. Se o objectivo era proteger um serviço a jusante que aguenta 400 chamadas simultâneas, o limite tem de estar junto a esse serviço, não à volta de toda a tarefa. Uma tarefa que chama três dependências e escreve na base de dados ocuparia um lugar dos 400 durante os 250 ms inteiros, quando só precisa de proteger 40 ms de chamada ao serviço lento.</p>
+      <p>A forma correcta é <code>Executors.newVirtualThreadPerTaskExecutor()</code> — que não é um <em>pool</em>, é uma fábrica com ciclo de vida — mais um <code>Semaphore</code> por dependência, com aquisição temporizada para rejeitar em vez de acumular. Com 400 permissões e 40 ms por chamada, o limite é 400 ÷ 0,04 = 10 000 chamadas por segundo àquela dependência, e o resto do pedido não consome permissões.</p>
+      <p>Quando é que a escolha contrária é a certa: se as tarefas forem limitadas por CPU, ou se fizerem chamadas nativas que fixam o transportador, um <em>pool</em> de <em>threads</em> de plataforma com dimensão igual ao número de núcleos continua a ser a estrutura adequada — e nesse caso o <em>pool</em> é o limitador legítimo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aceita porque «limita o uso de recursos» e não vê diferença entre limitar tarefas e limitar chamadas.</td></tr>
+        <tr><td>Mid</td><td>Sabe que não se agrupa <em>threads</em> virtuais, mas não sabe onde pôr o limite nem menciona a reutilização de <code>ThreadLocal</code>.</td></tr>
+        <tr><td>Sénior</td><td>Semáforo por dependência, aquisição temporizada, aritmética do limite, executor por tarefa com <code>try</code>-com-recursos.</td></tr>
+        <tr><td>Staff</td><td>Liga a disjuntores e a orçamento de latência; discute repartição de permissões entre chamadas críticas e opcionais.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Semáforo justo ou não justo? Que diferença faz no percentil 99?»</li>
+      <li>«E se a dependência ficar lenta — o semáforo cheio produz que erro para o cliente?»</li>
+      <li>«Como é que isto se relaciona com o <em>bulkhead</em> do Resilience4j?»</li>
+      <li>«O <code>tryAcquire</code> sem timeout serve? Porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não fechar o executor (fuga de tarefas por terminar).</li>
+      <li>Usar <code>acquire()</code> sem limite de espera, transformando saturação em bloqueio indefinido.</li>
+      <li>Confiar em <code>ThreadLocal</code> para contexto de pedido num executor que reutiliza <em>threads</em>.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-8-2"><div class="lhead"><span class="lnum">Listagem 8.2</span>
+<span class="lcap">Limitar a concorrência a jusante com um semáforo, não com um <em>pool</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public final class ClienteInventario {
+
+    // 400 chamadas em voo: o inventario mede 40 ms, logo o tecto e' 10 000 rps
+    private final Semaphore permissoes = new Semaphore(400);
+    private final HttpClient http;
+
+    public Stock consultar(String sku) throws InterruptedException {
+        // rejeitar depressa vale mais do que acumular: 25 ms de orcamento de espera
+        if (!permissoes.tryAcquire(25, TimeUnit.MILLISECONDS)) {
+            throw new SobrecargaException("inventario saturado: 400 chamadas em voo");
+        }
+        try {
+            HttpRequest req = HttpRequest.newBuilder(URI.create(base + "/stock/" + sku))
+                    .timeout(Duration.ofMillis(300))
+                    .build();
+            return mapear(http.send(req, BodyHandlers.ofString()));   // bloqueante, de proposito
+        } catch (IOException e) {
+            throw new DependenciaIndisponivelException("inventario", e);
+        } finally {
+            permissoes.release();
+        }
+    }
+}</code></pre></figure>
+
+<h2 id="sec-8-2" class="h2"><span class="secnum">8.2</span> Migrar um serviço bloqueante para threads virtuais<a class="anchor" href="#sec-8-2" aria-label="ligação">#</a></h2>
+
+<p>Em Spring Boot 3.2 e posteriores, a migração de um serviço MVC é uma linha: <code>spring.threads.virtual.enabled=true</code> passa o executor do Tomcat, o executor de <code>@Async</code> e o de <code>@Scheduled</code> a <em>threads</em> virtuais. É por isso que a pergunta de entrevista nunca é «como se activa», mas «o que é que a seguir se parte». A resposta tem quatro peças, todas mensuráveis.</p>
+
+<p>Primeira, o <em>pool</em> de ligações. O limite de ligações da base de dados é uma propriedade do PostgreSQL, não da aplicação: um servidor com <code>max_connections</code> a 200, partilhado por 12 réplicas de serviço, permite pouco mais de 15 ligações por réplica antes de haver rejeições. Aumentar o <code>maximum-pool-size</code> para acompanhar as <em>threads</em> virtuais degrada a base de dados por contenção de <em>locks</em> e de <em>buffers</em>, e a latência média sobe para todos. O caminho correcto é manter o <em>pool</em> pequeno, encurtar o <code>connection-timeout</code> para 250 ms e tratar a espera como sinal de sobrecarga.</p>
+
+<p>Segunda, a memória. Cada pedido em voo passa a reter o seu grafo de objectos até terminar. Com 6 000 pedidos em voo e 30 KB de estado por pedido (corpo desserializado, resposta parcial, contexto), são 180 MB retidos em permanência — que passam a ser promovidos para a geração antiga e a alimentar pausas do G1. Terceira, o contexto por <em>thread</em>: <code>ThreadLocal</code> usado como <em>cache</em> de objectos caros deixa de amortizar quando há um milhão de <em>threads</em>. Quarta, a observabilidade: dumps com 6 000 <em>threads</em> virtuais são inúteis com <code>jstack</code>, e é preciso <code>jcmd Thread.dump_to_file -format=json</code>, que agrupa por continuação.</p>
+
+<figure class="listing yaml" id="lst-8-3"><div class="lhead"><span class="lnum">Listagem 8.3</span>
+<span class="lcap">Configuração de migração: o limite muda de <em>threads</em> para ligações.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>spring:
+  threads:
+    virtual:
+      enabled: true              # Tomcat, @Async e @Scheduled passam a virtuais
+  datasource:
+    hikari:
+      maximum-pool-size: 24      # dimensionado pela BD (max_connections/replicas), nao pelas threads
+      connection-timeout: 250ms  # esperar mais do que isto e' sobrecarga, nao lentidao
+      leak-detection-threshold: 5s
+server:
+  tomcat:
+    threads:
+      max: 200                   # deixa de ser o tecto quando virtual.enabled=true
+management:
+  metrics:
+    tags:
+      servico: pagamentos</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Activar <em>threads</em> virtuais sem rever o <code>connection-timeout</code> transforma um erro rápido num bloqueio longo: com o valor por omissão de 30 s e 6 000 pedidos em voo, um pico na base de dados produz 6 000 <em>threads</em> à espera durante meio minuto, o cliente já desistiu, e o serviço continua a trabalhar para respostas que ninguém vai ler. Encurtar para 250 ms e devolver 503 é o que mantém o percentil 99 dentro do orçamento.</p></aside>
+
+<div class="qa" id="q-8-4" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Serviço Spring Boot 3.5 em MVC, Tomcat com 200 <em>threads</em>, 700 pedidos por segundo, percentil 99 de 400 ms, cada pedido chama três serviços e grava em PostgreSQL. Queremos chegar a 3 000 pedidos por segundo. Como conduz a migração e o que mede antes e depois?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Antes de mexer, estabelece-se a linha de base e verifica-se se o problema é mesmo de <em>threads</em>. A 700 pedidos por segundo com 400 ms, há 280 pedidos em voo pedidos a um <em>pool</em> de 200 — ou seja, já há fila no Tomcat, e é isso que explica parte dos 400 ms. Se a CPU estiver acima de 70%, as <em>threads</em> virtuais não dão os 3 000 e a conversa passa a ser de <em>scale-out</em> ou de perfil de CPU. Assumindo CPU a 25%, a migração é legítima.</p>
+      <p>A sequência é: activar <code>spring.threads.virtual.enabled=true</code>, medir <em>pinning</em> com JFR durante um teste de carga, repor limites explícitos por dependência (semáforo com 400, 200 e 150 permissões conforme a capacidade medida de cada serviço) e dimensionar o Hikari pela base de dados. Com 3 000 pedidos por segundo, uma gravação de 6 ms por pedido e um <em>pool</em> de 24 ligações, o tecto de escrita é 24 ÷ 0,006 = 4 000 por segundo — folga de 33%, aceitável. Se a gravação fosse de 15 ms, o tecto seria 1 600 e a migração falharia por aí, o que se resolve com escrita em lote ou com uma réplica dedicada, não com mais <em>threads</em>.</p>
+      <p>Depois há duas mudanças de código que quase sempre são precisas: passar as três chamadas a jusante de sequenciais para concorrentes, o que sozinho corta o percentil 99 de 400 para perto do máximo das três (tipicamente 150 ms), e substituir o contexto por <code>ThreadLocal</code> onde ele for usado como <em>cache</em>. O ganho de latência vem daqui, não das <em>threads</em> virtuais.</p>
+      <p>As métricas de aceitação, definidas antes: percentil 99 abaixo de 250 ms a 3 000 pedidos por segundo, <code>hikaricp.connections.pending</code> em zero na mediana, zero eventos <code>jdk.VirtualThreadPinned</code> por minuto, pausas do G1 abaixo de 50 ms no percentil 99 e taxa de 503 abaixo de 0,1%. Lançamento com bandeira por instância e comparação lado a lado com 10% do tráfego durante 48 horas, para apanhar o efeito no pico e no trabalho agendado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ligo a propriedade e fica 4 vezes mais rápido»; não mede nada antes.</td></tr>
+        <tr><td>Mid</td><td>Activa e verifica <em>pinning</em>, mas não redimensiona o <em>pool</em> de ligações nem define critérios de aceitação.</td></tr>
+        <tr><td>Sénior</td><td>Linha de base, aritmética de capacidade por dependência, limites explícitos, métricas de aceitação e lançamento gradual.</td></tr>
+        <tr><td>Staff</td><td>Questiona se 3 000 é o requisito certo, discute custo por pedido e compara com <em>scale-out</em> horizontal antes de mudar o modelo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que faz se a base de dados só permitir 15 ligações por réplica?»</li>
+      <li>«Como paraleliza as três chamadas mantendo o orçamento total de 250 ms?»</li>
+      <li>«Que sinal o faria reverter a bandeira em produção?»</li>
+      <li>«O trabalho agendado também passa a virtual — que risco introduz isso?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Subir <code>maximum-pool-size</code> para centenas «porque agora há mais <em>threads</em>».</li>
+      <li>Não medir a linha de base e não conseguir provar o ganho.</li>
+      <li>Ignorar o efeito no colector de lixo do estado retido por pedido em voo.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-8-5" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O nosso código usa <code>ThreadLocal</code> para o contexto de <em>tenant</em>, para o MDC de <em>logs</em> e para reutilizar objectos caros de formatação. O que é que se parte com um milhão de <em>threads</em> virtuais?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Os três usos partem-se de maneiras diferentes, e é essa distinção que a pergunta procura. O terceiro — reutilizar objectos caros por <em>thread</em> — deixa de fazer sentido por completo: a amortização assentava em haver 200 <em>threads</em> de vida longa a reutilizar 200 instâncias. Com um milhão de <em>threads</em> efémeras, criam-se um milhão de instâncias, cada uma usada uma vez; o que era optimização passa a ser pressão de alocação. A correcção é usar objectos imutáveis e partilhados quando existem (<code>DateTimeFormatter</code> em vez de <code>SimpleDateFormat</code>) ou um <em>pool</em> explícito.</p>
+      <p>O primeiro uso, contexto de <em>tenant</em>, é funcionalmente correcto com <em>threads</em> virtuais — cada uma tem o seu mapa e não há reutilização — mas é caro e frágil: o valor é mutável, herda-se por cópia com <code>InheritableThreadLocal</code> quando se criam sub-tarefas, e nada garante a limpeza se alguém esquecer o <code>remove()</code>. É exactamente o caso para que os <code>ScopedValue</code> existem: valor imutável, ligado a um âmbito léxico, automaticamente visível nas sub-tarefas de um <code>StructuredTaskScope</code> e automaticamente removido à saída do âmbito, sem cópia por <em>thread</em>.</p>
+      <p>O segundo uso, MDC, é o que dá mais trabalho: as bibliotecas de <em>logging</em> assentam em <code>ThreadLocal</code> por dentro e a propagação para sub-tarefas não é automática. Continua a funcionar, mas obriga a repor o contexto explicitamente em cada tarefa lançada. Em Spring, o <code>ContextPropagation</code> resolve o caso comum; o que não se deve fazer é assumir propagação implícita.</p>
+      <p>O <em>trade-off</em> dos <code>ScopedValue</code>: são imutáveis, portanto não servem para acumular estado ao longo do pedido, e a sua leitura fora do âmbito lança excepção em vez de devolver <code>null</code> — o que é uma vantagem de correcção e um custo de migração, porque obriga a tornar explícito quem precisa do contexto.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>ThreadLocal</code> deixa de funcionar»; não distingue os três usos.</td></tr>
+        <tr><td>Mid</td><td>Identifica a perda de amortização da <em>cache</em>, mas não fala de imutabilidade nem de herança em sub-tarefas.</td></tr>
+        <tr><td>Sénior</td><td>Separa <em>cache</em>, contexto e MDC; propõe <code>ScopedValue</code> para o contexto e explica o custo de memória e de limpeza.</td></tr>
+        <tr><td>Staff</td><td>Discute propagação de contexto como contrato de plataforma e o plano de migração incremental sem reescrever tudo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como propaga o MDC para as três sub-tarefas de um fan-out?»</li>
+      <li>«O que acontece a um <code>ScopedValue</code> lido fora do âmbito?»</li>
+      <li>«Quanto custa em memória um <code>ThreadLocal</code> com 1 milhão de <em>threads</em>?»</li>
+      <li>«E se precisar mesmo de estado mutável por pedido?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Manter <code>SimpleDateFormat</code> em <code>ThreadLocal</code> e chamar-lhe optimização.</li>
+      <li>Assumir que <code>InheritableThreadLocal</code> resolve a propagação sem custo.</li>
+      <li>Não mencionar que a falta de <code>remove()</code> é uma fuga de memória e de dados entre <em>tenants</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-8-3" class="h2"><span class="secnum">8.3</span> Concorrência estruturada e scoped values<a class="anchor" href="#sec-8-3" aria-label="ligação">#</a></h2>
+
+<p>Concorrência estruturada aplica ao paralelismo a mesma regra que as estruturas de controlo aplicam ao fluxo: uma tarefa lançada dentro de um bloco termina dentro desse bloco. Com <code>ExecutorService</code> e <code>CompletableFuture</code>, essa regra não existe — nada impede que um <code>submit</code> sobreviva ao método que o lançou, ninguém cancela as duas chamadas restantes quando a primeira falha, e o <em>stack trace</em> da tarefa não tem qualquer relação com o do chamador. O resultado prático são fugas de tarefas e trabalho desperdiçado: num fan-out de três chamadas com orçamento de 800 ms, se a primeira falhar aos 30 ms, as outras duas continuam a consumir permissões e capacidade a jusante durante mais 770 ms.</p>
+
+<p><code>StructuredTaskScope</code> resolve isto com um bloco <code>try</code>-com-recursos: as sub-tarefas são lançadas com <code>fork</code>, o <code>join</code> espera por todas, o fecho do bloco garante que nenhuma sobrevive, e a política de junção decide o critério — esperar por todas com sucesso, aceitar a primeira que responda, ou parar a um predicado. A API é ainda de pré-visualização em Java 25 e mudou de forma entre Java 21 e 25, o que numa entrevista se deve dizer explicitamente em vez de fingir que é estável.</p>
+
+<p>Os <code>ScopedValue</code>, finais em Java 25, são a peça complementar: um valor imutável ligado a um âmbito dinâmico, que as sub-tarefas de um <code>StructuredTaskScope</code> herdam sem cópia porque a estrutura em árvore garante que o âmbito do pai contém o do filho. É a razão pela qual as duas funcionalidades foram desenhadas em conjunto.</p>
+
+<figure class="listing java" id="lst-8-4"><div class="lhead"><span class="lnum">Listagem 8.4</span>
+<span class="lcap">Contexto de pedido com <code>ScopedValue</code> em vez de <code>ThreadLocal</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public final class Contexto {
+    public static final ScopedValue&lt;Tenant&gt; TENANT = ScopedValue.newInstance();
+    private Contexto() {}
+}
+
+// filtro HTTP: o valor vive exactamente enquanto durar a cadeia
+ScopedValue.where(Contexto.TENANT, tenant)
+           .run(() -&gt; cadeia.doFilter(pedido, resposta));
+
+// 40 chamadas abaixo, sem parametro a atravessar 12 assinaturas
+Tenant t = Contexto.TENANT.get();   // NoSuchElementException se fora do ambito
+
+// rebind local: o valor anterior volta a valer a' saida do bloco
+ScopedValue.where(Contexto.TENANT, tenantDeSistema)
+           .run(() -&gt; reconciliador.correr());</code></pre></figure>
+
+<div class="qa" id="q-8-6" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Já temos um fan-out com <code>CompletableFuture.allOf</code> e funciona. Convença-me a mudar para <code>StructuredTaskScope</code> — o que ganho concretamente?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Ganham-se três propriedades que o <code>allOf</code> não dá, e nenhuma delas é desempenho. A primeira é cancelamento em cascata. Com <code>allOf</code>, se a chamada ao serviço de risco falhar aos 30 ms, as chamadas a perfil e a encomendas continuam até ao fim; o <code>allOf</code> completa excepcionalmente mas ninguém interrompe nada. Com <code>StructuredTaskScope</code> e política de «todas com sucesso», a primeira falha interrompe as irmãs de imediato — num serviço com 3 000 pedidos por segundo e 5% de falhas, isso são 150 chamadas por segundo de trabalho a jusante que deixa de existir.</p>
+      <p>A segunda é a ausência de fugas. O bloco <code>try</code>-com-recursos garante que, ao sair do método, por retorno, excepção ou interrupção, não fica nenhuma sub-tarefa viva. Com <code>CompletableFuture</code>, um <code>timeout</code> no chamador deixa as tarefas a correr sobre um executor partilhado, o que se manifesta como carga fantasma e <em>latência</em> que ninguém consegue atribuir.</p>
+      <p>A terceira é observabilidade: as sub-tarefas ficam relacionadas com o pai por estrutura, aparecem agrupadas no <em>dump</em> de <em>threads</em> em formato JSON, e o <em>stack trace</em> de uma falha inclui o caminho até ao <code>fork</code> em vez de começar num <em>worker</em> anónimo do <code>ForkJoinPool</code>.</p>
+      <p>O que se perde: o resultado é sempre esperado no método que lançou as tarefas, portanto não serve para trabalho que deve sobreviver ao pedido (envio assíncrono de eventos, aquecimento de <em>cache</em>) — esse continua a precisar de um executor de vida longa. E a API é de pré-visualização em Java 25, o que obriga a <code>--enable-preview</code> e a aceitar que a assinatura pode mudar; para uma base de código que ainda esteja em Java 21, a forma disponível é <code>ShutdownOnFailure</code> com <code>joinUntil</code>. Para composição de <em>callbacks</em> sem esperar, o <code>CompletableFuture</code> continua a ser a ferramenta certa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É a forma moderna»; não sabe dizer o que o <code>allOf</code> não faz.</td></tr>
+        <tr><td>Mid</td><td>Menciona código mais limpo e cancelamento, sem quantificar nem discutir o ciclo de vida das tarefas.</td></tr>
+        <tr><td>Sénior</td><td>Cancelamento em cascata, ausência de fugas, observabilidade; nomeia o caso em que não serve e o estado de pré-visualização.</td></tr>
+        <tr><td>Staff</td><td>Enquadra como invariante de plataforma («nenhuma tarefa sobrevive ao seu âmbito») e propõe adopção por camada, começando pelos gateways.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como implementa "a primeira resposta ganha" com duas réplicas?»</li>
+      <li>«Uma das três chamadas é opcional — como a torna tolerante a falha?»</li>
+      <li>«O que faz o <code>close()</code> se uma sub-tarefa ignorar a interrupção?»</li>
+      <li>«Como propaga o <em>trace id</em> para as sub-tarefas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Prometer ganho de latência onde o ganho é de ciclo de vida e de cancelamento.</li>
+      <li>Não saber que a API é de pré-visualização e apresentá-la como estável.</li>
+      <li>Propor <code>StructuredTaskScope</code> para trabalho que tem de sobreviver ao pedido.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-8-7" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Compare <code>ScopedValue</code> com <code>ThreadLocal</code>: semântica, custo e o que acontece a cada um quando se lança uma sub-tarefa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A diferença fundamental é o modelo de tempo de vida. Um <code>ThreadLocal</code> é uma variável mutável cujo tempo de vida é o da <em>thread</em>: escreve-se com <code>set</code>, lê-se em qualquer ponto, e só desaparece com <code>remove()</code> explícito ou com a morte da <em>thread</em>. Um <code>ScopedValue</code> é imutável e o seu tempo de vida é o do bloco que o liga: existe dentro do <code>run</code> ou do <code>call</code> e deixa de existir à saída, sem código de limpeza possível de esquecer.</p>
+      <p>O custo é diferente por construção. O <code>ThreadLocal</code> guarda uma entrada num mapa por <em>thread</em>; com um milhão de <em>threads</em> virtuais e três variáveis, são três milhões de entradas retidas. O <code>ScopedValue</code> não copia nada: as sub-tarefas partilham a mesma ligação porque o valor é imutável, e a leitura é uma travessia curta com <em>cache</em> — o mecanismo aproxima-se do custo de ler um campo, e não há mapa a crescer.</p>
+      <p>Na criação de sub-tarefas, a diferença é visível. Um <code>ThreadLocal</code> normal não se propaga; o <code>InheritableThreadLocal</code> propaga-se por cópia no momento da criação, o que com um milhão de <em>threads</em> é exactamente o que não se quer, e que não sobrevive a executores que reutilizam <em>threads</em>. Um <code>ScopedValue</code> é herdado pelas sub-tarefas de um <code>StructuredTaskScope</code> por estrutura, sem cópia, porque o âmbito do filho está contido no do pai.</p>
+      <p>Quando é que <code>ThreadLocal</code> continua a ser a escolha: estado mutável acumulado ao longo do processamento — um contador, um <em>buffer</em> de reutilização, um MDC ao qual se acrescentam campos a meio do pedido. O <code>ScopedValue</code> não permite alterar o valor depois de ligado; a única forma é ligar de novo num bloco interior, e o valor exterior volta a valer à saída.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É o substituto do <code>ThreadLocal</code>»; não sabe que é imutável.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é imutável e ligado a um âmbito, mas não fala de custo de memória nem de propagação.</td></tr>
+        <tr><td>Sénior</td><td>Imutabilidade, âmbito dinâmico, ausência de cópia, herança estrutural em <code>fork</code>, e o caso em que <code>ThreadLocal</code> permanece.</td></tr>
+        <tr><td>Staff</td><td>Discute a migração de bibliotecas de terceiros que assumem <code>ThreadLocal</code> e o efeito na propagação de contexto de tracing.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como faz um contador por pedido com <code>ScopedValue</code>?»</li>
+      <li>«O que acontece se um <em>callback</em> assíncrono ler o valor depois do bloco fechar?»</li>
+      <li>«Que problema de segurança resolve a limpeza automática?»</li>
+      <li>«E as bibliotecas que só sabem ler <code>ThreadLocal</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que os <code>ScopedValue</code> substituem sempre os <code>ThreadLocal</code>.</li>
+      <li>Não perceber que a imutabilidade é a propriedade que torna a herança barata.</li>
+      <li>Ignorar que a leitura fora do âmbito falha em vez de devolver <code>null</code>.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Concorrência estruturada troca flexibilidade por invariantes. Ganha-se a garantia de que nenhuma tarefa sobrevive ao seu âmbito e que uma falha cancela as irmãs em milissegundos; perde-se a capacidade de lançar trabalho que continua depois da resposta. Num <em>gateway</em> de leitura, o ganho é claro. Num serviço que publica eventos após responder ao cliente, o padrão certo continua a ser um executor de vida longa com fila limitada e desligamento ordenado.</p></aside>
+
+<div class="lab" id="lab-8-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 8.1 — Fan-out com orçamento de 800 ms</span>
+    <div class="labpills"><span class="qpill">Concorrência estruturada</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Implemente <code>Painel painel(String clienteId)</code> que compõe a resposta a partir de três dependências: <code>perfis.buscar(id)</code> (~60 ms), <code>encomendas.ultimas(id, 10)</code> (~120 ms) e <code>riscos.avaliar(id)</code> (~400 ms, instável). Restrições: orçamento total de 800 ms para as três em conjunto; se perfil ou encomendas falharem, o pedido falha e as restantes chamadas têm de ser canceladas de imediato; o risco é opcional — se falhar ou exceder o tempo, devolve-se <code>Risco.INDISPONIVEL</code> e o painel é servido em modo degradado. Nenhuma <em>thread</em> pode sobreviver ao método. Entrada: <code>painel("c-4711")</code>. Saída esperada com o risco em baixo: <code>Painel[perfil=…, encomendas=[10 itens], risco=INDISPONIVEL]</code> em cerca de 120 ms.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-8-5"><div class="lhead"><span class="lnum">Listagem 8.5</span>
+        <span class="lcap">Fan-out com <code>StructuredTaskScope</code>, orçamento global e degradação parcial (Java 25, pré-visualização).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public Painel painel(String clienteId) {
+    try (var scope = StructuredTaskScope.open(
+            Joiner.&lt;Object&gt;awaitAllSuccessfulOrThrow(),
+            cf -&gt; cf.withName("painel-" + clienteId)
+                    .withTimeout(Duration.ofMillis(800)))) {
+
+        // criticas: a falha de qualquer uma cancela as irmas
+        Subtask&lt;Perfil&gt; perfil =
+                scope.fork(() -&gt; perfis.buscar(clienteId));
+        Subtask&lt;List&lt;Encomenda&gt;&gt; ultimas =
+                scope.fork(() -&gt; encomendas.ultimas(clienteId, 10));
+
+        // opcional: a tolerancia vive DENTRO da sub-tarefa, senao cancelaria as irmas
+        Subtask&lt;Risco&gt; risco = scope.fork(() -&gt; {
+            try {
+                return riscos.avaliar(clienteId);
+            } catch (RuntimeException | TimeoutException e) {
+                metricas.counter("painel.risco.degradado").increment();
+                return Risco.INDISPONIVEL;
+            }
+        });
+
+        scope.join();   // devolve quando as tres terminam com sucesso
+        return new Painel(perfil.get(), ultimas.get(), risco.get());
+
+    } catch (StructuredTaskScope.TimeoutException e) {
+        throw new OrcamentoEsgotadoException("painel: 800 ms esgotados", e);
+    } catch (StructuredTaskScope.FailedException e) {
+        throw traduzir(e.getCause());          // 502/504 conforme a causa
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new PedidoCanceladoException(e);
+    }
+}
+
+// Em Java 21 a forma equivalente e':
+// try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+//     var perfil = scope.fork(() -&gt; perfis.buscar(clienteId));
+//     ...
+//     scope.joinUntil(Instant.now().plusMillis(800));
+//     scope.throwIfFailed(this::traduzir);
+//     return new Painel(perfil.get(), ...);
+// }</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Latência ≈ máximo das três chamadas, não a soma: 400 ms em vez de 580 ms no caso bom, cerca de 120 ms quando o risco degrada cedo.</li>
+        <li>O ponto que separa candidatos: perceber que a tolerância à falha da chamada opcional tem de estar <strong>dentro</strong> da sub-tarefa. Com a política «todas com sucesso», deixar a excepção subir cancelaria perfil e encomendas.</li>
+        <li>Orçamento no âmbito e não por chamada: três timeouts de 800 ms davam 800 ms de latência garantida no pior caso de cada uma, e não um limite global.</li>
+        <li>A restauração do estado de interrupção em <code>InterruptedException</code> é sempre verificada; esquecê-la é <em>red flag</em> imediata.</li>
+        <li>Casos limite a nomear: cliente inexistente (perfil devolve vazio, não excepção), lista de encomendas vazia, e o que o <code>close()</code> faz se uma sub-tarefa ignorar a interrupção — bloqueia até ela sair, e por isso todos os clientes HTTP precisam do seu próprio timeout.</li>
+        <li>Requer <code>--enable-preview</code> em Java 25; dizê-lo em voz alta conta a favor.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-8-4" class="h2"><span class="secnum">8.4</span> Reactive: backpressure e quando compensa<a class="anchor" href="#sec-8-4" aria-label="ligação">#</a></h2>
+
+<p>O argumento a favor do modelo reactivo nunca foi «é mais rápido»; foi «o consumidor controla o ritmo do produtor». Em Reactive Streams, o subscritor chama <code>request(n)</code> e o produtor só pode emitir <em>n</em> elementos; é este protocolo, e não o facto de não bloquear, que impede um produtor rápido de encher a memória de um consumidor lento. As <em>threads</em> virtuais resolvem o custo do bloqueio, mas não trazem <em>backpressure</em>: um ciclo bloqueante a consumir de um <em>tópico</em> aplica <em>backpressure</em> por acidente (não pede o lote seguinte enquanto não acabar o actual), e num fan-out não aplica nenhum.</p>
+
+<p>Em Reactor, os números que interessam são poucos e conhecidos. O <em>prefetch</em> por omissão da maioria dos operadores é 256 elementos; o <code>flatMap</code> tem concorrência máxima 256 por omissão, o que significa que um <code>flatMap</code> sobre uma fonte rápida pode ter 256 operações em voo sem que ninguém o tenha decidido. O <code>limitRate(n)</code> força o pedido em blocos de <em>n</em>, e os operadores da família <code>onBackpressure*</code> são a válvula de escape quando a fonte não é controlável: <code>Buffer</code> com limite e estratégia de transbordo, <code>Drop</code>, <code>Latest</code>. A escolha é semântica, não técnica: descartar é aceitável em telemetria e em cotações, e é perda de dados em pagamentos.</p>
+
+<figure class="listing java" id="lst-8-6"><div class="lhead"><span class="lnum">Listagem 8.6</span>
+<span class="lcap"><em>Backpressure</em> real: o ritmo de escrita trava o consumo de Kafka.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>KafkaReceiver.create(opcoes)
+        .receive()
+        // prefetch explicito: 128 registos pedidos de cada vez, em vez do valor por omissao
+        .limitRate(128)
+        // 32 escritas em voo; a 8 ms cada, o tecto e' 32/0,008 = 4 000 gravacoes/s
+        .flatMap(r -&gt; gravar(r.value()).thenReturn(r), 32)
+        .doOnNext(r -&gt; r.receiverOffset().acknowledge())
+        .doOnError(e -&gt; log.error("consumo parou", e))
+        .retryWhen(Retry.backoff(5, Duration.ofMillis(200))
+                        .maxBackoff(Duration.ofSeconds(5)))
+        .subscribe();
+
+// NAO usar onBackpressureDrop nesta cadeia: descartar aqui e' perder um evento
+// ja' confirmado no broker. A pressao tem de chegar ao receptor, que pausa a particao.</code></pre></figure>
+
+<div class="qa" id="q-8-8" data-box="qa" data-area="api" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos um <code>Flux</code> alimentado por Kafka a 12 000 mensagens por segundo e a gravação em PostgreSQL aguenta 4 000. O serviço vai a OOM ao fim de 20 minutos. Explique o que está a acontecer e como o corrige.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Há algures na cadeia um operador que desliga o <em>backpressure</em>, e a diferença de 8 000 mensagens por segundo acumula-se em memória: ao fim de 20 minutos são 9,6 milhões de mensagens retidas, o que a 200 <em>bytes</em> cada dá quase 2 GB. Os suspeitos habituais são três: um <code>onBackpressureBuffer()</code> sem limite, um operador de janela ou de agrupamento que acumula, ou uma ponte <code>Flux.create</code> com <code>OverflowStrategy.BUFFER</code>. O diagnóstico faz-se com um <em>heap dump</em> — a fila do operador aparece como o maior retentor — e confirma-se com <code>doOnRequest</code> a registar os pedidos: se a fonte estiver a receber <code>Long.MAX_VALUE</code>, o <em>backpressure</em> foi cancelado.</p>
+      <p>A correcção correcta é fazer a pressão chegar ao consumidor de Kafka, para que ele pause a partição em vez de continuar a puxar. Isso significa substituir o <code>subscribe()</code> ilimitado por um consumo com <code>limitRate</code>, limitar a concorrência do <code>flatMap</code> ao que a base de dados aguenta — 32 escritas em voo a 8 ms dão 4 000 por segundo, que é exactamente a capacidade — e confirmar as compensações depois da escrita. Kafka é uma fonte reprodutível e durável, e é por isso que travar é seguro: o <em>lag</em> cresce, alarma-se acima de 60 segundos, e não se perde nada.</p>
+      <p>O que <strong>não</strong> se deve fazer é o reflexo comum de pôr <code>onBackpressureDrop</code>. Descartar aqui é perder eventos já aceites, com consequência de negócio. Os operadores de descarte pertencem a fluxos não reprodutíveis e sem obrigação de completude — cotações, telemetria, posições de GPS, notificações por SSE — onde o valor mais recente torna o anterior irrelevante e <code>onBackpressureLatest</code> é a escolha semântica certa.</p>
+      <p>Depois da correcção, a decisão é de capacidade, não de código: 12 000 por segundo contra 4 000 de escrita é um défice estrutural. As saídas são escrita em lote (agrupar 500 linhas por <code>COPY</code> ou <em>batch insert</em> leva a capacidade para dezenas de milhares por segundo), particionamento do tópico com mais consumidores, ou reduzir o que se grava. O <em>backpressure</em> impede o OOM; não cria capacidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe aumentar o <em>heap</em> ou pôr um <code>onBackpressureDrop</code> sem falar do significado dos dados.</td></tr>
+        <tr><td>Mid</td><td>Identifica o <em>buffer</em> ilimitado e limita a concorrência, mas não liga a pressão ao consumo de Kafka.</td></tr>
+        <tr><td>Sénior</td><td>Explica <code>request(n)</code>, faz a aritmética do défice, pausa a partição, distingue fontes reprodutíveis de não reprodutíveis e alarma o <em>lag</em>.</td></tr>
+        <tr><td>Staff</td><td>Trata como problema de capacidade: escrita em lote, partições, e uma decisão explícita de negócio sobre o que é aceitável perder.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como confirma que a fonte está a receber pedidos ilimitados?»</li>
+      <li>«Que valor de concorrência escolhe para o <code>flatMap</code> e porquê esse?»</li>
+      <li>«Quando é que <code>onBackpressureLatest</code> é a resposta certa?»</li>
+      <li>«Com escrita em lote, como mantém a garantia de pelo menos uma vez?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Descartar mensagens de negócio para resolver um problema de memória.</li>
+      <li>Confundir <em>buffer</em> com <em>backpressure</em>: um <em>buffer</em> ilimitado é a ausência de <em>backpressure</em>.</li>
+      <li>Não distinguir fonte reprodutível (Kafka) de fonte efémera (SSE, WebSocket).</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-8-9" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Com <em>threads</em> virtuais estáveis desde Java 21, em que casos é que ainda escolheria escrever um serviço novo em WebFlux? E o que faria com os que já existem?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Escolhe-se reactivo quando o problema é de fluxo, não de pedido-resposta. Três casos concretos: transmissão contínua com <em>backpressure</em> ponta a ponta (um consumidor de Kafka que alimenta escritas, um exportador que serve 400 MB de CSV sem os materializar em memória), fan-in de muitos fluxos com composição temporal (janelas, <code>merge</code>, <code>zip</code>, deduplicação com estado ao longo do tempo) e ligações de vida longa em grande número — 50 000 sessões de SSE ou WebSocket, em que o custo por ligação é um objecto e não uma <em>thread</em>. Em qualquer destes, o modelo bloqueante obriga a reinventar mal o que o protocolo de <em>request</em> já dá.</p>
+      <p>Para tudo o resto — o serviço REST típico que recebe um pedido, chama duas ou três dependências e grava — <em>threads</em> virtuais com Spring MVC é a escolha certa em 2026. A vazão é comparável, e ganham-se três coisas caras: <em>stack traces</em> que apontam para o código de domínio em vez de para operadores, depuração com pontos de paragem que funcionam, e uma barreira de entrada muito mais baixa para a equipa. O custo de manutenção de uma cadeia reactiva de 40 operadores é real e paga-se em cada incidente às três da manhã.</p>
+      <p>Sobre o que já existe: não se reescreve por moda. O critério é o custo marginal. Um serviço WebFlux estável, com equipa que o domina e sem incidentes atribuíveis ao modelo, fica como está. Reescreve-se quando há sinais concretos — tempo de diagnóstico de incidentes desproporcionado, bloqueio acidental no <em>event loop</em> a causar paragens de todo o nó, ou dependência de um <em>driver</em> bloqueante que já obriga a <code>publishOn(boundedElastic)</code> em metade da cadeia, o que anula a vantagem e mantém o custo.</p>
+      <p>O caso híbrido merece nota: WebFlux com <code>WebClient</code> num serviço cuja lógica é bloqueante é o pior dos dois mundos. Já as <em>threads</em> virtuais com <code>RestClient</code> ou com o <code>HttpClient</code> do JDK dão o mesmo resultado com metade da complexidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Reactivo é sempre mais escalável» ou «reactivo morreu com as <em>threads</em> virtuais».</td></tr>
+        <tr><td>Mid</td><td>Sabe que reactivo serve para <em>streaming</em>, mas não distingue <em>backpressure</em> de não bloquear.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia os três casos de fluxo, defende MVC + virtuais para o resto e identifica o híbrido como anti-padrão.</td></tr>
+        <tr><td>Staff</td><td>Decide por custo marginal e sinais de incidente, não por preferência; considera a capacidade da equipa como restrição de arquitectura.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como detecta bloqueio acidental num <em>event loop</em>?»</li>
+      <li>«50 000 ligações SSE com <em>threads</em> virtuais — quanto custa em memória?»</li>
+      <li>«Que parte de uma cadeia reactiva não tem equivalente simples em código bloqueante?»</li>
+      <li>«Como faria a migração incremental de um serviço WebFlux?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Recomendar reescrita total sem critério de custo nem sinal de incidente.</li>
+      <li>Não reconhecer que <code>publishOn(boundedElastic)</code> generalizado anula a vantagem do modelo.</li>
+      <li>Tratar a familiaridade da equipa como irrelevante numa decisão de arquitectura.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-8-5" class="h2"><span class="secnum">8.5</span> Threads virtuais vs WebFlux vs Quarkus reactive<a class="anchor" href="#sec-8-5" aria-label="ligação">#</a></h2>
+
+<p>Os três modelos coexistem e a pergunta de entrevista é quase sempre comparativa, com um cenário concreto. O que separa boas respostas de más é a recusa em comparar por «desempenho»: em carga limitada por I/O e com o mesmo número de ligações a jusante, os três atingem vazões da mesma ordem. As diferenças estão no custo por ligação inactiva, na existência de <em>backpressure</em>, na qualidade do diagnóstico e no arranque.</p>
+
+<p>Quarkus com Mutiny e o motor Vert.x acrescenta um eixo próprio: o <em>event loop</em> tem afinidade de <em>thread</em> por ligação, o arranque nativo com GraalVM anda em dezenas de milissegundos com 40 a 80 MB de memória residente, o que muda a economia em ambientes com escala a zero. Em troca, o modelo de <em>threads</em> tem duas categorias (<em>event loop</em> e <em>worker</em>) e a anotação errada leva o programador a bloquear o <em>event loop</em> — falha que o Quarkus detecta e regista, mas que continua a ser a causa número um de incidentes nessa <em>stack</em>.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 8.2</span> Comparação para um serviço de leitura com 20 000 ligações e três dependências.</div>
+<div class="tscroll"><table><thead><tr><th>Eixo</th><th>MVC + <em>threads</em> virtuais</th><th>Spring WebFlux</th><th>Quarkus reactive (Mutiny)</th></tr></thead><tbody>
+<tr><td>Custo por ligação inactiva</td><td>Estado no <em>heap</em>, ordem de 10-20 KB</td><td>Objecto por ligação, ordem de 1-4 KB</td><td>Semelhante a WebFlux</td></tr>
+<tr><td><em>Backpressure</em></td><td>Não existe; exige semáforos explícitos</td><td>No protocolo, ponta a ponta</td><td>No protocolo, ponta a ponta</td></tr>
+<tr><td>Diagnóstico</td><td><em>Stack trace</em> completo e útil</td><td>Cadeia de operadores; exige <em>checkpoints</em></td><td>Idem, com <em>logs</em> de bloqueio do <em>event loop</em></td></tr>
+<tr><td>Bloqueio acidental</td><td>Inofensivo</td><td>Pára o <em>event loop</em> do nó</td><td>Detectado e registado, mas prejudicial</td></tr>
+<tr><td>Arranque / memória</td><td>2-5 s, 250-400 MB</td><td>2-4 s, 200-350 MB</td><td>Nativo: 30-80 ms, 40-80 MB</td></tr>
+<tr><td>Curva de aprendizagem</td><td>Baixa</td><td>Alta</td><td>Alta</td></tr>
+</tbody></table></div></div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Uma resposta que ganha pontos numa ronda comparativa é dizer que os modelos não são exclusivos: um serviço em MVC com <em>threads</em> virtuais pode usar um cliente reactivo apenas no ponto onde há transmissão contínua, e um serviço reactivo pode delegar trabalho bloqueante isolado num executor de <em>threads</em> virtuais. A decisão é por caminho de dados, não por projecto inteiro.</p></aside>
+
+<div class="qa" id="q-8-10" data-box="qa" data-area="concorrencia" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Serviço de plantão às 3 da manhã: latência do percentil 99 subiu de 90 ms para 2 s. Compare o que faz para diagnosticar isto num serviço MVC com <em>threads</em> virtuais e no equivalente em WebFlux.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com <em>threads</em> virtuais, a primeira acção é <code>jcmd &lt;pid&gt; Thread.dump_to_file -format=json /tmp/d.json</code>, que produz um <em>dump</em> agrupado por âmbito de concorrência estruturada e legível com <code>jq</code>. Agregando os topos de pilha, em 30 segundos sabe-se se 5 800 das 6 000 <em>threads</em> estão em <code>HikariPool.getConnection</code>, em <code>SocketRead</code> de uma dependência, ou num <code>await</code> de semáforo. Nota importante: <code>jstack</code> não mostra <em>threads</em> virtuais, e é por isso que a resposta certa nomeia a ferramenta correcta.</p>
+      <p>Em WebFlux, o <em>dump</em> mostra 8 <em>threads</em> de <em>event loop</em> e diz pouco: o trabalho está em objectos de subscrição no <em>heap</em>, não em pilhas. O diagnóstico faz-se por outras vias — métricas por operador, <code>Hooks.onOperatorDebug()</code> ou <em>checkpoints</em> colocados previamente na cadeia, e <em>tracing</em> distribuído bem instrumentado. Se ninguém instrumentou antes do incidente, o custo de diagnóstico é muito maior; a versão de depuração global tem sobrecarga suficiente para não se ligar em produção sob carga.</p>
+      <p>A hipótese mais provável é a mesma nos dois casos: uma dependência degradou, e sem limite de concorrência a fila cresceu até o tempo de espera dominar a latência. Confirma-se pela distribuição — se o percentil 50 continuar em 90 ms e só o 99 subir, é uma dependência ou um <em>lock</em>; se toda a distribuição deslocar, é saturação de recurso partilhado (base de dados, CPU, colector de lixo).</p>
+      <p>A conclusão que interessa ao entrevistador é de <em>trade-off</em>: as <em>threads</em> virtuais melhoram substancialmente o diagnóstico porque o estado de cada pedido está numa pilha inspeccionável, e isso vale minutos por incidente. Em contrapartida, um <em>dump</em> com 100 000 <em>threads</em> virtuais é grande e demora a produzir, o que se mitiga com JFR contínuo e agregação por topo de pilha em vez de <em>dumps</em> a pedido.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Vejo os <em>logs</em>»; não nomeia nenhuma ferramenta específica de cada modelo.</td></tr>
+        <tr><td>Mid</td><td>Usa <code>jstack</code> sem saber que não mostra <em>threads</em> virtuais; não distingue os dois modelos.</td></tr>
+        <tr><td>Sénior</td><td>Ferramenta certa por modelo, agregação por topo de pilha, leitura da distribuição de latência para separar hipóteses.</td></tr>
+        <tr><td>Staff</td><td>Trata a observabilidade como requisito de escolha do modelo e nomeia o que tem de estar instrumentado antes do incidente.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que agregação faz sobre o <em>dump</em> JSON para chegar à causa em 30 segundos?»</li>
+      <li>«Percentil 50 estável e 99 a subir — que hipóteses exclui?»</li>
+      <li>«O que instrumentaria hoje para o próximo incidente custar metade?»</li>
+      <li>«Como mede tempo de espera em semáforo sem <em>dump</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Reiniciar o serviço como primeira acção e perder a evidência.</li>
+      <li>Propor <code>Hooks.onOperatorDebug()</code> em produção sob carga sem mencionar a sobrecarga.</li>
+      <li>Não olhar para a distribuição de latência antes de formular hipóteses.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-8-6" class="h2"><span class="secnum">8.6</span> Resumo e checklist<a class="anchor" href="#sec-8-6" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na forma em que é útil dentro de uma sala de entrevista:</p>
+
+<ul class="lst">
+  <li>Uma <em>thread</em> virtual é uma continuação montada num transportador de um <code>ForkJoinPool</code> FIFO com paralelismo igual ao número de núcleos; bloquear em I/O desmonta-a em centenas de nanossegundos, contra 1 a 5 µs de troca de contexto do núcleo.</li>
+  <li>O ganho é de vazão em carga limitada por I/O, nunca de latência por pedido nem de trabalho limitado por CPU. Quem prometer o contrário perde a ronda.</li>
+  <li><em>Pinning</em> por <code>synchronized</code> deixou de existir em Java 24; o que fixa em Java 25 é o <em>frame</em> nativo e o inicializador de classe. Mede-se com o evento <code>jdk.VirtualThreadPinned</code> em JFR.</li>
+  <li>Agrupar <em>threads</em> virtuais é anti-padrão: usa-se <code>newVirtualThreadPerTaskExecutor</code> e um <code>Semaphore</code> por dependência, com <code>tryAcquire</code> temporizado para rejeitar em vez de acumular.</li>
+  <li>Migrar move o gargalo, não o elimina: o <em>pool</em> de ligações, os limites por rota do cliente HTTP e a capacidade dos serviços a jusante passam a ser o tecto, e a aritmética da lei de Little é a ferramenta para o calcular.</li>
+  <li><code>StructuredTaskScope</code> traz cancelamento em cascata, ausência de tarefas órfãs e melhor diagnóstico; ainda é pré-visualização em Java 25 e a tolerância a falha de uma sub-tarefa opcional vive dentro da sub-tarefa.</li>
+  <li><code>ScopedValue</code>, final em Java 25, é imutável, ligado a um âmbito e herdado sem cópia pelas sub-tarefas; <code>ThreadLocal</code> mantém-se para estado mutável acumulado.</li>
+  <li><em>Backpressure</em> é um protocolo (<code>request(n)</code>), não uma consequência de não bloquear; <em>buffer</em> ilimitado é a ausência de <em>backpressure</em> e descartar só é aceitável em fluxos não reprodutíveis.</li>
+  <li>Em 2026, reactivo justifica-se por fluxo (transmissão contínua, composição temporal, ligações de vida longa em massa); para pedido-resposta, MVC com <em>threads</em> virtuais ganha em custo de manutenção e de diagnóstico.</li>
+</ul>
+
+<p>Checklist accionável antes de uma ronda de concorrência:</p>
+
+<ul class="lst">
+  <li>Saber dizer, em 60 segundos e sem hesitar, o percurso de <code>socket.read()</code> numa <em>thread</em> virtual: <em>park</em>, captura de pilha, desmontagem, <em>poller</em>, remontagem noutro transportador.</li>
+  <li>Ter na ponta da língua a lei de Little aplicada a um caso próprio: pedidos por segundo × latência = pedidos em voo, e o tecto que o <em>pool</em> de ligações impõe.</li>
+  <li>Saber nomear a ferramenta de diagnóstico para cada hipótese: JFR e <code>jdk.VirtualThreadPinned</code> para fixação, <code>hikaricp.connections.pending</code> para o <em>pool</em>, <code>Thread.dump_to_file -format=json</code> para o estado agregado.</li>
+  <li>Escrever de memória, sem consultar, um fan-out com <code>StructuredTaskScope</code>, orçamento global e uma dependência opcional degradável.</li>
+  <li>Ter uma frase preparada sobre o estado de pré-visualização da API e sobre a diferença entre a forma de Java 21 e a de Java 25.</li>
+  <li>Preparar um exemplo real de limite de concorrência que a equipa tenha imposto, com o número escolhido e a justificação (capacidade medida da dependência).</li>
+  <li>Conseguir defender, em dois minutos e com critério de custo, quando não se reescreve um serviço WebFlux existente.</li>
+  <li>Verificar que a resposta a «reactivo ou <em>threads</em> virtuais?» começa sempre por uma pergunta de esclarecimento sobre o perfil de carga.</li>
+</ul>

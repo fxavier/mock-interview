@@ -1,0 +1,46 @@
+{"chapter": 9, "questions": [
+  {"q": "Um serviço arranca num pod com `limits.memory: 4Gi` e sem `-Xmx` nem `-XX:MaxRAMPercentage`. A aplicação lança `OutOfMemoryError: Java heap space` enquanto o painel do pod mostra 1,4 GiB de memória residente. Qual é a explicação mais provável?",
+   "options": [
+     "A JVM não lê os limites do cgroup e dimensionou o heap pela memória do nó, que é maior do que 4 GiB.",
+     "`MaxRAMPercentage` tem por omissão 25%, pelo que o heap ficou em cerca de 1 GiB e o resto dos 4 GiB nunca chega a ser usado pelo heap.",
+     "O erro é na verdade um OOMKilled do kernel e o `OutOfMemoryError` é apenas o sintoma visível no log.",
+     "O metaspace esgotou-se primeiro e a JVM reporta esse esgotamento como «Java heap space»."],
+   "answer": 1,
+   "explain": "Com suporte a contentores activo por omissão, a JVM lê o limite do cgroup mas aplica-lhe `MaxRAMPercentage` de 25%, o que dá cerca de 1 GiB de heap num pod de 4 GiB — daí o OOM aplicacional com memória de sobra. A primeira opção descreve o comportamento anterior ao suporte a contentores. Um OOMKilled é `SIGKILL` sem stack trace nem heap dump, não produz `OutOfMemoryError`. E o esgotamento de metaspace tem mensagem própria, «Metaspace»."},
+
+  {"q": "Um serviço com `-Xmx6g` e heap estabilizado nos 30% falha com `OutOfMemoryError: Direct buffer memory`. A linha de comando inclui `-XX:+DisableExplicitGC` e não define `-XX:MaxDirectMemorySize`. Qual é a leitura correcta?",
+   "options": [
+     "Com heap folgado há poucas colecções, os objectos que representam os buffers directos sobrevivem e os cleaners não correm; `DisableExplicitGC` remove ainda a chamada a `System.gc()` que o mecanismo de reserva usa como última defesa.",
+     "Memória directa é libertada deterministicamente quando o `ByteBuffer` sai de âmbito, logo trata-se necessariamente de uma fuga no código da aplicação.",
+     "Sem `-XX:MaxDirectMemorySize` a memória directa é ilimitada, pelo que este erro não pode ocorrer; a mensagem tem de vir de outra região.",
+     "O erro indica que o heap está fragmentado e a solução é aumentar `-Xmx` para dar espaço aos buffers directos."],
+   "answer": 0,
+   "explain": "A memória nativa de um buffer directo só é devolvida quando o pequeno objecto no heap é recolhido e o cleaner corre, pelo que um heap folgado atrasa a libertação; `DisableExplicitGC` anula a chamada a `System.gc()` que o mecanismo de reserva faz para forçar os cleaners. Não há libertação determinística ao sair de âmbito. E sem a flag o limite não é ilimitado: herda o valor de `-Xmx`, aqui 6 GB. Aumentar o heap agrava, porque adia ainda mais as colecções."},
+
+  {"q": "Num log de G1 aparece `Pause Young (Concurrent Start) (G1 Humongous Allocation)` seguido, minutos depois, de `To-space exhausted` e de uma `Pause Full` de 3,2 s. O heap é de 8 GB com `-XX:G1HeapRegionSize=4m`. Que conclusão se retira?",
+   "options": [
+     "A geração jovem está mal dimensionada e a correcção é fixar `-Xmn` em 2 GB para estabilizar as pausas.",
+     "As pausas longas devem-se a tempo elevado até ao safepoint e nenhuma alteração de GC as resolve.",
+     "Estão a ser alocados objectos acima de 2 MB, que vão directos para regiões contíguas da geração velha; a fragmentação daí resultante impede a evacuação antes de o heap estar realmente cheio.",
+     "`To-space exhausted` significa que o survivor space está cheio e resolve-se aumentando `SurvivorRatio`."],
+   "answer": 2,
+   "explain": "Com regiões de 4 MB, qualquer objecto acima de metade da região — 2 MB — é humongous e é alocado directamente em regiões contíguas da geração velha, fragmentando-a e provocando esgotamento de to-space e colecções completas. Fixar `-Xmn` desliga o dimensionamento adaptativo do G1 e piora o caso geral. O tempo até ao safepoint é uma linha distinta do log e aqui não é o dominante. E `to-space` refere-se ao espaço de destino da evacuação, não ao survivor."},
+
+  {"q": "Um microbenchmark mede 180 ns/op durante dois minutos e depois estabiliza em 310 ns/op com carga idêntica. O log mostra `made not entrant` e uma armadilha rara com `reason=class_check`. O que aconteceu?",
+   "options": [
+     "O code cache encheu-se e a JVM desligou o compilador, voltando a execução ao interpretador.",
+     "Um ponto de chamada que o C2 tinha compilado como monomórfico deixou de o ser quando uma segunda implementação entrou em uso; o código foi desoptimizado e recompilado sem o inlining anterior.",
+     "O G1 promoveu objectos para a geração velha e o aumento de latência corresponde às colecções mistas.",
+     "A JVM baixou o método do nível 4 para o nível 3 porque o número de invocações desceu abaixo do limiar de C2."],
+   "answer": 1,
+   "explain": "`class_check` é exactamente a armadilha rara que dispara quando a assunção de tipo de um ponto de chamada monomórfico é violada: o código compilado é marcado `made not entrant`, a execução volta ao interpretador e a recompilação já não pode fazer inlining da chamada, agora bimórfica. Um code cache cheio escreve `CodeCache is full` e degrada por um factor muito maior. O GC não é indicado por esta linha de log. E a JVM não despromove um método por queda de invocações."},
+
+  {"q": "Uma aplicação num servidor com redeploy a quente perde cerca de 40 MB de metaspace por redeploy e acaba em `OutOfMemoryError: Metaspace`. Qual é a acção de diagnóstico correcta e o que se espera dela?",
+   "options": [
+     "Recolher um heap dump e procurar as classes com mais instâncias no histograma, porque o metaspace é uma zona do heap.",
+     "Aumentar `-XX:MaxMetaspaceSize` até o erro desaparecer, uma vez que o metaspace cresce naturalmente com o número de redeploys.",
+     "Correr `jcmd <pid> VM.classloader_stats` para contar class loaders vivos e o metaspace retido por cada um; espera-se encontrar um loader por redeploy que nunca se tornou inalcançável.",
+     "Forçar `System.gc()` periodicamente, dado que o descarregamento de classes só ocorre em colecções explícitas."],
+   "answer": 2,
+   "explain": "Um loader vivo por redeploy é a assinatura de uma fuga de class loader, e `VM.classloader_stats` mostra-a em segundos com o metaspace retido por cada loader. O metaspace é memória nativa, não heap, pelo que o histograma de instâncias não é o instrumento primário. Aumentar o limite apenas adia o erro proporcionalmente. E o descarregamento de classes depende de o loader ficar inalcançável, coisa que nenhuma colecção forçada consegue provocar."}
+]}

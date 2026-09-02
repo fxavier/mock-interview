@@ -1,0 +1,776 @@
+<p>A ronda de <em>code review</em> é a única do loop em que o candidato não escreve código: lê o de outra pessoa, decide o que diz, por que ordem e com que força. Mede três coisas ao mesmo tempo — se detecta defeitos reais (acesso concorrente, N+1, recursos por fechar, injecção de SQL), se distingue o que bloqueia uma entrega do que é preferência pessoal, e como escreve o comentário que outro engenheiro vai ler às seis da tarde de sexta-feira. É também a ronda onde a senioridade fica mais visível: um mid encontra nomes e formatação, um sénior encontra a <em>race condition</em> e o índice em falta, um staff diz qual dos cinco defeitos justifica travar o <em>merge</em> e qual entra no <em>backlog</em> com um número ao lado. Os candidatos caem por dois lados opostos: os que listam trinta <em>nits</em> e não vêem o defeito de concorrência, e os que respondem «reescrevia isto tudo» sem uma estratégia incremental nem uma estimativa. Este capítulo cobre a leitura rápida de código desconhecido, o catálogo de cheiros com o refactoring correspondente, a rede de segurança dos testes de caracterização e a conversa sobre dívida técnica feita com números.</p>
+
+<h2 id="sec-18-1" class="h2"><span class="secnum">18.1</span> A ronda de code review: o que é avaliado<a class="anchor" href="#sec-18-1" aria-label="ligação">#</a></h2>
+
+<p>O formato é quase sempre o mesmo: 45 a 60 minutos, um excerto de 40 a 150 linhas de Java com Spring, ou um <em>pull request</em> real anonimizado, e um entrevistador com uma lista fechada de quatro a oito defeitos plantados. A pontuação não é o número de defeitos encontrados — é a ordem por que aparecem e a justificação de severidade. Encontrar oito de oito e não saber dizer qual trava a entrega pontua abaixo de encontrar cinco de oito com a prioridade certa, porque a decisão de aprovar ou bloquear é o que a equipa vai delegar na pessoa contratada a partir da segunda semana.</p>
+
+<p>A ordem de leitura de um sénior é por severidade do que pode acontecer em produção, não pela ordem das linhas no ficheiro. Primeiro correcção sob acesso concorrente e perda ou corrupção de dados; depois segurança (injecção, dados sensíveis em <em>logs</em>, autorização em falta ao nível do recurso); depois recursos não fechados e fugas; depois desempenho com efeito super-linear, tipicamente N+1 e alocação dentro de ciclos; depois tratamento de erros e observabilidade; só no fim desenho, testabilidade e nomes. Quem abre a revisão a comentar a indentação e a ordem dos <em>imports</em> assina que nunca esteve de plantão a olhar para um <em>dashboard</em> às três da manhã.</p>
+
+<p>O comentário em si é avaliado como artefacto escrito. Um bom comentário tem quatro partes em duas ou três linhas: severidade explícita (bloqueante, pergunta, <em>nit</em>), o mecanismo do problema, o efeito observável em produção e uma sugestão concreta. «Isto está mal» não é um comentário; «bloqueante: este <code>HashMap</code> é partilhado por todos os pedidos num <em>bean</em> singleton — duas <em>threads</em> a inserir em simultâneo podem perder entradas ou entrar em ciclo no <em>resize</em>; trocar por <code>ConcurrentHashMap</code> com <code>computeIfAbsent</code>, ou por uma cache com TTL, já que a taxa de câmbio do dia não deve viver para sempre» é um comentário. A regra social: o comentário fala do código, nunca do autor, e usa pergunta em vez de imperativo sempre que falta contexto — «o que acontece se dois pedidos chegarem ao mesmo tempo aqui?» abre uma conversa e fecha o defeito na mesma.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Regra prática usada em quase todas as equipas maduras: revisões acima de 400 linhas numa só sessão perdem eficácia — a densidade de defeitos encontrados por linha cai visivelmente, e o revisor passa a aprovar por cansaço. Num orçamento de 60 minutos, 200 a 400 linhas é o tecto útil; acima disso pede-se a divisão do PR. Numa ronda de entrevista de 45 minutos com 100 linhas, um sénior tem os defeitos de severidade alta identificados nos primeiros 10 a 12 minutos e gasta os restantes 30 a discutir dois deles em profundidade.</p></aside>
+
+<div class="qa" id="q-18-1" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vou partilhar um <code>pull request</code> de 380 linhas num serviço que não conhece. Tem 20 minutos. Como conduz a revisão e o que me diz no fim?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Três passagens com orçamento fixo, e uma decisão explícita no fim. Passagem um, três minutos: ler apenas a descrição do PR, os nomes dos ficheiros alterados e os testes. Os testes dizem qual é a intenção declarada e, sobretudo, qual é a intenção que não foi testada — um PR que altera lógica de preço e só acrescenta testes de <em>mapper</em> já tem um comentário garantido.</p>
+      <p>Passagem dois, dez minutos: ler o caminho quente de fora para dentro — <em>controller</em> ou <em>listener</em>, serviço de aplicação, acesso a dados — com a lista de severidade na cabeça. Estado partilhado mutável em <em>beans</em> singleton, fronteiras de transacção (o que está dentro do <code>@Transactional</code> e, pior, que chamada de rede está lá dentro), concatenação de <em>strings</em> em SQL, ciclos que fazem I/O, recursos abertos sem <code>try</code>-com-recursos, <code>catch</code> que engole a excepção.</p>
+      <p>Passagem três, cinco minutos: escrever os comentários já ordenados por severidade, com prefixo. Dois minutos finais para a decisão, que é a parte que distingue o nível: «bloqueio por dois motivos — o acesso concorrente à cache e a injecção de SQL no filtro; os outros quatro são não-bloqueantes e proponho um <em>issue</em> para o N+1, que não é regressão deste PR, é anterior».</p>
+      <p>O <em>trade-off</em> está no número de comentários. Vinte comentários num PR produzem duas coisas: o autor perde a hierarquia e o próximo PR vem sem pedir revisão a essa pessoa. Um limite útil é cinco a sete comentários, com todos os bloqueantes primeiro; o resto vai para uma conversa síncrona de dez minutos ou para o <em>backlog</em>. Quando o PR é grande e o problema é estrutural, o comentário certo é um só: «isto mistura três alterações independentes, proponho dividir em três PRs — reviso o primeiro hoje».</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Começa na linha 1 e comenta estilo, nomes e chavetas; não chega ao acesso a dados dentro dos 20 minutos.</td></tr>
+        <tr><td>Mid</td><td>Encontra alguns defeitos reais, mas lista tudo com a mesma severidade e não toma decisão de aprovar ou bloquear.</td></tr>
+        <tr><td>Sénior</td><td>Ordem por severidade, mecanismo e efeito em produção em cada comentário, decisão explícita e limite ao número de comentários.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais o que faz fora do PR: <em>lint</em> ou regra de análise estática que impede a reincidência, e distinção entre o que é regressão deste PR e o que é dívida pré-existente.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o PR for de um colega que sai de férias amanhã e a entrega for hoje?»</li>
+      <li>«Qual é o comentário que nunca escreve, mesmo tendo razão?»</li>
+      <li>«Como impede que o mesmo defeito volte no próximo PR?»</li>
+      <li>«Quantos dos seus comentários costumam ser bloqueantes?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não distinguir bloqueante de preferência; tudo é «tem de mudar».</li>
+      <li>Reescrever o código do autor no comentário em vez de descrever o problema.</li>
+      <li>Aprovar sem ler os testes, ou não notar que não há testes novos.</li>
+      <li>Terminar sem uma decisão: «tem aqui umas coisas para pensar».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-18-2" data-box="qa" data-area="comportamental" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Escreveu um comentário bloqueante e o autor — mais antigo na empresa do que o candidato — responde «sempre fizemos assim, não é problema». O que faz a seguir?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Trocar opinião por evidência e mudar de canal. Numa <em>thread</em> de PR, duas respostas escritas em desacordo já é o limite: à terceira, marca-se quinze minutos, porque o custo de escrever é assimétrico e o tom degrada-se sem intenção.</p>
+      <p>A evidência tem de ser reproduzível e pequena. Para um defeito de acesso concorrente, um teste com <code>CountDownLatch</code> e dois <em>pools</em> que falha em menos de um segundo vale mais do que qualquer argumento de autoridade; para um N+1, o <em>log</em> de SQL com a contagem de <em>statements</em> antes e depois; para uma injecção, o pedido concreto que devolve a linha que não devia. «Sempre fizemos assim» é uma afirmação empírica e responde-se com dados, não com princípios.</p>
+      <p>Se a evidência não convencer, a saída é escalar o critério, não a pessoa: propor a regra de equipa («daqui para a frente estado mutável em <em>beans</em> singleton é bloqueante») numa conversa com o resto da equipa e aceitar o resultado. Ceder num caso concreto com a regra escrita para o futuro é melhor resultado do que ganhar a discussão e perder o revisor.</p>
+      <p>O limite onde não se cede: perda ou corrupção de dados, exposição de dados pessoais e falha de segurança explorável. Nesses três, o comentário mantém-se bloqueante e envolve-se quem tem a responsabilidade formal — o dono do serviço ou a equipa de segurança — sem drama e por escrito.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Ou cede imediatamente por hierarquia, ou insiste na <em>thread</em> até alguém desistir.</td></tr>
+        <tr><td>Mid</td><td>Argumenta com boas práticas e nomes de princípios, sem produzir evidência do problema.</td></tr>
+        <tr><td>Sénior</td><td>Produz um teste ou um <em>log</em> que demonstra o defeito, muda para conversa síncrona, distingue o que é negociável do que não é.</td></tr>
+        <tr><td>Staff</td><td>Resolve o caso e institucionaliza o critério (regra de equipa, verificação automática) para que a discussão não se repita a cada PR.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o teste que escreveu passar na máquina dele e falhar na sua?»</li>
+      <li>«Já mudou de opinião numa revisão? Sobre o quê?»</li>
+      <li>«Que percentagem dos seus comentários acha que são desnecessários?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Falar do autor («ele nunca testa nada») em vez do código.</li>
+      <li>Tratar toda a discórdia como igual — sem uma linha vermelha definida.</li>
+      <li>Escalar para o gestor antes de tentar evidência e conversa directa.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-18-2" class="h2"><span class="secnum">18.2</span> Ler código desconhecido em dez minutos<a class="anchor" href="#sec-18-2" aria-label="ligação">#</a></h2>
+
+<p>Ler código desconhecido depressa é uma técnica com passos, não talento. O primeiro passo não é o código: é o modelo de dados. Num serviço Spring Boot com PostgreSQL, dez minutos gastos no esquema — tabelas, chaves estrangeiras, índices, colunas com <code>status</code> e <code>version</code> — dão mais compreensão do domínio do que uma hora a saltar entre classes, porque o esquema é o único artefacto que ninguém pode refactorizar em silêncio.</p>
+
+<p>O segundo passo é enumerar os pontos de entrada e escolher um. Os pontos de entrada de um serviço Java são finitos e fáceis de listar: <code>@RestController</code>, <code>@KafkaListener</code> ou <code>@RabbitListener</code>, <code>@Scheduled</code>, <em>health checks</em> e o <code>main</code>. Escolhe-se o fluxo mais representativo — normalmente o comando de escrita mais frequente — e segue-se em profundidade até ao SQL, marcando três coisas pelo caminho: onde começa e acaba a transacção, onde há chamadas de rede e onde há estado partilhado.</p>
+
+<p>O terceiro passo é usar a história do ficheiro. <code>git log</code> sobre um ficheiro diz mais sobre risco do que o próprio conteúdo: um ficheiro com 40 alterações em seis meses e 900 linhas é o <em>hotspot</em> onde os defeitos vivem, e é aí que vale a pena investir leitura. Os testes servem de documentação executável — o nome de um teste diz a regra de negócio que alguém achou importante fixar — e a ausência de testes num pacote é, em si, informação sobre o risco de lá mexer.</p>
+
+<p>O que não se faz: ler ficheiro a ficheiro por ordem alfabética, tentar perceber tudo antes de mexer em alguma coisa, ou pedir uma explicação completa a um colega antes de ter uma pergunta concreta. A pergunta certa depois de dez minutos é «o fluxo de criação de encomenda passa por <code>OrderService.place</code>, escreve em três tabelas na mesma transacção e publica em Kafka depois do <em>commit</em> — é isto, ou há um caminho alternativo que não vi?».</p>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Numa entrevista com excerto curto, a leitura tem uma diferença importante: o entrevistador plantou os defeitos, portanto tudo o que parece estranho é intencional. Um <code>HashMap</code> como campo de instância, um <code>catch (Exception e)</code>, uma concatenação dentro de uma <em>query</em> e um ciclo com acesso a uma associação <em>lazy</em> não são acidentes de escrita — são a própria pergunta. Comentar em voz alta enquanto se lê é obrigatório: o entrevistador pontua o raciocínio, não o silêncio seguido de uma lista.</p></aside>
+
+<div class="qa" id="q-18-3" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Entra numa equipa e herda um serviço com 200 mil linhas que ninguém da equipa original mantém. Tem uma correcção urgente para fazer amanhã. Como aborda a primeira semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A ordem é: pôr a correr, medir, mapear o fluxo afectado, mudar com teste, e só depois generalizar. Pôr a correr localmente ou num ambiente de testes é a primeira prioridade absoluta — sem um ciclo de <em>feedback</em> de menos de dois minutos, qualquer alteração num sistema desconhecido é aposta.</p>
+      <p>Mapear faz-se pelo fluxo do defeito, não pelo sistema todo. Do <em>endpoint</em> ou do <em>consumer</em> até ao SQL, com o <em>log</em> de SQL ligado e uma execução real; o rasto distribuído, se existir, dá o mapa em segundos, e os <em>spans</em> mostram logo quantas <em>queries</em> uma operação faz. Em paralelo, <code>git log --since</code> nos ficheiros do caminho identifica quem mexeu por último — a pessoa certa para quinze minutos de contexto, com uma pergunta específica.</p>
+      <p>A correcção urgente entra com o menor raio possível e com um teste que falha antes e passa depois. Se o código não for testável no ponto onde é preciso mexer, cria-se um <em>seam</em> mínimo (extrair o método, injectar a dependência) em vez de refactorizar a classe; a regra é que a alteração de comportamento e o refactoring nunca vão no mesmo <em>commit</em>.</p>
+      <p>No fim da semana produz-se um artefacto que fica: um diagrama de uma página com os pontos de entrada, as tabelas quentes e as integrações externas, mais uma lista de cinco riscos ordenada. É o que transforma uma semana de leitura em propriedade de equipa, e é exactamente o sinal que o entrevistador procura para nível sénior ou acima.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Lia o código todo» ou «pedia a alguém que me explicasse»; nenhuma estratégia de execução ou medição.</td></tr>
+        <tr><td>Mid</td><td>Segue o fluxo no IDE e corrige, mas sem teste que falhe primeiro e sem se preocupar com o ciclo de <em>feedback</em>.</td></tr>
+        <tr><td>Sénior</td><td>Executa e mede primeiro, mapeia só o fluxo relevante, separa correcção de refactoring, deixa teste de regressão.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o artefacto partilhado (mapa, riscos ordenados) e negoceia com o gestor o que fica por fazer e porquê.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se não conseguir pôr o serviço a correr localmente em dois dias?»</li>
+      <li>«Que ferramentas usa para ver o SQL que uma operação faz?»</li>
+      <li>«Como escolhe o fluxo por onde começa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor reescrita antes de conseguir executar o sistema.</li>
+      <li>Misturar correcção urgente com limpeza no mesmo <em>commit</em>.</li>
+      <li>Não mencionar teste nenhum na alteração de um sistema que não conhece.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-18-4" data-box="qa" data-area="design" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Na sua equipa, o que é que classifica um comentário de revisão como bloqueante e o que é um <code>nit</code>? Dê exemplos concretos dos dois.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Bloqueante é o que causa dano irreversível ou difícil de detectar depois de entrar em produção. A lista é curta e estável:</p>
+      <ul class="lst">
+        <li>Perda ou corrupção de dados: escrita não idempotente num <em>consumer</em> com entrega pelo menos uma vez, actualização sem controlo de concorrência optimista.</li>
+        <li>Segurança: concatenação de entrada do utilizador em SQL, autorização verificada ao nível do <em>endpoint</em> mas não do recurso, segredo ou dado pessoal em <em>log</em>.</li>
+        <li>Correcção sob acesso concorrente: estado mutável partilhado num <em>bean</em> singleton, <em>check-then-act</em> sem atomicidade.</li>
+        <li>Fugas de recursos: ligações, ficheiros ou <code>InputStream</code> sem <code>try</code>-com-recursos; <em>pools</em> criadas por pedido.</li>
+        <li>Ausência de teste para lógica de negócio nova ou alterada.</li>
+      </ul>
+      <p>O <em>nit</em> é tudo o que um formatador ou um <em>linter</em> devia resolver sem intervenção humana: nomes, ordem de membros, <code>var</code> ou tipo explícito, comprimento de linha. A regra prática é que se um comentário se repete duas vezes em PRs diferentes, deixa de ser comentário e passa a ser regra automática — Spotless, Checkstyle, ArchUnit ou uma regra de SonarQube — porque revisão humana gasta em atenção o que a ferramenta faz por 200 milissegundos de <em>build</em>.</p>
+      <p>Entre os dois há uma categoria útil: a pergunta. Quando falta contexto, «isto é intencional? Se o pedido chegar duas vezes, o que acontece?» resolve mais depressa do que uma afirmação errada, e mantém a autoridade do revisor intacta para quando ela for precisa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não distingue categorias; considera estilo tão importante como correcção.</td></tr>
+        <tr><td>Mid</td><td>Distingue as duas categorias com exemplos genéricos («bugs bloqueiam, estilo não»).</td></tr>
+        <tr><td>Sénior</td><td>Lista fechada e justificada de bloqueantes, com a noção de dano irreversível, e automatiza o resto.</td></tr>
+        <tr><td>Staff</td><td>Trata o tempo de revisão como recurso escasso e desenha o processo (tamanho de PR, <em>lint</em>, regras arquitecturais) para o gastar bem.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde é que uma regra de ArchUnit é melhor do que um comentário?»</li>
+      <li>«Quanto tempo deve um PR esperar por revisão?»</li>
+      <li>«E se o autor ignorar um <em>nit</em> e fizer <em>merge</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Bloquear PRs por preferência pessoal de estilo.</li>
+      <li>Nunca bloquear nada — «aprovo e depois falamos».</li>
+      <li>Não ter nenhuma verificação automática no <em>pipeline</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-18-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 18.1 — Rever um excerto com cinco defeitos e escrever os comentários</span>
+    <div class="labpills"><span class="qpill">5 defeitos</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado, tal como o entrevistador o dá: «Este serviço corre em produção num Spring Boot 3.5, é chamado por um <em>endpoint</em> HTTP e por um <em>job</em> nocturno, com até 40 pedidos simultâneos. <code>Order</code> é uma entidade JPA e <code>getLines()</code> é uma associação <code>LAZY</code>. Tem 25 minutos: encontre os defeitos, ordene-os por severidade e escreva o comentário de revisão que deixaria no PR.» Há exactamente cinco defeitos reais — um de acesso concorrente, um de N+1, um de tratamento de erros, um de segurança e um de recurso não fechado. Restrições: não reescrever a classe, escrever comentários; para cada um indicar a linha, o mecanismo, o efeito observável em produção e a correcção. Saída esperada: cinco comentários, dos quais no máximo três bloqueantes, com decisão final de aprovar ou bloquear.</p>
+    <figure class="listing java" id="lst-18-1"><div class="lhead"><span class="lnum">Listagem 18.1</span>
+      <span class="lcap">Excerto sob revisão, com numeração de linhas para os comentários.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="java"><code> 1  @Service
+ 2  public class DailyPayoutExporter {
+ 3
+ 4      private static final Logger log = LoggerFactory.getLogger(DailyPayoutExporter.class);
+ 5
+ 6      private final OrderRepository orders;
+ 7      private final JdbcTemplate jdbc;
+ 8      private final FxClient fx;
+ 9      private final Map&lt;String, BigDecimal&gt; rateCache = new HashMap&lt;&gt;();
+10
+11      DailyPayoutExporter(OrderRepository orders, JdbcTemplate jdbc, FxClient fx) {
+12          this.orders = orders;
+13          this.jdbc = jdbc;
+14          this.fx = fx;
+15      }
+16
+17      public File export(String merchantId, LocalDate day) {
+18          try {
+19              List&lt;Order&gt; batch = orders.findByMerchantIdAndDay(merchantId, day);
+20              String path = &quot;/var/exports/&quot; + merchantId + &quot;-&quot; + day + &quot;.csv&quot;;
+21              FileWriter out = new FileWriter(path);
+22              BigDecimal total = BigDecimal.ZERO;
+23
+24              for (Order order : batch) {
+25                  for (OrderLine line : order.getLines()) {
+26                      BigDecimal rate = rateCache.get(line.getCurrency());
+27                      if (rate == null) {
+28                          rate = fx.rateFor(line.getCurrency(), day);
+29                          rateCache.put(line.getCurrency(), rate);
+30                      }
+31                      total = total.add(line.getAmount().multiply(rate));
+32                  }
+33                  out.write(order.getId() + &quot;;&quot; + order.getTotal() + &quot;\n&quot;);
+34              }
+35              out.flush();
+36
+37              jdbc.update(&quot;UPDATE payout SET amount = &quot; + total
+38                      + &quot; WHERE merchant_id = '&quot; + merchantId + &quot;'&quot;);
+39              return new File(path);
+40
+41          } catch (Exception e) {
+42              log.warn(&quot;falhou o export de {}&quot;, merchantId);
+43              return null;
+44          }
+45      }
+46  }</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-18-2"><div class="lhead"><span class="lnum">Listagem 18.2</span>
+        <span class="lcap">Os cinco comentários de revisão, por ordem de severidade.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>[BLOQUEANTE] linha 38 — injecção de SQL em merchant_id
+    merchantId vem do pedido HTTP e é concatenado na query. Um valor como
+    x' OR '1'='1 actualiza o montante de todos os comerciantes; a coluna amount
+    também entra por concatenação, o que quebra com locale decimal diferente.
+    Correcção: jdbc.update("UPDATE payout SET amount = ? WHERE merchant_id = ?",
+    total, merchantId). Se algum dia for preciso ordenar por coluna dinâmica,
+    essa parte não é parametrizável: valida-se contra uma lista branca.
+
+[BLOQUEANTE] linha 9 (uso nas 26-29) — HashMap partilhado num bean singleton
+    O serviço é singleton e é chamado por HTTP e pelo job nocturno em paralelo
+    (até 40 threads). HashMap não é seguro para acesso concorrente: entradas
+    perdidas, leituras de estado meio-construído e, em rehash simultâneo,
+    ciclos infinitos que aparecem como uma thread a 100% de CPU sem stack
+    de erro. Além disso a cache não tem expiração — a taxa de câmbio de
+    ontem serve o export de hoje. Correcção: cache por invocação (variável
+    local), ou ConcurrentHashMap com chave (moeda, dia) e computeIfAbsent,
+    ou Caffeine com TTL de algumas horas e limite de tamanho.
+
+[BLOQUEANTE] linhas 41-43 — catch(Exception) que engole e devolve null
+    Apanha tudo — IOException, DataAccessException, NullPointerException —,
+    perde a stack (o log não recebe a excepção) e devolve null, que rebenta
+    no chamador com um NPE a 20 quadros de distância do problema real.
+    Também apanha o que não devia ser apanhado aqui, e um export parcial
+    é dado como falha silenciosa: o ficheiro fica meio escrito no disco.
+    Correcção: log.error("falhou o export de {} em {}", merchantId, day, e)
+    e propagar uma ExportFailedException com a causa, ou não apanhar de todo
+    e deixar o @ControllerAdvice/o job tratar a falha e reagendar.
+
+[não-bloqueante] linha 21 — FileWriter nunca fechado
+    Só há flush(); o descritor fica aberto até o GC correr o finalizador, se
+    correr. Num job diário com centenas de comerciantes chega-se a "Too many
+    open files" e o processo deixa de aceitar ligações. Se houver excepção
+    a meio, nem o flush acontece. Correcção: try-com-recursos com
+    BufferedWriter e charset explícito — Files.newBufferedWriter(Path.of(path),
+    StandardCharsets.UTF_8) — e escrever para ficheiro temporário com
+    move atómico no fim, para não deixar CSV truncado visível.
+
+[não-bloqueante] linha 25 — N+1 na associação LAZY
+    findByMerchantIdAndDay traz N encomendas; order.getLines() dispara uma
+    query por encomenda. Com 5 000 encomendas são 5 001 idas à base de dados;
+    a 0,4 ms de ida e volta são ~2 s só de latência de rede, e o job cresce
+    linearmente com o comerciante. Correcção: @EntityGraph ou
+    "select distinct o from Order o join fetch o.lines where ..." numa só
+    query, ou @BatchSize(size = 100) se a projecção completa for pesada.
+    Nota: isto é anterior a este PR — proponho issue separado, não bloqueia.
+
+Decisão: bloqueio o PR pelos três primeiros. Os outros dois entram como
+follow-up, sendo que o do FileWriter só não é bloqueante porque o job corre
+uma vez por dia; se este caminho passar a ser chamado por HTTP, sobe.</code></pre></figure>
+      <figure class="listing java" id="lst-18-3"><div class="lhead"><span class="lnum">Listagem 18.3</span>
+        <span class="lcap">Versão corrigida: cache local, uma query, recurso fechado, erro propagado com causa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@Service
+public class DailyPayoutExporter {
+
+    private static final Logger log = LoggerFactory.getLogger(DailyPayoutExporter.class);
+
+    private final OrderRepository orders;
+    private final JdbcTemplate jdbc;
+    private final FxClient fx;
+
+    DailyPayoutExporter(OrderRepository orders, JdbcTemplate jdbc, FxClient fx) {
+        this.orders = orders;
+        this.jdbc = jdbc;
+        this.fx = fx;
+    }
+
+    public Path export(String merchantId, LocalDate day) {
+        // sem estado partilhado: a cache vive na invocação
+        Map&lt;String, BigDecimal&gt; rates = new HashMap&lt;&gt;();
+        // uma só query: @EntityGraph(attributePaths = &quot;lines&quot;) no repositório
+        List&lt;Order&gt; batch = orders.findByMerchantIdAndDayWithLines(merchantId, day);
+
+        Path target = Path.of(&quot;/var/exports&quot;, merchantId + &quot;-&quot; + day + &quot;.csv&quot;);
+        Path tmp = target.resolveSibling(target.getFileName() + &quot;.tmp&quot;);
+        BigDecimal total = BigDecimal.ZERO;
+
+        try (BufferedWriter out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
+            for (Order order : batch) {
+                for (OrderLine line : order.getLines()) {
+                    BigDecimal rate = rates.computeIfAbsent(
+                            line.getCurrency(), c -&gt; fx.rateFor(c, day));
+                    total = total.add(line.getAmount().multiply(rate));
+                }
+                out.write(order.getId() + &quot;;&quot; + order.getTotal());
+                out.newLine();
+            }
+        } catch (IOException e) {
+            throw new ExportFailedException(merchantId, day, e);   // com causa
+        }
+
+        jdbc.update(&quot;UPDATE payout SET amount = ? WHERE merchant_id = ?&quot;,
+                total.setScale(2, RoundingMode.HALF_UP), merchantId);
+
+        try {
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            throw new ExportFailedException(merchantId, day, e);
+        }
+        log.info(&quot;export de {} em {}: {} encomendas, total {}&quot;,
+                merchantId, day, batch.size(), total);
+        return target;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Custo antes e depois: de 1 + N <em>queries</em> para 1; com 5 000 encomendas e 0,4 ms de ida e volta, cerca de 2 s de latência de rede desaparecem do <em>job</em>.</li>
+        <li>A ordem dos comentários é metade da nota. Injecção de SQL, corrupção de estado e falha silenciosa antes de recursos e desempenho.</li>
+        <li>O candidato tem de dizer o efeito observável, não a categoria: «uma <em>thread</em> a 100% de CPU sem <em>stack</em>» pontua muito acima de «não é <em>thread-safe</em>».</li>
+        <li>Ponto de bónus, não é um dos cinco: o método escreve o ficheiro e actualiza a base de dados sem atomicidade entre os dois. Se o <code>UPDATE</code> falhar, o CSV já existe. A escrita para ficheiro temporário com <code>ATOMIC_MOVE</code> reduz a janela, mas a observação correcta é que a operação precisa de ser idempotente e repetível.</li>
+        <li>Casos limite a mencionar: <code>batch</code> vazio (ficheiro com zero linhas ainda deve ser produzido?), moeda sem taxa (o <code>computeIfAbsent</code> propaga a excepção do <code>FxClient</code>), <em>charset</em> por omissão do sistema a corromper acentos, e escala decimal antes de escrever no <code>payout</code>.</li>
+        <li>Sinal negativo forte: sugerir <code>synchronized</code> no método <code>export</code> para resolver a cache — serializa o <em>job</em> inteiro e mantém a cache sem expiração.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-18-3" class="h2"><span class="secnum">18.3</span> Cheiros de código e o refactoring correspondente<a class="anchor" href="#sec-18-3" aria-label="ligação">#</a></h2>
+
+<p>Um cheiro de código não é um defeito: é um sintoma que sugere um problema de desenho e que tem, quase sempre, um refactoring canónico associado. O valor de conhecer o catálogo em entrevista está na precisão do vocabulário — dizer «isto é inveja de dados: o método usa cinco <em>getters</em> de <code>Invoice</code> e nenhum campo próprio, o cálculo pertence a <code>Invoice</code>» é uma frase de sénior; «isto está confuso» não é.</p>
+
+<p>Os cheiros que aparecem com mais frequência em código Java empresarial são cinco. Método longo e classe-deus, quase sempre um serviço de aplicação que cresceu por acreção. Domínio anémico com <em>script</em> de transacção, em que as entidades são estruturas de dados e toda a regra vive em <code>XxxServiceImpl</code>. Obsessão por primitivos, com <code>String</code> a representar identificadores, moedas e estados. Argumento-bandeira, o <code>boolean</code> que muda o comportamento do método. E acoplamento temporal, quando <code>b()</code> só funciona se <code>a()</code> tiver sido chamado antes, o que nenhuma assinatura revela.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 18.1</span> Cheiros frequentes em serviços Java, sinal mensurável e refactoring canónico.</div>
+<div class="tscroll"><table><thead><tr><th>Cheiro</th><th>Sinal mensurável</th><th>Refactoring</th><th>Quando não vale a pena</th></tr></thead><tbody>
+<tr><td>Método longo</td><td>&gt; 50 linhas, complexidade ciclomática &gt; 10</td><td>Extrair método com nome de intenção; substituir condicional por polimorfismo</td><td>Método gerado ou <em>mapper</em> linear sem ramos</td></tr>
+<tr><td>Classe-deus</td><td>&gt; 700 linhas, &gt; 12 dependências injectadas</td><td>Extrair classe por caso de uso; separar leitura de escrita</td><td>Classe estável há dois anos e sem alterações previstas</td></tr>
+<tr><td>Domínio anémico</td><td>Entidades só com <em>getters</em>/<em>setters</em>; regras repetidas em 3+ serviços</td><td>Mover comportamento para a entidade; objectos-valor</td><td>Serviço que é só CRUD sobre um formulário</td></tr>
+<tr><td>Obsessão por primitivos</td><td><code>String</code> ou <code>BigDecimal</code> nu em assinaturas de negócio</td><td><code>record</code> como objecto-valor com validação no construtor compacto</td><td>Fronteira de API onde o tipo primitivo é o contrato</td></tr>
+<tr><td>Argumento-bandeira</td><td><code>boolean</code> em parâmetro; <code>if (flag)</code> logo na primeira linha</td><td>Dois métodos com nomes de intenção, ou <em>enum</em> de estratégia</td><td>Bandeira de compatibilidade temporária com data de remoção</td></tr>
+<tr><td>Acoplamento temporal</td><td>Ordem obrigatória de chamadas não expressa em tipos</td><td>Construtor completo, <em>builder</em>, ou tipos de estado distintos</td><td>Protocolo imposto por biblioteca externa</td></tr>
+<tr><td>Cirurgia com caçadeira</td><td>1 alteração de regra toca em 6+ ficheiros</td><td>Reunir a regra num só módulo; inverter a dependência</td><td>Alteração transversal genuína (versão de biblioteca)</td></tr>
+</tbody></table></div></div>
+
+<p>O argumento-bandeira merece o exemplo, porque é o mais fácil de reconhecer numa entrevista e o mais barato de corrigir. Um <code>boolean</code> no meio da lista de parâmetros é ilegível no local de chamada — <code>process(order, true, false)</code> não diz nada — e obriga o corpo a conter dois métodos entrelaçados.</p>
+
+<figure class="listing java" id="lst-18-4"><div class="lhead"><span class="lnum">Listagem 18.4</span>
+<span class="lcap">Argumento-bandeira substituído por intenção explícita; a lógica comum fica privada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// antes: o local de chamada não se lê — refunds.issue(order, true, false)
+public Refund issue(Order order, boolean partial, boolean notifyCustomer) { ... }
+
+// depois: dois nomes de intenção e um objecto-valor para o montante
+public Refund issueFull(OrderId orderId)                    { return issue(orderId, Money.of(order.total())); }
+public Refund issuePartial(OrderId orderId, Money amount)   { return issue(orderId, amount); }
+
+private Refund issue(OrderId orderId, Money amount) { ... }   // regra única, testada uma vez
+
+// a notificação sai do parâmetro e passa a consequência de um facto de negócio
+// (RefundIssued publicado depois do commit; quem quer notificar, subscreve)</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Refactorizar em PRs separados dos de funcionalidade dá revisões limpas e histórico legível, mas produz PRs que ninguém tem urgência em rever e que apodrecem em conflito de <em>merge</em> — um refactoring de 600 linhas parado três dias contra um ficheiro activo custa mais a reconciliar do que valeu. Refactorizar no mesmo PR da funcionalidade garante que entra, mas esconde a alteração de comportamento dentro do ruído e torna o <em>revert</em> impossível de fazer cirurgicamente. A convenção que funciona: refactoring primeiro, em PR próprio, pequeno (&lt; 200 linhas), fundido no mesmo dia; a funcionalidade segue em cima. Quando o refactoring só se torna evidente a meio da funcionalidade, faz-se o <em>commit</em> separado dentro do mesmo PR e assinala-se na descrição qual é qual.</p></aside>
+
+<div class="qa" id="q-18-5" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Herda um <code>OrderServiceImpl</code> com 1 400 linhas, 14 dependências injectadas e um método <code>process</code> de 300. Como o desmonta sem parar as entregas da equipa?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não se desmonta a classe: desmontam-se os casos de uso que a atravessam, e só os que estão a ser tocados. A ordem é medir, isolar, extrair por caso de uso, e deixar a classe original a delegar até ficar vazia.</p>
+      <p>Medir primeiro significa saber que partes do método são realmente exercitadas e alteradas. <code>git log</code> por <em>hunk</em> mostra que, tipicamente, 80% das alterações dos últimos seis meses concentram-se em duas ou três regiões do método; essas são as que valem refactoring, o resto pode ficar como está durante anos sem custo. Refactorizar código estável é trabalho sem retorno.</p>
+      <p>Isolar é criar a rede: testes de caracterização sobre o comportamento observável de <code>process</code>, escritos a partir da execução real (ver a secção seguinte), antes de mexer numa linha. Sem eles, qualquer extracção é uma aposta, porque uma classe destas tem sempre um efeito lateral que ninguém documentou.</p>
+      <p>Extrair faz-se por caso de uso e não por camada: <code>PlaceOrder</code>, <code>CancelOrder</code>, <code>ApplyDiscount</code>, cada um com as duas ou três dependências de que precisa — o que resolve as 14 injecções, porque nenhum caso de uso precisa de todas. A classe antiga passa a fachada que delega, e é removida quando o último chamador migrar. Esta é a forma local do <em>strangler fig</em>: os dois caminhos coexistem, o novo cresce, o antigo é apagado quando estiver morto.</p>
+      <p>Quanto ao ritmo: um orçamento fixo (por exemplo, 15% da capacidade do <em>sprint</em>, ou a regra do escuteiro — o ficheiro que se toca sai melhor do que entrou) sustenta-se durante meses; um «<em>sprint</em> de limpeza» é aprovado uma vez, produz um PR gigante e nunca mais é aprovado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Reescrevia a classe do zero» sem testes, sem migração e sem estimativa.</td></tr>
+        <tr><td>Mid</td><td>Extrai métodos privados dentro da mesma classe; o ficheiro continua com 1 400 linhas e 14 dependências.</td></tr>
+        <tr><td>Sénior</td><td>Testes de caracterização primeiro, extracção por caso de uso, fachada a delegar, orçamento contínuo em vez de <em>sprint</em> dedicado.</td></tr>
+        <tr><td>Staff</td><td>Usa dados de alteração para escolher onde investir, define a condição de fim («classe removida quando o último chamador migrar») e mede o efeito (tempo de <em>lead</em>, defeitos naquele módulo).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como sabe que a extracção não mudou comportamento?»</li>
+      <li>«Que faz com a região do método que ninguém toca há três anos?»</li>
+      <li>«Quem revê um PR de refactoring de 800 linhas?»</li>
+      <li>«E se a classe for chamada por outro serviço através de uma biblioteca partilhada?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Refactorizar sem rede de testes e chamar-lhe «limpeza segura».</li>
+      <li>Extrair por camada técnica (<code>Validator</code>, <code>Helper</code>, <code>Utils</code>) em vez de por caso de uso.</li>
+      <li>Não ter critério de fim: o refactoring fica a meio e a base fica com dois estilos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-18-6" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Explique o padrão <em>strangler fig</em> aplicado a um monólito de facturação e diga em que condições reescrever de raiz passa a ser a decisão certa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O <em>strangler fig</em> põe uma fachada à frente do sistema antigo e desvia funcionalidade para o novo, uma fatia de cada vez, até o antigo poder ser desligado. Em facturação, a fachada é normalmente o <em>gateway</em> HTTP ou um <em>router</em> aplicacional que decide por rota e por atributo: «emissão de facturas de subscrições novas vai para o serviço novo; tudo o resto continua no monólito». Cada fatia tem três fases — escrita paralela (o novo processa e compara sem publicar resultado), leitura desviada, e remoção do caminho antigo — e cada fase tem um interruptor de retorno em segundos.</p>
+      <p>A vantagem não é técnica, é económica: entrega valor ao fim de semanas em vez de trimestres, e o risco de cada passo é limitado ao que se desviou. O custo é real e tem de ser dito: durante meses existem dois sistemas, dois modelos de dados a sincronizar, testes de comparação e regras duplicadas — a equipa paga uma sobrecarga de coordenação que pode chegar a 20 ou 30% da capacidade enquanto durar.</p>
+      <p>A reescrita de raiz passa a ser a escolha certa em condições estreitas e verificáveis: quando o sistema antigo não pode ser executado nem testado (sem construção reprodutível, dependências extintas), quando a plataforma está fora de suporte com risco de segurança e sem caminho de actualização, quando o domínio mudou tanto que menos de um terço das regras antigas sobrevive, ou quando o sistema é pequeno o suficiente para caber em semanas — a fronteira empírica anda pelas poucas dezenas de milhares de linhas com um comportamento bem especificado.</p>
+      <p>A condição que torna qualquer reescrita defensável é a existência de uma especificação executável: ou testes de caracterização sobre o antigo, ou tráfego real que se possa repetir contra os dois em paralelo. Sem isso, a reescrita reimplanta os defeitos conhecidos e perde os comportamentos não documentados de que alguém depende — e é assim que se chega ao segundo ano de um projecto de seis meses.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Defende reescrita porque «o código é mau»; sem plano de migração de dados nem de retorno.</td></tr>
+        <tr><td>Mid</td><td>Descreve o padrão correctamente mas não menciona o custo dos dois sistemas em paralelo nem o critério de fim.</td></tr>
+        <tr><td>Sénior</td><td>Fatia por fluxo com fachada, escrita paralela e comparação, interruptor de retorno, e reconhece a sobrecarga de coordenação.</td></tr>
+        <tr><td>Staff</td><td>Enuncia as condições verificáveis em que a reescrita ganha, quantifica o custo das duas opções e define quem decide e com que dados.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como sincroniza os dados enquanto os dois sistemas coexistem?»</li>
+      <li>«Como compara os resultados dos dois sem duplicar efeitos externos?»</li>
+      <li>«O que faz quando 90% está migrado e os últimos 10% são o mais difícil?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não ter critério de desligar o sistema antigo — a migração fica permanente.</li>
+      <li>Ignorar que a escrita paralela pode duplicar efeitos externos (emails, cobranças).</li>
+      <li>Justificar a reescrita com preferência de <em>stack</em> em vez de risco ou custo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-18-4" class="h2"><span class="secnum">18.4</span> Refactorizar com rede: testes de caracterização<a class="anchor" href="#sec-18-4" aria-label="ligação">#</a></h2>
+
+<p>Um teste de caracterização não verifica o que o código <em>devia</em> fazer: regista o que ele <em>faz</em>, defeitos incluídos. Escreve-se ao contrário de um teste normal — invoca-se o código com uma entrada, observa-se o resultado, e escreve-se a asserção com esse valor. Se a asserção falhar mais tarde, o refactoring mudou comportamento; se o comportamento registado for errado, corrige-se depois, num <em>commit</em> separado e visível, que é precisamente o valor do método: torna cada alteração de comportamento numa decisão explícita em vez de um acidente.</p>
+
+<p>A cobertura destes testes constrói-se pelo espaço de entrada, não pelas linhas. Numa função com dois países, dois escalões de peso, dois níveis de serviço e duas categorias de cliente, o produto cartesiano são 16 casos, aos quais se acrescentam os valores de fronteira (exactamente 2 000 g, exactamente 50,00 €) e os degenerados (nulo, zero, negativo). Gerar a tabela uma vez com o código antigo, fixá-la no repositório e passar a compará-la é a técnica de <em>golden master</em>; para saídas grandes — um CSV, um JSON, um PDF — compara-se um resumo estável, por exemplo o <em>hash</em> da saída normalizada, com as partes voláteis (datas, identificadores gerados) substituídas.</p>
+
+<p>A cobertura de linhas não é medida suficiente para confiar na rede. O que valida um teste de caracterização é o teste de mutação: uma ferramenta como o PIT altera operadores e condições no código antigo e verifica se algum teste falha. Uma rede com 90% de cobertura de linhas e 40% de mutantes mortos não protege o refactoring; abaixo de 70 a 80% de mutantes mortos nas regiões que se vão tocar, vale mais gastar meia hora a acrescentar casos do que começar a mexer.</p>
+
+<p>Quando o código não é testável no ponto em que é preciso mexer — <code>new</code> a meio do método, <code>static</code>, <code>LocalDate.now()</code>, leitura directa do sistema de ficheiros — cria-se um <em>seam</em>, o ponto mínimo onde se pode substituir comportamento sem alterar a lógica: extrair o método e sobrepô-lo numa subclasse de teste, promover o objecto criado a parâmetro, injectar um <code>Clock</code> em vez de chamar <code>now()</code>. A regra é que a criação do <em>seam</em> vai num <em>commit</em> só, sem qualquer alteração de comportamento, e é revista como tal.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Testes de caracterização escritos com <em>mocks</em> de tudo deixam de testar comportamento e passam a testar a implementação: verificam que <code>repository.save()</code> foi chamado duas vezes, e depois falham em massa no primeiro refactoring, que é exactamente quando deviam ajudar. A rede tem de ser feita sobre entradas e saídas observáveis — valor devolvido, linhas na base de dados, mensagem publicada, ficheiro escrito — com o mínimo de duplos possível, tipicamente só nas fronteiras externas de rede. Um teste que só quebra quando o comportamento muda é rede; um que quebra sempre que a estrutura muda é lastro.</p></aside>
+
+<div class="qa" id="q-18-7" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O que é um teste de caracterização e em que difere de um teste unitário normal? Quando é que o apaga?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A diferença está na origem da asserção. Num teste unitário, o valor esperado vem da especificação: sabe-se qual é a regra e escreve-se o resultado correcto. Num teste de caracterização, o valor esperado vem da execução do código actual: regista-se o que o sistema faz hoje, incluindo comportamentos que ninguém queria, porque alguém a jusante pode já depender deles.</p>
+      <p>Consequências práticas. Primeira: um teste de caracterização que falha durante um refactoring não significa que o código novo está errado — significa que o comportamento mudou, e é preciso decidir se a mudança é intencional. Segunda: quando se descobre que o comportamento registado é um defeito, corrige-se com dois <em>commits</em>, um que muda a asserção com justificação e outro que muda o código; assim o histórico mostra a decisão. Terceira: estes testes documentam-se como tal, com nome explícito, para que ninguém os leia como especificação de negócio.</p>
+      <p>Apagam-se em dois momentos. Quando a região que protegiam foi refactorizada e passou a ter testes escritos a partir da regra real de negócio — aí a rede é substituída, não acumulada. E quando o comportamento registado foi deliberadamente removido, por exemplo porque se decidiu que arredondar para baixo era um defeito. O que não se faz é manter para sempre duzentos casos gerados que ninguém entende e que travam qualquer alteração legítima: isso troca dívida de código por dívida de testes, e a segunda é mais difícil de eliminar porque parece qualidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde com teste de integração ou com teste de regressão genérico.</td></tr>
+        <tr><td>Mid</td><td>Define correctamente mas não distingue a origem da asserção nem o que fazer quando o comportamento registado é um defeito.</td></tr>
+        <tr><td>Sénior</td><td>Explica a inversão (asserção vinda da execução), o fluxo de dois <em>commits</em> e o critério de remoção.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta como valida a rede (teste de mutação, produto cartesiano de entradas) e trata os testes como activo com custo de manutenção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como caracteriza um método que devolve <code>void</code> e escreve na base de dados?»</li>
+      <li>«E se a saída contiver a data actual ou um UUID gerado?»</li>
+      <li>«Como sabe que a rede é suficiente antes de começar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Escrever a asserção com o valor que «devia» sair e ficar com o teste vermelho desde o início.</li>
+      <li>Caracterizar com <em>mocks</em> de tudo, verificando chamadas em vez de resultados.</li>
+      <li>Nunca remover a rede, deixando testes que impedem alterações legítimas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-18-8" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O método que tem de alterar cria dependências com <code>new</code> lá dentro, chama um <em>singleton</em> estático e usa <code>LocalDate.now()</code>. Como o põe sob teste sem o refactorizar primeiro?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Cria-se um <em>seam</em>: o ponto mínimo onde se substitui comportamento sem alterar lógica. Há três formas, por ordem crescente de invasividade.</p>
+      <ul class="lst">
+        <li><em>Seam</em> de objecto: extrair a criação para um método protegido — <code>protected PdfRenderer newRenderer()</code> — e sobrepô-lo numa subclasse usada só no teste. Não muda uma linha de lógica e permite testar o método imediatamente.</li>
+        <li><em>Seam</em> de parâmetro: acrescentar uma sobrecarga que recebe a dependência, mantendo o método original a delegar com o valor por omissão. Compatível com todos os chamadores existentes.</li>
+        <li>Injecção verdadeira: passar a dependência ao construtor. É o destino final, mas obriga a tocar em todos os pontos de construção — faz-se depois de haver testes, não antes.</li>
+      </ul>
+      <p>Para o tempo, o caminho é <code>java.time.Clock</code>: substituir <code>LocalDate.now()</code> por <code>LocalDate.now(clock)</code> e injectar <code>Clock.systemUTC()</code> em produção e <code>Clock.fixed(...)</code> no teste. É a única forma de testar regras de fim de mês, mudança de ano e fusos sem depender do calendário da máquina de <em>build</em> — e evita o teste que só falha a 31 de Dezembro.</p>
+      <p>Para o estático, a ordem de preferência é: envolver numa interface fina e injectá-la; se não for possível hoje, usar o mecanismo de substituição de estáticos do Mockito, aceitando que é uma solução temporária que fixa a implementação. Nunca é a primeira escolha, porque um teste que mocka estáticos morre no próximo refactoring.</p>
+      <p>A disciplina que o entrevistador procura: cada um destes passos vai num <em>commit</em> próprio, sem alteração de comportamento, revisto como «criação de <em>seam</em>». A alteração funcional entra a seguir, com o teste já lá.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Não dá para testar»; ou mocka tudo com substituição de estáticos como primeira opção.</td></tr>
+        <tr><td>Mid</td><td>Propõe injecção por construtor sem notar que isso obriga a mexer em todos os chamadores antes de ter rede.</td></tr>
+        <tr><td>Sénior</td><td>Conhece os vários tipos de <em>seam</em>, escolhe o menos invasivo primeiro, usa <code>Clock</code> para o tempo, separa <em>commits</em>.</td></tr>
+        <tr><td>Staff</td><td>Enquadra os <em>seams</em> como passo temporário com plano de remoção e discute o custo de manter testes acoplados à implementação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a classe for <code>final</code> e os métodos também?»</li>
+      <li>«Como testa código que depende do sistema de ficheiros?»</li>
+      <li>«Quando é que um teste de integração com Testcontainers é a resposta mais barata?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tornar campos públicos ou métodos <code>public</code> só para o teste lhes aceder.</li>
+      <li>Depender da data do sistema no teste e chamar-lhe intermitência.</li>
+      <li>Misturar criação de <em>seam</em> e alteração funcional no mesmo <em>commit</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-18-2" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 18.2 — Refactorizar com testes de caracterização</span>
+    <div class="labpills"><span class="qpill">Comportamento invariante</span><span class="qpill">30 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: o cálculo de portes abaixo está em produção há quatro anos, é chamado em quatro sítios e não tem um único teste. É preciso acrescentar uma terceira zona de envio na semana que vem. Em 30 minutos: (1) escrever os testes de caracterização que fixam o comportamento actual, incluindo as fronteiras e as combinações que parecem erradas; (2) refactorizar para uma estrutura que aceite uma nova zona sem tocar na lógica existente, sem alterar nenhum resultado. Restrições: nenhuma saída pode mudar, nem sequer as que parecem defeitos; o refactoring e a correcção de comportamento não podem ir no mesmo <em>commit</em>. Exemplo de entrada e saída a preservar: encomenda de 1 800 g para PT, expresso, cliente aderente, total 60,00 € — o resultado actual é 8,58 € e não zero, porque a regra de portes grátis só se aplica a envio normal.</p>
+    <figure class="listing java" id="lst-18-5"><div class="lhead"><span class="lnum">Listagem 18.5</span>
+      <span class="lcap">Código legado a refactorizar: bandeiras booleanas e regras por ordem implícita.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="java"><code>public class ShippingCalculator {
+
+    public BigDecimal calculate(Order order, String country,
+                                boolean express, boolean member) {
+        BigDecimal price;
+        if (country.equals(&quot;PT&quot;) || country.equals(&quot;ES&quot;)) {
+            price = new BigDecimal(&quot;4.90&quot;);
+            if (order.weightGrams() &gt; 2000) price = price.add(new BigDecimal(&quot;3.10&quot;));
+            if (express) price = price.multiply(new BigDecimal(&quot;1.75&quot;));
+        } else {
+            price = new BigDecimal(&quot;12.50&quot;);
+            if (order.weightGrams() &gt; 2000) price = price.add(new BigDecimal(&quot;6.40&quot;));
+            if (express) price = price.multiply(new BigDecimal(&quot;2.10&quot;));
+        }
+        if (member &amp;&amp; !express) price = price.subtract(new BigDecimal(&quot;1.00&quot;));
+        if (!express &amp;&amp; order.total().compareTo(new BigDecimal(&quot;50.00&quot;)) &gt;= 0) {
+            price = BigDecimal.ZERO;
+        }
+        if (price.compareTo(BigDecimal.ZERO) &lt; 0) price = BigDecimal.ZERO;
+        return price.setScale(2, RoundingMode.HALF_UP);
+    }
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-18-6"><div class="lhead"><span class="lnum">Listagem 18.6</span>
+        <span class="lcap">Rede primeiro: produto cartesiano gerado, tabela fixada e comparada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>class ShippingCalculatorCharacterizationTest {
+
+    private final ShippingCalculator calc = new ShippingCalculator();
+
+    // 1) gerar uma vez com o código legado e colar o resultado como tabela fixa.
+    //    Depois disto o gerador NÃO volta a correr: a tabela é a especificação.
+    static Stream&lt;Arguments&gt; cases() {
+        return Stream.of(
+            //        país   gramas  expresso  aderente  total     esperado
+            arguments(&quot;PT&quot;,  1000,   false,    false,    &quot;10.00&quot;,  &quot;4.90&quot;),
+            arguments(&quot;PT&quot;,  1000,   false,    true,     &quot;10.00&quot;,  &quot;3.90&quot;),
+            arguments(&quot;PT&quot;,  2000,   false,    false,    &quot;10.00&quot;,  &quot;4.90&quot;),  // fronteira: &gt; 2000
+            arguments(&quot;PT&quot;,  2001,   false,    false,    &quot;10.00&quot;,  &quot;8.00&quot;),
+            arguments(&quot;PT&quot;,  1800,   true,     true,     &quot;60.00&quot;,  &quot;8.58&quot;),  // grátis não se aplica
+            arguments(&quot;PT&quot;,  1800,   false,    true,     &quot;50.00&quot;,  &quot;0.00&quot;),  // fronteira: &gt;= 50
+            arguments(&quot;PT&quot;,  1800,   false,    true,     &quot;49.99&quot;,  &quot;3.90&quot;),
+            arguments(&quot;ES&quot;,  3000,   true,     false,    &quot;10.00&quot;,  &quot;14.00&quot;),
+            arguments(&quot;FR&quot;,  1000,   false,    false,    &quot;10.00&quot;,  &quot;12.50&quot;),
+            arguments(&quot;FR&quot;,  2500,   true,     true,     &quot;10.00&quot;,  &quot;39.69&quot;),
+            arguments(&quot;US&quot;,  500,    false,    true,     &quot;100.00&quot;, &quot;0.00&quot;));
+    }
+
+    @ParameterizedTest(name = &quot;{0} {1}g expresso={2} aderente={3} total={4} -&gt; {5}&quot;)
+    @MethodSource(&quot;cases&quot;)
+    void caracteriza(String country, int grams, boolean express,
+                     boolean member, String total, String expected) {
+        Order order = new Order(grams, new BigDecimal(total));
+
+        BigDecimal actual = calc.calculate(order, country, express, member);
+
+        assertThat(actual).isEqualByComparingTo(new BigDecimal(expected));
+        assertThat(actual.scale()).isEqualTo(2);           // a escala faz parte do contrato
+    }
+
+    // 2) invariante que sobrevive ao refactoring e apanha o que a tabela não cobre
+    @Property(tries = 500)
+    void nuncaNegativoENuncaMaisDeDuasCasas(@ForAll @IntRange(min = 0, max = 30_000) int grams,
+                                            @ForAll boolean express, @ForAll boolean member) {
+        BigDecimal p = calc.calculate(new Order(grams, new BigDecimal(&quot;10.00&quot;)),
+                                      &quot;PT&quot;, express, member);
+        assertThat(p).isGreaterThanOrEqualTo(BigDecimal.ZERO);
+        assertThat(p.scale()).isEqualTo(2);
+    }
+}</code></pre></figure>
+      <figure class="listing java" id="lst-18-7"><div class="lhead"><span class="lnum">Listagem 18.7</span>
+        <span class="lcap">Refactoring com comportamento idêntico: zona como dado, bandeiras substituídas por tipos, ordem das regras explícita.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public enum ShippingZone {
+    DOMESTIC(new BigDecimal(&quot;4.90&quot;), new BigDecimal(&quot;3.10&quot;), new BigDecimal(&quot;1.75&quot;)),
+    INTERNATIONAL(new BigDecimal(&quot;12.50&quot;), new BigDecimal(&quot;6.40&quot;), new BigDecimal(&quot;2.10&quot;));
+    // acrescentar uma zona é uma linha aqui + uma entrada no mapa de países
+
+    private static final Set&lt;String&gt; DOMESTIC_COUNTRIES = Set.of(&quot;PT&quot;, &quot;ES&quot;);
+
+    final BigDecimal base, heavySurcharge, expressFactor;
+
+    ShippingZone(BigDecimal base, BigDecimal heavySurcharge, BigDecimal expressFactor) {
+        this.base = base; this.heavySurcharge = heavySurcharge; this.expressFactor = expressFactor;
+    }
+
+    static ShippingZone of(String country) {
+        return DOMESTIC_COUNTRIES.contains(country) ? DOMESTIC : INTERNATIONAL;
+    }
+}
+
+public enum ShippingSpeed { STANDARD, EXPRESS }
+
+public record ShippingRequest(String country, int weightGrams, BigDecimal orderTotal,
+                              ShippingSpeed speed, boolean loyaltyMember) {
+
+    boolean isExpress()  { return speed == ShippingSpeed.EXPRESS; }
+    boolean isHeavy()    { return weightGrams &gt; HEAVY_THRESHOLD_GRAMS; }
+}
+
+public class ShippingCalculator {
+
+    private static final int HEAVY_THRESHOLD_GRAMS = 2000;
+    private static final BigDecimal MEMBER_DISCOUNT = new BigDecimal(&quot;1.00&quot;);
+    private static final BigDecimal FREE_FROM = new BigDecimal(&quot;50.00&quot;);
+
+    public BigDecimal price(ShippingRequest request) {
+        ShippingZone zone = ShippingZone.of(request.country());
+
+        BigDecimal price = zone.base;
+        if (request.isHeavy())   price = price.add(zone.heavySurcharge);
+        if (request.isExpress()) price = price.multiply(zone.expressFactor);
+
+        // ordem preservada do legado: desconto de aderente antes de portes grátis,
+        // e nenhum dos dois se aplica a envio expresso (comportamento actual, não intenção)
+        if (request.loyaltyMember() &amp;&amp; !request.isExpress()) price = price.subtract(MEMBER_DISCOUNT);
+        if (!request.isExpress() &amp;&amp; request.orderTotal().compareTo(FREE_FROM) &gt;= 0) {
+            price = BigDecimal.ZERO;
+        }
+        return price.max(BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** Assinatura antiga mantida enquanto os quatro chamadores migram. */
+    @Deprecated(since = &quot;2026.9&quot;, forRemoval = true)
+    public BigDecimal calculate(Order order, String country, boolean express, boolean member) {
+        return price(new ShippingRequest(country, order.weightGrams(), order.total(),
+                express ? ShippingSpeed.EXPRESS : ShippingSpeed.STANDARD, member));
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A rede vem antes de tudo. Escrever o refactoring primeiro e os testes depois é a falha mais comum e mais penalizada: os testes escritos no fim descrevem o código novo, não o antigo, e não provam nada.</li>
+        <li>A tabela tem de incluir fronteiras exactas (2 000 g e 2 001 g; 49,99 € e 50,00 €), porque é aí que vivem os erros de comparação, e casos que parecem errados — 8,58 € num pedido de 60 € com envio expresso — precisamente para os congelar.</li>
+        <li>Preservar a ordem das regras é obrigatório: aplicar portes grátis antes do desconto de aderente muda o resultado de vários casos. Comentar no código que a ordem é herdada, não desenhada, evita que alguém a «arrume» no PR seguinte.</li>
+        <li>A assinatura antiga fica como adaptador marcado com <code>@Deprecated(forRemoval = true)</code> até os quatro chamadores migrarem; remover no mesmo PR transforma um refactoring de 60 linhas num PR de 400 que ninguém revê.</li>
+        <li>Validar a rede com teste de mutação: nesta função, mutantes que trocam <code>&gt;</code> por <code>&gt;=</code> nos dois limiares e que removem o <code>!express</code> têm de morrer. Se sobreviverem, faltam casos e o refactoring está a ser feito no escuro.</li>
+        <li>Complexidade irrelevante aqui — tudo é O(1). O que é avaliado é disciplina de sequência, escolha de fronteiras e capacidade de não «corrigir» comportamento a meio.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-18-5" class="h2"><span class="secnum">18.5</span> Argumentar dívida técnica com números<a class="anchor" href="#sec-18-5" aria-label="ligação">#</a></h2>
+
+<p>Dívida técnica argumentada em vocabulário de engenharia — «o código está mau, tem acoplamento a mais» — perde sempre contra uma funcionalidade com receita estimada. Argumentada em custo mensal e risco, ganha com frequência. A tradução faz-se com três termos: quanto custa hoje viver com ela, quanto custa pagá-la, e o que acontece se o custo continuar a crescer.</p>
+
+<div class="formula">custo_mensal ≈ alterações_por_mês × sobrecusto_por_alteração + incidentes_por_mês × custo_médio_do_incidente</div>
+
+<p>Um exemplo com números que se defendem numa sala: o módulo de facturação recebe 12 alterações por mês; cada uma leva em média 3 dias em vez de 1 por causa do acoplamento e da ausência de testes, o que dá 24 dias-pessoa perdidos por mês. A esse valor somam-se dois incidentes por trimestre naquele módulo, cada um com 4 horas de dois engenheiros mais o custo de suporte. Contra isso, a estimativa de pagamento: 20 dias-pessoa para pôr o módulo sob testes de caracterização e extrair os três casos de uso. O retorno é inferior a um mês — e é essa a frase que um gestor consegue repetir na reunião seguinte, ao contrário de «temos dívida técnica».</p>
+
+<p>Escolher onde investir faz-se com dados, não com desagrado. O critério mais fiável é o cruzamento de <em>churn</em> com complexidade: ficheiros muito alterados <em>e</em> complexos são onde o custo se materializa; ficheiros complexos que ninguém toca há dois anos são museu, não dívida. Os quatro indicadores DORA — frequência de entrega, tempo de <em>lead</em> da alteração, taxa de falha de alteração e tempo de reposição — dão o efeito agregado e são a linguagem que a gestão já reconhece.</p>
+
+<figure class="listing shell" id="lst-18-8"><div class="lhead"><span class="lnum">Listagem 18.8</span>
+<span class="lcap">Os ficheiros mais alterados nos últimos 12 meses: o eixo de <em>churn</em> do mapa de <em>hotspots</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># churn: número de commits que tocaram cada ficheiro no último ano
+git log --since=&quot;12 months ago&quot; --format=&quot;&quot; --name-only -- &quot;*.java&quot; \
+  | grep -v &quot;^$&quot; | sort | uniq -c | sort -rn | head -20
+
+# complexidade aproximada por linhas (cruzar as duas listas manualmente,
+# ou usar uma ferramenta de hotspots que já faz o produto churn x complexidade)
+git ls-files &quot;*.java&quot; | xargs wc -l | sort -rn | head -20
+
+# quem tem contexto sobre o ficheiro mais quente (para a conversa de 15 minutos)
+git shortlog -sne --since=&quot;12 months ago&quot; -- src/main/java/.../BillingService.java</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 18.2</span> Grelha de priorização de dívida: o que se leva a uma conversa com o gestor de produto.</div>
+<div class="tscroll"><table><thead><tr><th>Item</th><th>Custo mensal actual</th><th>Custo de pagar</th><th>Risco se nada for feito</th><th>Decisão</th></tr></thead><tbody>
+<tr><td>Facturação sem testes (12 alterações/mês)</td><td>24 dias-pessoa</td><td>20 dias-pessoa</td><td>Cresce com cada regra fiscal nova</td><td>Fazer já, em 3 fatias</td></tr>
+<tr><td>Spring Boot 2.7 fora de suporte</td><td>0 hoje</td><td>15 dias-pessoa</td><td>CVE sem correcção disponível</td><td>Fazer já, é risco e não custo</td></tr>
+<tr><td>Duplicação em 3 <em>mappers</em></td><td>~1 dia-pessoa</td><td>4 dias-pessoa</td><td>Baixo, estável há 18 meses</td><td>Regra do escuteiro, sem projecto</td></tr>
+<tr><td>Módulo legado de relatórios</td><td>0,5 dia-pessoa</td><td>30 dias-pessoa</td><td>Nenhum; sai do produto em 2027</td><td>Não fazer, documentar decisão</td></tr>
+</tbody></table></div></div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Pedir «um <em>sprint</em> de dívida técnica» é a forma mais eficaz de nunca mais o receber: concentra o custo num bloco visível, produz um PR gigante impossível de rever, e no <em>sprint</em> seguinte a pressão de entrega volta ao mesmo sítio. O que se sustenta durante um ano é um orçamento contínuo — 15 a 20% da capacidade, decidido pela equipa, gasto nos <em>hotspots</em> que a semana já obrigou a tocar — mais a regra de que qualquer funcionalidade nova naquele módulo paga a fatia de dívida que atravessa. A excepção legítima ao orçamento contínuo é a actualização de plataforma com fim de suporte marcado: essa tem data externa e trata-se como projecto, com estimativa e responsável.</p></aside>
+
+<div class="qa" id="q-18-9" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Convença-me, como gestor de produto com uma data de lançamento em seis semanas, a dar-lhe capacidade de equipa para dívida técnica.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não se pede capacidade para «dívida técnica»: pede-se para reduzir o custo de entregar aquilo que o gestor já quer entregar. A conversa começa pelo objectivo dele, não pelo código.</p>
+      <p>A estrutura tem quatro tempos. Primeiro, o custo actual em unidades que ele controla: «as últimas seis alterações no módulo de preços levaram 3 dias em média; duas voltaram atrás com defeito em produção; a estimativa de seis semanas que acabámos de dar tem 1,5 semanas dentro que são só o custo deste módulo». Segundo, a proposta com dimensão e limite: 20 dias-pessoa, em três fatias de uma semana, intercaladas com as funcionalidades — não um bloco. Terceiro, o retorno medido com um indicador que já existe: tempo de <em>lead</em> daquele módulo, ou número de reversões, comparado antes e depois. Quarto, a alternativa honesta: se não houver capacidade agora, o que se faz é limitar o alcance às duas regiões que a nova funcionalidade toca, e regista-se a decisão com a data em que se revê.</p>
+      <p>O erro que custa a conversa é apresentar a dívida como questão de qualidade abstracta ou de orgulho profissional. O gestor não recusa qualidade — recusa um pedido sem número, sem fim definido e sem forma de verificar que resultou. Um pedido de três semanas «para arrumar o código» é indistinguível de risco puro do lado dele.</p>
+      <p>A alavanca mais forte, quando existe, é ligar a dívida a um incidente recente com impacto visível para o cliente: «o incidente de 12 de Agosto, 40 minutos de pagamentos em falha, veio de uma alteração neste módulo que nenhum teste apanhou». Um facto desses vale mais do que qualquer métrica agregada, e vale a pena guardá-lo para a conversa em que é preciso.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Argumenta com qualidade, limpeza e boas práticas; sem números e sem fim definido.</td></tr>
+        <tr><td>Mid</td><td>Traz um exemplo de lentidão mas não quantifica nem propõe fatias com limite.</td></tr>
+        <tr><td>Sénior</td><td>Custo actual em dias, proposta dimensionada e fatiada, indicador de verificação, alternativa se a resposta for não.</td></tr>
+        <tr><td>Staff</td><td>Liga a dívida a resultados de negócio e a incidentes concretos, negoceia um orçamento permanente e regista a decisão de não fazer.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se eu disser que não? O que faz na semana seguinte?»</li>
+      <li>«Como me prova, três meses depois, que valeu a pena?»</li>
+      <li>«De onde vêm esses 3 dias por alteração — mediu ou estimou?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Fazer a limpeza em segredo, sem acordo, e chamar-lhe estimativa inflacionada.</li>
+      <li>Ameaçar com catástrofe sem probabilidade nem impacto quantificados.</li>
+      <li>Não aceitar um «não» com registo e data de revisão.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-18-10" data-box="qa" data-area="design" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Que métricas de saúde de código seguiria numa equipa de oito pessoas, e quais recusaria seguir mesmo que a direcção as peça?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Seguem-se métricas de efeito, não de esforço. As quatro que valem a pena são os indicadores DORA — frequência de entrega, tempo de <em>lead</em> da alteração, taxa de falha de alteração e tempo de reposição — porque medem o que a dívida técnica realmente estraga: a velocidade e a fiabilidade com que a equipa muda o sistema. A elas junto três locais: tempo de <em>build</em> e de execução da bateria de testes (acima de 10 minutos, as pessoas deixam de a correr localmente), percentagem de testes intermitentes (acima de 1% destrói a confiança na bateria inteira), e a lista dos dez <em>hotspots</em> por <em>churn</em> × complexidade, revista todos os trimestres.</p>
+      <p>Recuso três, mesmo pedidas. Linhas de código escritas ou <em>commits</em> por pessoa: mede-se produção de texto e incentiva-se exactamente o contrário do que se quer. Cobertura de testes como alvo contratual: 80% imposto produz testes sem asserções e testes de <em>getters</em>; a cobertura é útil como sinal de alerta (uma região crítica com 20% merece uma conversa), nunca como objectivo. E qualquer métrica individual comparada entre pessoas — número de comentários de revisão, defeitos atribuídos — porque converte a revisão de código num sistema de pontos e mata a colaboração em menos de um trimestre.</p>
+      <p>O princípio por trás é a lei de Goodhart: quando uma medida se torna alvo, deixa de ser boa medida. A protecção prática é seguir métricas ao nível da equipa e do sistema, nunca da pessoa, e emparelhar sempre duas que se opõem — velocidade de entrega com taxa de falha, para que optimizar uma à custa da outra fique visível.</p></div>
+      <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe cobertura de testes e número de <em>bugs</em> como métricas principais, sem crítica.</td></tr>
+        <tr><td>Mid</td><td>Conhece os indicadores DORA mas não explica que efeito medem nem como se manipulam.</td></tr>
+        <tr><td>Sénior</td><td>Métricas de efeito ao nível da equipa, com limiares concretos, e recusa fundamentada das métricas individuais.</td></tr>
+        <tr><td>Staff</td><td>Emparelha métricas opostas, invoca a lei de Goodhart com exemplo concreto, e define a cadência de revisão e quem age sobre cada indicador.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a direcção insistir em cobertura de 80%?»</li>
+      <li>«Como mede o tempo de <em>lead</em> sem instrumentar tudo?»</li>
+      <li>«Que faz quando a taxa de testes intermitentes chega a 5%?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Aceitar qualquer métrica pedida sem discutir o comportamento que induz.</li>
+      <li>Medir pessoas em vez de sistema e processo.</li>
+      <li>Recolher métricas que ninguém revê nem usa para decidir.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-18-6" class="h2"><span class="secnum">18.6</span> Resumo e checklist<a class="anchor" href="#sec-18-6" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, por ordem de valor numa entrevista de <em>code review</em> e refactoring:</p>
+
+<ul class="lst">
+  <li>A ronda de revisão avalia a ordem por severidade e a decisão final, não a contagem de defeitos: cinco defeitos bem priorizados valem mais do que oito soltos.</li>
+  <li>A sequência de leitura é fixa: acesso concorrente e integridade de dados, segurança, recursos, desempenho super-linear, erros e observabilidade, desenho, estilo. Estilo automatiza-se, não se comenta.</li>
+  <li>Cada comentário tem severidade explícita, mecanismo, efeito observável em produção e sugestão concreta; um comentário que se repete duas vezes vira regra automática no <em>pipeline</em>.</li>
+  <li>Em código desconhecido: esquema da base de dados primeiro, um ponto de entrada, o fluxo até ao SQL, e <code>git log</code> para saber onde vive o risco.</li>
+  <li>Refactoring sem testes de caracterização é aposta. A asserção vem da execução do código actual, defeitos incluídos; a rede valida-se com teste de mutação, não com cobertura de linhas.</li>
+  <li>Alteração de comportamento e refactoring nunca vão no mesmo <em>commit</em>; a criação de <em>seams</em> é um <em>commit</em> próprio, sem lógica alterada.</li>
+  <li>Reescrever de raiz só ganha em condições verificáveis (sistema inexecutável, plataforma sem suporte, domínio mudado, dimensão pequena); a opção por omissão é o <em>strangler fig</em> com fatias e interruptor de retorno.</li>
+  <li>Dívida técnica argumenta-se em dias-pessoa por mês e risco, com proposta fatiada, indicador de verificação e alternativa se a resposta for não. Orçamento contínuo de 15 a 20% sustenta-se; <em>sprint</em> de limpeza não.</li>
+  <li>Métricas ao nível da equipa e emparelhadas (velocidade com taxa de falha); nunca métricas por pessoa nem cobertura como alvo contratual.</li>
+</ul>
+
+<p>Checklist accionável antes da ronda de revisão e refactoring:</p>
+
+<ul class="lst">
+  <li>Treinar a leitura de um excerto de 100 linhas em 10 minutos, dizendo em voz alta o que se procura e por que ordem.</li>
+  <li>Ter a lista de bloqueantes decorada: corrupção de dados, segurança, acesso concorrente, fuga de recursos, ausência de teste para lógica nova.</li>
+  <li>Preparar três frases de comentário-modelo com a estrutura severidade + mecanismo + efeito + sugestão, prontas a adaptar.</li>
+  <li>Saber escrever, sem consultar nada, um teste de caracterização parametrizado em JUnit 5 com <code>@MethodSource</code> e valores de fronteira.</li>
+  <li>Saber criar os três tipos de <em>seam</em> (objecto, parâmetro, construtor) e injectar um <code>Clock</code> para o tempo.</li>
+  <li>Levar dois números do sistema actual: custo em dias por alteração num módulo com dívida e resultado medido depois de o pagar.</li>
+  <li>Ter uma história de <em>strangler fig</em> com fatias, critério de desligar o antigo e o que correu mal a meio.</li>
+  <li>Ter uma história de desacordo em revisão resolvido com evidência, e uma em que o candidato mudou de opinião.</li>
+  <li>Verificar antes de bloquear: o defeito apontado é regressão deste PR ou dívida pré-existente? A resposta muda a decisão e é sinal de senioridade.</li>
+</ul>

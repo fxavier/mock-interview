@@ -1,0 +1,51 @@
+{"chapter": 7, "questions": [
+  {"q": "Um serviço tem `private volatile int[] contadores = new int[16];` e várias threads executam `contadores[i]++`. Que garantia existe?",
+   "options": [
+     "Cada `contadores[i]++` é atómico, porque o array é volátil.",
+     "Os incrementos podem perder-se: `volatile` aplica-se à referência do array, não aos elementos, e `++` nunca é atómico.",
+     "As escritas são visíveis e atómicas desde que só uma thread escreva em cada índice diferente.",
+     "É seguro porque `int` cabe numa palavra e a JVM garante atomicidade de escritas de 32 bits."
+   ],
+   "answer": 1,
+   "explain": "`volatile` numa referência de array torna volátil apenas a leitura e escrita da própria referência; os elementos são acedidos como campos normais, sem visibilidade nem barreira. Além disso `++` é ler-somar-escrever, três operações. A opção sobre atomicidade de 32 bits confunde ausência de tearing com atomicidade de operação composta. A solução é `AtomicIntegerArray` ou `LongAdder` por posição."},
+
+  {"q": "Configurou `new ThreadPoolExecutor(4, 64, 60L, SECONDS, new LinkedBlockingQueue<>(), new AbortPolicy())` e o serviço recebe 800 pedidos/s de 200 ms. O que observa em produção?",
+   "options": [
+     "O pool cresce até 64 threads e depois começa a rejeitar tarefas com `RejectedExecutionException`.",
+     "O pool fica em 4 threads, a fila cresce sem limite, a latência dispara e acaba em `OutOfMemoryError`; a política de rejeição nunca é aplicada.",
+     "O pool cresce até 64 threads e a fila mantém-se vazia porque as threads consomem mais depressa do que a fila enche.",
+     "O `keepAliveTime` de 60 s faz o pool oscilar entre 4 e 64 threads conforme a carga."
+   ],
+   "answer": 1,
+   "explain": "O `ThreadPoolExecutor` só cria threads acima de `corePoolSize` quando a fila recusa a tarefa. Com uma `LinkedBlockingQueue` sem capacidade a fila nunca recusa, logo `maximumPoolSize` e a política de rejeição ficam inertes. Pela lei de Little seriam precisos 160 pedidos em curso e há 4 threads: a fila cresce indefinidamente. A correcção é uma fila limitada, que reactiva o crescimento do pool e a rejeição."},
+
+  {"q": "Num `ConcurrentHashMap<String, List<Evento>>` partilhado, qual destas linhas está correcta sob concorrência?",
+   "options": [
+     "`if (!m.containsKey(k)) m.put(k, new ArrayList<>()); m.get(k).add(e);`",
+     "`List<Evento> l = m.get(k); if (l == null) { l = new ArrayList<>(); m.put(k, l); } l.add(e);`",
+     "`m.computeIfAbsent(k, x -> Collections.synchronizedList(new ArrayList<>())).add(e);`",
+     "`m.putIfAbsent(k, new ArrayList<>()); m.get(k).add(e);`"
+   ],
+   "answer": 2,
+   "explain": "As duas primeiras são check-then-act: duas threads podem criar listas diferentes e uma perde as suas escritas. A quarta cria a lista de forma atómica, mas o `add` continua a correr sobre um `ArrayList` não sincronizado, partilhado por várias threads, que pode corromper-se ao crescer. Só a terceira combina criação atómica com uma lista segura para escrita concorrente."},
+
+  {"q": "`CompletableFuture<Preco> f = catalogo.lerAsync(id).thenApply(a -> precos.consultarAsync(a));` — o que está errado?",
+   "options": [
+     "Nada: `thenApply` achata automaticamente o futuro devolvido pela função.",
+     "`thenApply` devolve `CompletableFuture<CompletableFuture<Preco>>`; é preciso `thenCompose` para achatar o resultado.",
+     "Falta `thenApplyAsync`, sem o qual a função nunca é executada.",
+     "`thenApply` bloqueia a thread chamadora até `lerAsync` completar."
+   ],
+   "answer": 1,
+   "explain": "`thenApply` é o `map` desta API: embrulha o que a função devolver, e como a função devolve um `CompletableFuture`, o resultado é um futuro dentro de um futuro. `thenCompose` é o `flatMap` e resolve isso. `thenApply` sem `Async` não bloqueia — executa na thread que completou o futuro anterior, ou na chamadora se ele já estiver completo."},
+
+  {"q": "Num serviço com um pool fixo de 200 threads, o contexto de tenant é guardado num `ThreadLocal` com `set()` no início de cada pedido. Porque é que a heap cresce indefinidamente?",
+   "options": [
+     "Porque o `ThreadLocal` é `static` e a JVM nunca liberta campos estáticos.",
+     "Porque as chaves do `ThreadLocalMap` são referências fortes e impedem a recolha do objecto `ThreadLocal`.",
+     "Porque os valores são referenciados fortemente pela thread e as threads do pool nunca morrem; falta `remove()` num `finally`.",
+     "Porque o `set()` acumula uma entrada nova por pedido no `ThreadLocalMap` de cada thread."
+   ],
+   "answer": 2,
+   "explain": "As chaves do `ThreadLocalMap` são referências fracas, mas os valores são fortes e vivem enquanto a thread viver — e as threads de um pool vivem tanto quanto o processo. Cada `set()` substitui a entrada anterior, por isso não há acumulação de entradas: o que fica retido é o último valor por thread, 200 contextos que o GC não pode recolher. A correcção é `remove()` num `finally`, no mesmo âmbito do `set()`."}
+]}

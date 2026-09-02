@@ -1,0 +1,940 @@
+<p>Observabilidade é a ronda em que o entrevistador descobre se o candidato já esteve de plantão. Toda a gente sabe recitar «métricas, logs e traços»; poucos sabem dizer quanto custa uma etiqueta nova num histograma, porque é que a média de latência não serve para nada, ou o que fazem nos primeiros noventa segundos de um alerta às três da manhã. O sinal que se procura é procedimento: uma sequência de hipóteses ordenada por probabilidade e por custo de verificação, com um comando ou uma <em>query</em> concreta em cada passo, e a disciplina de mitigar antes de compreender. Este capítulo cobre o que instrumentar num serviço Java, como desenhar SLO e alertas que não geram ruído, como se lê um <em>thread dump</em>, como se perfila uma JVM em produção sem a parar, e como se conduz e se escreve um incidente.</p>
+
+<h2 id="sec-34-1" class="h2"><span class="secnum">34.1</span> Os três sinais e o que instrumentar num serviço Java<a class="anchor" href="#sec-34-1" aria-label="ligação">#</a></h2>
+
+<p>Os três sinais respondem a perguntas diferentes e têm custos que diferem em duas ordens de grandeza. Uma métrica responde a «está mau?» — é uma série temporal agregada, barata de guardar (alguns bytes por ponto por série) e barata de consultar em segundos sobre semanas de histórico, mas não sabe nada sobre o pedido individual. Um traço responde a «onde, dentro do pedido?» — mostra a árvore de chamadas com tempos por salto, custa uns 2 a 5 KB por pedido amostrado e só é útil se o contexto se propagar entre serviços. Um log responde a «o que aconteceu exactamente a este pedido?» — é o mais caro por unidade de informação (0,5 a 2 KB por linha, indexado) e o único que carrega o detalhe do domínio.</p>
+
+<p>A regra de investimento que separa um sénior de um mid é esta: <strong>alerta-se em métricas, navega-se em traços, confirma-se em logs</strong>. Quem tenta alertar a partir de logs paga uma factura de indexação desproporcionada e obtém latência de detecção de minutos; quem tenta diagnosticar latência distribuída só com logs acaba a fazer <em>grep</em> por <em>timestamp</em> em cinco serviços. O caminho correcto é o alerta apontar para um painel, o painel para um <em>exemplar</em> de traço, e o traço para as linhas de log daquele <code>trace_id</code>.</p>
+
+<p>Num serviço Spring Boot 3.5 com Java 25, o mínimo que tem de estar ligado no primeiro dia de produção é: <code>http.server.requests</code> como histograma (não apenas contador), o pool <em>HikariCP</em> (<code>hikaricp_connections_active</code>, <code>_pending</code>, <code>_timeout_total</code>), as métricas de JVM (<code>jvm_gc_pause_seconds</code>, <code>jvm_memory_used_bytes</code>, <code>jvm_threads_live_threads</code>), os clientes de saída (<code>http.client.requests</code>, consumidor e produtor Kafka, latência do Redis), e um <em>health check</em> separado para <em>liveness</em> e <em>readiness</em>. Falta qualquer um destes e há uma classe inteira de incidentes que fica invisível: sem <code>hikaricp_connections_pending</code>, uma saturação de pool aparece como «a aplicação está lenta» e não se distingue de um problema de GC.</p>
+
+<p>Acrescenta-se depois a camada que ninguém instrumenta e que é a que o negócio nota primeiro: métricas de domínio. Pagamentos autorizados por minuto, taxa de recusa por motivo, idade da mensagem mais antiga por partição de Kafka, tamanho da fila de reprocessamento. Um serviço pode ter 200 <em>OK</em> por segundo e estar completamente avariado porque passou a recusar tudo com <code>limite_diario</code>. As métricas técnicas medem o processo; as de domínio medem o resultado.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 34.1</span> Os três sinais: o que cada um responde, o que custa e onde falha.</div>
+<div class="tscroll"><table><thead><tr><th>Sinal</th><th>Responde a</th><th>Custo típico</th><th>Retenção viável</th><th>Falha quando</th></tr></thead><tbody>
+<tr><td>Métrica</td><td>Está mau? Desde quando? Em que instância?</td><td>Bytes por série por ponto; o custo é a cardinalidade, não o volume</td><td>13 meses a granularidade reduzida</td><td>É preciso o pedido individual ou um identificador de alta cardinalidade</td></tr>
+<tr><td>Traço</td><td>Onde se gastou o tempo dentro do pedido, através dos serviços</td><td>2-5 KB por pedido amostrado; 1-5% de amostragem em pico</td><td>7 a 30 dias</td><td>O contexto não se propaga (fila, <em>thread</em> de fundo, cliente sem instrumentação)</td></tr>
+<tr><td>Log</td><td>O que aconteceu exactamente, com dados de domínio</td><td>0,5-2 KB por linha indexada; o item mais caro dos três</td><td>7 a 14 dias quente, arquivo frio depois</td><td>Não é estruturado, não tem <code>trace_id</code>, ou o volume obriga a amostrar o que interessa</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing yaml" id="lst-34-1"><div class="lhead"><span class="lnum">Listagem 34.1</span>
+<span class="lcap">Configuração mínima de observabilidade num serviço Spring Boot 3.5.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,threaddump,heapdump
+  endpoint:
+    health:
+      probes:
+        enabled: true          # /health/liveness e /health/readiness separados
+  metrics:
+    tags:                      # etiquetas comuns a todas as séries deste processo
+      application: pagamentos
+      env: ${ENV}
+      version: ${GIT_SHA}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true      # baldes no servidor: p99 agregável
+      slo:
+        http.server.requests: 50ms,100ms,250ms,500ms,1s
+      maximum-expected-value:
+        http.server.requests: 5s        # limita o número de baldes gerados
+  tracing:
+    sampling:
+      probability: 0.05        # 5% em regime normal; 1.0 em staging
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces</code></pre></figure>
+
+<div class="qa" id="q-34-1" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vai pôr em produção um serviço Spring Boot novo, com tráfego de cerca de 1500 pedidos por segundo. O que instrumenta antes do primeiro deploy e porquê exactamente isso?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Instrumento o que preciso para responder, sem fazer <em>deploy</em>, às quatro perguntas de um plantão: o serviço está a servir? está lento? está a errar? e está a ficar sem recursos? Na prática são quatro camadas.</p>
+      <ul class="lst">
+        <li><strong>RED nas entradas</strong>: <code>http.server.requests</code> como histograma com etiquetas <code>uri</code> (a rota, não o caminho com identificadores), <code>method</code>, <code>status</code> e <code>outcome</code>. Histograma e não <em>timer</em> simples, porque preciso de <code>histogram_quantile</code> agregável entre réplicas.</li>
+        <li><strong>USE nos recursos</strong>: pool de conexões (activas, pendentes, <em>timeouts</em>), <em>heap</em> por geração, pausas de GC, contagem de <em>threads</em>, fila do executor, ficheiros abertos. É aqui que se vê a saturação antes de ela virar latência.</li>
+        <li><strong>RED nas saídas</strong>: uma métrica por dependência — PostgreSQL, Redis, Kafka, cada cliente HTTP externo — com latência e taxa de erro separadas. Sem isto, uma dependência lenta é indistinguível de código lento.</li>
+        <li><strong>Domínio</strong>: 3 a 6 contadores que o negócio reconhece. Autorizações por minuto, recusas por motivo, atraso de consumo por tópico. São os que detectam a avaria silenciosa em que tudo devolve 200.</li>
+      </ul>
+      <p>Além das métricas, três coisas não negociáveis: logs em JSON com <code>trace_id</code> no MDC, <em>tracing</em> OTLP com 5% de amostragem e <em>exemplars</em> a ligar o histograma aos traços, e sondas <em>liveness</em>/<em>readiness</em> distintas — o <em>liveness</em> não pode consultar a base de dados, senão uma degradação do PostgreSQL faz o Kubernetes reiniciar toda a frota e transforma um incidente parcial num total.</p>
+      <p>Com 1500 pedidos por segundo e uma janela de <em>scrape</em> de 15 s, o volume de métricas é irrelevante face à cardinalidade: 20 rotas × 5 estados × 12 baldes de histograma × 6 réplicas dá cerca de 7000 séries, o que qualquer Prometheus digere. O que me tiraria do ar seria pôr o identificador do pagamento como etiqueta.</p>
+      <p>O <em>trade-off</em> é o custo de arranque: cada métrica é código, dinheiro e um painel a manter. Por isso a linha de corte é «existe um alerta ou uma pergunta de plantão que dependa desta série?». Se não existe, não entra no primeiro dia — entra quando um incidente provar que faz falta.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ligo o Actuator e o Prometheus.» Não distingue contador de histograma nem sabe que métricas existem.</td></tr>
+        <tr><td>Mid</td><td>Enumera métricas técnicas (CPU, memória, latência) mas esquece dependências de saída, métricas de domínio e a separação <em>liveness</em>/<em>readiness</em>.</td></tr>
+        <tr><td>Sénior</td><td>Cobre entradas, recursos, saídas e domínio; justifica o histograma pela agregação de percentis; liga logs e traços por <code>trace_id</code>; fala de cardinalidade.</td></tr>
+        <tr><td>Staff</td><td>Parte dos SLO e do plantão para derivar a instrumentação; define o critério de corte de novas métricas; refere <em>exemplars</em>, orçamento de custo e o efeito de um <em>liveness</em> mal desenhado numa falha correlacionada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porquê histograma e não os percentis pré-calculados que o Micrometer também sabe exportar?»</li>
+      <li>«O que põe no <em>liveness</em> e o que põe no <em>readiness</em>?»</li>
+      <li>«Como é que sabe que a instrumentação não está a custar mais do que vale?»</li>
+      <li>«Que métrica de domínio teria apanhado o vosso último incidente mais depressa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Pôr a base de dados na sonda de <em>liveness</em>.</li>
+      <li>Etiquetar métricas com identificadores de utilizador, de pedido ou com o caminho já expandido (<code>/conta/8371</code>).</li>
+      <li>Achar que se pode calcular o p99 global fazendo a média dos p99 das réplicas.</li>
+      <li>Nenhuma métrica de negócio: só existe CPU e memória.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Percentis pré-calculados por instância (<code>percentiles: 0.99</code> no Micrometer) não são agregáveis. Com 6 réplicas obtêm-se 6 números que não se podem somar nem promediar para obter o p99 do serviço — o p99 global pode ser maior do que qualquer um deles. A forma correcta é exportar baldes (<code>percentiles-histogram: true</code>) e calcular com <code>histogram_quantile</code> sobre a soma dos baldes de todas as instâncias.</p></aside>
+
+<div class="qa" id="q-34-2" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa de plataforma diz que o vosso serviço é responsável por 40% do custo do Prometheus. O que é que provavelmente fizeram e como se corrige sem perder capacidade de diagnóstico?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É quase sempre cardinalidade, não volume. O custo de um sistema de métricas escala com o número de séries temporais distintas — o produto cartesiano dos valores de todas as etiquetas — e não com o número de pedidos. Uma série ocupa tipicamente 1 a 3 KB de memória de índice; passar de 10 000 para 2 milhões de séries transforma um Prometheus de 4 GB num de 100 GB e degrada todas as <em>queries</em>, incluindo as dos vizinhos.</p>
+      <p>As três causas por ordem de frequência: (1) o caminho da URI não normalizado, com identificadores dentro (<code>/pagamentos/8371</code> em vez de <code>/pagamentos/{id}</code>), o que cria uma série por entidade; (2) etiquetas com identidade — <code>user_id</code>, <code>order_id</code>, <code>session</code>, <code>host</code> de <em>pods</em> efémeros que rodam a cada <em>deploy</em>; (3) mensagens de excepção ou <code>status</code> livres usados como etiqueta, em que cada nova mensagem cria uma série nova.</p>
+      <p>A correcção tem quatro passos. Primeiro medir: <code>topk(20, count by (__name__)({__name__=~&quot;.+&quot;}))</code> identifica as métricas com mais séries, e <code>count(count by (etiqueta)(metrica))</code> a etiqueta culpada. Segundo, normalizar as rotas e aplicar um <code>MeterFilter</code> que rejeita ou limita etiquetas de alta cardinalidade — o Micrometer tem <code>MeterFilter.maximumAllowableTags</code>, que colapsa o excedente em <code>other</code> e evita que um erro novo derrube o sistema. Terceiro, mover a dimensão que interessa para o sinal certo: o <code>user_id</code> pertence ao log e ao traço, onde é um atributo barato, não à métrica. Quarto, reduzir baldes de histograma — <code>maximum-expected-value</code> e um conjunto explícito de SLO em vez dos baldes por omissão.</p>
+      <p>Não se perde diagnóstico porque a pergunta muda de sinal: a métrica diz «os erros subiram na rota X»; o <em>exemplar</em> anexo ao balde leva a um traço concreto; o traço tem o <code>user_id</code>. A informação continua lá, apenas deixou de ser paga 24 horas por dia por todas as combinações possíveis.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Fala em «reduzir a frequência de recolha» ou «guardar menos tempo»; não menciona cardinalidade.</td></tr>
+        <tr><td>Mid</td><td>Sabe que etiquetas com identificadores são más, mas não sabe medir a cardinalidade nem propor onde a dimensão deve viver.</td></tr>
+        <tr><td>Sénior</td><td>Explica o produto cartesiano, dá o custo por série, identifica as três causas típicas, corrige com <code>MeterFilter</code> e normalização de rotas, e move a dimensão para traços/logs.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta guardas permanentes: limite de séries por serviço no <em>collector</em>, alerta sobre crescimento de cardinalidade, revisão de novas métricas em <em>code review</em>, e o custo por equipa como número visível.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas séries acha aceitável para um serviço deste tamanho?»</li>
+      <li>«E se a equipa precisar mesmo de latência por cliente, com 3000 clientes?»</li>
+      <li>«O que muda se o backend for baseado em <em>push</em> e facturado por ponto ingerido?»</li>
+      <li>«Como impede que isto volte a acontecer no próximo <em>sprint</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir volume de pedidos com custo de métricas.</li>
+      <li>Propor apagar métricas sem saber quais têm alertas ou painéis dependentes.</li>
+      <li>Usar a mensagem de excepção como etiqueta e não ver o problema.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-34-2" class="h2"><span class="secnum">34.2</span> Métricas: RED, USE, percentis e SLO<a class="anchor" href="#sec-34-2" aria-label="ligação">#</a></h2>
+
+<p>RED aplica-se a coisas que servem pedidos: <em>Rate</em> (pedidos por segundo), <em>Errors</em> (fracção que falha) e <em>Duration</em> (distribuição da latência). USE aplica-se a recursos: <em>Utilization</em>, <em>Saturation</em> e <em>Errors</em>. Um serviço Java precisa dos dois — RED nas rotas e nas dependências, USE no pool de conexões, no <em>heap</em>, nas <em>threads</em> e no executor. A confusão comum é medir utilização e chamar-lhe saturação: um pool a 100% de utilização com fila vazia está perfeitamente saudável; o que dói é a fila (<code>hikaricp_connections_pending</code>), porque é ela que se traduz em latência de espera.</p>
+
+<p>A média de latência é inútil por três razões independentes. Primeira, não é robusta: 1% de pedidos a 10 s sobre 99% a 20 ms dá uma média de 120 ms, um número que nenhum utilizador experimenta. Segunda, não é composicional: um pedido que faz 10 chamadas de saída vê, com probabilidade elevada, pelo menos uma cauda — se cada chamada tiver p99 de 100 ms, a probabilidade de o pedido inteiro escapar a todas as caudas é 0,99<sup>10</sup> ≈ 90%, ou seja, o p99 do agregado é dominado pelas caudas das partes. Terceira, é o percentil alto que corresponde a dinheiro: são os pedidos lentos que fazem o utilizador desistir e o cliente reclamar.</p>
+
+<p>Um SLI é a razão entre eventos bons e eventos válidos; um SLO é o alvo dessa razão numa janela; o <em>error budget</em> é o complemento — quanto se pode falhar antes de a promessa ser quebrada. Com um SLO de disponibilidade de 99,9% em 30 dias, o orçamento é de 43,2 minutos de falha; com 99,95%, 21,6 minutos. Este número é a peça que transforma observabilidade em decisão de engenharia: se restam 5% do orçamento a meio do mês, congela-se o que for arriscado; se sobram 90% no dia 28, a equipa está a ser demasiado conservadora e devia estar a lançar mais depressa.</p>
+
+<p>Os alertas devem sair do orçamento, não de limiares fixos. A técnica padrão é o <em>burn rate</em>: a velocidade a que se consome o orçamento em relação ao ritmo que o esgotaria exactamente no fim da janela. Um <em>burn rate</em> de 14,4 durante 1 hora consome 2% do orçamento mensal — merece página imediata; um <em>burn rate</em> de 3 durante 6 horas consome 5% — merece um <em>ticket</em>, não uma chamada às quatro da manhã. Duas janelas por alerta (uma longa para significância, uma curta para deixar de disparar depressa quando o problema passa) eliminam a maior parte do ruído.</p>
+
+<div class="formula">error_budget_restante = 1 − (1 − SLI_observado) / (1 − SLO) &nbsp;&nbsp;·&nbsp;&nbsp; burn_rate = (1 − SLI_janela) / (1 − SLO)</div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Orçamento de erro em 30 dias: 99% → 7,2 h; 99,9% → 43,2 min; 99,95% → 21,6 min; 99,99% → 4,3 min. Um único <em>rolling restart</em> mal feito consome facilmente 2 minutos. Prometer 99,99% a um serviço com dependência síncrona de uma base de dados de instância única é aritmeticamente impossível: a disponibilidade composta de dependências em série é o produto das disponibilidades.</p></aside>
+
+<div class="qa" id="q-34-3" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O painel mostra latência média de 45 ms e a equipa diz que o serviço está rápido. O suporte tem reclamações diárias de lentidão. Explique o que se está a passar e o que mede em vez disso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A média está a esconder a cauda. Distribuições de latência de serviços reais são fortemente assimétricas à direita — o corpo é estreito e há um rasto longo produzido por GC, esperas de pool, <em>cache miss</em>, retentativas e vizinhos barulhentos. Com 45 ms de média é perfeitamente possível ter p99 de 1,8 s: 1% de 1500 pedidos por segundo são 15 utilizadores por segundo com uma experiência péssima, o que dá dezenas de milhares de más experiências por dia — exactamente o volume que chega ao suporte.</p>
+      <p>Mede-se a distribuição: p50 para saber como está o caso típico, p95 e p99 para a cauda, e p99.9 quando o serviço é interno e um pedido do utilizador final abre dezenas de chamadas. O p50 e o p99 contam histórias diferentes e o diagnóstico depende de quais se movem juntos. Se p50 e p99 sobem em conjunto, o problema é sistémico — dependência lenta, saturação de CPU, tabela sem índice. Se o p50 está estável e só o p99 dispara, é fenómeno de cauda: pausas de GC, espera por conexão, retentativa por <em>timeout</em>, uma réplica doente, ou um subconjunto de pedidos com dados patológicos (o cliente com 40 000 linhas no carrinho).</p>
+      <p>Há duas correcções técnicas que um sénior traz. Primeira, medir na fronteira certa: a latência do servidor não inclui fila do <em>load balancer</em>, tempo de rede nem <em>garbage collection</em> antes de o pedido ser aceite — se o utilizador se queixa e o servidor diz 45 ms, é preciso comparar com o p99 do <em>ingress</em>. Segunda, calcular os percentis por agregação de baldes e não pela média dos percentis das réplicas, que é matematicamente inválida.</p>
+      <p>O <em>trade-off</em> dos percentis é a resolução: <code>histogram_quantile</code> interpola dentro do balde, por isso o p99 nunca é mais preciso do que a fronteira de baldes escolhida. Com baldes de 50 ms, 100 ms, 250 ms, 500 ms e 1 s, um p99 real de 700 ms será estimado dentro do intervalo 500 ms a 1 s. Isso é suficiente para alertar e insuficiente para afinar; para afinar usa-se o traço.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«A média é uma boa aproximação» ou propõe olhar para o máximo, que é ruído puro.</td></tr>
+        <tr><td>Mid</td><td>Diz «usar p95/p99» sem explicar o mecanismo da cauda nem o que significa p50 estável com p99 alto.</td></tr>
+        <tr><td>Sénior</td><td>Explica a assimetria, quantifica o impacto de 1%, usa o par p50/p99 como sinal de diagnóstico, e conhece a agregação correcta de baldes.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a amplificação de cauda em <em>fan-out</em>, a medição na fronteira do cliente e não do servidor, e liga a escolha de percentil ao SLO e ao custo do negócio.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O p50 está bom e o p99 mau. Quais são as suas três primeiras hipóteses?»</li>
+      <li>«Porque é que o p99 do serviço A pode ser pior do que o p99 de cada uma das suas cinco dependências?»</li>
+      <li>«Como escolhe as fronteiras de baldes do histograma?»</li>
+      <li>«Quando é que o p99.9 é a métrica certa e quando é ruído?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Promediar percentis entre instâncias ou entre janelas de tempo.</li>
+      <li>Usar o máximo como métrica de alerta.</li>
+      <li>Não distinguir latência vista pelo servidor da vista pelo cliente.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-4" data-box="qa" data-area="obs" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Defina o SLO do serviço de autorização de pagamentos e derive daí os alertas. Quantos alertas quer que o plantão receba por semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo pelo utilizador, não pela infra-estrutura. O SLI é «fracção de pedidos <code>POST /v1/autorizacoes</code> que devolvem resposta não-5xx em menos de 300 ms», medido no <em>ingress</em> e não na aplicação, porque é o que o comerciante experimenta. O SLO é 99,9% em janela deslizante de 30 dias: 43,2 minutos de orçamento. Um segundo SLO de latência separado — p99 abaixo de 300 ms em 99% das janelas de 5 minutos — evita que um serviço lento mas sem erros pareça saudável.</p>
+      <p>Os alertas saem do orçamento por <em>burn rate</em>, com quatro regras e duas severidades:</p>
+      <ul class="lst">
+        <li><em>Burn rate</em> 14,4 sustentado 1 h (com confirmação a 5 min): consome 2% do orçamento — <strong>página</strong>, alguém acorda.</li>
+        <li><em>Burn rate</em> 6 sustentado 6 h (confirmação a 30 min): consome 5% — <strong>página</strong> em horário laboral, <em>ticket</em> fora dele.</li>
+        <li><em>Burn rate</em> 3 sustentado 24 h: consome 10% — <em>ticket</em> para o dono do serviço.</li>
+        <li><em>Burn rate</em> 1 sustentado 3 dias: erosão lenta — item de <em>backlog</em>, revisto na reunião semanal.</li>
+      </ul>
+      <p>Quantos alertas por semana? O alvo é <strong>zero a dois avisos por semana de plantão, e todos accionáveis</strong>. Acima de cinco, a equipa começa a ignorar; é um resultado documentado de fadiga de alertas e transforma um sistema de alarme em ruído de fundo. A métrica de saúde do próprio sistema de alertas é a taxa de alertas que resultaram em acção: abaixo de 60%, há alertas a apagar.</p>
+      <p>O <em>trade-off</em> do SLO baseado em orçamento é a detecção de falhas curtas e catastróficas: uma paragem total de 3 minutos consome 7% do orçamento e pode não disparar a janela longa. Por isso mantenho duas — e só duas — excepções de limiar absoluto: «zero pedidos com sucesso durante 2 minutos» e «taxa de erro acima de 25% durante 2 minutos». Tudo o resto é orçamento. E os alertas sobre causas (CPU alto, <em>heap</em> a 85%, disco a 80%) não paginam ninguém: vão para painel, porque CPU alto com SLO cumprido é uma máquina a trabalhar, não um incidente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde SLA com SLO; propõe alertas em CPU e memória como sinal primário.</td></tr>
+        <tr><td>Mid</td><td>Define um SLO razoável mas alerta com limiar fixo («p99 acima de 300 ms durante 5 min»), sem noção de orçamento nem de ruído.</td></tr>
+        <tr><td>Sénior</td><td>SLI centrado no utilizador e medido na fronteira certa, orçamento quantificado em minutos, alertas por <em>burn rate</em> com múltiplas janelas, distinção sintoma/causa.</td></tr>
+        <tr><td>Staff</td><td>Usa o orçamento como instrumento de decisão (congelar lançamentos, negociar prioridades), define a meta de alertas por semana e a métrica de accionabilidade, e reconhece o buraco das falhas curtas com excepções explícitas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O orçamento esgotou no dia 12. O que muda na prática para a equipa?»</li>
+      <li>«Uma dependência externa causou metade da falha. Conta para o vosso orçamento?»</li>
+      <li>«Como mede o SLI quando o <em>load balancer</em> devolve 502 e a aplicação nunca vê o pedido?»</li>
+      <li>«Porque é que 99,99% pode ser uma promessa irresponsável?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Paginar em causas (CPU, memória) em vez de sintomas visíveis ao utilizador.</li>
+      <li>SLO decidido pela engenharia sem o dono do produto e sem número de negócio por trás.</li>
+      <li>Não ter resposta para «quantos alertas por semana é aceitável?».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-34-3" class="h2"><span class="secnum">34.3</span> Logs estruturados, correlação e custo<a class="anchor" href="#sec-34-3" aria-label="ligação">#</a></h2>
+
+<p>Um log estruturado é um objecto, não uma frase. A linha continua legível por humanos, mas cada campo é indexável e agregável: em vez de <code>log.info("pagamento " + id + " recusado por " + motivo)</code>, emite-se um evento com <code>event=autorizacao_recusada</code>, <code>motivo=limite_diario</code>, <code>valor_cent=128900</code>. A diferença mede-se na velocidade de resposta: com campos, «quantas recusas por motivo na última hora, por cliente» é uma agregação de dois segundos; com <em>string</em> concatenada, é uma expressão regular sobre 400 GB.</p>
+
+<p>A correlação faz-se com três identificadores. O <code>trace_id</code> liga tudo o que aconteceu num pedido através de todos os serviços; o <code>span_id</code> liga ao salto concreto; um identificador de negócio (referência do pagamento, número da encomenda) liga ao que o suporte tem em mãos. Em Java isto passa pelo <em>MDC</em> (<em>Mapped Diagnostic Context</em>), um mapa por <em>thread</em> que o <em>appender</em> serializa em cada linha. O Spring Boot com Micrometer Tracing já coloca <code>traceId</code> e <code>spanId</code> no MDC; o resto é responsabilidade do serviço.</p>
+
+<p>O MDC tem duas armadilhas caras. Primeira: como está associado à <em>thread</em>, tem de ser limpo no fim do pedido — se não for, a <em>thread</em> regressa ao pool do Tomcat com o <code>tenant</code> do pedido anterior e os logs passam a atribuir eventos ao cliente errado, um problema que já produziu incidentes de privacidade. Segunda: em código assíncrono — <code>CompletableFuture</code>, <code>@Async</code>, executores próprios, consumidores Kafka — o contexto não atravessa a fronteira de <em>thread</em> sem ajuda; é preciso um decorador (<code>TaskDecorator</code>, ou os <em>wrappers</em> de contexto do Micrometer) que copie o mapa. Com <em>virtual threads</em> em Java 21 e posteriores o problema muda de forma: cada tarefa tem a sua <em>thread</em>, o vazamento entre pedidos desaparece, mas o MDC clássico continua a não se propagar sozinho para as tarefas filhas.</p>
+
+<figure class="listing json" id="lst-34-2"><div class="lhead"><span class="lnum">Listagem 34.2</span>
+<span class="lcap">Uma linha de log estruturado com contexto de traço e de domínio.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="json"><code>{
+  &quot;@timestamp&quot;: &quot;2026-03-11T14:02:17.418Z&quot;,
+  &quot;level&quot;: &quot;WARN&quot;,
+  &quot;logger&quot;: &quot;pt.acme.pag.AutorizacaoService&quot;,
+  &quot;thread&quot;: &quot;http-nio-8080-exec-42&quot;,
+  &quot;service&quot;: &quot;pagamentos&quot;,
+  &quot;version&quot;: &quot;3.14.2&quot;,
+  &quot;env&quot;: &quot;prod&quot;,
+  &quot;trace_id&quot;: &quot;4bf92f3577b34da6a3ce929d0e0e4736&quot;,
+  &quot;span_id&quot;: &quot;00f067aa0ba902b7&quot;,
+  &quot;tenant&quot;: &quot;PT-0042&quot;,
+  &quot;event&quot;: &quot;autorizacao_recusada&quot;,
+  &quot;motivo&quot;: &quot;limite_diario&quot;,
+  &quot;valor_cent&quot;: 128900,
+  &quot;latencia_ms&quot;: 412,
+  &quot;msg&quot;: &quot;autorizacao recusada por limite diario&quot;
+}</code></pre></figure>
+
+<figure class="listing java" id="lst-34-3"><div class="lhead"><span class="lnum">Listagem 34.3</span>
+<span class="lcap">Filtro que enriquece o MDC e — sobretudo — o limpa no fim.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Component
+public class ContextoLogFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req,
+                                    HttpServletResponse res,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+        SpanContext ctx = Span.current().getSpanContext();
+        MDC.put(&quot;trace_id&quot;, ctx.getTraceId());
+        MDC.put(&quot;span_id&quot;, ctx.getSpanId());
+        String tenant = req.getHeader(&quot;X-Tenant&quot;);
+        if (tenant != null) {
+            MDC.put(&quot;tenant&quot;, tenant);
+        }
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            MDC.clear();   // sem isto, a thread volta ao pool com o tenant anterior
+        }
+    }
+}
+
+// Propagacao para tarefas assincronas: sem o decorador, o MDC nasce vazio na thread do executor.
+@Bean
+TaskDecorator mdcDecorator() {
+    return runnable -&gt; {
+        Map&lt;String, String&gt; ctx = MDC.getCopyOfContextMap();
+        return () -&gt; {
+            if (ctx != null) MDC.setContextMap(ctx);
+            try { runnable.run(); } finally { MDC.clear(); }
+        };
+    };
+}</code></pre></figure>
+
+<div class="qa" id="q-34-5" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um cliente diz que o pagamento <code>PG-99213</code> falhou às 14:02. Descreva, do princípio ao fim, como reconstrói o que aconteceu através de seis serviços.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Procuro pelo identificador de negócio para obter o identificador técnico, e a partir daí a reconstrução é mecânica. Passo 1: <code>event:pagamento_* AND referencia:&quot;PG-99213&quot;</code> na janela 13:55-14:10, o que devolve uma ou duas linhas do serviço de entrada e — o ponto essencial — o <code>trace_id</code>. Passo 2: <code>trace_id:&quot;4bf9...&quot;</code> sem filtro de serviço, ordenado por <em>timestamp</em>; isto dá a narrativa completa através dos seis serviços numa única lista. Passo 3: abrir o mesmo <code>trace_id</code> no <em>backend</em> de <em>tracing</em>, que dá a cascata com a duração de cada salto e o serviço onde o erro nasceu.</p>
+      <p>Isto só funciona se três decisões tiverem sido tomadas antes: o <code>trace_id</code> é propagado em todos os saltos, incluindo os assíncronos, com <code>traceparent</code> do W3C; o identificador de negócio está num campo de log estruturado com o mesmo nome em todos os serviços — a divergência entre <code>paymentId</code>, <code>payment_id</code> e <code>referencia</code> é a razão número um por que esta pesquisa falha; e a amostragem não deitou fora o traço. Um serviço com 5% de amostragem tem 95% de probabilidade de não ter o traço deste pagamento — daí a regra de <strong>amostrar traços, nunca amostrar logs de erro</strong>, e de forçar a amostragem quando o pedido acaba em erro.</p>
+      <p>Quando o traço não existe, o plano B é a correlação por logs: os campos <code>service</code>, <code>trace_id</code> e <code>@timestamp</code> chegam para reconstruir a sequência, e a latência por salto obtém-se pela diferença de <em>timestamps</em> — com a ressalva de que o desvio de relógio entre nós pode ser de dezenas de milissegundos e torna a atribuição de tempos pouco fiável abaixo dessa escala.</p>
+      <p>O que apresento ao suporte não é o <em>dump</em> de logs: é a frase «às 14:02:17 o serviço de limites recusou por <code>limite_diario</code> com valor 1289,00 EUR contra um limite diário de 1000,00 EUR» — o campo estruturado permite dizer isso sem interpretar prosa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Vou aos logs do serviço e faço <em>grep</em>»; não tem forma de atravessar serviços.</td></tr>
+        <tr><td>Mid</td><td>Conhece o <code>trace_id</code> mas não sabe como lá chega a partir de um identificador de negócio, nem o que acontece com amostragem.</td></tr>
+        <tr><td>Sénior</td><td>Negócio → <code>trace_id</code> → traço; exige nomes de campo consistentes e propagação W3C; sabe que os erros não se amostram; tem plano B por <em>timestamps</em>.</td></tr>
+        <tr><td>Staff</td><td>Fala de convenções de nomes impostas por biblioteca partilhada, amostragem condicionada ao erro, desvio de relógio, e do custo de manter esta capacidade viva (testes de correlação em CI).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o salto crítico for uma mensagem Kafka consumida 40 segundos depois?»</li>
+      <li>«Quem garante que os seis serviços usam o mesmo nome de campo?»</li>
+      <li>«O que faz se a amostragem tiver descartado o traço?»</li>
+      <li>«Que dados nunca podem aparecer nestes logs?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não limpar o MDC e não perceber a consequência de vazamento entre pedidos.</li>
+      <li>Registar PAN de cartão, credenciais ou dados pessoais completos «para facilitar o <em>debug</em>».</li>
+      <li>Assumir que o contexto atravessa sozinho <code>@Async</code>, filas e <em>thread pools</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-6" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A factura da plataforma de logs triplicou em dois meses e a direcção pediu um corte de 60%. O que corta e o que se recusa a cortar?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro meço antes de cortar: volume por serviço, por nível e por <em>logger</em>. Em quase todos os casos que vi, 3 a 5 <em>loggers</em> produzem mais de metade do volume, e são quase sempre <code>DEBUG</code> deixado ligado, o registo de <em>payloads</em> HTTP completos, ou uma linha por iteração dentro de um ciclo em processamento por lotes.</p>
+      <p>A ordem de corte, do mais barato ao mais doloroso: (1) desligar <code>DEBUG</code> em produção e garantir que só se liga por serviço, temporariamente, com alteração dinâmica de nível via Actuator; (2) eliminar <em>payloads</em> completos — guarda-se o tamanho, o <em>hash</em> e os 3 campos que interessam, não o corpo com 8 KB; (3) amostrar as linhas de rotina de alto volume — uma em 100 dos <code>INFO</code> de sucesso mantém a estatística e corta 99% do volume dessa família; (4) reduzir retenção quente de 30 para 7 ou 14 dias e mandar o resto para armazenamento de objectos, onde o mesmo gigabyte custa uma ordem de grandeza menos; (5) mover contagens que estão a ser derivadas de logs para métricas, que é onde deviam estar desde o início.</p>
+      <p>O que não se corta, em nenhuma circunstância: <code>WARN</code> e <code>ERROR</code>, tudo o que tem valor de auditoria ou obrigação legal, os eventos de domínio que sustentam SLI, e os logs dos caminhos de mutação de dados. Amostrar erros é a decisão que se paga no incidente seguinte, quando o único traço da causa está exactamente na linha descartada.</p>
+      <p>O <em>trade-off</em> honesto: reduzir retenção quente e amostrar rotina aumenta o tempo médio de diagnóstico de incidentes antigos e raros. A troca aceita-se porque a maioria dos diagnósticos usa as últimas 24 horas, e porque o dinheiro poupado é real e imediato. O que se protege é a capacidade de responder a incidentes recentes e a auditorias — não a capacidade de fazer arqueologia sobre um <code>INFO</code> de há cinco semanas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Baixamos tudo para <code>ERROR</code>» ou «reduzimos a retenção para 2 dias», sem medir nem distinguir famílias de logs.</td></tr>
+        <tr><td>Mid</td><td>Propõe desligar <code>DEBUG</code> e reduzir retenção; não pensa em amostragem selectiva nem em mover para métricas.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, corta por famílias, amostra rotina e nunca erros, move agregações para métricas, separa quente de arquivo, e declara explicitamente o que perde.</td></tr>
+        <tr><td>Staff</td><td>Institui um orçamento de logs por serviço com visibilidade por equipa, define política de níveis e de <em>payloads</em> em biblioteca partilhada, e negoceia a retenção com requisitos legais e de auditoria em mãos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como amostra logs mantendo todas as linhas dos pedidos que falharam?»</li>
+      <li>«Que obrigações legais podem impedir a redução de retenção?»</li>
+      <li>«Como muda o nível de <em>log</em> de um serviço em produção sem <em>deploy</em>?»</li>
+      <li>«Quanto custa, por GB, guardar quente contra arquivo frio?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Amostrar ou descartar <code>ERROR</code>.</li>
+      <li>Cortar sem medir quem produz o volume.</li>
+      <li>Ignorar requisitos de auditoria e depois descobri-los durante uma inspecção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-34-4" class="h2"><span class="secnum">34.4</span> Tracing distribuído com OpenTelemetry<a class="anchor" href="#sec-34-4" aria-label="ligação">#</a></h2>
+
+<p>Um traço é uma árvore de <em>spans</em>. Cada <em>span</em> tem nome, instante de início e fim, atributos, eventos, estado e um pai; o conjunto partilha um <code>trace_id</code> de 16 bytes. A propagação entre processos faz-se por cabeçalho <code>traceparent</code> do W3C — versão, <code>trace_id</code>, <code>span_id</code> do pai e <em>flags</em>, onde o bit de amostragem viaja com o pedido. Dentro do processo, o contexto vive numa variável de escopo associada à <em>thread</em>, com as mesmas fronteiras assíncronas que afectam o MDC.</p>
+
+<p>Em Java há dois modos de instrumentação e a resposta correcta é usar os dois. O agente Java (<code>-javaagent:opentelemetry-javaagent.jar</code>) instrumenta automaticamente dezenas de bibliotecas — servlets, WebClient, JDBC, Kafka, Redis — sem tocar no código, e dá logo a espinha dorsal do traço com custo de 3 a 10% de CPU e alguns segundos de arranque. A instrumentação manual acrescenta o que o agente não pode saber: os limites de operações de domínio e os atributos de negócio. Um traço só com <em>spans</em> automáticos diz que a chamada JDBC demorou 400 ms; um traço com <em>spans</em> manuais diz que a operação <code>liquidacao.executar</code> demorou 400 ms para o método <code>SEPA</code> com valor acima do limite de revisão.</p>
+
+<p>Os atributos são onde a alta cardinalidade é bem-vinda: <code>tenant</code>, <code>payment.id</code>, <code>user.id</code> não custam nada num traço amostrado e são inutilizáveis numa métrica. É esta assimetria que dita a divisão de trabalho entre sinais — e é a resposta correcta a metade das perguntas de observabilidade em entrevista.</p>
+
+<figure class="listing java" id="lst-34-4"><div class="lhead"><span class="lnum">Listagem 34.4</span>
+<span class="lcap">Span manual com atributos de domínio e registo correcto de excepção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>private static final Tracer TRACER =
+        GlobalOpenTelemetry.getTracer(&quot;pt.acme.pagamentos&quot;, &quot;3.14.2&quot;);
+
+public Recibo liquidar(Pagamento p) {
+    Span span = TRACER.spanBuilder(&quot;liquidacao.executar&quot;)
+            .setSpanKind(SpanKind.INTERNAL)
+            .setAttribute(&quot;pagamento.metodo&quot;, p.metodo())      // SEPA, CARTAO, MBWAY
+            .setAttribute(&quot;pagamento.valor_cent&quot;, p.valorCent())
+            .setAttribute(&quot;tenant&quot;, p.tenant())                // alta cardinalidade: OK no traco
+            .startSpan();
+    try (Scope ignorado = span.makeCurrent()) {
+        Recibo r = motor.executar(p);
+        span.setAttribute(&quot;liquidacao.resultado&quot;, r.estado().name());
+        return r;
+    } catch (RuntimeException e) {
+        span.recordException(e);
+        span.setStatus(StatusCode.ERROR, e.getClass().getSimpleName());
+        throw e;                       // marcar o span nao substitui propagar o erro
+    } finally {
+        span.end();                    // sem end(), o span nunca e exportado
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-34-7" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O traço mostra o serviço de entrada e o de pagamentos, mas o consumidor Kafka que faz a liquidação aparece sempre como um traço isolado. Porquê e como se corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o contexto não atravessou a fila. Numa chamada HTTP o contexto viaja no cabeçalho <code>traceparent</code>; numa mensagem Kafka tem de viajar nos <em>headers</em> do registo, e alguém tem de o injectar na produção e extrair no consumo. Se o produtor não injecta, o consumidor arranca um traço novo — tecnicamente correcto, operacionalmente inútil.</p>
+      <p>A correcção tem três partes. Primeira, injecção no produtor: o agente OpenTelemetry faz isto automaticamente para <code>KafkaTemplate</code>, mas deixa de funcionar quando a mensagem é construída numa <em>thread</em> sem contexto activo — o caso típico é o padrão <em>outbox</em>, em que a mensagem é publicada mais tarde por um <em>scheduler</em>. Nesse caso o <code>traceparent</code> tem de ser persistido na linha da <em>outbox</em> e reinjectado na publicação. Segunda, extracção no consumidor, com o cuidado de escolher a relação certa: para processamento assíncrono a ligação correcta é frequentemente um <em>span link</em> e não uma relação pai-filho, porque um consumo em lote de 500 mensagens tem 500 pais distintos e uma cascata de pai único mentiria sobre a duração.</p>
+      <p>Terceira, a decisão de amostragem: o bit de amostragem viaja no contexto, por isso um traço amostrado a montante mantém-se amostrado a jusante. Se o produtor descartou, o consumidor não pode recuperar. Em pipelines assíncronos com processamento diferido, é comum forçar amostragem 100% no caminho de erro e manter 1 a 5% no caminho feliz.</p>
+      <p>O <em>trade-off</em>: manter a árvore ligada através de filas custa <em>headers</em> por mensagem (cerca de 60 bytes) e disciplina de código; em contrapartida, transforma «o pagamento ficou pendente» de uma investigação de meia hora em três cliques. Quando a latência entre produção e consumo é de minutos ou horas, o traço deixa de ser a ferramenta certa para medir duração e passa a ser apenas o fio de causalidade — a duração mede-se por uma métrica de idade da mensagem.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe como o contexto se propaga; sugere passar o <code>trace_id</code> no corpo da mensagem e reconstruir à mão.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há <em>headers</em> de Kafka e que o agente instrumenta, mas não distingue <em>span link</em> de pai-filho nem pensa no lote.</td></tr>
+        <tr><td>Sénior</td><td>Explica injecção/extracção, o caso da <em>outbox</em>, o uso de <em>links</em> em consumo em lote e a herança do bit de amostragem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o limite do modelo (traços não medem bem esperas de horas), a política de amostragem forçada em erros e o custo por mensagem; propõe verificação automática de propagação em testes de integração.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como propaga o contexto num padrão <em>outbox</em> com publicação diferida?»</li>
+      <li>«O que muda com <em>virtual threads</em> e com <code>ScopedValue</code>?»</li>
+      <li>«Quanto custa o agente OpenTelemetry em CPU e em tempo de arranque?»</li>
+      <li>«Como testa, em CI, que a propagação não se partiu?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que instalar o agente basta e que o resto acontece por magia.</li>
+      <li>Criar um <em>span</em> por iteração de ciclo e gerar traços com 50 000 <em>spans</em>.</li>
+      <li>Esquecer <code>span.end()</code> em <code>finally</code>, deixando <em>spans</em> nunca exportados e memória a crescer.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-8" data-box="qa" data-area="obs" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Com 1500 pedidos por segundo não conseguem guardar todos os traços. Que estratégia de amostragem escolhe e o que perde com ela?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Há duas famílias. Na amostragem à cabeça (<em>head sampling</em>), a decisão é tomada no primeiro serviço, antes de se saber o que vai acontecer, e viaja no contexto: é barata, determinística e não exige memória, mas descarta cegamente — dos 5% guardados, a esmagadora maioria são pedidos normais e os interessantes perdem-se. Na amostragem à cauda (<em>tail sampling</em>), o <em>collector</em> retém os <em>spans</em> em memória até o traço fechar e só então decide, com regras como «guardar todos os que têm erro, todos os que passam de 1 s, e 2% do resto». Guarda o que interessa, mas precisa de memória proporcional ao produto do débito pela janela de espera (a 1500 pedidos por segundo e 30 s de janela, dezenas de milhares de traços em <em>buffer</em>) e obriga a que todos os <em>spans</em> do mesmo traço cheguem ao mesmo nó do <em>collector</em>, o que se resolve com encaminhamento por <code>trace_id</code>.</p>
+      <p>A escolha prática para um serviço deste tamanho é híbrida: <em>head sampling</em> a 100% nos serviços de entrada de baixo volume e a 5-10% no caminho quente, mais <em>tail sampling</em> no <em>collector</em> com política por categoria — 100% de erros, 100% acima do p99 do SLO, 100% de um conjunto de clientes marcados, 1-2% do tráfego normal. Com isto, o volume exportado fica na ordem de 3 a 5% dos traços e cobre praticamente todos os casos de diagnóstico.</p>
+      <p>O que se perde é a estatística: com amostragem enviesada para os lentos e para os erros, os traços deixam de ser uma amostra representativa e não se pode calcular o p50 a partir deles. Por isso os percentis vêm sempre das métricas — que vêem 100% dos pedidos — e os traços servem só para explicar casos individuais. Confundir os dois papéis leva a conclusões erradas do tipo «o traço médio mostra 800 ms», quando isso é apenas a consequência de se ter guardado os lentos de propósito.</p>
+      <p>O terceiro elemento é o custo: cada traço exportado custa 2 a 5 KB e a factura de ingestão é linear no volume. Descer de 100% para 5% num serviço com 1500 pedidos por segundo passa de cerca de 6 MB/s para 300 KB/s — a diferença entre um orçamento incomportável e um trivial.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Guardamos 10%» sem distinguir cabeça de cauda nem pensar em erros.</td></tr>
+        <tr><td>Mid</td><td>Conhece as duas famílias mas não conhece os custos de memória do <em>tail sampling</em> nem a necessidade de encaminhar por <code>trace_id</code>.</td></tr>
+        <tr><td>Sénior</td><td>Propõe híbrido com política por categoria, quantifica o volume poupado, e sabe que a decisão viaja no contexto.</td></tr>
+        <tr><td>Staff</td><td>Explicita que a amostragem enviesada invalida estatística a partir de traços, separa os papéis de métrica e traço, e dimensiona a memória do <em>collector</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como garante que todos os <em>spans</em> de um traço chegam ao mesmo <em>collector</em>?»</li>
+      <li>«Um serviço a jusante quer 100% de amostragem. Consegue, se o de entrada decidiu descartar?»</li>
+      <li>«Como estima a memória necessária no <em>collector</em>?»</li>
+      <li>«Porque não calcula o p99 a partir dos traços?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Calcular percentis de latência sobre traços amostrados por enviesamento.</li>
+      <li>Ligar <em>tail sampling</em> sem dimensionar memória do <em>collector</em>.</li>
+      <li>Amostragem aleatória por serviço, criando traços com buracos no meio.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Head sampling</em> custa quase nada e perde o que interessa; <em>tail sampling</em> guarda o que interessa e custa memória, complexidade de encaminhamento e um atraso de dezenas de segundos até o traço estar disponível. A regra prática: abaixo de 200 pedidos por segundo, amostrar tudo à cabeça a 100% é mais barato do que operar <em>tail sampling</em>. Acima de 1000, o híbrido paga-se sozinho.</p></aside>
+
+<h2 id="sec-34-5" class="h2"><span class="secnum">34.5</span> A pergunta clássica: o serviço está lento, o que fazes?<a class="anchor" href="#sec-34-5" aria-label="ligação">#</a></h2>
+
+<p>Esta é a pergunta mais frequente de toda a área e a que mais candidatos falha, não por ignorância mas por desorganização: começam a enumerar causas possíveis por ordem de familiaridade em vez de percorrerem o caminho do pedido por ordem de custo de verificação. A resposta que passa é um procedimento — perguntas de enquadramento, depois uma bissecção do caminho do pedido, com um comando ou <em>query</em> por passo e um critério explícito de confirmação ou eliminação.</p>
+
+<p>O enquadramento tem quatro perguntas que se fazem antes de abrir qualquer terminal: <strong>lento para quem</strong> (todos os clientes, uma rota, um <em>tenant</em>, uma região), <strong>desde quando</strong> (o instante exacto muda tudo: se coincide com um <em>deploy</em>, a hipótese número um é o <em>deploy</em>), <strong>em que percentil</strong> (p50 e p99 juntos ou só o p99), e <strong>está a piorar</strong> (degradação linear sugere fuga ou crescimento de dados; degradação em degrau sugere alteração de configuração ou de dependência). Se houver impacto em utilizadores, mitiga-se em paralelo — reverter o <em>deploy</em> suspeito, desviar tráfego, activar o <em>circuit breaker</em> — porque diagnosticar não é obrigação durante o incidente.</p>
+
+<p>A seguir percorre-se o caminho do pedido de fora para dentro: <em>load balancer</em> e <em>ingress</em>, aplicação (CPU, GC, <em>threads</em>, pools), base de dados, dependências externas, e finalmente o código. A ordem não é arbitrária — é por custo de verificação. Olhar o painel do <em>ingress</em> custa 10 segundos; tirar um <em>thread dump</em> custa 30 segundos; correr o <em>profiler</em> custa 2 minutos e uma decisão; ler <code>pg_stat_statements</code> custa 20 segundos e elimina a hipótese mais provável de todas em serviços com base de dados.</p>
+
+<figure class="listing text" id="lst-34-5"><div class="lhead"><span class="lnum">Listagem 34.5</span>
+<span class="lcap">As <em>queries</em> PromQL dos primeiros 90 segundos.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code># 1. onde e que a latencia subiu: p99 por rota (o p50 na mesma expressao, com 0.50)
+histogram_quantile(0.99,
+  sum by (le, uri) (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))
+
+# 2. o trafego mudou? (RED: Rate) — descartar &quot;esta lento porque duplicou a carga&quot;
+sum by (uri) (rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;}[5m]))
+
+# 3. erros (RED: Errors)
+sum(rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;,status=~&quot;5..&quot;}[5m]))
+  / sum(rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;}[5m]))
+
+# 4. saturacao do pool de conexoes — pending acima de zero e sempre patologico
+hikaricp_connections_pending{app=&quot;pagamentos&quot;}
+hikaricp_connections_active / hikaricp_connections_max
+
+# 5. GC: fraccao de tempo de parede gasta em pausa, por instancia
+sum by (instance) (rate(jvm_gc_pause_seconds_sum{app=&quot;pagamentos&quot;}[5m]))
+
+# 6. dependencias de saida: latencia por servico chamado
+histogram_quantile(0.99,
+  sum by (le, client_name) (rate(http_client_requests_seconds_bucket[5m])))
+
+# 7. e uma instancia so ou todas? (uma so = no doente, drenar e seguir)
+histogram_quantile(0.99,
+  sum by (le, instance) (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))</code></pre></figure>
+
+<figure class="listing shell" id="lst-34-6"><div class="lhead"><span class="lnum">Listagem 34.6</span>
+<span class="lcap">Três <em>thread dumps</em> espaçados e a sua triagem imediata.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># PID dentro do contentor (quase sempre 1, mas confirma-se)
+kubectl exec pagamentos-7d9f4b -c app -- jcmd -l
+
+# tres amostras espacadas: uma so nao distingue &quot;bloqueado&quot; de &quot;a passar por ali&quot;
+for i in 1 2 3; do
+  kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print &gt; td-$i.txt
+  sleep 5
+done
+
+# quantas threads em cada estado
+grep 'java.lang.Thread.State' td-2.txt | sort | uniq -c | sort -rn
+
+# o frame de topo mais repetido: e ali que as threads estao presas
+grep -A 1 'java.lang.Thread.State' td-2.txt | grep '	at ' | sort | uniq -c | sort -rn | head
+
+# deteccao de deadlock e resumo de contencao, sem parsing manual
+kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print -l | grep -i 'deadlock' -A 20
+
+# alternativa sem shell no contentor: o endpoint do Actuator devolve JSON
+curl -s localhost:8080/actuator/threaddump | jq -r '.threads[] | .threadState' | sort | uniq -c</code></pre></figure>
+
+<figure class="listing text" id="lst-34-7"><div class="lhead"><span class="lnum">Listagem 34.7</span>
+<span class="lcap">Excerto de <em>thread dump</em>: 187 <em>threads</em> HTTP à espera de conexão ao PostgreSQL.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>&quot;http-nio-8080-exec-42&quot; #142 daemon prio=5 os_prio=0 cpu=311.44ms elapsed=1841.02s
+   tid=0x00007f2c1c0b8a00 nid=0x5a1f waiting on condition  [0x00007f2b9c3fd000]
+   java.lang.Thread.State: TIMED_WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@25/Native Method)
+	- parking to wait for  &lt;0x00000006c1a3f2b8&gt; (a java.util.concurrent.SynchronousQueue$Transferer)
+	at java.util.concurrent.locks.LockSupport.parkNanos(java.base@25/LockSupport.java:269)
+	at com.zaxxer.hikari.util.ConcurrentBag.borrow(ConcurrentBag.java:161)
+	at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:160)
+	at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:100)
+	at org.springframework.jdbc.datasource.DataSourceUtils.fetchConnection(DataSourceUtils.java:160)
+	...
+	at pt.acme.pag.AutorizacaoService.autorizar(AutorizacaoService.java:88)
+
+&quot;http-nio-8080-exec-9&quot; #109 daemon prio=5 os_prio=0 cpu=48214.77ms elapsed=1841.10s
+   tid=0x00007f2c1c0119c0 nid=0x5a03 runnable  [0x00007f2b9d1fe000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.SocketInputStream.socketRead0(java.base@25/Native Method)
+	at org.postgresql.core.PGStream.receiveChar(PGStream.java:465)
+	at org.postgresql.jdbc.PgStatement.executeInternal(PgStatement.java:512)
+	at pt.acme.pag.LimiteRepository.somaDiaria(LimiteRepository.java:41)
+
+Leitura: 187 threads em ConcurrentBag.borrow (esperam conexao) e 13 em socketRead0
+(esperam resposta do PostgreSQL). A fila nao esta na aplicacao — esta na base de dados.
+Nota: RUNNABLE em socketRead0 e espera de rede, nao consumo de CPU.</code></pre></figure>
+
+<figure class="listing sql" id="lst-34-8"><div class="lhead"><span class="lnum">Listagem 34.8</span>
+<span class="lcap">O que se pergunta ao PostgreSQL: o agora e o acumulado.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- AGORA: quem esta a correr, ha quanto tempo e a espera de que
+SELECT pid,
+       now() - query_start        AS duracao,
+       state, wait_event_type, wait_event,
+       left(query, 90)            AS q
+  FROM pg_stat_activity
+ WHERE state &lt;&gt; 'idle'
+   AND backend_type = 'client backend'
+ ORDER BY duracao DESC
+ LIMIT 20;
+
+-- Bloqueios: quem espera por quem (a causa mais comum de p99 em degrau)
+SELECT bloqueada.pid AS espera, bloqueante.pid AS bloqueia,
+       left(bloqueada.query, 60) AS q_espera
+  FROM pg_stat_activity bloqueada
+  JOIN pg_stat_activity bloqueante
+    ON bloqueante.pid = ANY(pg_blocking_pids(bloqueada.pid))
+ WHERE cardinality(pg_blocking_pids(bloqueada.pid)) &gt; 0;
+
+-- ACUMULADO: onde o tempo total foi gasto desde o ultimo reset
+SELECT calls,
+       round(total_exec_time)::bigint                AS total_ms,
+       round(mean_exec_time::numeric, 2)             AS media_ms,
+       round(stddev_exec_time::numeric, 2)           AS desvio_ms,
+       rows,
+       left(query, 90)                               AS q
+  FROM pg_stat_statements
+ ORDER BY total_exec_time DESC
+ LIMIT 15;
+-- media baixa com desvio alto = cauda; total alto com media baixa = chamada N+1
+
+-- Ligacoes ociosas dentro de transaccao: seguram conexoes e bloqueiam VACUUM
+SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';</code></pre></figure>
+
+<div class="qa" id="q-34-9" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">São 3h20. O alerta diz que o serviço de pagamentos está lento. O que faz, por ordem, e com que comandos?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Sigo um procedimento fixo em três fases: enquadrar (60 s), mitigar se houver impacto, bissectar o caminho do pedido. A ordem dos passos é por custo de verificação, e cada passo tem um critério explícito que confirma ou elimina uma classe de causas.</p>
+      <ol class="lst">
+        <li><strong>Enquadrar (0-1 min).</strong> Painel de SLO: quando começou, que rotas, que percentis, o tráfego mudou. Timeline de alterações: <code>kubectl rollout history deploy/pagamentos</code>, <em>feature flags</em>, alterações de configuração e migrações nas últimas 6 horas. Se o início coincidir com uma alteração a menos de 15 minutos, a hipótese principal é essa alteração.</li>
+        <li><strong>Mitigar em paralelo (1-3 min).</strong> Se há impacto no utilizador: reverter o <em>deploy</em> suspeito (<code>kubectl rollout undo</code>), desligar a <em>flag</em>, ou escalar réplicas se o sinal for saturação. Diagnóstico não é obrigação durante o incidente; restaurar é.</li>
+        <li><strong>Todas as instâncias ou uma?</strong> <code>histogram_quantile(0.99, sum by (le, instance) (rate(http_server_requests_seconds_bucket[5m])))</code>. Se for uma só, drena-se esse <em>pod</em> e o incidente acaba; guarda-se para autópsia.</li>
+        <li><strong>Fora ou dentro da aplicação?</strong> Comparar p99 do <em>ingress</em> com p99 do servidor. Diferença grande significa fila antes da aplicação — <em>threads</em> esgotadas, arranque lento, <em>keep-alive</em> mal configurado, <em>readiness</em> a oscilar.</li>
+        <li><strong>Saturação de recursos (USE).</strong> <code>hikaricp_connections_pending</code> acima de zero é sempre patológico; <code>jvm_gc_pause_seconds_sum</code> acima de 5% do tempo de parede é problema de memória; <code>container_cpu_cfs_throttled_seconds_total</code> revela estrangulamento de CPU pelo Kubernetes, que produz p99 alto com CPU aparentemente baixa.</li>
+        <li><strong>Dentro ou fora do processo?</strong> Três <em>thread dumps</em> espaçados de 5 s (<code>jcmd 1 Thread.print</code>), contagem por estado e agregação do <em>frame</em> de topo. Muitas <em>threads</em> em <code>ConcurrentBag.borrow</code> significa pool esgotado; em <code>socketRead0</code> significa espera por dependência; muitas em <code>RUNNABLE</code> com CPU alto significa código a arder.</li>
+        <li><strong>Base de dados.</strong> <code>pg_stat_activity</code> para o agora (duração, <code>wait_event</code>, bloqueios via <code>pg_blocking_pids</code>) e <code>pg_stat_statements</code> ordenado por <code>total_exec_time</code> para o acumulado. Uma <em>query</em> nova no topo aponta directamente para a alteração que a introduziu; muitas chamadas com média baixa é N+1.</li>
+        <li><strong>Dependências externas.</strong> p99 por <code>client_name</code>, taxa de <em>timeout</em> e estado dos <em>circuit breakers</em>. Uma dependência lenta com retentativas activas multiplica a carga e transforma degradação em colapso.</li>
+        <li><strong>Só então, perfilar.</strong> <code>jcmd 1 JFR.start settings=profile duration=5m</code> ou async-profiler 60 s em CPU e em <code>lock</code>. É o passo mais caro e o mais informativo; chega-se aqui com uma hipótese, não à procura de uma.</li>
+      </ol>
+      <p>Ao longo de todo o processo escrevo no canal do incidente o que testei e o que eliminei, com <em>timestamps</em>. Não é burocracia: é o que permite a quem entra às 4h não repetir o mesmo trabalho, e é a matéria-prima do <em>postmortem</em>.</p>
+      <p>O erro que distingue um mid é saltar directamente para o passo 9 — abrir o <em>profiler</em> antes de saber se o problema é sequer da aplicação. Em serviços com base de dados, a distribuição empírica de causas é aproximadamente: 40% base de dados (<em>query</em> nova, plano mudado, bloqueio, N+1), 20% dependência externa, 15% alteração recente de código ou configuração, 10% saturação de pool ou de <em>threads</em>, 10% GC ou memória, 5% infra-estrutura. O procedimento segue essa ordem de probabilidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Lista causas possíveis sem ordem nem forma de as verificar; ou vai directo a «reiniciar o serviço» sem recolher nada.</td></tr>
+        <tr><td>Mid</td><td>Tem uma ordem razoável mas nomeia ferramentas sem comandos concretos; não separa mitigação de diagnóstico; esquece a pergunta «uma instância ou todas?».</td></tr>
+        <tr><td>Sénior</td><td>Enquadra antes de agir, mitiga em paralelo, bissecta o caminho do pedido com comandos e <em>queries</em> concretos, e tem critério de confirmação por passo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a distribuição de probabilidade das causas, a comunicação escrita durante o incidente, o custo de cada passo de diagnóstico, e o que faria a seguir para que o mesmo alerta fosse auto-explicativo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Reiniciar resolveu. Fica por aqui?»</li>
+      <li>«O p50 está bom e só o p99 subiu. Muda alguma coisa no procedimento?»</li>
+      <li>«Como distingue estrangulamento de CPU pelo Kubernetes de código lento?»</li>
+      <li>«E se não houver <em>shell</em> no contentor nem <code>jcmd</code> disponível?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Reiniciar os <em>pods</em> antes de recolher <em>thread dump</em> ou <em>heap dump</em>: destrói a prova e o incidente repete-se em duas horas.</li>
+      <li>Perfilar sem hipótese, à procura de inspiração.</li>
+      <li>Nunca perguntar «o que mudou nas últimas horas?».</li>
+      <li>Diagnosticar sozinho e em silêncio durante 40 minutos com clientes afectados.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um <em>thread dump</em> com <code>jcmd Thread.print</code> num <em>heap</em> normal custa 10 a 50 ms de pausa e é seguro em produção. Um <code>GC.heap_dump</code> de um <em>heap</em> de 8 GB pára a JVM durante 10 a 30 segundos e escreve 8 GB em disco — só se faz com o <em>pod</em> drenado do <em>load balancer</em>. Uma gravação JFR com <code>settings=profile</code> custa tipicamente 1 a 3% de CPU; o async-profiler em modo CPU, abaixo de 1%.</p></aside>
+
+<div class="qa" id="q-34-10" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O <em>thread dump</em> mostra 187 <em>threads</em> HTTP em <code>HikariPool.getConnection</code> e 13 em <code>socketRead0</code>. O pool tem 20 conexões. Diagnostique e diga o que faz a seguir.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O pool está esgotado e a fila de espera é a latência. As 13 <em>threads</em> em <code>socketRead0</code> são as que têm conexão e estão à espera da resposta do PostgreSQL; as 187 estão paradas à porta. O sintoma na aplicação é latência alta com CPU baixo — a assinatura clássica de saturação por espera, não por trabalho. Se o tempo médio de uma <em>query</em> passou de 5 ms para 300 ms, a capacidade do pool caiu de 4000 para 66 operações por segundo com as mesmas 20 conexões; o pool não mudou, o débito por conexão é que colapsou.</p>
+      <p>O erro que se comete a seguir é aumentar o pool. Isso desloca a fila para a base de dados, onde é muito mais cara: 200 conexões activas num PostgreSQL com 8 vCPU produzem contenção de <em>locks</em>, mais processos a competir pelo CPU e um colapso pior. O dimensionamento correcto é próximo de <code>núcleos × 2 + discos efectivos</code> para carga OLTP, tipicamente 10 a 30 por instância de aplicação, e a soma de todos os pools de todas as réplicas tem de caber em <code>max_connections</code> com margem — 6 réplicas × 20 = 120 conexões contra um limite de 200 já está apertado quando entram tarefas em lote.</p>
+      <p>A investigação certa é para trás: <em>porque</em> ficaram as conexões presas. Verifico três coisas. Primeira, <code>pg_stat_statements</code> ordenado por <code>total_exec_time</code>, à procura da <em>query</em> que mudou de perfil — plano novo por estatísticas desactualizadas, índice em falta depois de uma migração, ou crescimento de tabela que fez o planeador trocar <em>index scan</em> por <em>seq scan</em>. Segunda, <code>idle in transaction</code>: transacções abertas que não fecham seguram conexões indefinidamente, e a causa habitual é <code>@Transactional</code> a envolver uma chamada HTTP externa — a conexão fica retida durante o <em>timeout</em> dessa chamada. Terceira, bloqueios com <code>pg_blocking_pids</code>.</p>
+      <p>Mitigação imediata: reduzir <code>connectionTimeout</code> para falhar depressa (2 s em vez de 30 s) e devolver 503 em vez de acumular <em>threads</em>, activar o <em>circuit breaker</em> no caminho afectado, e — se identificada — terminar a <em>query</em> patológica com <code>pg_cancel_backend</code>. A correcção estrutural é tirar chamadas remotas de dentro de transacções, adicionar o índice em falta e pôr um alerta em <code>hikaricp_connections_pending</code> acima de zero durante 1 minuto, que teria detectado isto vinte minutos antes do SLO.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentamos o pool» e nada mais; não lê o <em>dump</em> nem distingue espera de trabalho.</td></tr>
+        <tr><td>Mid</td><td>Identifica o pool esgotado mas trata o sintoma; não investiga porque as conexões ficam presas.</td></tr>
+        <tr><td>Sénior</td><td>Explica a aritmética do débito por conexão, recusa aumentar o pool com justificação, investiga <code>pg_stat_statements</code>, <code>idle in transaction</code> e bloqueios, e falha depressa como mitigação.</td></tr>
+        <tr><td>Staff</td><td>Dimensiona o pool globalmente contra <code>max_connections</code>, propõe <em>pooler</em> externo se houver muitas réplicas, elimina a classe de erro (chamadas remotas em transacção) e institui o alerta de saturação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escolhe o tamanho do pool, com números?»</li>
+      <li>«O que muda com <em>virtual threads</em>? O pool deixa de ser o limite?»</li>
+      <li>«Como detecta <code>@Transactional</code> a envolver chamadas HTTP em <em>code review</em>?»</li>
+      <li>«Quando é que um <em>pooler</em> como o PgBouncer resolve e quando é que piora?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Multiplicar o pool por dez como primeira acção.</li>
+      <li>Interpretar <code>RUNNABLE</code> em <code>socketRead0</code> como consumo de CPU.</li>
+      <li>Tirar um único <em>thread dump</em> e concluir a partir dele.</li>
+      <li>Não somar os pools de todas as réplicas antes de os aumentar.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-34-1" data-box="lab" data-lang="shell">
+  <div class="labhead"><span class="labttl">Exercício 34.1 — Plano de diagnóstico para p99 alto</span>
+    <div class="labpills"><span class="qpill">Diagnóstico</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Cenário, tal como o entrevistador o dá. Serviço <code>pagamentos</code> (Spring Boot 3.5, Java 25, PostgreSQL 17, 6 réplicas em Kubernetes, pool HikariCP de 20 por réplica). Às 14:05 o p99 de <code>POST /v1/autorizacoes</code> passou de 180 ms para 2,1 s e mantém-se. O p50 está em 62 ms, praticamente inalterado. Os 5xx estão em 0,3% (linha de base 0,1%). O tráfego é o normal de terça-feira, 1400 pedidos por segundo. Houve um <em>deploy</em> às 11:30 e uma migração de esquema às 13:50. O SLO é 99,9% em 30 dias e o orçamento já consumido é de 35%.</p>
+    <p>Escreva o plano de diagnóstico: as hipóteses por ordem, o comando ou <em>query</em> exacto que testa cada uma, e o sinal que a confirma ou elimina. Diga também o que mitiga e em que momento. Restrição: tem <code>kubectl</code>, acesso de leitura ao PostgreSQL e ao Prometheus; não tem <em>shell</em> interactivo prolongado nem autorização para reiniciar sem comunicar.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing shell" id="lst-34-9"><div class="lhead"><span class="lnum">Listagem 34.9</span>
+        <span class="lcap">Plano de diagnóstico executável, por ordem de custo de verificação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="shell"><code># ---------------------------------------------------------------------------
+# LEITURA DO CENARIO (antes de qualquer comando)
+# p50 estavel + p99 x11 = fenomeno de cauda, nao degradacao sistemica.
+# Isso elimina logo: falta de CPU global, aumento de carga, codigo mais lento
+# em todos os pedidos. Restam: uma instancia doente, espera por recurso
+# (pool/lock), GC, ou um subconjunto de pedidos com plano de query novo.
+# Ancora temporal: 14:05 nao coincide com o deploy (11:30) mas fica 15 min
+# depois da migracao (13:50) — hipotese 1 tem de ser a migracao.
+# ---------------------------------------------------------------------------
+
+# H1. UMA INSTANCIA OU TODAS?  (custo: 10 s)   confirma se: uma curva descolada
+#   histogram_quantile(0.99, sum by (le, instance)
+#     (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))
+#   -&gt; uma so: kubectl label pod X drenar=true ; incidente termina, autopsia depois.
+#   -&gt; todas: continuar.
+
+# H2. A MIGRACAO DAS 13:50 MUDOU UM PLANO?  (custo: 20 s)   hipotese principal
+psql -c &quot;SELECT calls, round(total_exec_time)::bigint AS total_ms,
+                round(mean_exec_time::numeric,2) AS media_ms,
+                round(stddev_exec_time::numeric,2) AS desvio_ms,
+                left(query,90)
+           FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 15;&quot;
+#   confirma se: query do caminho de autorizacao no topo com desvio_ms alto
+#   (media baixa + desvio alto = cauda: parte dos pedidos apanha seq scan).
+psql -c &quot;SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+          WHERE relname='limites' ORDER BY idx_scan;&quot;
+#   elimina se: nenhum indice com idx_scan=0 e nenhuma query nova no topo.
+
+# H3. ESPERA POR CONEXAO (fila do pool)  (custo: 10 s)
+#   hikaricp_connections_pending{app=&quot;pagamentos&quot;}          -&gt; acima de 0 e patologico
+#   hikaricp_connections_timeout_total                      -&gt; taxa a subir?
+#   confirma se: pending acima de 0 sustentado E p99 correlacionado com ele.
+
+# H4. O QUE ESTA A CORRER AGORA NA BASE DE DADOS  (custo: 20 s)
+psql -c &quot;SELECT pid, now()-query_start AS dur, state, wait_event_type, wait_event,
+                left(query,80)
+           FROM pg_stat_activity
+          WHERE state &lt;&gt; 'idle' AND backend_type='client backend'
+          ORDER BY dur DESC LIMIT 20;&quot;
+psql -c &quot;SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction';&quot;
+psql -c &quot;SELECT bloqueada.pid, bloqueante.pid, left(bloqueada.query,60)
+           FROM pg_stat_activity bloqueada
+           JOIN pg_stat_activity bloqueante
+             ON bloqueante.pid = ANY(pg_blocking_pids(bloqueada.pid));&quot;
+#   confirma bloqueio se: wait_event_type='Lock' ou pg_blocking_pids nao vazio.
+#   NOTA: uma migracao que ainda segure ACCESS EXCLUSIVE aparece aqui.
+
+# H5. GC  (custo: 10 s)   confirma se: pausa acima de 5% do tempo de parede
+#   sum by (instance) (rate(jvm_gc_pause_seconds_sum{app=&quot;pagamentos&quot;}[5m]))
+#   jvm_memory_used_bytes{area=&quot;heap&quot;,id=~&quot;.*Old.*&quot;}   -&gt; patamar a subir apos GC?
+
+# H6. ESTRANGULAMENTO DE CPU PELO KUBERNETES  (custo: 10 s)
+#   rate(container_cpu_cfs_throttled_seconds_total{pod=~&quot;pagamentos.*&quot;}[5m])
+#   confirma se: throttling acima de 0 com CPU media aparentemente baixa.
+
+# H7. ONDE ESTAO AS THREADS  (custo: 30 s)   so se H2-H6 nao decidirem
+for i in 1 2 3; do
+  kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print &gt; td-$i.txt; sleep 5
+done
+grep 'java.lang.Thread.State' td-2.txt | sort | uniq -c | sort -rn
+grep -A 1 'java.lang.Thread.State' td-2.txt | grep '	at ' | sort | uniq -c | sort -rn | head
+#   ConcurrentBag.borrow -&gt; volta a H3/H4    socketRead0 -&gt; dependencia ou BD
+#   RUNNABLE em codigo proprio com CPU alto  -&gt; H8
+
+# H8. PERFILAR (ultimo passo, ja com hipotese)  (custo: 2 min + decisao)
+kubectl exec pagamentos-7d9f4b -c app -- \
+  jcmd 1 JFR.start name=diag settings=profile duration=3m filename=/tmp/diag.jfr
+#   ou, se o async-profiler estiver no contentor:
+#   ./profiler.sh -e cpu   -d 60 -f /tmp/cpu.html 1
+#   ./profiler.sh -e lock  -d 60 -f /tmp/lock.html 1
+
+# ---------------------------------------------------------------------------
+# MITIGACAO (em paralelo, desde o minuto 2 — nao no fim)
+# - Comunicar no canal de incidente: sintoma, impacto, hipotese actual, proxima
+#   actualizacao em 15 min.
+# - Orcamento: 35% consumido; um p99 de 2,1 s sustentado queima o resto em horas
+#   -&gt; tratar como Sev2 e escalar se nao houver causa em 30 min.
+# - Se H2 confirmar: CREATE INDEX CONCURRENTLY em janela, ou reverter a migracao
+#   se for reversivel; entretanto ANALYZE na tabela afectada (barato, pode
+#   corrigir o plano imediatamente).
+# - Se H4 mostrar bloqueio: pg_cancel_backend(pid) do bloqueante identificado.
+# - Reduzir connectionTimeout para 2 s: falhar depressa em vez de acumular fila.
+# - NAO reiniciar pods antes de recolher thread dump (destroi a prova).
+# ---------------------------------------------------------------------------</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A dedução <strong>p50 estável + p99 alto = fenómeno de cauda</strong> é o primeiro sinal avaliado; quem começa a investigar CPU global já perdeu metade da pontuação.</li>
+        <li>Usar a âncora temporal para ordenar hipóteses: 14:05 está 15 minutos depois da migração e 2h35 depois do <em>deploy</em>. A migração é a hipótese principal e tem de ser a primeira verificação, não a quarta.</li>
+        <li>Cada passo tem custo e critério. Um plano em que todos os passos custam o mesmo não é um plano, é uma lista.</li>
+        <li>Caso limite frequente: uma migração que criou índice sem <code>CONCURRENTLY</code> pode ter terminado às 13:52 mas deixado estatísticas desactualizadas; <code>ANALYZE</code> é a mitigação de 10 segundos que ninguém propõe.</li>
+        <li>Caso limite 2: se o p99 subiu exactamente 15 minutos depois da migração e não imediatamente, suspeitar de cache de planos preparados no lado do JDBC — o plano só troca ao fim de algumas execuções.</li>
+        <li>Mitigação em paralelo e comunicação com cadência fixa contam tanto como o diagnóstico; um candidato que diagnostica em silêncio durante 30 minutos é penalizado.</li>
+        <li>Fechar com prevenção: alerta em <code>hikaricp_connections_pending</code>, verificação de plano em migrações, e <em>canary</em> com comparação de p99 antes de promover.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-34-6" class="h2"><span class="secnum">34.6</span> Incidentes: mitigar, comunicar e o postmortem<a class="anchor" href="#sec-34-6" aria-label="ligação">#</a></h2>
+
+<p>Um incidente tem três papéis distintos e o erro mais comum é uma pessoa acumular os três. O <em>incident commander</em> decide e não escreve código; o responsável de operações investiga e executa; o de comunicação escreve para dentro e para fora. Numa equipa pequena, o mesmo engenheiro pode acumular investigação e execução, mas o comando e a comunicação têm de ser explícitos — sem eles, o incidente prolonga-se porque três pessoas investigam a mesma hipótese e ninguém informa o negócio.</p>
+
+<p>A regra de ouro é <strong>mitigar antes de compreender</strong>. Reverter o <em>deploy</em>, desligar a <em>flag</em>, desviar tráfego, servir de cache degradada — qualquer destas acções restaura o serviço sem exigir causa raiz. A causa investiga-se depois, com os dados recolhidos antes de mitigar: <em>thread dump</em>, <em>heap dump</em> de um <em>pod</em> drenado, exportação das métricas da janela e uma lista de traços da cauda. Quem inverte a ordem tem incidentes mais longos e autópsias sem provas.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 34.2</span> Severidades típicas e o que cada uma obriga.</div>
+<div class="tscroll"><table><thead><tr><th>Sev</th><th>Critério</th><th>Resposta</th><th>Comunicação</th><th>Postmortem</th></tr></thead><tbody>
+<tr><td>Sev1</td><td>Serviço crítico indisponível ou perda/corrupção de dados; receita parada</td><td>Página imediata, <em>commander</em> nomeado, ponte aberta</td><td>Actualização a cada 15 min, página de estado pública</td><td>Obrigatório, em 5 dias úteis</td></tr>
+<tr><td>Sev2</td><td>Degradação séria: SLO a queimar depressa, funcionalidade central afectada</td><td>Página em qualquer hora, escalar se não houver causa em 30 min</td><td>Actualização a cada 30 min, para dentro</td><td>Obrigatório</td></tr>
+<tr><td>Sev3</td><td>Impacto limitado ou com contorno disponível</td><td><em>Ticket</em> prioritário em horário laboral</td><td>Nota no canal da equipa</td><td>Opcional; obrigatório se repetir</td></tr>
+<tr><td>Sev4</td><td>Sem impacto no utilizador: ruído, degradação interna, alerta a afinar</td><td><em>Backlog</em></td><td>Nenhuma</td><td>Não</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-34-11" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A equipa recebe cerca de 40 alertas por semana de plantão e ignora a maioria. O que é um bom alerta e como reconstrói o conjunto?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um bom alerta cumpre quatro condições em simultâneo: é <strong>sintoma</strong> e não causa (o utilizador está a ser afectado), é <strong>accionável</strong> (existe algo que a pessoa acordada pode fazer agora), é <strong>urgente</strong> (esperar até de manhã piora as coisas) e é <strong>específico</strong> (aponta para um serviço e traz o painel e o <em>runbook</em> na própria notificação). Falhar qualquer uma torna o alerta ruído, e o ruído é activamente prejudicial: uma equipa com 40 alertas por semana aprende a ignorar, e o alerta número 41, que era o verdadeiro, também é ignorado.</p>
+      <p>A reconstrução faz-se com dados, não com opinião. Extraio 90 dias de histórico e classifico cada alerta em quatro caixas: gerou acção humana; auto-resolveu-se sem intervenção; foi silenciado; era duplicado de outro. Tipicamente 60 a 80% caem nas três últimas caixas e são candidatos a eliminação imediata. Depois aplico quatro transformações: (1) apagar todos os alertas de causa que não têm sintoma associado — CPU a 90%, <em>heap</em> a 85%, disco a 75% passam a painel; (2) converter os restantes em alertas de SLO por <em>burn rate</em> com duas janelas; (3) agrupar por serviço e por causa comum, para que uma falha de base de dados envie uma notificação e não trinta; (4) exigir <em>runbook</em> em todos os que paginam — sem <em>runbook</em>, não pagina.</p>
+      <p>O alvo quantificado é 0 a 2 avisos por semana de plantão, com pelo menos 60% a resultar em acção. E o critério de admissão de um alerta novo é uma única pergunta: «se isto disparar às 3h da manhã, o que é que a pessoa faz?». Se a resposta for «olha e volta a dormir», é um painel.</p>
+      <p>O <em>trade-off</em> é o risco de detecção tardia: menos alertas significa que certas degradações lentas só aparecem no dia seguinte. Aceita-se porque a alternativa medida é pior — a fadiga faz com que os alertas verdadeiros sejam ignorados, e o custo de um incidente detectado 20 minutos mais tarde é muito menor do que o de um Sev1 detectado por um cliente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ajustamos os limiares»; mantém alertas de CPU e memória como principais.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há ruído a mais e propõe silenciar; não tem critério objectivo nem plano de reconstrução.</td></tr>
+        <tr><td>Sénior</td><td>Define as quatro condições, classifica o histórico, converte causa em sintoma, agrupa, exige <em>runbook</em>, e fixa um alvo numérico.</td></tr>
+        <tr><td>Staff</td><td>Trata o sistema de alertas como produto com métrica própria (taxa de accionabilidade), institui revisão periódica de plantão e liga a decisão ao custo humano de acordar alguém.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um alerta que se auto-resolve em 3 minutos: apaga ou mantém?»</li>
+      <li>«Como evita apagar o alerta que só dispara duas vezes por ano e é crítico?»</li>
+      <li>«O que põe num <em>runbook</em> para ele ser útil às 3h da manhã?»</li>
+      <li>«Como mede a saúde do plantão ao longo do tempo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Silenciar alertas sem os classificar nem apagar a origem.</li>
+      <li>Paginar em métricas de recurso com SLO cumprido.</li>
+      <li>Não ter noção do custo humano de um plantão ruidoso.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-12" data-box="qa" data-area="comportamental" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Conte um incidente sério que tenha conduzido: o que fez durante, o que escreveu depois, e o que mudou por causa disso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A estrutura da resposta é: impacto quantificado, o que se fez para mitigar e em quanto tempo, o que se descobriu como causa, e — a parte que separa sénior de staff — o que mudou no sistema para que a classe inteira de falhas desapareça.</p>
+      <p>Durante: assumi o comando explicitamente («eu sou o <em>commander</em>, A investiga, B comunica»), declarei a severidade em voz alta, e fixei uma cadência de comunicação de 15 minutos mesmo quando não havia novidades — «continuamos a investigar, próxima actualização às 03:45» é informação valiosa, porque impede que cinco pessoas perguntem o mesmo. Mitigámos primeiro: reversão do <em>deploy</em> das 22:40, com o serviço restabelecido 18 minutos após o alerta, antes de qualquer hipótese de causa raiz. Antes de reverter, recolhi <em>thread dump</em> de dois <em>pods</em> e um <em>heap dump</em> de um <em>pod</em> drenado — sem isso, a autópsia teria sido especulação.</p>
+      <p>Depois: um <em>postmortem</em> sem culpa, publicado em 4 dias. Sem culpa não significa sem responsabilidade; significa que a análise procura as condições que tornaram o erro possível, e não a pessoa que carregou no botão. Se uma alteração de configuração derrubou produção, a pergunta certa não é «quem escreveu isto» mas «porque é que o sistema aceitou uma configuração inválida sem validação, sem <em>canary</em> e sem reversão automática». O documento tem sempre: cronologia com <em>timestamps</em> ao minuto (incluindo o intervalo entre início real e detecção), impacto quantificado (23 minutos, 41 000 pagamentos falhados, 0,9% do orçamento mensal), causas contribuintes em vez de causa raiz única, o que correu bem, e acções com dono e prazo.</p>
+      <p>O critério de qualidade das acções é este: cada uma tem de eliminar uma classe, não uma instância. «Corrigir o valor da configuração» é uma instância; «validar o esquema de configuração no arranque e falhar cedo, com <em>canary</em> de 5% durante 10 minutos antes de promover» é a classe. E as acções entram no <em>sprint</em> seguinte com dono nomeado — um <em>postmortem</em> cujas acções ficam por fazer é pior do que nenhum, porque cria a ilusão de aprendizagem. Meço isso: percentagem de acções de <em>postmortem</em> fechadas em 30 dias, revista mensalmente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Narrativa heróica sem números, ou culpabilização de uma pessoa ou de outra equipa.</td></tr>
+        <tr><td>Mid</td><td>Descreve o diagnóstico técnico com detalhe mas não fala de comando, comunicação nem acções posteriores.</td></tr>
+        <tr><td>Sénior</td><td>Impacto quantificado, mitigação antes de causa raiz, recolha de provas, <em>postmortem</em> com cronologia e acções com dono.</td></tr>
+        <tr><td>Staff</td><td>Papéis explícitos, cadência de comunicação, causas contribuintes em vez de culpado, acções que eliminam classes, e uma métrica de fecho das acções.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual foi o intervalo entre o início real e a detecção, e o que fizeram para o reduzir?»</li>
+      <li>«Quantas das acções do <em>postmortem</em> foram efectivamente feitas?»</li>
+      <li>«Como reage quando alguém na retrospectiva aponta um culpado?»</li>
+      <li>«O que teria feito diferente com metade da informação?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Zero números: «afectou alguns clientes durante algum tempo».</li>
+      <li>Reiniciar tudo antes de recolher provas e depois não saber explicar a causa.</li>
+      <li>Causa raiz única, sempre humana, sempre de outra pessoa.</li>
+      <li>Acções sem dono nem prazo.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Duas métricas dizem quase tudo sobre a maturidade operacional de uma equipa: o tempo entre o início real da falha e a detecção (se for maior do que o tempo de mitigação, o problema é de instrumentação, não de resposta) e a percentagem de acções de <em>postmortem</em> fechadas em 30 dias. Em entrevista, citar estas duas é um sinal forte de que o candidato já operou serviços a sério.</p></aside>
+
+<h2 id="sec-34-7" class="h2"><span class="secnum">34.7</span> Perfilar Java em produção sem parar o serviço<a class="anchor" href="#sec-34-7" aria-label="ligação">#</a></h2>
+
+<p>Há três ferramentas e cada uma responde a uma pergunta diferente. O <em>Java Flight Recorder</em> (JFR) está na JVM, não precisa de instalação e grava eventos de alto nível — pausas de GC, alocação por tipo, <em>I/O</em>, bloqueio de monitores, amostras de execução — com custo de 1 a 3% de CPU em <code>settings=profile</code> e praticamente nulo em <code>settings=default</code>. É a escolha para deixar a gravar permanentemente e ter sempre os últimos minutos disponíveis quando algo corre mal. O async-profiler usa <code>perf_events</code> e <code>AsyncGetCallTrace</code>, produz <em>flame graphs</em> sem o enviesamento de <em>safepoint</em> que afecta os perfiladores clássicos, e distingue tempo de CPU real de tempo de espera — é a escolha quando é preciso saber exactamente que linha arde. Os perfiladores por amostragem baseados em <code>Thread.getStackTrace</code> sofrem de enviesamento de <em>safepoint</em>: só amostram em pontos onde a JVM pode parar, o que desloca a atribuição de tempo e pode apontar para o método errado.</p>
+
+<p>A distinção que separa candidatos é entre perfil de CPU e perfil de espera. Um <em>flame graph</em> de CPU responde a «que código consome ciclos»; se o problema é latência por espera — pool, <em>lock</em>, rede — o perfil de CPU aparece vazio e a conclusão errada é «o código está bem». Nesse caso usa-se <code>-e lock</code> ou <code>-e wall</code>, ou os eventos de <code>JavaMonitorEnter</code> e <code>ThreadPark</code> do JFR.</p>
+
+<p>Fugas de memória em Java raramente são fugas no sentido de C: são retenções não intencionais. Os quatro padrões que cobrem a esmagadora maioria: caches sem limite de tamanho nem expiração; <code>ThreadLocal</code> não limpo em <em>threads</em> de pool (o mesmo mecanismo que faz vazar o MDC); colecções estáticas que só crescem, incluindo listeners registados e nunca removidos; e <em>classloaders</em> retidos em redeployments. A assinatura no gráfico é inequívoca: o patamar de <em>heap</em> usado <strong>após</strong> cada GC completo sobe monotonicamente ao longo de horas, em vez de voltar ao mesmo nível. Só olhar para o <em>heap</em> total, que é serrilhado por natureza, não distingue nada.</p>
+
+<figure class="listing shell" id="lst-34-10"><div class="lhead"><span class="lnum">Listagem 34.10</span>
+<span class="lcap">Perfilar e inspeccionar memória em produção, com o custo de cada comando.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># --- PERFIL: JFR (na JVM, ~1-3% de CPU em settings=profile) ---
+jcmd 1 JFR.start name=diag settings=profile duration=5m filename=/tmp/diag.jfr
+jcmd 1 JFR.check                       # ver gravacoes activas
+jcmd 1 JFR.dump  name=diag filename=/tmp/diag.jfr
+kubectl cp pagamentos-7d9f4b:/tmp/diag.jfr ./diag.jfr   # analisar no JDK Mission Control
+
+# --- PERFIL: async-profiler (flame graph, sem enviesamento de safepoint) ---
+./profiler.sh -e cpu   -d 60 -f /tmp/cpu.html   1     # onde ardem os ciclos
+./profiler.sh -e lock  -d 60 -f /tmp/lock.html  1     # contencao de monitores
+./profiler.sh -e alloc -d 60 -f /tmp/alloc.html 1     # pressao de alocacao
+./profiler.sh -e wall  -d 60 -f /tmp/wall.html  1     # tempo de parede: inclui espera
+
+# --- MEMORIA: do barato para o caro ---
+jcmd 1 GC.heap_info                                   # instantaneo, ~0 custo
+jcmd 1 GC.class_histogram | head -25                  # pausa curta; classes por bytes retidos
+jcmd 1 VM.native_memory summary                       # exige -XX:NativeMemoryTracking=summary
+jcmd 1 GC.heap_dump /tmp/heap.hprof                   # PARA A JVM 10-30 s num heap de 8 GB:
+                                                      # drenar o pod do load balancer primeiro
+
+# --- Rede de seguranca permanente, decidida antes do incidente ---
+# -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps
+# -XX:StartFlightRecording=settings=default,disk=true,maxsize=200m,dumponexit=true</code></pre></figure>
+
+<div class="qa" id="q-34-13" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Precisa de perfilar um serviço em produção com tráfego real. Que ferramenta usa, com que custo, e como decide entre perfil de CPU e perfil de espera?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo pelo JFR porque já está na JVM e não exige instalar nada num contentor de produção: <code>jcmd 1 JFR.start settings=profile duration=5m</code> custa 1 a 3% de CPU e dá pausas de GC, alocação por tipo, eventos de bloqueio e amostras de execução num único ficheiro que se analisa fora do <em>pod</em>. Em serviços críticos deixo uma gravação contínua em disco com <code>-XX:StartFlightRecording=settings=default,disk=true,maxsize=200m</code>: quando algo corre mal, os últimos minutos já estão gravados e não é preciso reproduzir o problema.</p>
+      <p>Uso async-profiler quando preciso de resolução ao nível da linha ou quando suspeito que o JFR está a mentir por enviesamento de <em>safepoint</em>. Ele amostra por <code>perf_events</code> e <code>AsyncGetCallTrace</code>, fora dos <em>safepoints</em>, e produz um <em>flame graph</em> directamente. O custo em modo CPU a 100 Hz fica abaixo de 1%.</p>
+      <p>A decisão entre CPU e espera vem do sintoma, e é aqui que a maioria erra. Se a latência é alta <strong>e</strong> o CPU está alto, o perfil de CPU é o certo — procura-se a torre larga no <em>flame graph</em>. Se a latência é alta e o CPU está baixo, o tempo está a ser passado à espera e o perfil de CPU vai parecer inocente; nesse caso uso <code>-e wall</code> (tempo de parede, que inclui bloqueio), <code>-e lock</code> para contenção de monitores, e os eventos <code>JavaMonitorEnter</code>, <code>ThreadPark</code> e <code>SocketRead</code> do JFR. O atalho equivalente e mais barato continua a ser três <em>thread dumps</em> espaçados.</p>
+      <p>Restrições práticas em contentores: o <em>profiler</em> precisa de <code>perf_event_paranoid</code> permissivo ou da capacidade <code>SYS_ADMIN</code>, e de <code>-XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints</code> para pilhas correctas com código compilado. Se nada disso estiver disponível, sobra JFR — outra razão para o preferir como primeira linha. E qualquer perfil deve ser tirado de <strong>uma</strong> réplica, comparado com uma réplica saudável: um <em>flame graph</em> sem linha de base é uma imagem bonita sem conclusão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe ligar um perfilador de IDE a produção, ou não conhece nenhuma ferramenta.</td></tr>
+        <tr><td>Mid</td><td>Conhece JFR ou async-profiler mas não sabe o custo nem distingue CPU de espera.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe pela restrição do ambiente, quantifica o custo, e decide CPU vs espera a partir do sintoma; conhece o enviesamento de <em>safepoint</em>.</td></tr>
+        <tr><td>Staff</td><td>Deixa gravação contínua ligada por omissão, compara sempre com linha de base saudável, e conhece as restrições de <em>capabilities</em> em contentores e o seu impacto na política de segurança.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O <em>flame graph</em> de CPU está plano e a latência é alta. O que conclui?»</li>
+      <li>«O que é enviesamento de <em>safepoint</em> e porque importa?»</li>
+      <li>«Como perfila um <em>pod</em> sem <em>shell</em> nem ferramentas instaladas?»</li>
+      <li>«Que <em>flags</em> deixa ligadas por omissão em produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tirar <em>heap dump</em> de um <em>pod</em> em serviço, sem o drenar, durante um incidente.</li>
+      <li>Concluir «o código está bem» a partir de um perfil de CPU vazio.</li>
+      <li>Perfilar sem comparar com uma réplica ou período saudável.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-14" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O serviço reinicia por <code>OutOfMemoryError</code> a cada 30 horas, sempre com o mesmo padrão. Como confirma que é uma fuga e como a localiza sem afectar os clientes?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Confirmo primeiro que é retenção e não subdimensionamento, e a distinção faz-se num único gráfico: o <em>heap</em> usado <strong>imediatamente após cada GC completo</strong>. Se esse patamar sobe monotonicamente ao longo de 30 horas, há retenção; se oscila em torno de um valor estável e só o pico toca no limite, o <em>heap</em> é pequeno para a carga e a correcção é dimensionamento. O sinal secundário é a frequência de GC completo a aumentar com o tempo enquanto a memória libertada por ciclo diminui — a JVM está a trabalhar cada vez mais para recuperar cada vez menos, e a latência degrada-se muito antes do <code>OutOfMemoryError</code>.</p>
+      <p>Localizo sem afectar clientes em três passos. Primeiro, barato e imediato: <code>jcmd 1 GC.class_histogram</code> em duas amostras separadas por algumas horas; a classe cuja contagem cresce proporcionalmente ao tempo de <em>uptime</em> é a suspeita. Segundo, se o histograma não decidir: drenar um <em>pod</em> do <em>load balancer</em> (retirar o rótulo do <em>service</em>, esperar as ligações em curso) e só então <code>jcmd 1 GC.heap_dump</code> — 10 a 30 segundos de paragem e 8 GB de ficheiro num <em>heap</em> de 8 GB, o que é inaceitável num <em>pod</em> em serviço mas irrelevante num drenado. Terceiro, analisar o <em>dump</em> em Eclipse MAT com o relatório de suspeitos: o que interessa é a <em>árvore de dominadores</em> e o caminho de raízes GC até ao objecto — é isso que mostra <em>quem</em> segura a memória, e não apenas o que está lá.</p>
+      <p>Os culpados por ordem de frequência: cache <code>HashMap</code> ou <code>ConcurrentHashMap</code> sem limite nem expiração (a correcção é Caffeine com <code>maximumSize</code> e <code>expireAfterWrite</code>); <code>ThreadLocal</code> não limpo em <em>threads</em> de pool, que vive tanto quanto a <em>thread</em>; colecções estáticas e listeners registados e nunca removidos; e sessões ou contextos retidos por bibliotecas em <em>redeploy</em>. Nos casos em que o <em>heap</em> está estável mas o processo é morto pelo Kubernetes por limite de memória do contentor, o problema é fora do <em>heap</em> — <em>metaspace</em>, <em>buffers</em> directos, código nativo — e diagnostica-se com <code>VM.native_memory summary</code>, o que exige <code>-XX:NativeMemoryTracking=summary</code> ligado desde o arranque.</p>
+      <p>A rede de segurança decide-se antes do incidente: <code>-XX:+HeapDumpOnOutOfMemoryError</code> com <code>-XX:HeapDumpPath</code> a apontar para um volume persistente. Sem isso, cada reinício apaga a prova e o ciclo repete-se durante semanas — que é exactamente a situação descrita na pergunta.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentamos o <code>-Xmx</code>» sem distinguir retenção de subdimensionamento.</td></tr>
+        <tr><td>Mid</td><td>Sabe tirar <em>heap dump</em> e abrir no MAT, mas não conhece o critério do patamar pós-GC nem o impacto de tirar o <em>dump</em> em produção.</td></tr>
+        <tr><td>Sénior</td><td>Usa o patamar pós-GC como critério, escala do barato para o caro, drena antes do <em>dump</em>, e usa a árvore de dominadores; conhece os padrões típicos de retenção.</td></tr>
+        <tr><td>Staff</td><td>Distingue <em>heap</em> de memória fora do <em>heap</em>, deixa a rede de segurança configurada por omissão, e transforma a correcção em regra (limite obrigatório em todas as caches).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O <em>heap</em> está estável mas o Kubernetes mata o <em>pod</em> por memória. O que investiga?»</li>
+      <li>«Qual a diferença entre <em>shallow size</em>, <em>retained size</em> e árvore de dominadores?»</li>
+      <li>«Como impede que uma cache nova entre sem limite no próximo <em>sprint</em>?»</li>
+      <li>«Reiniciar de 24 em 24 horas é solução aceitável em algum cenário?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Olhar apenas para o <em>heap</em> total serrilhado e concluir o que quer que seja.</li>
+      <li>Tirar <em>heap dump</em> de todos os <em>pods</em> em simultâneo durante um incidente.</li>
+      <li>Não ter <code>HeapDumpOnOutOfMemoryError</code> ligado e perder a prova em cada reinício.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>-XX:MaxRAMPercentage</code> mal calculado é a causa silenciosa de metade dos <code>OOMKilled</code> em Kubernetes. O limite de memória do contentor tem de acomodar <em>heap</em> mais <em>metaspace</em>, pilhas de <em>threads</em>, <em>buffers</em> directos, cache de código e o próprio código nativo — tipicamente 25 a 35% acima do <em>heap</em>. Definir <code>-Xmx4g</code> num contentor com limite de 4 GiB garante que o Kubernetes mata o processo antes de a JVM sequer lançar <code>OutOfMemoryError</code>, e sem <em>heap dump</em>.</p></aside>
+
+<h2 id="sec-34-8" class="h2"><span class="secnum">34.8</span> Resumo e checklist<a class="anchor" href="#sec-34-8" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, por ordem de utilidade numa entrevista.</p>
+
+<ul class="lst">
+  <li>Alerta-se em métricas, navega-se em traços, confirma-se em logs. Cada sinal tem um custo que difere em ordens de grandeza e uma pergunta a que responde melhor do que os outros.</li>
+  <li>O custo de métricas é cardinalidade, não volume: identificadores pertencem a traços e logs, onde são baratos, nunca a etiquetas de série temporal.</li>
+  <li>A média de latência mente por assimetria e por composição. O par p50/p99 é diagnóstico: juntos indicam problema sistémico, p99 sozinho indica fenómeno de cauda.</li>
+  <li>Percentis agregam-se por baldes de histograma, nunca por média de percentis de réplicas.</li>
+  <li>SLO de 99,9% em 30 dias são 43,2 minutos de orçamento; os alertas saem do <em>burn rate</em> com duas janelas, e paginam-se sintomas, não causas.</li>
+  <li>A resposta a «o serviço está lento» é um procedimento por custo de verificação: enquadrar, mitigar em paralelo, uma instância ou todas, fora ou dentro da aplicação, saturação, <em>thread dumps</em>, base de dados, dependências e — por último — perfilador.</li>
+  <li>Muitas <em>threads</em> em <code>getConnection</code> significa pool esgotado, e a correcção quase nunca é aumentar o pool: é descobrir porque as conexões ficam presas.</li>
+  <li>Mitigar antes de compreender, mas recolher provas antes de mitigar: <em>thread dump</em> custa 10 a 50 ms, <em>heap dump</em> custa 10 a 30 segundos e exige o <em>pod</em> drenado.</li>
+  <li>Fuga de memória confirma-se pelo patamar de <em>heap</em> após GC completo, não pelo gráfico serrilhado do <em>heap</em> total.</li>
+</ul>
+
+<p>Checklist accionável antes da ronda de observabilidade.</p>
+
+<ul class="lst">
+  <li>Ter na ponta da língua os quatro números do orçamento de erro (99% a 99,99%) e o cálculo do <em>burn rate</em>.</li>
+  <li>Saber dizer, sem hesitar, o comando de <em>thread dump</em>, o de JFR e as duas <em>queries</em> de PostgreSQL (<code>pg_stat_activity</code> e <code>pg_stat_statements</code>).</li>
+  <li>Ter um incidente próprio preparado com impacto quantificado, tempo de mitigação, causas contribuintes e duas acções que eliminaram classes de falha.</li>
+  <li>Conseguir explicar em 30 segundos porque não se promediam percentis e porque a cardinalidade é o custo das métricas.</li>
+  <li>Praticar a resposta ao «serviço lento» em voz alta como lista numerada, com um comando por passo e o critério de eliminação de cada hipótese.</li>
+  <li>Saber distinguir perfil de CPU de perfil de espera e o que fazer quando o <em>flame graph</em> de CPU aparece vazio.</li>
+  <li>Levar uma opinião fundamentada sobre quantos alertas por semana são aceitáveis e o que fazer com os restantes.</li>
+  <li>Rever a diferença entre <em>liveness</em> e <em>readiness</em> e a consequência de pôr a base de dados na sonda errada.</li>
+</ul>

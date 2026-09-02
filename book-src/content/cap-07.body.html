@@ -1,0 +1,759 @@
+<p>A ronda de concorrência é a que melhor separa quem já operou um serviço com carga de quem só leu sobre <em>threads</em>. O entrevistador não quer a definição de <code>volatile</code>: quer saber se o candidato sabe <em>porque</em> é que um campo sem barreira pode nunca ser visto por outra <em>thread</em>, quanto custa um monitor sob contenção, e o que muda no dimensionamento de um <em>pool</em> quando o trabalho passa de CPU para I/O. Onde os candidatos caem é em três sítios: descrevem <code>synchronized</code> como «exclusão mútua» e esquecem que também é uma barreira de memória; dimensionam <em>pools</em> por hábito («50 <em>threads</em>») em vez de por fórmula; e não sabem que evidência recolher numa produção que está lenta sem estar em erro. Este capítulo cobre o modelo de memória, monitores, deadlock, CAS e colecções concorrentes, dimensionamento de executores, composição assíncrona e o diagnóstico que fecha o ciclo. Threads virtuais e concorrência estruturada ficam para o capítulo seguinte — quase tudo o que se segue continua a valer lá.</p>
+
+<h2 id="sec-7-1" class="h2"><span class="secnum">7.1</span> Happens-before, visibilidade e volatile<a class="anchor" href="#sec-7-1" aria-label="ligação">#</a></h2>
+
+<p>O <em>Java Memory Model</em> (JMM) não descreve caches nem barreiras de processador: descreve uma relação de ordem parcial entre acções, <em>happens-before</em>. Se a acção A tem <em>happens-before</em> com a acção B, tudo o que A escreveu é visível a B. Se não tem, o compilador, o JIT e o processador podem reordenar à vontade e não existe garantia nenhuma — nem sequer a de que a escrita chegue alguma vez. É um contrato de mínimos, deliberadamente fraco, para que a JVM possa fazer <em>hoisting</em> de leituras para fora de ciclos, manter valores em registos e reordenar escritas independentes.</p>
+
+<p>As arestas que interessam num serviço real são cinco. Dentro de uma <em>thread</em>, a ordem do programa. A libertação de um monitor tem <em>happens-before</em> com a aquisição seguinte <em>do mesmo</em> monitor. A escrita num campo <code>volatile</code> tem <em>happens-before</em> com qualquer leitura posterior desse campo. <code>Thread.start()</code> tem <em>happens-before</em> com tudo o que a nova <em>thread</em> faz, e tudo o que uma <em>thread</em> faz tem <em>happens-before</em> com o <code>join()</code> que a espera. Por fim, a escrita de um campo <code>final</code> no construtor é visível a qualquer <em>thread</em> que veja a referência publicada correctamente — a base da segurança dos objectos imutáveis.</p>
+
+<p>A consequência prática é que a maioria dos bugs de visibilidade não é um bug de «valor errado»: é um ciclo que nunca termina, um <em>flag</em> de <em>shutdown</em> que nunca é observado, ou um objecto parcialmente construído que outra <em>thread</em> vê com campos a zero. Nenhum deles aparece num teste de uma <em>thread</em>, e o JIT só os expõe depois de a <em>hot loop</em> ser compilada — tipicamente após dez mil iterações, ou seja, em produção e não no portátil.</p>
+
+<figure class="listing java" id="lst-7-1"><div class="lhead"><span class="lnum">Listagem 7.1</span>
+<span class="lcap">Ciclo que pode nunca terminar: o JIT tem licença para içar a leitura para fora do ciclo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>final class Consumidor implements Runnable {
+    private boolean aCorrer = true;            // sem volatile: nenhuma aresta happens-before
+
+    void parar() { aCorrer = false; }          // thread A (o hook de shutdown)
+
+    @Override public void run() {              // thread B
+        while (aCorrer) {                      // o JIT pode compilar isto como while (true)
+            processar(fila.poll());            // ... e o serviço nunca drena
+        }
+    }
+}
+
+// Correcto: uma escrita volátil e uma leitura volátil criam a aresta.
+private volatile boolean aCorrer = true;</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa máquina x86-64, uma leitura <code>volatile</code> é uma leitura normal (custo ~0) e uma escrita <code>volatile</code> compila para uma instrução com barreira, na ordem de 20 a 50 ciclos, contra 1 a 2 ciclos de uma escrita simples. Um <code>synchronized</code> não contendido custa dezenas de nanossegundos; contendido e inflacionado para monitor do SO, o <em>park/unpark</em> mais a mudança de contexto colocam-no na ordem de 1 a 10 microssegundos. A diferença entre «sem contenção» e «com contenção» é de duas ordens de grandeza — é por isso que o número de <em>threads</em> a competir importa mais do que o custo unitário do <em>lock</em>.</p></aside>
+
+<div class="qa" id="q-7-1" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos um serviço em que o <em>hook</em> de <em>shutdown</em> põe uma <code>boolean parar</code> a <code>true</code> e o ciclo de trabalho testa essa <em>flag</em>. Em produção, um <em>pod</em> em cada vinte não termina e é morto pelo <code>SIGKILL</code> ao fim de 30 segundos. Explique o que está a acontecer ao nível do modelo de memória.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não existe nenhuma aresta <em>happens-before</em> entre a escrita da <em>flag</em> na <em>thread</em> do <em>hook</em> e a leitura no ciclo de trabalho, logo a JVM não é obrigada a propagar a escrita — e, com o ciclo compilado, tipicamente não a propaga. O JIT vê que <code>parar</code> não é modificado dentro do ciclo, faz <em>hoisting</em> da leitura para fora e mantém o valor num registo. O ciclo passa a ser literalmente <code>while (true)</code> no código nativo.</p>
+      <p>Não é um problema de <em>cache</em> de CPU, é a explicação errada mais comum. Em x86-64 a coerência de <em>cache</em> é forte e a escrita chegaria; o que impede a propagação é uma optimização do compilador, perfeitamente legal segundo o JMM. Isso explica o padrão observado: falha num <em>pod</em> em vinte, porque só falha quando aquele ciclo específico foi compilado a C2 antes do <em>shutdown</em> — em máquinas menos carregadas o interpretador ainda relê o campo e o <em>pod</em> termina.</p>
+      <p>A correcção é uma palavra: <code>volatile</code> no campo. A escrita volátil tem <em>happens-before</em> com a leitura volátil seguinte, o que proíbe o <em>hoisting</em> e força a releitura em cada iteração. Alternativas equivalentes: um <code>AtomicBoolean</code>, ou consultar <code>Thread.currentThread().isInterrupted()</code> e usar <code>interrupt()</code> — que tem a vantagem de também desbloquear a <em>thread</em> se ela estiver parada num <code>poll()</code> com <em>timeout</em>.</p>
+      <p>O <em>trade-off</em> de <code>volatile</code> aqui é irrelevante: uma leitura volátil em x86 é uma leitura normal e o ciclo faz milhares de iterações por segundo, não milhares de milhões. O caso em que <code>volatile</code> não chega é quando a <em>flag</em> faz parte de uma decisão composta com outro estado — aí é preciso um <em>lock</em>, porque <code>volatile</code> garante visibilidade mas não atomicidade de duas variáveis.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Falta sincronizar» sem dizer o quê; ou propõe <code>Thread.sleep()</code> no ciclo para «dar oportunidade».</td></tr>
+        <tr><td>Mid</td><td>Identifica que falta <code>volatile</code>, mas justifica com «cada CPU tem a sua cache» e não menciona reordenação nem o compilador.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia <em>happens-before</em>, atribui a causa ao <em>hoisting</em> do JIT, explica a intermitência pela compilação tardia e sabe que <code>volatile</code> não dá atomicidade composta.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a alternativa por interrupção para desbloquear esperas, e um plano de detecção: <em>thread dump</em> automático antes do <code>SIGKILL</code> e métrica de duração do <em>graceful shutdown</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se em vez de <code>volatile</code> puser o campo dentro de um bloco <code>synchronized</code> nos dois lados, funciona? Porquê?»</li>
+      <li>«O <code>terminationGracePeriodSeconds</code> do Kubernetes tem alguma coisa a ver com isto?»</li>
+      <li>«Como escreveria um teste que expõe este bug de forma fiável?»</li>
+      <li>«E se a <em>flag</em> fosse um <code>long</code> em vez de <code>boolean</code>, mudava alguma coisa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que «em x86 isto nunca acontece» — acontece, porque a causa é o compilador.</li>
+      <li>Propor tornar o campo <code>static</code> ou <code>synchronized</code> ao acaso, sem explicar a aresta criada.</li>
+      <li>Dizer que <code>volatile</code> torna as operações atómicas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-2" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Diga-me exactamente o que <code>volatile</code> garante e o que não garante, e dê-me um caso em que substituir <code>synchronized</code> por <code>volatile</code> introduz um bug.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>volatile</code> garante três coisas: visibilidade (a escrita é vista pela leitura seguinte), proibição de reordenação através do acesso volátil, e atomicidade da leitura e da escrita individuais, incluindo para <code>long</code> e <code>double</code>, que sem <code>volatile</code> podem ser lidos em duas metades numa JVM de 32 bits. Não garante atomicidade de nenhuma operação composta: <code>contador++</code> é ler, somar e escrever, e duas <em>threads</em> podem ler o mesmo valor e perder um incremento.</p>
+      <p>O caso clássico de regressão é substituir um <code>synchronized</code> que protegia um par de campos por dois campos <code>volatile</code>. Se o estado for «saldo» e «último movimento», e a invariante for que o movimento corresponde sempre ao saldo, um leitor pode ver o saldo novo com o movimento antigo: cada campo é visível, mas o par nunca é atómico. O mesmo se aplica a um <em>cache</em> com «valor» e «validade»: passa a ser possível servir um valor já expirado ou expirar um valor acabado de calcular.</p>
+      <p>O segundo caso é o «verificar e depois agir». <code>if (mapa.get(k) == null) mapa.put(k, v)</code> continua a ser uma corrida mesmo que a referência para o mapa seja <code>volatile</code> — o <code>volatile</code> protege a referência, não o conteúdo. É a mesma armadilha de declarar <code>volatile int[] contadores</code>: a referência ao <em>array</em> é volátil, os elementos não são.</p>
+      <p>Quando é que <code>volatile</code> é suficiente e preferível: quando existe um único escritor, ou quando a nova escrita não depende do valor anterior, e a leitura é dominante. Um <em>flag</em> de configuração recarregada, uma referência para um <em>snapshot</em> imutável trocada por inteiro, um <em>timestamp</em> de último sucesso. Nesses casos, <code>volatile</code> tem custo de leitura nulo em x86 e evita toda a contenção de um monitor. A regra de decisão: se a operação lê e escreve a mesma variável, ou envolve duas variáveis com uma invariante entre elas, <code>volatile</code> não chega — usa-se <code>Atomic*</code>, um <em>lock</em>, ou um objecto imutável publicado por uma única escrita volátil.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>volatile</code> é como <code>synchronized</code> mas mais leve»; não distingue visibilidade de atomicidade.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>contador++</code> não é atómico, mas não dá o caso das duas variáveis com invariante nem a armadilha do <em>array</em>.</td></tr>
+        <tr><td>Sénior</td><td>Separa visibilidade, ordenação e atomicidade; dá o exemplo do par de campos e a regra de quando <code>volatile</code> basta (escritor único ou troca de <em>snapshot</em> imutável).</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a leitura de <code>long</code>/<code>double</code>, a publicação segura de imutáveis via campos <code>final</code>, e quantifica o custo relativo das duas soluções.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E <code>AtomicReference</code> — em que é que difere de um campo <code>volatile</code>?»</li>
+      <li>«Como publica com segurança um objecto de configuração recarregado a cada 30 segundos?»</li>
+      <li>«O que faz a semântica de campos <code>final</code> pela segurança de um <em>record</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que <code>volatile</code> «faz flush da cache para a memória principal» como explicação única.</li>
+      <li>Usar <code>volatile</code> num contador de métricas e chamar-lhe correcto.</li>
+      <li>Não reconhecer que <code>volatile</code> numa referência não protege o objecto apontado.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-7-2"><div class="lhead"><span class="lnum">Listagem 7.2</span>
+<span class="lcap">Double-checked locking correcto e a alternativa sem lock nenhum.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public final class Registo {
+    private static volatile Registo instancia;      // volatile é obrigatório, não decorativo
+
+    public static Registo obter() {
+        Registo r = instancia;                      // 1 leitura volátil no caminho quente
+        if (r == null) {
+            synchronized (Registo.class) {
+                r = instancia;
+                if (r == null) { r = new Registo(); instancia = r; }
+            }
+        }
+        return r;
+    }
+}
+
+// Preferível quando não há parâmetros de construção: a JVM já sincroniza a inicialização
+// da classe, e a inicialização é preguiçosa porque Suporte só é carregada no primeiro obter().
+public final class RegistoLazy {
+    private static final class Suporte { static final Registo INSTANCIA = new Registo(); }
+    public static Registo obter() { return Suporte.INSTANCIA; }
+}</code></pre></figure>
+
+<div class="qa" id="q-7-3" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Este código faz <em>double-checked locking</em> sem <code>volatile</code> no campo. Está correcto? Se não, o que pode a outra <em>thread</em> observar, e qual é a alternativa que prefere hoje?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Está errado, e a falha não é «pode criar duas instâncias» — é pior: outra <em>thread</em> pode obter uma referência não nula para um objecto <strong>parcialmente construído</strong>. A construção de <code>new Registo()</code> são três passos: reservar memória, correr o construtor, atribuir a referência ao campo. Sem <code>volatile</code>, a JVM pode reordenar os passos 2 e 3, publicando a referência antes de os campos estarem inicializados. Uma <em>thread</em> que passe na primeira verificação sem entrar no <code>synchronized</code> vê o objecto com campos a <code>null</code> ou a zero, e falha com <code>NullPointerException</code> num sítio que parece impossível.</p>
+      <p>Antes do Java 5 o padrão era irreparável, porque a semântica de <code>volatile</code> não proibia essa reordenação. Desde o JSR-133, a escrita volátil na atribuição da instância impede que qualquer escrita anterior seja movida para depois dela, e a leitura volátil na primeira verificação garante que quem vê a referência vê o construtor completo. Por isso o <code>volatile</code> é obrigatório e por isso se copia o campo para uma variável local: evita uma segunda leitura volátil no caminho quente, o que em código muito chamado poupa a barreira de leitura em arquitecturas com ordenação fraca.</p>
+      <p>Hoje, quando não há parâmetros de construção, prefere-se o <em>initialization-on-demand holder</em>: uma classe interna estática com o campo <code>final</code>. A inicialização de classes já é sincronizada pela JVM com garantias de <em>happens-before</em>, a classe só é carregada na primeira utilização, e o caminho quente fica sem barreira nenhuma depois de a classe estar inicializada. Quando há parâmetros, o DCL correcto ou um <code>ConcurrentHashMap.computeIfAbsent</code> por chave resolvem melhor.</p>
+      <p>O <em>trade-off</em> a declarar: em código de aplicação com Spring, nada disto é preciso — o contentor já garante <em>singleton</em> com publicação segura. O DCL só se justifica em bibliotecas, em código sem contentor, ou quando a inicialização é cara (dezenas de milissegundos) e não pode acontecer no arranque.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Está bem, o segundo <code>if</code> resolve»; ou diz que o risco é criar duas instâncias.</td></tr>
+        <tr><td>Mid</td><td>Sabe que falta <code>volatile</code>, mas não consegue descrever a publicação de um objecto parcialmente construído.</td></tr>
+        <tr><td>Sénior</td><td>Descreve a reordenação dos três passos, cita a mudança de semântica do JSR-133, e propõe o <em>holder idiom</em> como alternativa preferida.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a variável local para evitar a segunda leitura volátil, o caso com parâmetros via <code>computeIfAbsent</code>, e observa que num serviço Spring o padrão raramente se justifica.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a variável local <code>r</code> está lá?»</li>
+      <li>«E se o campo fosse <code>final</code> numa classe interna — porque é que isso é seguro sem <code>volatile</code>?»</li>
+      <li>«Como faria isto para um mapa de instâncias por <em>tenant</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Defender que o padrão «funciona na prática» porque nunca falhou em testes.</li>
+      <li>Substituir por <code>synchronized</code> no método inteiro e não mencionar o custo em código muito chamado.</li>
+      <li>Não distinguir «duas instâncias» de «instância meio construída».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-2" class="h2"><span class="secnum">7.2</span> synchronized, monitores e reentrância<a class="anchor" href="#sec-7-2" aria-label="ligação">#</a></h2>
+
+<p>Cada objecto Java tem um monitor associado. Um bloco <code>synchronized</code> compila para o par de instruções <code>monitorenter</code>/<code>monitorexit</code>, com um segundo <code>monitorexit</code> num manipulador de excepções para garantir a libertação em qualquer saída; um método <code>synchronized</code> não gera essas instruções — traz uma <em>flag</em> de acesso que faz a JVM adquirir o monitor da instância, ou da classe se for estático. O monitor é <strong>reentrante</strong>: guarda o dono e um contador de entradas, pelo que um método sincronizado pode chamar outro do mesmo objecto sem se auto-bloquear.</p>
+
+<p>A implementação tem níveis. Sem contenção, a JVM usa um <em>lock</em> leve baseado em CAS sobre a cabeçalho do objecto, com custo de dezenas de nanossegundos. Quando duas <em>threads</em> competem, o monitor «infla» para uma estrutura pesada com fila de espera e passa a usar primitivas do sistema operativo; o custo salta para microssegundos por causa do <em>park</em>, do <em>unpark</em> e da mudança de contexto. O <em>biased locking</em>, que eliminava até o CAS para o caso de uma só <em>thread</em>, foi desactivado por omissão no JDK 15 e o código acabou removido: em cargas modernas com muitos objectos partilhados, o custo de revogar o enviesamento superava o ganho.</p>
+
+<p>O ponto que separa níveis é perceber que <code>synchronized</code> faz duas coisas ao mesmo tempo — exclusão mútua <em>e</em> barreira de memória. Remover um <code>synchronized</code> «porque só há um escritor» remove também a garantia de visibilidade para os leitores. E o âmbito importa: sincronizar num método público expõe o monitor a qualquer código que tenha a referência, o que permite a terceiros bloquearem o objecto. Um <code>private final Object lock = new Object()</code> resolve isso por 16 bytes de cabeçalho.</p>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Reduzir o âmbito do bloco sincronizado reduz o tempo de posse e aumenta o débito — mas cada entrada e saída tem custo fixo. Dividir um bloco de 100 ns em vinte blocos de 5 ns paga vinte pares <code>monitorenter</code>/<code>monitorexit</code> e pode ficar mais lento sem contenção, além de partir invariantes que dependiam do bloco único. A regra: tirar do bloco tudo o que é I/O, chamadas a código alheio e cálculo puro sobre cópias locais; manter no bloco todas as leituras e escritas que formam uma invariante.</p></aside>
+
+<div class="qa" id="q-7-4" data-box="qa" data-area="concorrencia" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O que é a reentrância de um monitor e porque é que a JVM a implementa? Dê-me um exemplo de código que ficaria bloqueado se os monitores não fossem reentrantes.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Reentrância significa que o <em>lock</em> é adquirido por <em>thread</em>, não por invocação: o monitor guarda a identidade do dono e um contador. Se a <em>thread</em> que já é dona voltar a entrar, o contador incrementa; a libertação só acontece quando o contador volta a zero. Sem isso, qualquer método sincronizado que chamasse outro método sincronizado do mesmo objecto bloquearia contra si próprio, e o bloqueio seria irrecuperável.</p>
+      <p>O exemplo canónico é a herança. Uma subclasse com <code>public synchronized void guardar(X x) { registar(x); super.guardar(x); }</code> em que <code>super.guardar</code> também é <code>synchronized</code>: são dois métodos sincronizados sobre o mesmo monitor da mesma instância. Com monitores não reentrantes, a segunda aquisição esperaria por uma libertação que só aconteceria depois de a segunda aquisição terminar — um <em>self-deadlock</em>. O mesmo acontece com recursividade e com <em>callbacks</em> que reentram no objecto.</p>
+      <p>A reentrância tem um custo escondido que vale a pena nomear: dá falsa sensação de segurança. O facto de a <em>thread</em> poder reentrar não significa que a invariante do objecto esteja intacta no ponto de reentrada. Um método sincronizado que chama código alheio — um <em>listener</em>, um <em>callback</em>, um método <em>abstract</em> — dentro do bloco pode ser reentrado no meio de uma modificação e observar estado inconsistente. É a razão de a regra «nunca chamar código alheio com um <em>lock</em> na mão» existir.</p>
+      <p><code>ReentrantLock</code> tem a mesma semântica e expõe o contador via <code>getHoldCount()</code>. Quem quer explicitamente proibir reentrância usa um semáforo com uma permissão — que é adquirido por permissão e não por <em>thread</em>, e por isso bloqueia mesmo o próprio dono.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde reentrância com «vários métodos sincronizados podem correr ao mesmo tempo».</td></tr>
+        <tr><td>Mid</td><td>Explica dono e contador e dá o exemplo da chamada entre métodos sincronizados.</td></tr>
+        <tr><td>Sénior</td><td>Acrescenta o caso da herança, o risco de reentrar com invariantes partidas, e a diferença face a <code>Semaphore(1)</code>.</td></tr>
+        <tr><td>Staff</td><td>Liga à regra de não chamar código alheio sob <em>lock</em> e dá um exemplo real de <em>callback</em> reentrante que corrompeu estado.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um <code>Semaphore(1)</code> substitui um <code>synchronized</code>? Em que é que difere?»</li>
+      <li>«O que muda se o método sincronizado for <code>static</code>?»</li>
+      <li>«Como evita expor o monitor do seu objecto a código externo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <code>synchronized</code> em métodos diferentes usa <em>locks</em> diferentes.</li>
+      <li>Não perceber que o método estático sincroniza no objecto <code>Class</code>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-5" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando é que troca <code>synchronized</code> por <code>ReentrantLock</code>? E quando é que a troca é injustificada?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Troca-se por uma de quatro capacidades que <code>synchronized</code> não tem. Primeira, aquisição com <em>timeout</em> ou tentativa não bloqueante: <code>tryLock(200, TimeUnit.MILLISECONDS)</code> permite desistir e devolver um erro em vez de acumular <em>threads</em> paradas — a base de qualquer estratégia de prevenção de deadlock por desistência. Segunda, aquisição interrompível com <code>lockInterruptibly()</code>, que permite cancelar um pedido durante o <em>shutdown</em>. Terceira, várias condições de espera sobre o mesmo <em>lock</em> via <code>newCondition()</code>, em vez do único conjunto de espera de <code>wait()</code>/<code>notify()</code> — indispensável numa fila limitada com «não cheia» e «não vazia» separadas. Quarta, aquisição e libertação em âmbitos diferentes, por exemplo <em>lock striping</em> por chave.</p>
+      <p>A justiça também está disponível — <code>new ReentrantLock(true)</code> serve por ordem de chegada — mas custa caro: um <em>lock</em> justo não permite <em>barging</em> e obriga a uma mudança de contexto por transferência de posse, o que em contenção alta reduz o débito por uma ordem de grandeza. Só se justifica quando a variância de latência importa mais do que o débito, tipicamente para evitar <em>starvation</em> de uma <em>thread</em> num sistema com posses longas.</p>
+      <p>A troca é injustificada quando o motivo é «desempenho». Desde o JDK 6 as duas implementações estão próximas sem contenção, e a JVM optimiza <code>synchronized</code> de formas que não aplica a um <em>lock</em> de biblioteca — nomeadamente a eliminação de <em>lock</em> quando a análise de escape prova que o objecto não escapa. Em troca, <code>ReentrantLock</code> obriga ao <code>try/finally</code> com <code>unlock()</code>: um <code>return</code> antecipado sem <code>finally</code> deixa o <em>lock</em> preso para sempre, e essa classe de bug não existe com <code>synchronized</code>.</p>
+      <p>Duas notas de contexto actual. Para leitura dominante, nenhum dos dois é a resposta certa: <code>ReentrantReadWriteLock</code> ou, melhor, <code>StampedLock</code> com <code>tryOptimisticRead()</code>, que evita escrever no <em>lock</em> no caminho de leitura — ao custo de não ser reentrante e de exigir validação explícita. E, no contexto de <em>threads</em> virtuais, o antigo argumento de que <code>synchronized</code> fixava a <em>thread</em> virtual ao <em>carrier</em> deixou de valer a partir do JDK 24; até lá, era razão legítima para preferir <code>ReentrantLock</code> em caminhos bloqueantes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>ReentrantLock</code> é mais rápido» sem mais nada.</td></tr>
+        <tr><td>Mid</td><td>Nomeia <code>tryLock</code> e <code>Condition</code>, mas não fala do custo da justiça nem do risco do <code>finally</code>.</td></tr>
+        <tr><td>Sénior</td><td>Enumera as capacidades exclusivas, quantifica o custo do modo justo, e defende <code>synchronized</code> por omissão pela impossibilidade de esquecer a libertação.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>StampedLock</code> para leitura dominante com o aviso da não reentrância, e a evolução do <em>pinning</em> com <em>threads</em> virtuais.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva a fila limitada com duas <code>Condition</code>. Porque não chega uma?»</li>
+      <li>«O que acontece se fizer <code>unlock()</code> numa <em>thread</em> que não é dona?»</li>
+      <li>«<code>StampedLock</code> em modo optimista: o que tem de validar e porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>ReentrantLock</code> sem <code>try/finally</code> no exemplo que escreve no quadro.</li>
+      <li>Recomendar <em>fair locks</em> por omissão «para ser justo».</li>
+      <li>Achar que <code>ReadWriteLock</code> é sempre melhor do que um <em>lock</em> exclusivo — com escritas frequentes é pior.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-3" class="h2"><span class="secnum">7.3</span> Deadlock, livelock e starvation<a class="anchor" href="#sec-7-3" aria-label="ligação">#</a></h2>
+
+<p>Um <em>deadlock</em> exige quatro condições simultâneas: exclusão mútua, posse e espera, ausência de preempção e espera circular. Como as três primeiras são inerentes a <em>locks</em> em Java, na prática só se ataca a quarta — quebrando o ciclo por ordenação global de aquisição, ou introduzindo preempção artificial com <code>tryLock</code> e desistência. A forma que aparece em entrevista é sempre a mesma: duas transferências simétricas entre as mesmas duas contas.</p>
+
+<p>O que distingue os outros dois: no <em>livelock</em> as <em>threads</em> não estão bloqueadas — estão a trabalhar, a reagir umas às outras e a não progredir. O padrão típico é «detectar conflito, recuar, tentar outra vez» com o mesmo tempo de recuo em todos os intervenientes; a correcção é recuo aleatório. Na <em>starvation</em>, há progresso global mas uma <em>thread</em> específica nunca é servida: acontece com <em>locks</em> não justos e posses longas, com prioridades de <em>thread</em> mal usadas, e com <code>ReadWriteLock</code> não justo onde um fluxo contínuo de leitores adia indefinidamente o escritor.</p>
+
+<figure class="listing java" id="lst-7-3"><div class="lhead"><span class="lnum">Listagem 7.3</span>
+<span class="lcap">Deadlock por espera circular e a correcção por ordem total de aquisição.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Errado: transferir(a, b) e transferir(b, a) em paralelo bloqueiam-se mutuamente.
+void transferirErrado(Conta a, Conta b, BigDecimal v) {
+    synchronized (a) {
+        synchronized (b) { a.debitar(v); b.creditar(v); }
+    }
+}
+
+// Correcto: ordem total pelo identity hash; lock de desempate para o caso raro de colisão.
+private static final Object DESEMPATE = new Object();
+
+void transferir(Conta a, Conta b, BigDecimal v) {
+    int ha = System.identityHashCode(a), hb = System.identityHashCode(b);
+    if (ha &lt; hb) {
+        synchronized (a) { synchronized (b) { mover(a, b, v); } }
+    } else if (ha &gt; hb) {
+        synchronized (b) { synchronized (a) { mover(a, b, v); } }
+    } else {                                   // colisão: ~1 em 2^32, mas tem de estar correcta
+        synchronized (DESEMPATE) {
+            synchronized (a) { synchronized (b) { mover(a, b, v); } }
+        }
+    }
+}</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>A ordenação de <em>locks</em> só funciona se for global. Numa base de dados, o mesmo problema reaparece como <em>deadlock</em> do PostgreSQL: dois <code>UPDATE</code> na mesma transacção por ordem inversa de chave primária. O PostgreSQL detecta-o passado <code>deadlock_timeout</code> — 1 segundo por omissão — e aborta uma das transacções com <code>SQLState 40P01</code>. A correcção é a mesma: ordenar as chaves antes de as bloquear, por exemplo com <code>ORDER BY id FOR UPDATE</code> numa única instrução. Uma retentativa cega sem ordenação transforma o <em>deadlock</em> em <em>livelock</em>.</p></aside>
+
+<div class="qa" id="q-7-6" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Este método de transferência entre contas bloqueia as duas contas por ordem de argumento. Mostre-me como provoco um <em>deadlock</em> e dê-me duas correcções diferentes, com o custo de cada uma.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Duas <em>threads</em> a executar <code>transferir(A, B, 10)</code> e <code>transferir(B, A, 10)</code> em simultâneo. A primeira adquire o monitor de A e pede o de B; a segunda adquire o de B e pede o de A. Espera circular, e como monitores não têm <em>timeout</em>, ambas ficam <code>BLOCKED</code> para sempre — sem consumir CPU, o que torna o sintoma «pedidos param, CPU a 5%, latência infinita» e não «serviço lento».</p>
+      <p>Primeira correcção: ordem total de aquisição. Ordena-se por um identificador estável — o número de conta, se existir, ou <code>System.identityHashCode</code> — e adquire-se sempre do menor para o maior, com um <em>lock</em> de desempate para o caso de colisão de <em>hash</em>. O custo é quase nulo em tempo de execução e alto em disciplina: basta um sítio no código que adquira por outra ordem para o ciclo voltar. Escala mal quando os <em>locks</em> são adquiridos em módulos diferentes que não conhecem a ordem uns dos outros.</p>
+      <p>Segunda correcção: desistência com <code>tryLock</code>. Adquire-se o primeiro, tenta-se o segundo com <em>timeout</em> de dezenas de milissegundos; se falhar, liberta-se o primeiro, espera-se um tempo aleatório e retenta-se. Isto quebra a condição «posse e espera» e funciona mesmo sem ordem global, mas exige <code>ReentrantLock</code>, torna a operação não determinista e introduz risco de <em>livelock</em> se o recuo não for aleatório. Precisa de um limite de tentativas — três a cinco — e de uma métrica de desistências, senão a falha fica invisível.</p>
+      <p>A terceira correcção, que é a que eu proporia em produção, é remover a necessidade de dois <em>locks</em>: serializar as transferências por conta através de uma fila por chave, ou empurrar a atomicidade para a base de dados com uma única instrução que bloqueia as linhas por ordem de chave primária. O custo é arquitectural — a operação passa a ser assíncrona ou a depender do isolamento transaccional — mas elimina a classe de bug em vez de a gerir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não consegue construir o cenário das duas chamadas simétricas; propõe «sincronizar tudo num só <em>lock</em> global» sem ver o custo de débito.</td></tr>
+        <tr><td>Mid</td><td>Descreve o <em>deadlock</em> e propõe ordenação, mas esquece o caso de <em>hash</em> igual e não fala de custos.</td></tr>
+        <tr><td>Sénior</td><td>Dá as duas correcções com custos, trata o desempate, e sabe que o sintoma em produção é CPU baixo com latência infinita.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a eliminação do problema por serialização por chave ou pela base de dados, e propõe detecção activa com <code>findDeadlockedThreads</code> mais alarme.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o <em>identity hash</em> das duas contas coincidir?»</li>
+      <li>«Com <code>tryLock</code>, quantas retentativas e com que recuo?»</li>
+      <li>«Como detecta isto em produção sem ter reproduzido localmente?»</li>
+      <li>«O mesmo problema no PostgreSQL — como se manifesta e como se resolve?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor um <em>lock</em> global sobre todas as contas sem reconhecer que serializa o serviço inteiro.</li>
+      <li>Retentar sem recuo aleatório e não ver o <em>livelock</em>.</li>
+      <li>Dizer que a JVM «resolve» <em>deadlocks</em> automaticamente — ela apenas os reporta no <em>thread dump</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-7" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um serviço deixou de progredir mas o CPU está a 95% e não há <em>deadlock</em> no <em>thread dump</em>. Que hipóteses põe e como as distingue?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>CPU alto com progresso nulo exclui <em>deadlock</em> — <em>threads</em> bloqueadas não consomem CPU. Ficam quatro hipóteses. Primeira, <em>livelock</em>: <em>threads</em> em ciclo de retentativa a reagir umas às outras, tipicamente CAS que falha sempre ou <code>tryLock</code> com recuo fixo. Segunda, <em>GC thrashing</em>: a <em>heap</em> quase cheia, ciclos de <em>full GC</em> consecutivos a recuperar 2% de espaço, e o tempo de aplicação a colapsar. Terceira, um ciclo infinito genuíno, incluindo o caso histórico de <code>HashMap</code> corrompido por acesso concorrente. Quarta, contenção que degenerou em <em>spinning</em> — <em>locks</em> curtos com dezenas de <em>threads</em> a competir.</p>
+      <p>A distinção faz-se por dados, não por intuição. Três <em>thread dumps</em> com cinco segundos de intervalo: se as mesmas <em>threads</em> aparecem <code>RUNNABLE</code> sempre no mesmo par de <em>frames</em>, é ciclo ou <em>livelock</em>; se os <em>frames</em> mudam mas o trabalho útil não avança, é <em>livelock</em>; se as <em>threads</em> de GC dominam, é a segunda hipótese. Confirma-se o GC com <code>jstat -gcutil</code> ou com a métrica de <code>jvm_gc_pause_seconds</code>: mais de 50% do tempo em pausa é diagnóstico.</p>
+      <p>A <em>starvation</em> distingue-se destas por ser parcial: o sistema progride, mas uma classe de pedidos tem p99 muito acima da mediana. A assinatura é uma distribuição de latência bimodal. As causas habituais são um <code>ReadWriteLock</code> não justo com leituras contínuas a adiar o escritor, ou um <em>pool</em> partilhado onde tarefas longas ocupam todas as <em>threads</em> e as curtas ficam na fila. A correcção não é «tornar o <em>lock</em> justo»: é separar os <em>pools</em> por classe de trabalho, que resolve a causa em vez do sintoma.</p>
+      <p>Como acção imediata em produção, antes de perceber a causa: recolher os <em>dumps</em> e um perfil JFR de 60 segundos <em>antes</em> de reiniciar o <em>pod</em>. Um reinício sem evidência transforma um incidente de 20 minutos numa investigação de duas semanas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Diz «é <em>deadlock</em>» apesar do CPU alto; propõe reiniciar e ver se volta.</td></tr>
+        <tr><td>Mid</td><td>Menciona ciclo infinito e GC, mas não descreve como distinguir com evidência.</td></tr>
+        <tr><td>Sénior</td><td>Enumera as hipóteses, propõe três <em>dumps</em> espaçados mais métricas de GC, e define <em>livelock</em> e <em>starvation</em> pelas suas assinaturas observáveis.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a ordem de recolha antes do reinício, a leitura bimodal da latência, e a correcção estrutural por separação de <em>pools</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que eventos do JFR usaria e com que limiar?»</li>
+      <li>«Como automatiza a recolha de <em>thread dumps</em> num <em>pod</em> antes de ele ser reiniciado?»</li>
+      <li>«Porque é que um <code>HashMap</code> partilhado pode entrar em ciclo infinito?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir <code>BLOCKED</code> com <code>WAITING</code> ao ler um <em>thread dump</em>.</li>
+      <li>Não reconhecer que <em>deadlock</em> implica CPU baixo.</li>
+      <li>Reiniciar primeiro e recolher depois.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-4" class="h2"><span class="secnum">7.4</span> Colecções concorrentes e CAS<a class="anchor" href="#sec-7-4" aria-label="ligação">#</a></h2>
+
+<p>Todas as classes <code>Atomic*</code> assentam na mesma primitiva: <em>compare-and-swap</em>, uma instrução do processador que compara o valor em memória com um esperado e, se coincidirem, escreve o novo — tudo atomicamente e sem bloquear. Em Java o acesso faz-se hoje por <code>VarHandle</code>. O algoritmo típico é um ciclo: ler, calcular, tentar trocar, repetir se falhar. Isto é <em>lock-free</em>, não <em>wait-free</em>: garante que alguma <em>thread</em> progride, não que uma <em>thread</em> específica termine em número limitado de passos.</p>
+
+<p>A implicação de desempenho é decisiva. Com poucas <em>threads</em>, o CAS é imbatível: sem mudança de contexto, sem fila. Com contenção alta — dezenas de núcleos a incrementar o mesmo contador — o ciclo de retentativa desperdiça CPU e a linha de <em>cache</em> partilhada obriga a tráfego de coerência entre núcleos. É por isso que existe <code>LongAdder</code>: distribui o valor por várias células, uma por zona de contenção, e só as soma em <code>sum()</code>. Troca uma leitura exacta e barata por escritas escaláveis; num contador de métricas com 32 <em>threads</em>, a diferença de débito face a <code>AtomicLong</code> chega a ser de cinco a dez vezes.</p>
+
+<p>O <code>ConcurrentHashMap</code> moderno não tem segmentos — isso foi até ao Java 7. Desde o Java 8, é uma tabela de <em>bins</em>: a inserção do primeiro nó de um <em>bin</em> vazio faz-se por CAS, sem <em>lock</em> nenhum; a partir do segundo nó, sincroniza-se no nó cabeça, pelo que a granularidade do <em>lock</em> é a posição da tabela e não o mapa. Uma <em>bin</em> que ultrapasse oito nós converte-se em árvore vermelho-preta, desde que a tabela já tenha pelo menos 64 posições — abaixo disso o mapa prefere crescer. As leituras são completamente sem <em>lock</em>, apoiadas em campos voláteis. O preço é a semântica fraca: <code>size()</code> é uma estimativa, os iteradores são <em>weakly consistent</em> e nunca lançam <code>ConcurrentModificationException</code>, mas também não representam um instante único.</p>
+
+<figure class="listing java" id="lst-7-4"><div class="lhead"><span class="lnum">Listagem 7.4</span>
+<span class="lcap">Ciclo CAS explícito, contador escalável e actualização atómica de mapa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// CAS explícito: publicar o máximo observado sem lock.
+private final AtomicLong maximo = new AtomicLong(Long.MIN_VALUE);
+
+void publicar(long v) {
+    long actual;
+    while (v &gt; (actual = maximo.get()) &amp;&amp; !maximo.compareAndSet(actual, v)) {
+        // outra thread ganhou a corrida; relê e volta a tentar
+    }
+}
+
+// Contenção alta: LongAdder distribui as escritas por células.
+private final LongAdder pedidos = new LongAdder();
+pedidos.increment();
+long total = pedidos.sum();   // soma não atómica: aproximação se houver escritas em curso
+
+// Errado: três operações, duas corridas (get/put e o ++ perdido).
+if (!porRota.containsKey(rota)) porRota.put(rota, 0L);
+porRota.put(rota, porRota.get(rota) + 1L);
+
+// Correcto: uma travessia, atómica sob o lock do bin.
+private final ConcurrentHashMap&lt;String, LongAdder&gt; porRota = new ConcurrentHashMap&lt;&gt;();
+porRota.computeIfAbsent(rota, k -&gt; new LongAdder()).increment();</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 7.1</span> Escolha de colecção concorrente por perfil de acesso.</div>
+<div class="tscroll"><table><thead><tr><th>Estrutura</th><th>Mecanismo</th><th>Custo dominante</th><th>Quando é a escolha certa</th></tr></thead><tbody>
+<tr><td><code>ConcurrentHashMap</code></td><td>CAS no primeiro nó, <code>synchronized</code> no <em>bin</em></td><td>Leitura sem <em>lock</em>; escrita contende só na mesma <em>bin</em></td><td>Omissão para mapas partilhados com leitura e escrita mistas</td></tr>
+<tr><td><code>ConcurrentSkipListMap</code></td><td>Lista de saltos <em>lock-free</em></td><td>O(log n) com constante alta</td><td>Só quando é preciso ordem ou consultas por intervalo</td></tr>
+<tr><td><code>CopyOnWriteArrayList</code></td><td>Cópia integral do <em>array</em> em cada escrita</td><td>O(n) por escrita, leitura sem custo</td><td>Listas pequenas (dezenas) quase só lidas: <em>listeners</em>, configuração</td></tr>
+<tr><td><code>ArrayBlockingQueue</code></td><td>Um <em>lock</em> e duas <code>Condition</code>, capacidade fixa</td><td>Contenção num só <em>lock</em></td><td>Produtor-consumidor com <em>backpressure</em> obrigatória</td></tr>
+<tr><td><code>ConcurrentLinkedQueue</code></td><td>Michael-Scott, <em>lock-free</em>, ilimitada</td><td><code>size()</code> é O(n) e não fiável</td><td>Alto débito sem necessidade de bloquear nem de limitar</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-7-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique-me o que faz <code>AtomicInteger.incrementAndGet()</code> por baixo, o que é o problema ABA e em que situação é que ele o morde a sério.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>incrementAndGet()</code> é um ciclo de <em>compare-and-swap</em>: lê o valor actual, calcula o valor mais um, e emite uma instrução atómica do processador que só escreve se a memória ainda contiver o valor lido. Se outra <em>thread</em> mudou o valor entretanto, o CAS falha e o ciclo repete. Não há <em>lock</em>, não há mudança de contexto, e o progresso do sistema está garantido — mas uma <em>thread</em> azarada pode retentar muitas vezes, o que faz de CAS um algoritmo <em>lock-free</em> e não <em>wait-free</em>.</p>
+      <p>O ABA é a falha lógica desta primitiva: o CAS compara valores, não histórias. Se o valor for A, outra <em>thread</em> o mudar para B e depois de volta para A, o CAS da primeira <em>thread</em> tem sucesso como se nada tivesse acontecido. Com um contador inteiro isso é inofensivo — o valor é o estado. Onde morde é em estruturas com referências, sobretudo em <em>stacks</em> e filas <em>lock-free</em> com reutilização de nós: a cabeça volta a apontar para o mesmo endereço, mas o nó já foi retirado, reciclado e o seu <code>next</code> aponta para outro sítio. O resultado é corrupção silenciosa da estrutura, não uma excepção.</p>
+      <p>A defesa padrão é acrescentar um contador de versão à comparação: <code>AtomicStampedReference</code> compara referência e <em>stamp</em>, e o <em>stamp</em> incrementa em cada modificação, tornando A-B-A distinguível de A. Existe também <code>AtomicMarkableReference</code> quando basta um bit de marcação, tipicamente para marcar nós logicamente removidos. Em Java, o <em>garbage collector</em> reduz muito a exposição — enquanto houver uma referência viva ao nó antigo, ele não é reciclado no mesmo endereço — o que explica porque a maioria dos programadores Java nunca encontra ABA na prática, ao contrário de quem escreve C++.</p>
+      <p>O <em>trade-off</em> prático que interessa numa entrevista não é o ABA: é a contenção. Para um contador partilhado por muitos núcleos, o ciclo CAS degrada-se porque a linha de <em>cache</em> anda a saltar entre núcleos. Aí a resposta é <code>LongAdder</code>, que distribui as escritas por células, ou eliminar o partilhamento acumulando por <em>thread</em> e somando na exportação da métrica. A regra: CAS até haver contenção medida, <em>striping</em> depois.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É atómico porque é <code>Atomic</code>»; não descreve o ciclo de retentativa.</td></tr>
+        <tr><td>Mid</td><td>Descreve o CAS e sabe a definição de ABA, mas não dá um caso concreto onde causa dano.</td></tr>
+        <tr><td>Sénior</td><td>Distingue <em>lock-free</em> de <em>wait-free</em>, dá o exemplo da <em>stack</em> com reutilização de nós, e propõe <code>AtomicStampedReference</code>.</td></tr>
+        <tr><td>Staff</td><td>Explica porque o GC atenua o ABA em Java, e desloca a conversa para a contenção de linha de <em>cache</em> e a escolha entre <code>AtomicLong</code> e <code>LongAdder</code> com números.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quando é que <code>LongAdder</code> é pior do que <code>AtomicLong</code>?»</li>
+      <li>«O que é que <code>sum()</code> garante exactamente sob escritas concorrentes?»</li>
+      <li>«<code>getAndUpdate</code> com uma função com efeitos secundários — porque é que é um bug?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que CAS «bloqueia» a memória e por isso é igual a um <em>lock</em>.</li>
+      <li>Usar <code>LongAdder</code> onde se precisa de ler o valor exacto a cada operação.</li>
+      <li>Passar uma função com efeitos secundários a <code>updateAndGet</code>, que a pode executar várias vezes.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-9" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como funciona o <code>ConcurrentHashMap</code> por dentro no Java 21, e o que é que ele deliberadamente <em>não</em> garante?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É uma tabela de <em>bins</em> com sincronização por posição. Uma escrita numa <em>bin</em> vazia insere o nó por CAS, sem <em>lock</em>. Se a <em>bin</em> já tiver nós, sincroniza-se no nó cabeça e percorre-se a lista. Assim, a granularidade de exclusão é uma posição da tabela: duas escritas em chaves com <em>hash</em> diferente quase nunca contendem. As leituras não adquirem nada — os campos <code>val</code> e <code>next</code> dos nós são voláteis, o que dá visibilidade sem custo de exclusão. O modelo de segmentos com um <code>ReentrantLock</code> por segmento e <code>concurrencyLevel</code> configurável foi abandonado no Java 8.</p>
+      <p>Duas optimizações de forma. Se uma <em>bin</em> ultrapassar oito nós e a tabela tiver pelo menos 64 posições, a lista converte-se em árvore vermelho-preta, o que limita o pior caso de <em>hash</em> mau a O(log n) em vez de O(n) — é a defesa contra ataques de colisão de <em>hash</em>. Abaixo de 64 posições, o mapa prefere redimensionar. O redimensionamento é cooperativo: as <em>threads</em> que encontram uma <em>bin</em> já migrada ajudam a transferir outras, em vez de esperarem.</p>
+      <p>O que não garante: <code>size()</code> é uma estimativa, calculada a partir de células distribuídas à maneira do <code>LongAdder</code>, e <code>mappingCount()</code> existe precisamente para devolver <code>long</code> sem sugerir exactidão. Os iteradores e os fluxos são <em>weakly consistent</em>: percorrem um estado que reflecte o mapa em algum momento entre a criação e o consumo, nunca lançam <code>ConcurrentModificationException</code>, e podem ou não ver escritas concorrentes. Não há <em>snapshot</em> global, não há operação atómica sobre várias chaves, e não aceita <code>null</code> como chave nem como valor — porque <code>get()</code> devolver <code>null</code> tem de significar «ausente» sem ambiguidade num mapa que não pode ser inspeccionado atomicamente.</p>
+      <p>Duas armadilhas práticas. Primeira, <code>computeIfAbsent</code> é atómico mas mantém o <em>lock</em> da <em>bin</em> durante a função de mapeamento: uma função lenta, ou que faça I/O, serializa todas as chaves dessa <em>bin</em>, e uma função que reentre no mesmo mapa lança <code>IllegalStateException</code> por actualização recursiva desde o Java 9 — no <code>HashMap</code>, a mesma reentrância corrompe a estrutura em silêncio. Segunda, compor operações continua a ser uma corrida: <code>containsKey</code> seguido de <code>put</code> não é atómico, e é para isso que existem <code>putIfAbsent</code>, <code>compute</code>, <code>merge</code> e <code>replace</code> com valor esperado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É um <code>HashMap</code> sincronizado»; ou descreve <code>Collections.synchronizedMap</code>.</td></tr>
+        <tr><td>Mid</td><td>Fala de segmentos e <code>concurrencyLevel</code> — a implementação do Java 7 — e não menciona a semântica fraca.</td></tr>
+        <tr><td>Sénior</td><td>Descreve CAS por <em>bin</em> mais <code>synchronized</code> na cabeça, <em>treeification</em>, leituras sem <em>lock</em>, e enuncia o que não é garantido (<code>size()</code>, iteradores, composição).</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o redimensionamento cooperativo, a proibição de <code>null</code> com a razão, e as armadilhas de <code>computeIfAbsent</code> com função lenta ou recursiva.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que não aceita <code>null</code>?»</li>
+      <li>«O que acontece se a função de <code>computeIfAbsent</code> fizer uma chamada HTTP?»</li>
+      <li>«Quando prefere <code>Collections.synchronizedMap</code>?»</li>
+      <li>«E se eu precisar de um <em>snapshot</em> consistente para exportar métricas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Descrever a implementação de segmentos como se fosse a actual.</li>
+      <li>Assumir que iterar sobre um <code>ConcurrentHashMap</code> dá uma vista consistente.</li>
+      <li>Usar <code>containsKey</code> seguido de <code>put</code> e chamar-lhe seguro.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-7-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 7.1 — Contador de rotas com corrida</span>
+    <div class="labpills"><span class="qpill">Sem locks no caminho quente</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Este contador está em produção num filtro de <em>servlet</em> e perde entre 2% e 8% dos eventos sob carga. Identifique <strong>todas</strong> as corridas, corrija-as sem colocar um <code>synchronized</code> no caminho de escrita, e escreva o teste que expõe o bug na versão original de forma consistente.</p>
+    <p>Versão original: <code>private long total; private final Map&lt;String, Long&gt; porRota = new HashMap&lt;&gt;(); public void registar(String r) { total++; porRota.put(r, porRota.getOrDefault(r, 0L) + 1); } public long total() { return total; } public Map&lt;String, Long&gt; instantaneo() { return porRota; }</code></p>
+    <p>Restrições: <code>registar</code> é chamado por 200 <em>threads</em> a cerca de 30 000 vezes por segundo; <code>instantaneo()</code> é chamado uma vez por minuto pelo exportador de métricas e não pode lançar excepções nem bloquear as escritas. Exemplo: 16 <em>threads</em> × 50 000 chamadas na rota <code>/pagamentos</code> tem de dar exactamente 800 000.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-7-5"><div class="lhead"><span class="lnum">Listagem 7.5</span>
+        <span class="lcap">Contador corrigido: escrita sem lock, leitura sem bloquear o caminho quente.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public final class ContadorDeRotas {
+
+    private final LongAdder total = new LongAdder();
+    private final ConcurrentHashMap&lt;String, LongAdder&gt; porRota = new ConcurrentHashMap&lt;&gt;();
+
+    public void registar(String rota) {
+        total.increment();                                       // sem CAS partilhado
+        porRota.computeIfAbsent(rota, k -&gt; new LongAdder())       // atómico, lock só do bin
+               .increment();                                     // e só na criação da chave
+    }
+
+    public long total() { return total.sum(); }
+
+    /** Cópia defensiva: o exportador nunca vê a estrutura interna nem a bloqueia. */
+    public Map&lt;String, Long&gt; instantaneo() {
+        var saida = new HashMap&lt;String, Long&gt;(porRota.size() * 2);
+        porRota.forEach((rota, valor) -&gt; saida.put(rota, valor.sum()));
+        return Map.copyOf(saida);
+    }
+}</code></pre></figure>
+      <figure class="listing java" id="lst-7-6"><div class="lhead"><span class="lnum">Listagem 7.6</span>
+        <span class="lcap">Teste que falha na versão original: arranque simultâneo e repetição.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@RepeatedTest(20)   // uma corrida é probabilística: uma execução única não prova nada
+void naoPerdeIncrementosSobConcorrencia() throws Exception {
+    final int threads = 16, porThread = 50_000;
+    var contador = new ContadorDeRotas();
+    var arranque = new CountDownLatch(1);          // liberta todas ao mesmo tempo
+    var fim = new CountDownLatch(threads);
+
+    try (var pool = Executors.newFixedThreadPool(threads)) {   // AutoCloseable desde o Java 19
+        for (int i = 0; i &lt; threads; i++) {
+            pool.submit(() -&gt; {
+                arranque.await();
+                for (int j = 0; j &lt; porThread; j++) contador.registar(&quot;/pagamentos&quot;);
+                fim.countDown();
+                return null;
+            });
+        }
+        arranque.countDown();
+        assertTrue(fim.await(30, TimeUnit.SECONDS), &quot;as tarefas não terminaram&quot;);
+    }
+
+    long esperado = (long) threads * porThread;
+    assertEquals(esperado, contador.total());
+    assertEquals(esperado, contador.instantaneo().get(&quot;/pagamentos&quot;));
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>São <strong>três</strong> corridas, não uma: <code>total++</code> (ler-somar-escrever), o par <code>getOrDefault</code>/<code>put</code> no mapa, e a devolução da referência interna em <code>instantaneo()</code>, que permite ao exportador iterar enquanto se escreve. Nomear as três vale mais do que a correcção.</li>
+        <li>Há uma quarta, estrutural e mais grave: um <code>HashMap</code> escrito por várias <em>threads</em> pode corromper-se durante o redimensionamento, com resultados que vão de entradas perdidas a ciclos infinitos numa <em>bin</em>. Perda de contagem é o sintoma benigno.</li>
+        <li><code>registar</code> é O(1) amortizado e não bloqueia: <code>computeIfAbsent</code> só sincroniza no <em>bin</em> quando a chave é criada; depois disso o caminho é <code>get</code> sem <em>lock</em> mais <code>increment()</code> distribuído. <code>instantaneo()</code> é O(n) no número de rotas, com n na ordem das centenas.</li>
+        <li>O teste tem de ter <strong>arranque simultâneo</strong> por <code>CountDownLatch</code> e ser repetido: sem isso as <em>threads</em> escalonam-se e a corrida pode não ocorrer. Com 16 × 50 000, a versão original falha em praticamente todas as repetições; com 2 × 1 000 pode passar sempre.</li>
+        <li>Resposta de nível staff: um teste multi-<em>thread</em> demonstra a presença do bug, nunca a sua ausência. Para provar a correcção do modelo de memória usa-se <em>jcstress</em>, que enumera os resultados permitidos pelo JMM. Dizer isto explicitamente é um sinal forte.</li>
+        <li>Alternativa aceitável: acumular por <em>thread</em> com <code>ThreadLocal</code> e somar na exportação — melhor débito, mas exige registo das instâncias e <code>remove()</code> disciplinado num <em>pool</em>, e a leitura fica atrasada. Só se justifica acima de dezenas de milhões de eventos por minuto.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-7-5" class="h2"><span class="secnum">7.5</span> Executores, thread pools e dimensionamento<a class="anchor" href="#sec-7-5" aria-label="ligação">#</a></h2>
+
+<p>Um <code>ThreadPoolExecutor</code> tem seis parâmetros e a interacção entre três deles é onde quase toda a gente erra. A ordem de decisão do executor é: se há menos <em>threads</em> do que <code>corePoolSize</code>, cria uma <em>thread</em>; senão, tenta pôr na fila; só se a fila estiver cheia é que cria <em>threads</em> até <code>maximumPoolSize</code>; só se a fila estiver cheia e o máximo atingido é que aplica a política de rejeição. A consequência é contra-intuitiva e vale sempre pontos: <strong>com uma fila ilimitada, <code>maximumPoolSize</code> nunca é usado</strong>. É exactamente o que fazem <code>Executors.newFixedThreadPool</code> e <code>newSingleThreadExecutor</code>, que usam uma <code>LinkedBlockingQueue</code> sem limite — a fila cresce até ao <code>OutOfMemoryError</code>, com a latência a subir muito antes disso.</p>
+
+<p>O dimensionamento tem uma fórmula, atribuída a Brian Goetz: <code>N = N_cpu × U_cpu × (1 + W/C)</code>, em que <code>W/C</code> é o rácio entre tempo de espera e tempo de computação. Para trabalho puramente CPU-bound, <code>W/C = 0</code> e o número óptimo é o número de núcleos, mais um para cobrir falhas de página. Para trabalho dominado por I/O, o rácio explode: uma tarefa com 190 ms à espera de uma API e 10 ms de processamento tem <code>W/C = 19</code>, e em 4 vCPU com utilização alvo de 0,9 dá cerca de 4 × 0,9 × 20 = 72 <em>threads</em>. O outro lado é a lei de Little, <code>L = λ × W</code>: a 500 pedidos por segundo com 200 ms de serviço, existem em média 100 pedidos em curso, e é esse o número que a soma de <em>threads</em> e fila tem de suportar.</p>
+
+<p>A fila é a peça de <em>backpressure</em>, não um <em>buffer</em> de conforto. Uma fila limitada com <code>CallerRunsPolicy</code> faz o produtor executar a tarefa quando o sistema satura, o que abranda a admissão na origem em vez de acumular trabalho — o mecanismo mais barato de <em>backpressure</em> em Java. Dimensiona-se pelo tempo aceitável de espera: com 16 <em>threads</em> a 20 ms por tarefa, uma fila de 512 significa até 640 ms de espera na cauda, e não faz sentido se o orçamento de latência for 300 ms.</p>
+
+<figure class="listing java" id="lst-7-7"><div class="lhead"><span class="lnum">Listagem 7.7</span>
+<span class="lcap">Pool dimensionado com fila limitada, nomes de thread úteis e limpeza de ThreadLocal.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>var fila = new ArrayBlockingQueue&lt;Runnable&gt;(512);          // limitada: é o backpressure
+var executor = new ThreadPoolExecutor(
+        32, 32,                                            // núcleo = máximo: sem elasticidade oculta
+        60L, TimeUnit.SECONDS,
+        fila,
+        Thread.ofPlatform().name(&quot;pagamentos-&quot;, 0).factory(),   // nomes legíveis no thread dump
+        new ThreadPoolExecutor.CallerRunsPolicy());        // satura -&gt; o produtor paga e abranda
+
+// ThreadLocal num pool: sem remove(), o valor vive tanto quanto a thread (ou seja, para sempre).
+private static final ThreadLocal&lt;Contexto&gt; CTX = new ThreadLocal&lt;&gt;();
+
+void servir(Pedido p) {
+    CTX.set(new Contexto(p.tenant()));
+    try {
+        processar(p);
+    } finally {
+        CTX.remove();          // obrigatório: o finally é o contrato, não uma boa prática
+    }
+}</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Num contentor com <code>cpu: &quot;4&quot;</code>, <code>Runtime.availableProcessors()</code> devolve 4 desde o JDK 10, porque a JVM lê os limites do <em>cgroup</em>. Uma <em>thread</em> de plataforma custa cerca de 1 MB de <em>stack</em> reservada (<code>-Xss</code>, por omissão 1 MB em Linux x64) fora da <em>heap</em>: 500 <em>threads</em> são ~500 MB de memória nativa que não aparece no <em>heap dump</em> e que faz o <em>pod</em> ser morto por OOM do <em>kernel</em> sem qualquer <code>OutOfMemoryError</code> nos <em>logs</em>. É a razão de fundo para as <em>threads</em> virtuais existirem.</p></aside>
+
+<div class="qa" id="q-7-10" data-box="qa" data-area="concorrencia" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O nosso serviço de <em>checkout</em> corre em <em>pods</em> com 4 vCPU e chama três APIs externas com 180 ms de p99 cada. Recebe 400 pedidos por segundo por <em>pod</em>. Dimensione o <em>pool</em> e justifique cada número.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo por classificar o trabalho. Com três chamadas de 180 ms, mesmo em paralelo, o tempo de espera domina: digamos 200 ms de espera e 10 ms de CPU por pedido, logo <code>W/C = 20</code>. Pela fórmula <code>N = N_cpu × U_cpu × (1 + W/C)</code> com 4 vCPU e utilização alvo de 0,8 — deixar margem para GC e para o <em>sidecar</em> — dá 4 × 0,8 × 21 ≈ 67 <em>threads</em>. Arredondo para 64 e valido pela lei de Little: 400 pedidos por segundo × 0,21 s de serviço = 84 pedidos em curso. Como 84 é maior do que 64, o <em>pool</em> por si só não chega e a diferença tem de caber na fila ou ser rejeitada — o que é informação, não um problema.</p>
+      <p>Escolho fila limitada em 128 com <code>CallerRunsPolicy</code>. Justificação numérica: 128 tarefas a dividir por 64 <em>threads</em> com 210 ms de serviço são cerca de 420 ms de espera adicional na cauda; se o orçamento de p99 do <em>checkout</em> for 1,5 s, cabe. Uma fila de 10 000 daria 32 segundos de espera — o cliente já desistiu, e o serviço continua a processar trabalho que ninguém quer, o que é a definição de colapso por congestão.</p>
+      <p>Depois separo <em>pools</em>. Um <em>pool</em> por dependência externa, dimensionado ao seu orçamento — é a ideia de <em>bulkhead</em>. Se as três APIs partilharem um <em>pool</em> e uma delas degradar de 180 ms para 5 s, ela sozinha ocupa as 64 <em>threads</em> e derruba as outras duas funcionalidades. Com <em>pools</em> separados de 24, 24 e 16, a degradação fica contida, e um disjuntor com limiar de 50% de falhas em janela de 20 pedidos corta a chamada em vez de a deixar consumir <em>threads</em>.</p>
+      <p>Por fim, o que faria a fórmula deixar de importar: com <em>threads</em> virtuais, o dimensionamento deixa de ser sobre <em>threads</em> e passa a ser sobre concorrência admitida a jusante — um <code>Semaphore</code> por dependência, com os mesmos 24, 24 e 16. A fórmula continua a decidir esse limite; muda só quem o implementa. E, em qualquer dos modelos, o número final vem de medição: instrumento a fila (<code>queueSize</code>, tempo de espera, rejeições) e ajusto com carga real, porque <code>W/C</code> muda com o dia da semana.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Dá um número redondo («200 <em>threads</em>») sem cálculo, ou usa <code>newCachedThreadPool</code>.</td></tr>
+        <tr><td>Mid</td><td>Aplica a fórmula, mas deixa a fila ilimitada e não repara que <code>maximumPoolSize</code> fica inerte.</td></tr>
+        <tr><td>Sénior</td><td>Calcula com a fórmula, valida com a lei de Little, escolhe fila limitada com política de rejeição e justifica o tamanho pelo orçamento de latência.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a separação por <em>bulkhead</em> com disjuntor, quantifica o efeito de uma dependência lenta, e diz como mede e reajusta em produção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que métricas do <em>pool</em> exporta e qual delas alarma?»</li>
+      <li>«Porque não <code>newCachedThreadPool</code>?»</li>
+      <li>«O que muda se passarmos a <em>threads</em> virtuais?»</li>
+      <li>«<code>AbortPolicy</code> ou <code>CallerRunsPolicy</code> — qual e porquê, neste serviço?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Fila ilimitada num serviço com dependências externas.</li>
+      <li>Um <em>pool</em> único partilhado por todas as dependências.</li>
+      <li>Não distinguir CPU-bound de IO-bound antes de escolher o número.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-11" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos uma fuga de memória num serviço que usa <code>ThreadLocal</code> para o contexto de <em>tenant</em>. O <em>heap</em> cresce 40 MB por hora e o <em>full GC</em> não recupera. Explique o mecanismo e a correcção.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Cada <code>Thread</code> tem um <code>ThreadLocalMap</code> próprio. As chaves desse mapa são referências <strong>fracas</strong> para o objecto <code>ThreadLocal</code>, mas os valores são referências <strong>fortes</strong>, guardadas pela <em>thread</em>. Enquanto a <em>thread</em> viver, o valor vive. Num <em>pool</em>, as <em>threads</em> vivem tanto quanto o processo — logo, sem <code>remove()</code>, cada <em>thread</em> retém o último contexto que lhe foi atribuído, para sempre. Com 200 <em>threads</em> e contextos de 200 KB, são 40 MB que o GC não pode recolher porque são alcançáveis a partir de raízes vivas.</p>
+      <p>A variante pior aparece quando o <code>ThreadLocal</code> é declarado numa classe carregada por um <em>classloader</em> de aplicação — o caso do <em>redeploy</em> em Tomcat. O valor retém a sua classe, a classe retém o <em>classloader</em>, e o <em>classloader</em> retém todas as classes da aplicação. Cada <em>redeploy</em> acrescenta uma cópia completa da aplicação na <em>metaspace</em>, e o sintoma é <code>OutOfMemoryError: Metaspace</code> ao terceiro ou quarto <em>redeploy</em>.</p>
+      <p>A correcção é <code>remove()</code> num <code>finally</code>, no mesmo âmbito em que se fez <code>set()</code>. Não basta pôr a <code>null</code>: a entrada continua no mapa. Em Spring, o sítio certo é um <code>Filter</code> ou um <code>HandlerInterceptor</code> com <code>afterCompletion</code>, e é exactamente o que o <code>MDC</code> do Logback exige — daí os <em>logs</em> com o <code>traceId</code> do pedido anterior quando alguém esquece o <code>MDC.clear()</code>. Confirma-se com um <em>heap dump</em> e o caminho para as raízes GC: as entradas aparecem penduradas em <code>Thread &rarr; threadLocals &rarr; table</code>.</p>
+      <p>O <em>trade-off</em>: a limpeza automática que a implementação faz — desalojar entradas cuja chave já foi recolhida — só acontece de forma oportunista em <code>get</code>, <code>set</code> e <code>remove</code>, e não é garantida. Depender dela é depender do acaso. E o modelo muda com <em>threads</em> virtuais: cada tarefa tem a sua <em>thread</em>, que morre no fim, pelo que a fuga desaparece; em contrapartida, milhões de <code>ThreadLocal</code> com valores grandes tornam-se caros em memória, e a alternativa passa a ser passar o contexto explicitamente ou usar valores com âmbito delimitado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>ThreadLocal</code> tem <em>memory leaks</em>» sem explicar chave fraca e valor forte.</td></tr>
+        <tr><td>Mid</td><td>Sabe que falta <code>remove()</code>, mas não explica porque é que a chave fraca não chega.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o mapa por <em>thread</em>, a assimetria fraca/forte, a longevidade das <em>threads</em> do <em>pool</em>, e localiza a correcção no <code>finally</code> do filtro.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a fuga de <em>classloader</em> no <em>redeploy</em>, o caso do <code>MDC</code>, a verificação por <em>heap dump</em>, e o que muda com <em>threads</em> virtuais.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a chave ser uma referência fraca não resolve o problema?»</li>
+      <li>«Como é que o <code>traceId</code> de um pedido acabou nos <em>logs</em> de outro?»</li>
+      <li>«Onde põe o <code>remove()</code> numa aplicação Spring MVC? E numa <code>@Async</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <code>System.gc()</code> ou aumentar a <em>heap</em> como correcção.</li>
+      <li>Pôr o valor a <code>null</code> em vez de chamar <code>remove()</code>.</li>
+      <li>Não ver que o problema só existe porque as <em>threads</em> do <em>pool</em> são reutilizadas.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-6" class="h2"><span class="secnum">7.6</span> CompletableFuture e composição assíncrona<a class="anchor" href="#sec-7-6" aria-label="ligação">#</a></h2>
+
+<p><code>CompletableFuture</code> resolve o que o <code>Future</code> original não resolvia: compor sem bloquear. As três operações estruturantes são <code>thenApply</code> (transforma o valor com uma função síncrona), <code>thenCompose</code> (encadeia outra operação que já devolve um <code>CompletableFuture</code>, achatando o resultado — o <em>flatMap</em> desta monada) e <code>thenCombine</code> (junta dois futuros independentes que correm em paralelo). Usar <code>thenApply</code> onde é preciso <code>thenCompose</code> devolve um <code>CompletableFuture&lt;CompletableFuture&lt;T&gt;&gt;</code>, e o erro só aparece na compilação ou, pior, num <code>join()</code> que devolve um objecto inesperado.</p>
+
+<p>O tratamento de erros tem três formas com semânticas distintas. <code>exceptionally</code> recupera: recebe a excepção e devolve um valor de substituição, transformando falha em degradação graciosa. <code>handle</code> vê sempre os dois lados, sucesso e falha, e pode transformar ambos. <code>whenComplete</code> observa sem alterar — o resultado propaga-se tal como estava, o que o torna o sítio certo para <em>logging</em> e métricas e o sítio errado para recuperar. Uma excepção lançada dentro de uma fase é embrulhada em <code>CompletionException</code>, pelo que qualquer tratamento sério tem de desembrulhar a causa antes de decidir.</p>
+
+<p>A escolha de executor é onde os incidentes nascem. Todos os métodos têm três variantes: <code>thenApply</code> executa na <em>thread</em> que completou o futuro anterior — ou na chamadora, se já estiver completo; <code>thenApplyAsync</code> sem executor usa o <code>ForkJoinPool.commonPool()</code>; <code>thenApplyAsync</code> com executor usa o que lhe derem. A primeira forma é a mais barata e a mais perigosa, porque faz trabalho da aplicação numa <em>thread</em> de I/O de outra biblioteca — por exemplo o <em>event loop</em> de Netty do <code>WebClient</code>.</p>
+
+<figure class="listing java" id="lst-7-8"><div class="lhead"><span class="lnum">Listagem 7.8</span>
+<span class="lcap">Composição com executor explícito, timeout e degradação em vez de propagação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>private final Executor io = Executors.newFixedThreadPool(
+        32, Thread.ofPlatform().name(&quot;cotacao-&quot;, 0).factory());
+
+CompletableFuture&lt;Cotacao&gt; cotacao(String artigoId) {
+    var preco = CompletableFuture
+            .supplyAsync(() -&gt; catalogo.ler(artigoId), io)   // executor explícito, nunca o comum
+            .thenCompose(artigo -&gt; precos.consultar(artigo)); // devolve CF: compose, não apply
+
+    var stock = CompletableFuture.supplyAsync(() -&gt; inventario.disponivel(artigoId), io);
+
+    return preco.thenCombine(stock, Cotacao::new)            // os dois correm em paralelo
+            .orTimeout(400, TimeUnit.MILLISECONDS)           // orçamento explícito
+            .whenComplete((r, e) -&gt; metricas.registar(artigoId, e))   // observa, não altera
+            .exceptionally(e -&gt; {                            // recupera: degradação graciosa
+                var causa = (e instanceof CompletionException ce) ? ce.getCause() : e;
+                log.warn(&quot;cotação indisponível para {}&quot;, artigoId, causa);
+                return Cotacao.indisponivel(artigoId);
+            });
+}</code></pre></figure>
+
+<div class="qa" id="q-7-12" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Diferença entre <code>thenApply</code>, <code>thenCompose</code> e <code>thenCombine</code>, e entre <code>exceptionally</code>, <code>handle</code> e <code>whenComplete</code>. Dê-me um caso em que a escolha errada só falha em produção.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>thenApply</code> é <em>map</em>: aplica <code>T &rarr; U</code> e devolve <code>CompletableFuture&lt;U&gt;</code>. <code>thenCompose</code> é <em>flatMap</em>: aplica <code>T &rarr; CompletableFuture&lt;U&gt;</code> e achata, evitando o futuro dentro de futuro. <code>thenCombine</code> junta dois futuros já iniciados e independentes com uma função binária, e é a forma de obter paralelismo real — encadear com <code>thenCompose</code> serializa as chamadas, o que num agregador de três APIs de 180 ms é a diferença entre 180 ms e 540 ms de latência.</p>
+      <p>No tratamento de erros: <code>exceptionally</code> só corre em falha e substitui o valor; <code>handle</code> corre sempre e recebe <code>(valor, excepção)</code>, podendo converter sucesso em falha e vice-versa; <code>whenComplete</code> corre sempre mas o seu resultado é ignorado — o futuro devolvido tem o mesmo desfecho do original. O erro comum é usar <code>whenComplete</code> a pensar que recupera: o <em>log</em> aparece, a métrica é registada, e a excepção propaga-se na mesma para o chamador.</p>
+      <p>O caso que só falha em produção é o do executor. <code>thenApply</code> sem <code>Async</code> executa na <em>thread</em> que completou o futuro anterior. Se esse futuro veio de um <code>WebClient</code>, a continuação corre num <em>event loop</em> de Netty, que tem tantas <em>threads</em> quantos os núcleos. Em desenvolvimento, com um pedido de cada vez, é imperceptível e até mais rápido por evitar a mudança de contexto. Em produção, uma continuação com 50 ms de trabalho bloqueante — uma consulta JDBC, uma serialização pesada — bloqueia um dos quatro <em>event loops</em> e derruba o débito de <strong>todas</strong> as chamadas HTTP do serviço, incluindo as que nada têm a ver com aquele fluxo. A regra: qualquer continuação que faça trabalho não trivial usa a variante <code>Async</code> com executor explícito.</p>
+      <p>Dois complementos que separam níveis. <code>allOf</code> devolve <code>CompletableFuture&lt;Void&gt;</code> e não recolhe resultados — é preciso fazer <code>join()</code> em cada futuro depois de ele completar, o que aí já não bloqueia. E o cancelamento é fraco: <code>cancel(true)</code> num <code>CompletableFuture</code> completa-o excepcionalmente mas não interrompe a <em>thread</em> que está a correr a tarefa, ao contrário de um <code>Future</code> de <code>ExecutorService</code>. Quem precisa de cancelamento verdadeiro em Java 21 usa concorrência estruturada.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata <code>thenApply</code> e <code>thenCompose</code> como equivalentes; usa <code>get()</code> a meio da cadeia.</td></tr>
+        <tr><td>Mid</td><td>Explica <em>map</em> versus <em>flatMap</em> e conhece <code>exceptionally</code>, mas não distingue <code>handle</code> de <code>whenComplete</code>.</td></tr>
+        <tr><td>Sénior</td><td>Distingue as seis operações com precisão, quantifica o ganho de <code>thenCombine</code> face ao encadeamento, e explica o risco da variante não-<code>Async</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o embrulho em <code>CompletionException</code>, a limitação de <code>allOf</code>, e a fraqueza do cancelamento com a alternativa estruturada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como recolhe os resultados de <code>allOf</code> sem bloquear cedo demais?»</li>
+      <li>«O que acontece se uma das cinco chamadas de <code>allOf</code> falhar?»</li>
+      <li>«<code>orTimeout</code> versus <code>completeOnTimeout</code> — quando usa cada um?»</li>
+      <li>«<code>cancel(true)</code> interrompe a <em>thread</em>? Porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Chamar <code>join()</code> ou <code>get()</code> dentro de uma continuação, dentro do <em>pool</em> que a executa.</li>
+      <li>Usar <code>whenComplete</code> para recuperar de erros.</li>
+      <li>Encadear com <code>thenCompose</code> chamadas que podiam ser paralelas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-7-13" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O que é o <code>ForkJoinPool.commonPool()</code>, quem o usa sem que o programador o saiba, e porque é que isso é perigoso num servidor?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É um <code>ForkJoinPool</code> estático, criado à primeira utilização, com paralelismo por omissão igual a <code>availableProcessors() - 1</code> — em 4 vCPU, três <em>threads</em> mais a chamadora. Usa <em>work-stealing</em>: cada <em>thread</em> tem a sua fila dupla e rouba trabalho das outras quando fica ociosa, o que é excelente para tarefas recursivas CPU-bound e péssimo para tarefas bloqueantes.</p>
+      <p>Quem o usa sem se declarar: todo o <code>parallelStream()</code>, todos os métodos <code>*Async</code> de <code>CompletableFuture</code> sem executor explícito, e bibliotecas que usam <code>CompletableFuture.supplyAsync</code> de uma só argumento. É um recurso global do processo, partilhado por toda a aplicação e por todas as dependências.</p>
+      <p>O perigo é directo: três <em>threads</em> partilhadas por todo o processo. Um único <code>parallelStream()</code> sobre uma lista de 10 000 elementos em que cada elemento faz uma chamada HTTP de 200 ms ocupa as três <em>threads</em> durante muito tempo, e qualquer outro <code>parallelStream</code> ou <code>supplyAsync</code> do serviço — incluindo dentro de uma biblioteca — fica atrás em fila. O sintoma é uma degradação global sem causa aparente, com uma única funcionalidade a explicar tudo. O <em>work-stealing</em> agrava a análise, porque a mesma tarefa aparece em <em>threads</em> diferentes entre <em>dumps</em>.</p>
+      <p>As regras que aplico: nunca correr I/O no <em>pool</em> comum; usar sempre a variante de <code>CompletableFuture</code> que aceita <code>Executor</code>; e, se for mesmo preciso paralelizar uma colecção com trabalho bloqueante, submeter o <em>stream</em> paralelo a um <code>ForkJoinPool</code> dedicado através de <code>submit(...).get()</code>, que confina o trabalho a esse <em>pool</em>. A alternativa moderna, e a que prefiro em Java 21, é abandonar o <em>pool</em> comum e usar um executor de <em>threads</em> virtuais por tarefa com um <code>Semaphore</code> a limitar a concorrência a jusante. Ajustar <code>-Djava.util.concurrent.ForkJoinPool.common.parallelism</code> existe, mas é um remendo global que afecta código de terceiros de forma imprevisível.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe que <code>parallelStream</code> e <code>supplyAsync</code> partilham o mesmo <em>pool</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que existe um <em>pool</em> comum, mas não sabe o paralelismo por omissão nem quem mais o usa.</td></tr>
+        <tr><td>Sénior</td><td>Dá <code>availableProcessors() - 1</code>, enumera os utilizadores implícitos, e explica a degradação global com um cenário concreto.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o truque do <code>ForkJoinPool</code> dedicado com <code>submit(...).get()</code>, avisa que a <em>flag</em> global afecta terceiros, e propõe a alternativa com <em>threads</em> virtuais e semáforo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas <em>threads</em> tem o <em>pool</em> comum num <em>pod</em> com <code>cpu: 2</code>?»</li>
+      <li>«O que é <em>work-stealing</em> e porque é que ajuda em tarefas recursivas?»</li>
+      <li>«Como confina um <code>parallelStream</code> a um <em>pool</em> próprio?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>parallelStream()</code> com I/O e chamar-lhe optimização.</li>
+      <li>Achar que cada <code>parallelStream()</code> cria o seu próprio <em>pool</em>.</li>
+      <li>Alterar a <em>flag</em> global de paralelismo sem considerar as bibliotecas.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-7" class="h2"><span class="secnum">7.7</span> Diagnosticar concorrência em produção<a class="anchor" href="#sec-7-7" aria-label="ligação">#</a></h2>
+
+<p>Bugs de concorrência raramente se reproduzem: diagnosticam-se por evidência recolhida no momento. A ferramenta base continua a ser o <em>thread dump</em> — <code>jcmd &lt;pid&gt; Thread.print</code> ou <code>jstack</code> — que dá o estado de cada <em>thread</em>, os <em>locks</em> que detém, aquele por que espera, e uma secção explícita quando a JVM encontra um ciclo. Ler um <em>dump</em> exige distinguir <code>BLOCKED</code> (à espera de um monitor) de <code>WAITING</code> (em <code>wait()</code>, <code>park()</code> ou <code>await()</code>) e de <code>RUNNABLE</code>, que em Java inclui as <em>threads</em> paradas em I/O de <em>socket</em>. Um único <em>dump</em> não diz nada; três, espaçados de cinco segundos, mostram o que é persistente.</p>
+
+<p>Para contenção que não chega a bloquear, o instrumento certo é o Java Flight Recorder, que regista eventos de entrada em monitor e de espera com o <em>stack trace</em> e o dono do <em>lock</em>, acima de um limiar de duração. Um perfil de 60 segundos em produção custa tipicamente 1 a 2% de <em>overhead</em> e responde à pergunta que os <em>dumps</em> não respondem: qual é a linha de código que mais tempo total faz esperar. Complementa-se com <code>ThreadMXBean.findDeadlockedThreads()</code> exposto numa verificação de saúde, o que transforma um incidente de investigação num alarme.</p>
+
+<figure class="listing shell" id="lst-7-9"><div class="lhead"><span class="lnum">Listagem 7.9</span>
+<span class="lcap">Recolha mínima antes de reiniciar um pod suspeito de contenção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># 1) Três dumps espaçados: só o que persiste nos três é contenção real.
+for i in 1 2 3; do jcmd 1 Thread.print &gt; /tmp/td-$i.txt; sleep 5; done
+grep -c &quot;java.lang.Thread.State: BLOCKED&quot; /tmp/td-*.txt
+
+# 2) A JVM declara ciclos de monitores explicitamente.
+grep -A 40 &quot;Found one Java-level deadlock&quot; /tmp/td-1.txt
+
+# 3) Perfil com eventos de monitor e de espera; ~1-2% de overhead.
+jcmd 1 JFR.start name=diag settings=profile duration=60s filename=/tmp/diag.jfr
+
+# 4) Sanidade do GC antes de culpar os locks: %FGC alto explica CPU alto sem progresso.
+jstat -gcutil 1 1000 10</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 7.2</span> Sintoma observado, hipótese mais provável e evidência que a confirma.</div>
+<div class="tscroll"><table><thead><tr><th>Sintoma</th><th>Hipótese</th><th>Evidência decisiva</th></tr></thead><tbody>
+<tr><td>Latência infinita, CPU perto de 0%</td><td><em>Deadlock</em> ou espera sem <em>timeout</em></td><td>Secção de <em>deadlock</em> no <em>dump</em>, ou N <em>threads</em> <code>BLOCKED</code> no mesmo monitor</td></tr>
+<tr><td>CPU a 95%, sem progresso</td><td><em>Livelock</em>, ciclo infinito ou <em>GC thrashing</em></td><td><code>jstat -gcutil</code> com %FGC alto; ou os mesmos <em>frames</em> <code>RUNNABLE</code> nos três <em>dumps</em></td></tr>
+<tr><td>p50 normal, p99 dez vezes maior</td><td>Contenção de <em>lock</em> ou fila do <em>pool</em></td><td>Eventos de monitor no JFR; métrica de tempo de espera na fila</td></tr>
+<tr><td>Débito estagna ao aumentar <em>threads</em></td><td>Serialização num <em>lock</em> partilhado</td><td>Um único <em>stack</em> a dominar os eventos de monitor do JFR</td></tr>
+<tr><td><em>Pod</em> morto por OOM sem <code>OutOfMemoryError</code></td><td>Memória nativa de <em>stacks</em> de <em>threads</em></td><td>Contagem de <em>threads</em> × <code>-Xss</code> comparada com o limite do contentor</td></tr>
+</tbody></table></div></div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Testes multi-<em>thread</em> em JUnit demonstram a presença de uma corrida, nunca a sua ausência: passar cem vezes não prova nada sobre o modelo de memória. Para afirmações sobre o JMM — se um determinado par de leituras pode observar um estado — a ferramenta é o <em>jcstress</em>, que enumera os resultados possíveis e os classifica em aceitáveis, proibidos e interessantes. Mencioná-lo numa entrevista é um sinal claro de quem já depurou concorrência a sério.</p></aside>
+
+<div class="qa" id="q-7-14" data-box="qa" data-area="obs" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um serviço tem p50 de 25 ms e p99 de 3 s, sem erros e com CPU a 30%. Suspeita-se de contenção. Descreva o que faz nos primeiros 15 minutos e o que instrumentaria para não voltar a depender de sorte.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A assinatura — p50 baixo, p99 cem vezes maior, CPU folgado, zero erros — é de espera, não de trabalho. Nos primeiros cinco minutos recolho três <em>thread dumps</em> espaçados de cinco segundos num <em>pod</em> afectado e conto <em>threads</em> por estado e por <em>frame</em>. Se o mesmo monitor aparecer com dez ou mais <em>threads</em> <code>BLOCKED</code> nos três, o culpado está identificado sem mais nada. Em paralelo verifico o GC com <code>jstat -gcutil</code>, porque pausas de <em>full GC</em> produzem exactamente a mesma assinatura e são a causa mais frequente.</p>
+      <p>Nos dez minutos seguintes, um JFR de 60 segundos com o perfil que inclui eventos de monitor e de espera, e leitura pelo tempo total acumulado por <em>stack</em> — não pelo evento mais lento. Isso separa três causas que os <em>dumps</em> confundem: contenção de <em>lock</em> aplicacional, espera na fila do <em>pool</em>, e espera no <em>pool</em> de ligações à base de dados, que é a resposta certa mais vezes do que qualquer <em>lock</em> em Java. Um HikariCP com dez ligações e 64 <em>threads</em> a chamar a base de dados dá esta assinatura de forma perfeita.</p>
+      <p>Para não voltar a depender de sorte, instrumento quatro coisas. Do <em>pool</em> de tarefas: tamanho da fila, tempo de espera na fila em histograma, contagem de rejeições e <em>threads</em> activas. Do <em>pool</em> de ligações: tempo de aquisição em p99 e ligações pendentes — o Micrometer expõe ambos com <code>hikaricp.connections.acquire</code> e <code>pending</code>. Do processo: contagem de <em>threads</em> por estado, exportada continuamente. E um <em>endpoint</em> de diagnóstico que corre <code>findDeadlockedThreads()</code> e falha a verificação de saúde se devolver algo.</p>
+      <p>Duas decisões de processo que valem mais do que as métricas. Primeira: recolher antes de reiniciar — um <em>preStop hook</em> que escreve o <em>thread dump</em> para um volume antes do <code>SIGTERM</code> custa pouco e salva investigações inteiras. Segunda: separar o orçamento de latência por dependência e alarmar sobre o tempo de espera na fila, não sobre o p99 total; o p99 total sobe por dez razões, o tempo de fila sobe por uma.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentava as <em>threads</em> e via se melhorava»; reinicia sem recolher nada.</td></tr>
+        <tr><td>Mid</td><td>Pede <em>thread dumps</em>, mas tira um só e não considera GC nem o <em>pool</em> de ligações.</td></tr>
+        <tr><td>Sénior</td><td>Três <em>dumps</em> espaçados, verificação de GC, JFR lido por tempo acumulado, e a hipótese do <em>pool</em> de ligações à base de dados.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a instrumentação permanente com métricas nomeadas, a recolha automática antes do reinício, e o alarme sobre tempo de fila em vez de p99 total.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como distingue espera no <em>pool</em> de tarefas de espera no <em>pool</em> de ligações?»</li>
+      <li>«Que <em>overhead</em> tem o JFR e como o justificaria ao SRE de serviço?»</li>
+      <li>«Porque é que uma <em>thread</em> parada num <em>socket</em> aparece como <code>RUNNABLE</code>?»</li>
+      <li>«Qual seria o seu limiar de alarme para o tempo de espera na fila?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Ir directo a «aumentar o <em>pool</em>» sem medir onde está a espera.</li>
+      <li>Ignorar o <em>pool</em> de ligações à base de dados, que é a causa mais comum desta assinatura.</li>
+      <li>Confiar num <em>thread dump</em> único.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-7-8" class="h2"><span class="secnum">7.8</span> Resumo e checklist<a class="anchor" href="#sec-7-8" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na ordem em que aparece numa entrevista:</p>
+
+<ul class="lst">
+  <li>Concorrência correcta é uma questão de <em>happens-before</em>, não de <em>caches</em>. Sem aresta, o compilador tem licença para não propagar a escrita — e o sintoma típico é um ciclo que nunca termina, não um valor errado.</li>
+  <li><code>volatile</code> dá visibilidade, ordenação e atomicidade de uma leitura ou escrita isolada; não dá atomicidade composta nem protege o objecto apontado por uma referência volátil.</li>
+  <li><code>synchronized</code> faz duas coisas — exclusão mútua e barreira de memória. Sem contenção custa dezenas de nanossegundos; contendido e inflacionado, microssegundos. A diferença entre os dois regimes é maior do que qualquer micro-optimização.</li>
+  <li>Contra <em>deadlock</em>, ataca-se a espera circular: ordem total de aquisição, com <em>lock</em> de desempate, ou <code>tryLock</code> com recuo aleatório e limite de tentativas. <em>Deadlock</em> tem CPU baixo; CPU alto sem progresso é <em>livelock</em>, ciclo infinito ou GC.</li>
+  <li>CAS é <em>lock-free</em>, não <em>wait-free</em>, e degrada sob contenção alta — aí passa-se a <code>LongAdder</code> ou elimina-se o partilhamento. O <code>ConcurrentHashMap</code> moderno bloqueia por <em>bin</em>, lê sem <em>lock</em>, e oferece deliberadamente semântica fraca em <code>size()</code> e nos iteradores.</li>
+  <li>Num <code>ThreadPoolExecutor</code>, uma fila ilimitada torna <code>maximumPoolSize</code> inerte e transforma sobrecarga em <code>OutOfMemoryError</code>. Dimensiona-se por <code>N_cpu × U × (1 + W/C)</code>, valida-se com <code>L = λ × W</code>, e a fila limita-se pelo orçamento de latência.</li>
+  <li><code>ThreadLocal</code> num <em>pool</em> é uma fuga garantida sem <code>remove()</code> no <code>finally</code>: as chaves são fracas, os valores são fortes e as <em>threads</em> do <em>pool</em> não morrem.</li>
+  <li>Em <code>CompletableFuture</code>, <code>thenCompose</code> encadeia, <code>thenCombine</code> paraleliza, <code>whenComplete</code> observa sem recuperar; e qualquer variante sem <code>Async</code> corre na <em>thread</em> que completou o futuro anterior — que pode ser um <em>event loop</em> alheio.</li>
+  <li>O <code>ForkJoinPool.commonPool()</code> tem <code>availableProcessors() - 1</code> <em>threads</em> e é partilhado por <code>parallelStream()</code>, por <code>CompletableFuture</code> sem executor e por todas as bibliotecas do processo.</li>
+</ul>
+
+<p>Checklist antes da ronda de concorrência:</p>
+
+<ul class="lst">
+  <li>Saber enunciar as cinco arestas de <em>happens-before</em> sem hesitar e desenhar o cenário de reordenação do <em>double-checked locking</em>.</li>
+  <li>Ter na ponta da língua uma correcção de <em>deadlock</em> por ordenação, incluindo o caso de <em>hash</em> igual, e uma por <code>tryLock</code> com o seu risco de <em>livelock</em>.</li>
+  <li>Descrever o <code>ConcurrentHashMap</code> do Java 8 em diante — CAS por <em>bin</em>, <code>synchronized</code> na cabeça, <em>treeification</em> — e não a versão de segmentos.</li>
+  <li>Saber dimensionar um <em>pool</em> com números reais em menos de dois minutos, incluindo o tamanho da fila justificado pelo orçamento de latência.</li>
+  <li>Escrever de cor um teste que expõe uma corrida, com <code>CountDownLatch</code> de arranque e repetição, e dizer porque é que ele não prova a ausência do bug.</li>
+  <li>Ter um exemplo próprio de incidente de concorrência com número antes e depois: latência, taxa de erro ou débito.</li>
+  <li>Conhecer os comandos de recolha — <code>jcmd Thread.print</code>, <code>jstat -gcutil</code>, <code>JFR.start</code> — e a ordem em que os usa.</li>
+  <li>Saber dizer o que muda com <em>threads</em> virtuais em cada um destes pontos, porque a pergunta seguinte é quase sempre essa.</li>
+</ul>

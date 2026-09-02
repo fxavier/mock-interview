@@ -1,0 +1,934 @@
+<p>Nenhuma área produz tantas rejeições silenciosas como esta. O candidato descreve correctamente o que é um <code>EntityManager</code>, sabe recitar a diferença entre <code>FetchType.LAZY</code> e <code>FetchType.EAGER</code>, e depois não consegue dizer quantas instruções SQL o seu próprio endpoint emite, nem como o mediria. O entrevistador de Spring Data não está a testar a API: está a testar se o candidato percebe que o JPA é uma máquina de gerar SQL cujo comportamento é observável, mensurável e frequentemente catastrófico por omissão. As perguntas deste capítulo cobrem o ciclo completo — contexto de persistência, N+1, fronteiras transaccionais, <em>locking</em>, escrita em lote e migrações — e todas terminam no mesmo sítio: mostre-me o SQL que isso gera e o número que o justifica.</p>
+
+<h2 id="sec-12-1" class="h2"><span class="secnum">12.1</span> O modelo de persistência: EntityManager, contexto e dirty checking<a class="anchor" href="#sec-12-1" aria-label="ligação">#</a></h2>
+
+<p>O contexto de persistência é um mapa de identidade com âmbito transaccional: uma entrada por par (classe, identificador). Duas consequências decorrem disto e explicam metade dos comportamentos que surpreendem os candidatos. Primeira, dois <code>findById</code> do mesmo identificador dentro da mesma transacção devolvem a <em>mesma referência</em> em memória e apenas o primeiro toca na base de dados — é a <em>cache</em> de primeiro nível, que não se desliga e não tem política de despejo. Segunda, tudo o que está no mapa está sob vigilância: no <em>flush</em>, o Hibernate compara o estado actual de cada entidade gerida com a fotografia (<em>snapshot</em>) tirada no momento do carregamento e emite <code>UPDATE</code> para os campos que mudaram. É o <em>dirty checking</em>, e é por isso que um <code>setEstado(...)</code> dentro de um método <code>@Transactional</code> persiste sem que ninguém chame <code>save()</code>.</p>
+
+<p>Uma entidade vive em quatro estados. <em>Transient</em>: criada com <code>new</code>, sem identificador conhecido pelo contexto. <em>Managed</em>: dentro do mapa, sob <em>dirty checking</em>. <em>Detached</em>: tem identificador mas o contexto que a geria já fechou — típico de um objecto que atravessou a fronteira HTTP. <em>Removed</em>: marcada para <code>DELETE</code> no próximo <em>flush</em>. As transições entre estes quatro estados são a raiz de quase todas as perguntas sobre <code>persist</code>, <code>merge</code> e <code>save</code>.</p>
+
+<p>O custo do <em>dirty checking</em> é linear no número de entidades geridas multiplicado pelo número de campos, e ocorre a <em>cada</em> <em>flush</em>. Com o <code>FlushModeType.AUTO</code> por omissão, o Hibernate faz <em>flush</em> antes de cada consulta cujas tabelas intersectem as entidades sujas, e no <em>commit</em>. Um método que carregue 20 000 entidades e execute 50 consultas paga 50 varrimentos de 20 000 objectos: já vimos isto transformar um trabalho de 4 s em 90 s sem que uma única linha de SQL mudasse. A correcção não é mexer no <em>flush mode</em>; é não carregar 20 000 entidades geridas para uma operação que só precisa de ler.</p>
+
+<p>A ordem das instruções no <em>flush</em> também não é a ordem do código. O Hibernate agrupa por tipo de acção — primeiro todos os <code>INSERT</code> pela ordem de <code>persist</code>, depois <code>UPDATE</code>, depois remoções de colecção, e os <code>DELETE</code> de entidades no fim. Um teste que apaga uma linha e insere outra com a mesma chave única falha com violação de restrição, porque o <code>INSERT</code> corre antes do <code>DELETE</code>. A solução é um <code>flush()</code> explícito entre as duas operações, ou uma restrição <code>DEFERRABLE INITIALLY DEFERRED</code> em PostgreSQL.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um <code>hashCode()</code> calculado sobre o identificador gerado muda quando o <em>flush</em> atribui o <code>id</code>. Se a entidade já tiver sido posta num <code>HashSet</code> enquanto <em>transient</em>, o <em>bucket</em> deixa de corresponder e <code>contains()</code> devolve <code>false</code> sobre o próprio objecto que lá está. É um <em>bug</em> que não parte nada visivelmente: apenas duplica linhas e faz <code>orphanRemoval</code> apagar o que não devia.</p></aside>
+
+<figure class="listing java" id="lst-12-1"><div class="lhead"><span class="lnum">Listagem 12.1</span>
+<span class="lcap">Entidade com chave de negócio e identidade estável antes e depois do <em>flush</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Entity
+@Table(name = "encomenda",
+       uniqueConstraints = @UniqueConstraint(columnNames = "referencia"))
+public class Encomenda {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "enc_seq")
+    @SequenceGenerator(name = "enc_seq", sequenceName = "encomenda_seq",
+                       allocationSize = 50)
+    private Long id;
+
+    // Chave de negocio: atribuida antes de persist(), imutavel, com indice unico.
+    @Column(name = "referencia", nullable = false, updatable = false, length = 26)
+    private String referencia;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "cliente_id")
+    private Cliente cliente;
+
+    @OneToMany(mappedBy = "encomenda", cascade = CascadeType.ALL, orphanRemoval = true)
+    private Set&lt;LinhaEncomenda&gt; linhas = new LinkedHashSet&lt;&gt;();
+
+    @Version
+    private short versao;
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        // Hibernate.getClass() desfaz o proxy: EncomendaProxy nao e Encomenda.class,
+        // e um getClass() cru quebraria a simetria exigida pelo contrato de equals.
+        if (o == null || Hibernate.getClass(o) != Hibernate.getClass(this)) return false;
+        Encomenda outra = (Encomenda) o;
+        return referencia != null &amp;&amp; referencia.equals(outra.referencia);
+    }
+
+    @Override
+    public int hashCode() {
+        // Constante por classe: nunca muda entre o estado transient e o managed.
+        // Degrada o HashSet a lista ligada, mas as coleccoes de uma encomenda
+        // tem dezenas de elementos, nao milhoes.
+        return Encomenda.class.hashCode();
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-12-1" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tenho um método anotado com <code>@Transactional</code> que carrega uma entidade, altera um campo e devolve. Não há nenhuma chamada a <code>save()</code>. A alteração é persistida? Explique o mecanismo e diga-me quando é que isso lhe custa caro.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Sim, é persistida, e não por magia: pelo <em>dirty checking</em>. Quando a entidade é carregada, o Hibernate guarda no contexto de persistência uma cópia dos valores das colunas — o <em>snapshot</em> de carregamento. No <em>flush</em>, que ocorre no <em>commit</em> e antes de qualquer consulta que toque nas tabelas afectadas, compara campo a campo o estado actual com esse <em>snapshot</em> e gera <code>UPDATE</code> para as entidades divergentes. O <code>save()</code> do Spring Data é redundante aqui: para uma entidade já gerida, <code>save()</code> resolve-se num <code>merge</code> que devolve a própria instância e não emite SQL adicional.</p>
+      <p>O custo tem duas componentes. A primeira é de memória: o <em>snapshot</em> duplica os dados de cada entidade gerida, pelo que carregar 100 000 entidades consome aproximadamente o dobro do <em>heap</em> que um DTO equivalente. A segunda é de CPU e é a que morde: cada <em>flush</em> percorre todas as entidades geridas e todos os seus campos. Num método que carregue 20 000 entidades e depois execute 50 consultas, o <code>FlushModeType.AUTO</code> força até 50 varrimentos de 20 000 objectos antes de cada consulta que intersecte as tabelas sujas — trabalho quadrático em tudo menos no nome.</p>
+      <p>Por omissão o Hibernate 6 faz comparação campo a campo. Existe instrumentação de <em>bytecode</em> em tempo de compilação que marca os campos alterados e reduz o custo do <em>flush</em> a O(entidades sujas), mas introduz um passo de <em>build</em> e complica o diagnóstico de casos estranhos; só compensa quando o perfil mostrar tempo real gasto em <code>DefaultFlushEntityEventListener</code>.</p>
+      <p>A regra prática que uso: leituras puras vão em <code>@Transactional(readOnly = true)</code>, o que põe o <em>flush mode</em> em <code>MANUAL</code> e desliga o <em>dirty checking</em>; escritas em massa não passam pelo contexto de persistência de todo. O <em>trade-off</em> do <em>dirty checking</em> é conveniência contra previsibilidade: escreve-se menos código, mas o SQL emitido deixa de ser localmente legível, e é por isso que qualquer serviço sério regista as instruções em ambiente de teste.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Não, é preciso chamar <code>save()</code>», ou responde que sim sem conseguir nomear o mecanismo.</td></tr>
+        <tr><td>Mid</td><td>Diz «dirty checking» e que o Hibernate detecta a alteração, mas não sabe onde vive o <em>snapshot</em> nem quando ocorre o <em>flush</em>.</td></tr>
+        <tr><td>Sénior</td><td>Explica <em>snapshot</em>, momentos de <em>flush</em> (<code>AUTO</code>, antes de consultas e no <em>commit</em>), o custo linear e a mitigação por <code>readOnly</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo em <em>heap</em>, a instrumentação de <em>bytecode</em> como opção medida e não por omissão, e liga a decisão à política de fronteiras transaccionais do serviço.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se eu alterar a entidade depois do <code>commit</code>, fora do método?»</li>
+      <li>«Como é que o Hibernate decide que uma consulta obriga a <em>flush</em>?»</li>
+      <li>«O que muda com <code>@Transactional(readOnly = true)</code> em PostgreSQL, ao nível do JDBC?»</li>
+      <li>«Como mediria o tempo gasto em <em>flush</em> em produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que o <code>save()</code> é sempre necessário, sinal de nunca ter lido o SQL gerado.</li>
+      <li>Confundir <em>flush</em> com <em>commit</em>: o <em>flush</em> sincroniza, o <em>commit</em> termina a transacção.</li>
+      <li>Propor <code>FlushMode.MANUAL</code> global como optimização sem perceber que quebra a coerência leitura-após-escrita.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-2" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Diferença entre <code>persist</code>, <code>merge</code> e o <code>save</code> do Spring Data. Recebo uma entidade desserializada de um pedido REST com o <code>id</code> preenchido e chamo <code>save()</code>. Que SQL sai e que risco é que isso tem?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>persist</code> torna gerida uma instância <em>transient</em> e não devolve nada de novo: a instância passada é a que fica no contexto. <code>merge</code> aceita uma instância <em>detached</em>, carrega (ou reutiliza) a versão gerida correspondente ao identificador, copia os campos e devolve <em>essa outra</em> instância — a original permanece <em>detached</em>. Ignorar o valor de retorno de <code>merge</code> é um erro clássico: as alterações subsequentes ao objecto original não são persistidas.</p>
+      <p>O <code>save()</code> do <code>SimpleJpaRepository</code> é um despacho: se <code>isNew()</code> for verdadeiro chama <code>persist</code>, caso contrário chama <code>merge</code>. E <code>isNew()</code>, na estratégia por omissão, é «o identificador é nulo». Logo, com um <code>id</code> preenchido vindo do JSON, sai um <code>merge</code>: um <code>SELECT</code> pelo identificador seguido de um <code>UPDATE</code> se algo diferir. Duas instruções onde a intenção era uma.</p>
+      <p>O risco real não é o <code>SELECT</code> extra — é a semântica de sobreposição total. O <code>merge</code> copia <em>todos</em> os campos da instância <em>detached</em> para a gerida. Se o cliente enviou um JSON parcial, os campos ausentes chegam a <code>null</code> e o <code>UPDATE</code> apaga colunas que o cliente nunca quis tocar. É a forma mais comum de perda de dados silenciosa em APIs de actualização: um <code>PUT</code> mal desenhado combinado com <code>save(entidadeVindaDoJson)</code>. Junta-se a isto a perda de actualizações concorrentes, porque o <code>merge</code> escreve por cima do que outra transacção gravou entretanto, a menos que exista <code>@Version</code> — e nesse caso a versão que veio no JSON é que decide, o que só é seguro se o cliente a devolver fielmente.</p>
+      <p>O padrão correcto: nunca desserializar directamente para entidade. Recebe-se um DTO de comando, carrega-se a entidade dentro da transacção com <code>findById</code>, aplicam-se apenas os campos que o comando traz, e o <em>dirty checking</em> emite o <code>UPDATE</code> mínimo. Custa uma classe a mais e elimina duas classes de <em>bugs</em>. Quando é que a escolha contrária é a certa? Em importações em que a entidade recebida <em>é</em> a verdade completa — sincronização de um sistema externo, por exemplo — aí o <code>merge</code> com sobreposição total é exactamente a semântica desejada.</p>
+      <p>Nota sobre identificadores atribuídos: se a chave for um <code>UUID</code> gerado na aplicação, o <code>id</code> nunca é nulo e o <code>save()</code> faz sempre <code>merge</code>, com um <code>SELECT</code> inútil por cada inserção. Implementar <code>Persistable</code> com um campo transitório <code>novo</code>, ou usar <code>em.persist</code> explicitamente, remove esse <code>SELECT</code> — em cargas de inserção de 5 000 linhas por segundo isso é metade do tráfego SQL.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>save</code> insere ou actualiza», sem noção de estados nem do SQL emitido.</td></tr>
+        <tr><td>Mid</td><td>Distingue <code>persist</code> de <code>merge</code> e sabe que <code>merge</code> devolve outra instância, mas não vê o <code>SELECT</code> extra nem o risco de sobreposição.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o despacho por <code>isNew()</code>, o par <code>SELECT</code>+<code>UPDATE</code>, a perda de campos com JSON parcial, e propõe DTO de comando.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o caso do identificador atribuído (<code>Persistable</code>), a interacção com <code>@Version</code>, e quando a sobreposição total é a semântica correcta.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como evita o <code>SELECT</code> antes do <code>INSERT</code> com chaves <code>UUID</code>?»</li>
+      <li>«O que acontece se chamar <code>persist</code> numa entidade <em>detached</em>?»</li>
+      <li>«E se o objecto tiver colecções em cascata — o <code>merge</code> propaga?»</li>
+      <li>«Como desenharia o <code>PATCH</code> parcial sem apagar campos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Desserializar o corpo HTTP directamente para a entidade JPA e considerar isso boa prática.</li>
+      <li>Usar o valor original depois de <code>merge</code>, ignorando o retorno.</li>
+      <li>Não saber que <code>save()</code> pode emitir um <code>SELECT</code> que ninguém pediu.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-12-2" class="h2"><span class="secnum">12.2</span> Fetch types, N+1 e as suas correcções<a class="anchor" href="#sec-12-2" aria-label="ligação">#</a></h2>
+
+<p>As associações têm valores por omissão que quase ninguém quer. <code>@ManyToOne</code> e <code>@OneToOne</code> são <code>EAGER</code> por omissão na especificação; <code>@OneToMany</code> e <code>@ManyToMany</code> são <code>LAZY</code>. O primeiro par é o problema: cada <code>@ManyToOne</code> <code>EAGER</code> acrescenta um <code>JOIN</code> a toda e qualquer consulta que devolva a entidade, e uma consulta JPQL que o Hibernate não consiga resolver com <em>join</em> resolve-o com uma consulta por linha. A primeira decisão de qualquer modelo de domínio sério é declarar <code>fetch = FetchType.LAZY</code> em todas as associações, sem excepção, e depois pedir explicitamente o que cada caso de uso precisa.</p>
+
+<p>O N+1 é isto: uma consulta devolve N linhas, e o acesso a uma associação <em>lazy</em> de cada linha dispara mais uma consulta — N+1 no total. Com N igual a 200 e uma latência de rede de 0,4 ms por ida e volta, as 200 consultas adicionais custam 80 ms de rede pura, antes de qualquer trabalho na base de dados; com duas associações aninhadas o padrão torna-se N×M e um endpoint de 200 encomendas com 5 linhas cada emite 1 201 instruções. Vi este caso exacto passar de 1 743 ms para 21 ms com três anotações.</p>
+
+<p>Detectar é mais importante do que corrigir, porque a correcção é trivial quando se sabe onde. Três instrumentos, por ordem de utilidade. Em teste: <code>Statistics.getPrepareStatementCount()</code> do Hibernate, com uma asserção sobre o número máximo de instruções por caso de uso — é a única forma de impedir a regressão. Em desenvolvimento: um <em>proxy</em> de <code>DataSource</code> que regista e conta as instruções por pedido HTTP. Em produção: <em>spans</em> de base de dados por pedido no APM, com alerta sobre a razão entre número de instruções e número de pedidos. Ligar <code>show-sql</code> não é detecção: é ruído sem contagem.</p>
+
+<figure class="listing text" id="lst-12-2"><div class="lhead"><span class="lnum">Listagem 12.2</span>
+<span class="lcap">O padrão a reconhecer no <em>log</em>: a mesma instrução repetida com parâmetros diferentes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>09:12:41.118 DEBUG org.hibernate.SQL
+  select e1_0.id,e1_0.criada_em,e1_0.estado,e1_0.referencia,e1_0.versao
+    from encomenda e1_0 where e1_0.criada_em &gt;= ? order by e1_0.criada_em desc
+    offset ? rows fetch first ? rows only
+09:12:41.140 DEBUG org.hibernate.SQL
+  select c1_0.id,c1_0.nome from cliente c1_0 where c1_0.id=?            &lt;-- 1 de 200
+09:12:41.146 DEBUG org.hibernate.SQL
+  select l1_0.encomenda_id,l1_0.id,l1_0.artigo_id,l1_0.quantidade
+    from linha_encomenda l1_0 where l1_0.encomenda_id=?                 &lt;-- 1 de 200
+09:12:41.151 DEBUG org.hibernate.SQL
+  select a1_0.id,a1_0.preco_unitario from artigo a1_0 where a1_0.id=?   &lt;-- 1 de 1000
+...
+09:12:42.884 INFO  c.a.enc.ResumoService : 1401 instrucoes preparadas, 1743 ms</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Orçamento de instruções por pedido HTTP num serviço de leitura: 1 a 3 é saudável, 4 a 10 exige justificação, acima de 20 é defeito. Com 0,4 ms de ida e volta na mesma zona de disponibilidade, 200 instruções sequenciais gastam 80 ms só em rede; a mesma informação num <em>join</em> único custa uma ida e volta e cerca de 2 ms de execução. O ganho típico de eliminar um N+1 num endpoint de listagem está entre 10× e 80×.</p></aside>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 12.1</span> Correcções de N+1: o que cada uma emite e onde falha.</div>
+<div class="tscroll"><table><thead><tr><th>Técnica</th><th>SQL emitido</th><th>Quando é a certa</th><th>Onde falha</th></tr></thead><tbody>
+<tr><td><code>join fetch</code> em JPQL</td><td>1 consulta com produto cartesiano</td><td>Caso de uso único e conhecido; uma colecção só</td><td>Paginação (<code>HHH000104</code>) e duas colecções (<code>MultipleBagFetchException</code>)</td></tr>
+<tr><td><code>@EntityGraph</code></td><td>1 consulta, igual ao <code>join fetch</code></td><td>Reutilizar o mesmo método de repositório com grafos diferentes</td><td>Mesmas limitações; grafos grandes multiplicam linhas</td></tr>
+<tr><td><code>@BatchSize(size = n)</code> ou <code>default_batch_fetch_size</code></td><td>1 + ⌈N/n⌉ consultas com <code>in (?, ?, …)</code></td><td>Paginação, colecções múltiplas, grafos profundos</td><td>Não é 1 consulta; com n = 50 e N = 1 000 ainda são 21</td></tr>
+<tr><td><code>@Fetch(FetchMode.SUBSELECT)</code></td><td>2 consultas: a original e uma com <code>in (subconsulta)</code></td><td>Colecção grande de uma consulta cara de repetir</td><td>Reexecuta a consulta original; inútil se ela for lenta</td></tr>
+<tr><td>Consulta DTO (<code>select new …</code>)</td><td>1 consulta, só as colunas necessárias</td><td>Leituras que não vão ser modificadas — a maioria</td><td>Não devolve entidades geridas; duplica lógica de mapeamento</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-12-3" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um endpoint de listagem passou de 40 ms para 1,7 s depois de uma alteração ao modelo. Suspeita-se de N+1. Como é que o confirma, sem adivinhar, e como impede que volte a acontecer daqui a três meses?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Confirmo por contagem, não por leitura de <em>log</em>. O sinal do N+1 é a razão entre instruções e pedidos: se um pedido emite 1 401 instruções preparadas e a página tem 200 elementos, o padrão é 1 + 200 + 200 + 1 000. Em produção obtenho esse número dos <em>spans</em> de base de dados por transacção no APM; localmente, com um <em>proxy</em> de <code>DataSource</code> que conta e agrupa por instrução normalizada, o que expõe imediatamente qual é a repetida.</p>
+      <p>Confirmada a suspeita, a segunda medição é onde está o tempo. 1,7 s divididos por 1 400 instruções dá 1,2 ms por instrução — coerente com ida e volta de rede mais análise, não com falta de índice. Se a divisão desse 40 ms por instrução, o problema seria outro: uma consulta sem índice, e corrigir o N+1 pouparia pouco.</p>
+      <p>Impedir a regressão é o ponto que separa níveis. Uma correcção pontual dura até ao próximo <code>@OneToMany</code> acedido dentro de um ciclo. O que fica no repositório é um teste por caso de uso crítico que fixa o orçamento de instruções: <code>Statistics.setStatisticsEnabled(true)</code>, <code>clear()</code>, executar, e afirmar <code>getPrepareStatementCount() &lt;= 3</code>. É um teste que falha na revisão de código, não em produção. Complemento-o com <code>spring.jpa.open-in-view=false</code>, que transforma o acesso <em>lazy</em> tardio numa excepção ruidosa em vez de numa consulta silenciosa.</p>
+      <p>Custa alguma coisa? Sim: os testes ficam acoplados à estratégia de <em>fetch</em>, e uma optimização legítima que passe de 1 para 2 instruções obriga a actualizar a asserção. É exactamente o que se quer — a alteração ao orçamento passa a ser uma decisão visível na revisão, e não um acidente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ligava o <code>show-sql</code> e via.» Sem contagem, sem métrica, sem prevenção.</td></tr>
+        <tr><td>Mid</td><td>Sabe o que é N+1, encontra-o no <em>log</em> e corrige com <code>join fetch</code>; a prevenção é «ter cuidado».</td></tr>
+        <tr><td>Sénior</td><td>Mede a razão instruções/pedido, divide o tempo para distinguir N+1 de consulta lenta, e deixa um teste de contagem no repositório.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o orçamento de instruções como norma da equipa, o alerta em produção sobre a razão, e o efeito de desligar o <em>open session in view</em> como rede de segurança.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o problema aparecer só em produção, com dados reais, e não em teste?»</li>
+      <li>«Como escreve esse teste sem acoplar demasiado à implementação?»</li>
+      <li>«Qual é a diferença entre contar instruções preparadas e contar execuções?»</li>
+      <li>«Que alerta poria e com que limiar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <code>EAGER</code> como correcção de N+1 — troca N+1 por <em>joins</em> em todas as consultas.</li>
+      <li>Corrigir sem medir o antes e o depois.</li>
+      <li>Ignorar que uma listagem pode ser lenta por falta de índice e não por número de instruções.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-4" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tem <code>join fetch</code>, <code>@EntityGraph</code>, <code>@BatchSize</code> e <code>FetchMode.SUBSELECT</code> à disposição. Escolha uma para cada um destes casos e justifique: um detalhe de encomenda com linhas, uma listagem paginada de 50 encomendas, e um relatório que percorre três níveis de associação.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Detalhe de uma encomenda: <code>join fetch</code>. Uma raiz, uma ou duas colecções pequenas, sem paginação — uma consulta resolve tudo e o produto cartesiano é irrelevante com dezenas de linhas. Se a mesma entidade for pedida por vários casos de uso com grafos diferentes, uso <code>@EntityGraph</code> sobre o método do repositório, porque separa a forma do grafo da consulta e evita três métodos quase iguais. Tecnicamente <code>@EntityGraph</code> e <code>join fetch</code> geram o mesmo SQL; a diferença é de manutenção.</p>
+      <p>Listagem paginada: nunca <code>join fetch</code> sobre uma colecção. O Hibernate não consegue aplicar <code>LIMIT</code> a um resultado onde cada raiz ocupa várias linhas, por isso desiste da paginação em SQL, traz o conjunto completo e pagina em memória — com o aviso <code>HHH000104</code>. Com 400 000 encomendas isso é um incidente de <em>heap</em>, não uma lentidão. A resposta correcta é <code>@BatchSize</code> ou, melhor, a propriedade global <code>hibernate.default_batch_fetch_size</code> a 50: a página de 50 raízes é obtida com <code>LIMIT</code> real e as colecções são preenchidas com uma consulta <code>in (?, ?, …)</code> por nível. Total: 2 a 3 instruções, com paginação correcta.</p>
+      <p>Relatório com três níveis: não uso nenhuma delas para carregar entidades. Um grafo de três níveis com <code>join fetch</code> multiplica linhas — 200 raízes × 5 linhas × 3 sub-elementos são 3 000 linhas transportadas para preencher 200 objectos — e a maioria dos relatórios não modifica nada. Escrevo uma consulta que projecta directamente para um <em>record</em>, com agregação feita na base de dados. Se o relatório tiver mesmo de devolver entidades geridas, então <code>default_batch_fetch_size</code>, porque é o único mecanismo que degrada graciosamente com a profundidade.</p>
+      <p><code>FetchMode.SUBSELECT</code> fica para o caso estreito em que a consulta original é barata e as colecções são muitas: reexecuta a consulta original dentro de um <code>in (subconsulta)</code>. Se a consulta original for cara ou tiver parâmetros voláteis, executá-la duas vezes é pior do que o lote. Em Hibernate 6 a estratégia por omissão para colecções é adequada quando <code>default_batch_fetch_size</code> está definido; sem essa propriedade, o comportamento por omissão é uma consulta por colecção, ou seja, N+1.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe <code>join fetch</code> para tudo, incluindo a listagem paginada.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>join fetch</code> e <code>@EntityGraph</code>, sabe que há um problema com paginação, mas não nomeia o mecanismo nem a alternativa.</td></tr>
+        <tr><td>Sénior</td><td>Explica a paginação em memória, propõe <code>@BatchSize</code> com número, e distingue leitura projectada de leitura gerida.</td></tr>
+        <tr><td>Staff</td><td>Quantifica o produto cartesiano, discute o valor concreto do lote face ao limite de parâmetros do PostgreSQL, e escolhe por caso de uso e não por regra única.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que <code>distinct</code> em JPQL deixou de ser necessário no Hibernate 6?»</li>
+      <li>«Que valor daria a <code>default_batch_fetch_size</code> e porquê?»</li>
+      <li>«O que acontece se tiver dois <code>join fetch</code> sobre duas listas?»</li>
+      <li>«Como pagina uma consulta que precisa mesmo de filtrar por um campo da colecção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não conhecer a paginação em memória e considerar o aviso do <em>log</em> inofensivo.</li>
+      <li>Definir <code>@BatchSize</code> a 1 000 sem pensar no tamanho da lista <code>in</code> nem no plano gerado.</li>
+      <li>Carregar entidades geridas para relatórios que só são serializados.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-5" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Preciso de uma página de 50 encomendas com todas as linhas carregadas, ordenada por data, e o total de elementos para a paginação. Escreva-me a estratégia — e diga-me porque é que a solução ingénua com <code>Page&lt;Encomenda&gt;</code> e <code>join fetch</code> é perigosa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A solução ingénua é perigosa porque a paginação deixa de existir onde o candidato pensa que existe. Com um <code>join fetch</code> sobre <code>e.linhas</code>, cada encomenda ocupa tantas linhas quantas as suas linhas de detalhe; aplicar <code>LIMIT 50</code> ao conjunto de resultados devolveria encomendas truncadas. O Hibernate sabe disso, ignora o <code>LIMIT</code>, executa a consulta completa e faz a paginação em memória, registando <code>HHH000104: firstResult/maxResults specified with collection fetch; applying in memory</code>. Numa tabela com 400 000 encomendas isso são milhões de linhas transportadas para devolver 50: o <em>pod</em> morre com <code>OutOfMemoryError</code> ou fica minutos em GC. A propriedade <code>hibernate.query.fail_on_pagination_over_collection_fetch=true</code> converte esse aviso em excepção e devia estar ligada em todos os projectos.</p>
+      <p>Há duas estratégias sãs. A primeira, e a que uso por omissão, é o lote de <em>fetch</em>: consulta paginada normal sobre a raiz, sem <code>join fetch</code> de colecções, com <code>hibernate.default_batch_fetch_size=50</code>. O SQL fica: uma consulta com <code>ORDER BY</code> e <code>LIMIT 50</code> real, uma consulta de contagem para o total, e uma consulta <code>where encomenda_id in (?, …)</code> por cada nível de colecção. Três instruções, memória proporcional à página, ordenação feita pela base de dados. É a resposta certa em 90% dos casos e não exige código especial.</p>
+      <p>A segunda é a paginação em dois passos, útil quando o grafo é grande ou quando se quer controlo total: primeiro uma consulta que projecta só os identificadores, com <code>ORDER BY</code> e <code>LIMIT</code>; depois uma segunda consulta com <code>join fetch</code> restrita a <code>id in :ids</code>, onde a paginação já não é necessária porque o conjunto é fechado e pequeno. A ordenação tem de ser reaplicada em memória, ou repetida no <code>ORDER BY</code> da segunda consulta, porque <code>in</code> não preserva ordem.</p>
+      <p>Sobre o total: <code>Page</code> emite sempre uma consulta <code>count</code>, e num filtro pouco selectivo sobre dezenas de milhões de linhas essa contagem pode custar mais do que a página. Em listagens de <em>scroll</em> infinito devolvo <code>Slice</code>, que pede <code>LIMIT n+1</code> e não conta nada; quando o número exacto é mesmo exigido pelo produto, uso uma estimativa a partir das estatísticas do planeador ou uma contagem materializada. O <em>trade-off</em> é entre exactidão do total e uma consulta que cresce linearmente com a tabela.</p>
+      <p>E se a ordenação for por um campo da colecção — «encomendas ordenadas pelo artigo mais caro»? Aí nem lote nem dois passos resolvem sozinhos: escreve-se a consulta de identificadores com a agregação e o <code>ORDER BY</code> sobre o agregado, e mantém-se o segundo passo. É o momento em que se aceita SQL nativo sem culpa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escreve <code>Page&lt;Encomenda&gt; findAll…</code> com <code>join fetch</code> e não vê problema nenhum.</td></tr>
+        <tr><td>Mid</td><td>Sabe que «não se deve paginar com <em>join fetch</em>» mas não explica porquê nem propõe alternativa concreta.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia a paginação em memória, propõe lote de <em>fetch</em> com valor, ou dois passos, e conta as instruções resultantes.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo da consulta <code>count</code>, <code>Slice</code> como alternativa, e o caso da ordenação por agregado da colecção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quanto custa a consulta <code>count</code> numa tabela de 40 milhões de linhas?»</li>
+      <li>«Como garante a ordem no segundo passo com <code>in</code>?»</li>
+      <li>«Porque é que a paginação por <em>offset</em> degrada e o que usaria em alternativa?»</li>
+      <li>«E se o cliente pedir 5 000 elementos por página?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Considerar o aviso <code>HHH000104</code> um detalhe de <em>log</em>.</li>
+      <li>Paginar em memória com <code>stream().skip().limit()</code> sobre o resultado do repositório.</li>
+      <li>Não perceber que <code>Page</code> implica sempre uma segunda consulta de contagem.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Paginação por <em>offset</em> é simples e permite saltar para a página 97; o custo é que o PostgreSQL tem de percorrer e descartar as 4 800 linhas anteriores, pelo que a página 97 é 97 vezes mais cara do que a primeira. Paginação por <em>keyset</em> (<code>where (criada_em, id) &lt; (?, ?) order by criada_em desc, id desc limit 50</code>) é O(1) em qualquer profundidade com o índice composto certo, mas só permite avançar e recuar. Regra: catálogos navegáveis com poucas páginas usam <em>offset</em>; feeds, exportações e APIs de integração usam <em>keyset</em>.</p></aside>
+
+<div class="lab" id="lab-12-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 12.1 — Eliminar um N+1 e provar a correcção por contagem de instruções</span>
+    <div class="labpills"><span class="qpill">Alvo ≤ 3 instruções</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>O serviço da Listagem 12.3 devolve um resumo das encomendas criadas depois de uma data, paginado a 200 elementos. O modelo tem <code>Encomenda</code> → <code>Cliente</code> (<code>@ManyToOne</code> LAZY), <code>Encomenda</code> → <code>LinhaEncomenda</code> (<code>@OneToMany</code> LAZY) e <code>LinhaEncomenda</code> → <code>Artigo</code> (<code>@ManyToOne</code> LAZY). Em produção, com 200 encomendas de 5 linhas, o endpoint emite 1 401 instruções e responde em 1 743 ms. Restrições: manter a paginação correcta na base de dados (nada de paginar em memória), manter a ordenação por <code>criadaEm</code> descendente, não alterar os tipos de <em>fetch</em> das associações no modelo, e não introduzir SQL nativo. Entregue duas coisas: a nova versão do repositório e do serviço, e um teste que <em>falhe</em> se alguém reintroduzir o N+1. Objectivo: no máximo 3 instruções preparadas por invocação.</p>
+    <figure class="listing java" id="lst-12-3"><div class="lhead"><span class="lnum">Listagem 12.3</span>
+      <span class="lcap">Ponto de partida: uma consulta paginada e três associações acedidas em ciclo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="java"><code>public interface EncomendaRepository extends JpaRepository&lt;Encomenda, Long&gt; {
+    Page&lt;Encomenda&gt; findByCriadaEmGreaterThanEqual(Instant desde, Pageable pageable);
+}
+
+@Service
+public class ResumoService {
+
+    private final EncomendaRepository repo;
+
+    @Transactional(readOnly = true)
+    public Page&lt;ResumoEncomenda&gt; resumo(Instant desde, Pageable pageable) {
+        return repo.findByCriadaEmGreaterThanEqual(desde, pageable)
+                   .map(e -&gt; new ResumoEncomenda(
+                        e.getReferencia(),
+                        e.getCliente().getNome(),                    // 1 consulta por encomenda
+                        e.getLinhas().size(),                        // 1 consulta por encomenda
+                        e.getLinhas().stream()                       // 1 consulta por linha
+                         .map(l -&gt; l.getArtigo().getPrecoUnitario()
+                                    .multiply(BigDecimal.valueOf(l.getQuantidade())))
+                         .reduce(BigDecimal.ZERO, BigDecimal::add)));
+    }
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <p>Há duas soluções defensáveis e o entrevistador quer ouvir a comparação antes do código. A primeira, mínima: acrescentar <code>hibernate.default_batch_fetch_size=50</code> e um <code>@EntityGraph</code> apenas para <code>cliente</code>, que é um <code>@ManyToOne</code> e pode ser trazido por <em>join</em> sem multiplicar linhas. O resultado é 1 consulta paginada com <em>join</em> ao cliente, 1 de contagem, 1 lote para as linhas e 1 lote para os artigos — 4 instruções, uma acima do orçamento. A segunda, e a que entrego, é a paginação em dois passos: os identificadores vêm paginados e ordenados pela base de dados, e o grafo completo é carregado num único <code>join fetch</code> sobre um conjunto fechado de 200 identificadores, onde o produto cartesiano é conhecido e pequeno (200 × 5 = 1 000 linhas).</p>
+      <figure class="listing java" id="lst-12-4"><div class="lhead"><span class="lnum">Listagem 12.4</span>
+        <span class="lcap">Repositório em dois passos: identificadores paginados, grafo carregado por lote fechado.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public interface EncomendaRepository extends JpaRepository&lt;Encomenda, Long&gt; {
+
+    // Passo 1 — paginacao e ordenacao reais em SQL, sem coleccoes no caminho.
+    @Query("""
+           select e.id from Encomenda e
+            where e.criadaEm &gt;= :desde
+            order by e.criadaEm desc, e.id desc
+           """)
+    Page&lt;Long&gt; idsCriadasApos(@Param("desde") Instant desde, Pageable pageable);
+
+    // Passo 2 — um unico join fetch sobre um conjunto fechado; sem LIMIT, sem HHH000104.
+    @Query("""
+           select e from Encomenda e
+             join fetch e.cliente
+             left join fetch e.linhas l
+             left join fetch l.artigo
+            where e.id in :ids
+            order by e.criadaEm desc, e.id desc
+           """)
+    List&lt;Encomenda&gt; carregarGrafo(@Param("ids") List&lt;Long&gt; ids);
+}
+
+@Service
+public class ResumoService {
+
+    private final EncomendaRepository repo;
+
+    @Transactional(readOnly = true)
+    public Page&lt;ResumoEncomenda&gt; resumo(Instant desde, Pageable pageable) {
+        Page&lt;Long&gt; ids = repo.idsCriadasApos(desde, pageable);
+        if (ids.isEmpty()) {
+            return Page.empty(pageable);
+        }
+        List&lt;ResumoEncomenda&gt; conteudo = repo.carregarGrafo(ids.getContent())
+            .stream()
+            .map(ResumoService::mapear)
+            .toList();
+        return new PageImpl&lt;&gt;(conteudo, pageable, ids.getTotalElements());
+    }
+
+    private static ResumoEncomenda mapear(Encomenda e) {
+        BigDecimal total = e.getLinhas().stream()
+            .map(l -&gt; l.getArtigo().getPrecoUnitario()
+                       .multiply(BigDecimal.valueOf(l.getQuantidade())))
+            .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return new ResumoEncomenda(e.getReferencia(), e.getCliente().getNome(),
+                                   e.getLinhas().size(), total);
+    }
+}</code></pre></figure>
+      <p>O teste é a parte que o entrevistador valoriza mais, porque é a que sobrevive à próxima alteração. As estatísticas do Hibernate contam instruções preparadas ao nível do <code>SessionFactory</code>; limpa-se o contador, executa-se o caso de uso e afirma-se o orçamento. O teste falha se alguém acrescentar um <code>getFornecedor()</code> dentro do <code>mapear</code>.</p>
+      <figure class="listing java" id="lst-12-5"><div class="lhead"><span class="lnum">Listagem 12.5</span>
+        <span class="lcap">Teste de orçamento de instruções com <code>Statistics</code> e uma base de dados real.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Import(ResumoService.class)
+class ResumoServiceOrcamentoSqlTest {
+
+    @Container @ServiceConnection
+    static PostgreSQLContainer&lt;?&gt; PG = new PostgreSQLContainer&lt;&gt;("postgres:17-alpine");
+
+    @Autowired EntityManagerFactory emf;
+    @Autowired ResumoService servico;
+
+    private Statistics estatisticas() {
+        Statistics s = emf.unwrap(SessionFactory.class).getStatistics();
+        s.setStatisticsEnabled(true);
+        s.clear();
+        return s;
+    }
+
+    @Test
+    void resumoNaoUltrapassaTresInstrucoes() {
+        dados.criarEncomendas(200, 5);          // 200 encomendas x 5 linhas
+        Statistics s = estatisticas();
+
+        Page&lt;ResumoEncomenda&gt; pagina =
+            servico.resumo(Instant.now().minus(Duration.ofDays(1)), PageRequest.of(0, 200));
+
+        assertThat(pagina.getContent()).hasSize(200);
+        assertThat(s.getPrepareStatementCount())
+            .as("ids paginados + contagem + carregamento do grafo")
+            .isLessThanOrEqualTo(3);
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Instruções por invocação: de 1 + N + N + N×M (1 401 com N = 200 e M = 5) para 3, independentemente de N. Linhas transportadas: de 1 401 idas e voltas para 1 000 linhas numa só.</li>
+        <li>A ordenação tem de ser repetida no passo 2: <code>in (…)</code> não preserva a ordem dos identificadores. Esquecer isto é o erro mais comum e passa despercebido em testes com poucos dados.</li>
+        <li>O tamanho da página limita a lista <code>in</code>. O PostgreSQL aceita até 65 535 parâmetros por instrução, mas listas com milhares de elementos degradam o plano e enchem a <em>cache</em> de planos com variantes; acima de 500 identificadores vale mais partir em lotes ou passar um <em>array</em> com <code>= any(?)</code>.</li>
+        <li>Duas colecções irmãs com <code>join fetch</code> na mesma consulta dão <code>MultipleBagFetchException</code> se forem <code>List</code> sem <code>@OrderColumn</code>; com <code>Set</code> não há excepção mas há produto cartesiano. Com dois níveis a solução é <code>default_batch_fetch_size</code> para o segundo.</li>
+        <li><code>PageImpl</code> com <code>getTotalElements()</code> do passo 1 preserva a semântica de paginação sem uma segunda contagem; devolver <code>new PageImpl&lt;&gt;(conteudo, pageable, conteudo.size())</code> seria um erro silencioso que quebra a última página.</li>
+        <li>O que se procura: que o candidato conte instruções em vez de as descrever, que reconheça que <code>@DataJpaTest</code> com base de dados em memória esconderia problemas de plano, e que deixe o teste de orçamento como artefacto permanente.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-12-3" class="h2"><span class="secnum">12.3</span> Transacções: propagação, isolamento e rollback<a class="anchor" href="#sec-12-3" aria-label="ligação">#</a></h2>
+
+<p>O <code>@Transactional</code> do Spring é implementado por <em>proxy</em>. O contentor envolve o <em>bean</em> num objecto que abre a transacção antes de delegar e faz <em>commit</em> ou <em>rollback</em> depois. Daqui saem duas limitações que aparecem em quase todas as entrevistas. Uma chamada interna — um método público anotado a ser invocado por outro método da mesma classe — não passa pelo <em>proxy</em> e a anotação não tem efeito nenhum, sem qualquer aviso. E um método <code>private</code>, <code>final</code> ou <code>static</code> anotado é igualmente ignorado com <em>proxies</em> baseados em subclasse. A saída é extrair o método para outro <em>bean</em>, injectar o próprio <em>bean</em> através da interface, ou usar <code>TransactionTemplate</code> de forma explícita — que é a opção que prefiro quando a fronteira precisa de ser evidente na leitura do código.</p>
+
+<p>A transacção existe para delimitar a unidade atómica de trabalho, e por isso a regra de ouro é: a fronteira é o caso de uso, e nada que não seja base de dados entra lá dentro. Uma chamada HTTP com <em>timeout</em> de 3 s dentro de um método transaccional prende uma ligação do <em>pool</em> durante 3 s. Com um <em>pool</em> HikariCP de 20 ligações e 30 pedidos por segundo a entrar nesse caminho, o <em>pool</em> esgota em menos de um segundo e o serviço devolve <code>SQLTransientConnectionException</code> a tudo, incluindo aos <em>endpoints</em> saudáveis. É a forma mais eficiente de transformar uma dependência lenta numa indisponibilidade total.</p>
+
+<p>Sobre isolamento: o valor por omissão do PostgreSQL é <code>READ COMMITTED</code>, e é o que o Spring usa a não ser que se peça outra coisa (<code>Isolation.DEFAULT</code> significa «o da base de dados», não «o da especificação»). Em <code>READ COMMITTED</code> cada instrução vê uma fotografia nova, pelo que leituras não repetíveis e <em>phantoms</em> são possíveis dentro da mesma transacção. Subir para <code>REPEATABLE READ</code> em PostgreSQL dá um <em>snapshot</em> estável para toda a transacção e detecta conflitos de escrita com <code>could not serialize access due to concurrent update</code> — o que significa que o código passa a precisar de retentativa. <code>SERIALIZABLE</code> acrescenta detecção de anomalias de predicado e, sob contenção, taxas de aborto que já vi entre 3% e 15%. Na prática, para o típico «ler saldo, decidir, escrever», <code>READ COMMITTED</code> com <code>@Version</code> ou com <code>SELECT … FOR UPDATE</code> é mais barato e mais previsível do que subir o isolamento global.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 12.2</span> Propagação: comportamento com e sem transacção em curso.</div>
+<div class="tscroll"><table><thead><tr><th>Propagação</th><th>Sem transacção activa</th><th>Com transacção activa</th><th>Uso típico</th></tr></thead><tbody>
+<tr><td><code>REQUIRED</code> (omissão)</td><td>Abre uma nova</td><td>Junta-se à existente</td><td>Praticamente tudo</td></tr>
+<tr><td><code>REQUIRES_NEW</code></td><td>Abre uma nova</td><td>Suspende a exterior e abre outra ligação</td><td>Auditoria e registo que têm de sobreviver ao <em>rollback</em></td></tr>
+<tr><td><code>NESTED</code></td><td>Abre uma nova</td><td><em>Savepoint</em> na mesma ligação</td><td><em>Rollback</em> parcial sem segunda ligação; só com JDBC, não com JTA</td></tr>
+<tr><td><code>SUPPORTS</code></td><td>Corre sem transacção</td><td>Junta-se à existente</td><td>Leituras que aceitam ambos os contextos</td></tr>
+<tr><td><code>NOT_SUPPORTED</code></td><td>Corre sem transacção</td><td>Suspende a exterior</td><td>Trabalho longo que não deve prender <em>locks</em></td></tr>
+<tr><td><code>MANDATORY</code></td><td><code>IllegalTransactionStateException</code></td><td>Junta-se à existente</td><td>Componentes internos que exigem contexto do chamador</td></tr>
+<tr><td><code>NEVER</code></td><td>Corre sem transacção</td><td><code>IllegalTransactionStateException</code></td><td>Guarda contra fronteiras acidentais</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing java" id="lst-12-6"><div class="lhead"><span class="lnum">Listagem 12.6</span>
+<span class="lcap">Auditoria que sobrevive ao <em>rollback</em>: <em>bean</em> separado, <em>timeout</em> curto, falha isolada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class RegistoAuditoria {
+
+    private final EntityManager em;
+
+    // Bean SEPARADO: a chamada atravessa o proxy. Se este metodo vivesse em
+    // PagamentoService e fosse chamado por liquidar(), a anotacao seria ignorada.
+    @Transactional(propagation = Propagation.REQUIRES_NEW, timeout = 2)
+    public void registar(String referencia, String motivo) {
+        em.persist(new EventoAuditoria(referencia, motivo, Instant.now()));
+    }
+}
+
+@Service
+public class PagamentoService {
+
+    private final RegistoAuditoria auditoria;
+    private final PagamentoRepository repo;
+
+    @Transactional                      // REQUIRED: ligacao #1 do pool
+    public void liquidar(Long id) {
+        Pagamento p = repo.findById(id).orElseThrow(PagamentoInexistente::new);
+        p.liquidar();                   // dirty checking trata do UPDATE
+
+        try {
+            auditoria.registar(p.getReferencia(), "liquidado");   // ligacao #2 do pool
+        } catch (RuntimeException ex) {
+            // A auditoria falhou; a liquidacao nao deve cair por causa disso.
+            log.warn("auditoria falhou para {}", p.getReferencia(), ex);
+        }
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-12-6" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando é que usa <code>REQUIRES_NEW</code> em vez de <code>REQUIRED</code>? E porque é que anotar um método privado com <code>@Transactional</code>, ou chamá-lo a partir de outro método da mesma classe, não funciona?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>REQUIRES_NEW</code> serve para um único propósito legítimo: escrever algo que tem de sobreviver ao <em>rollback</em> da transacção exterior. Registo de auditoria, marcação de uma tentativa falhada, incremento de um contador de erros. A transacção exterior é suspensa, abre-se uma segunda transacção numa <em>segunda ligação</em> do <em>pool</em>, faz-se <em>commit</em> dessa, e a exterior retoma. Fora desse padrão, o uso quase sempre revela um caso de uso mal recortado.</p>
+      <p>O custo é concreto e é onde os candidatos falham. Cada <code>REQUIRES_NEW</code> aninhado consome mais uma ligação do <em>pool</em> ao mesmo tempo. Com HikariCP a 20 ligações, um caminho que use dois níveis de <code>REQUIRES_NEW</code> tem uma capacidade efectiva de 10 pedidos concorrentes, e um ciclo que chame <code>REQUIRES_NEW</code> dentro de uma transacção aberta é um <em>deadlock</em> de <em>pool</em> à espera de acontecer: as ligações exteriores esperam por ligações interiores que nunca ficam livres. Além disso, a transacção interior não vê as escritas não confirmadas da exterior — em <code>READ COMMITTED</code> lê o estado anterior — o que produz auditorias inconsistentes se alguém tentar ler lá dentro o que acabou de escrever cá fora.</p>
+      <p>Quando o objectivo é apenas <em>rollback</em> parcial, e não sobrevivência ao <em>rollback</em>, <code>NESTED</code> é melhor: usa um <em>savepoint</em> na mesma ligação, não gasta uma segunda, e desfaz-se apenas o bloco interior. A limitação é que só funciona com <code>DataSourceTransactionManager</code> ou <code>JpaTransactionManager</code> sobre JDBC, não com JTA, e o Hibernate obriga a cuidados com o contexto de persistência partilhado.</p>
+      <p>Sobre o <em>proxy</em>: o Spring cria um objecto que envolve o <em>bean</em> e é essa referência que fica no contexto. O aconselhamento transaccional só corre quando a invocação passa por essa referência. Um método privado nunca é invocável de fora, logo nunca é aconselhado. Uma chamada interna usa <code>this</code>, que é o objecto real e não o <em>proxy</em>, portanto a anotação é lida e ignorada — o Spring Boot regista um aviso na criação do <em>bean</em> em alguns casos, mas não falha. As saídas: extrair para outro <em>bean</em> (a que prefiro, porque também melhora o desenho), auto-injecção com <code>@Lazy</code>, <code>TransactionTemplate</code> explícito, ou tecelagem em tempo de carregamento com AspectJ (<code>mode = ASPECTJ</code>), que resolve o problema mas acrescenta um agente de <em>runtime</em> e complica o arranque.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde <code>REQUIRES_NEW</code> com «transacção mais forte»; não sabe que a chamada interna não funciona.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é uma transacção independente e que a chamada interna falha por causa do <em>proxy</em>, mas não quantifica o custo nem propõe <code>NESTED</code>.</td></tr>
+        <tr><td>Sénior</td><td>Liga <code>REQUIRES_NEW</code> ao consumo de uma segunda ligação, dimensiona o <em>pool</em>, distingue <code>NESTED</code>, e enumera as saídas ao problema do <em>proxy</em>.</td></tr>
+        <tr><td>Staff</td><td>Descreve o cenário de esgotamento do <em>pool</em> com números, a invisibilidade das escritas não confirmadas, e defende o recorte do caso de uso em vez do remendo de propagação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como dimensiona o <em>pool</em> se o código usa <code>REQUIRES_NEW</code>?»</li>
+      <li>«O que vê a transacção interior das escritas da exterior?»</li>
+      <li>«Quando é que <code>NESTED</code> não está disponível?»</li>
+      <li>«Como testaria que a auditoria sobrevive mesmo a um <em>rollback</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>REQUIRES_NEW</code> para «evitar problemas de <em>lock</em>» sem perceber que duplica ligações.</li>
+      <li>Achar que anotar o método privado funciona porque «o Spring lê a anotação».</li>
+      <li>Chamar serviços HTTP externos dentro do bloco transaccional.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-7" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um método <code>@Transactional</code> lança uma excepção verificada declarada em <code>throws</code>. A transacção faz <em>rollback</em>? E se eu apanhar uma <code>RuntimeException</code> lá dentro, registar no <em>log</em> e continuar — o que acontece no <em>commit</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não faz <em>rollback</em>. A regra por omissão do Spring — herdada do modelo EJB — é reverter apenas em <code>RuntimeException</code> e <code>Error</code>; uma excepção verificada faz <em>commit</em> do que já foi escrito e propaga-se ao chamador. É contra-intuitivo e é a origem de estados meio escritos em produção: metade das entidades gravadas, a excepção a subir, e ninguém a reverter nada. Corrige-se com <code>@Transactional(rollbackFor = Exception.class)</code> no método, ou — melhor — não usando excepções verificadas na camada de domínio, o que também elimina a discussão.</p>
+      <p>O segundo caso é mais subtil e é o que separa sénior de mid. Se uma operação JPA lançar dentro da transacção e o código apanhar a excepção e continuar, o <em>rollback</em> pode já estar decidido. O <code>TransactionAspectSupport</code> marca a transacção como <em>rollback-only</em> quando o aconselhamento interior falha; no <em>commit</em>, o gestor detecta a marca e lança <code>UnexpectedRollbackException</code> — «Transaction silently rolled back because it has been marked as rollback-only». Aparece tipicamente quando um método <code>REQUIRED</code> interior falha, o exterior apanha a excepção e segue: como ambos partilham a <em>mesma</em> transacção física, o interior só pôde marcar, não reverter, e o exterior é quem leva com a excepção no fim.</p>
+      <p>Pior do que isso: depois de uma excepção do Hibernate, o contexto de persistência fica num estado indefinido. A especificação diz explicitamente que continuar a usar o <code>EntityManager</code> depois de uma excepção que provoque <em>rollback</em> não é suportado. Apanhar <code>ConstraintViolationException</code> para «tentar outra coisa» na mesma transacção não é uma estratégia de recuperação; é adiar o erro.</p>
+      <p>O que faço na prática: excepções de domínio são todas não verificadas e revertem por omissão; validações que devem produzir 400 são detectadas <em>antes</em> de qualquer escrita; e quando é mesmo preciso continuar depois de uma falha parcial, a operação falível vai para <code>REQUIRES_NEW</code>, onde o seu <em>rollback</em> é independente e o chamador pode apanhar a excepção sem contaminar a transacção principal. É exactamente o padrão da Listagem 12.6.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Qualquer excepção faz <em>rollback</em>.»</td></tr>
+        <tr><td>Mid</td><td>Sabe a regra <em>unchecked</em>/<em>checked</em> e menciona <code>rollbackFor</code>, mas desconhece o <em>rollback-only</em>.</td></tr>
+        <tr><td>Sénior</td><td>Explica a marca <em>rollback-only</em>, a <code>UnexpectedRollbackException</code> no <em>commit</em>, e o estado inválido do contexto de persistência após excepção.</td></tr>
+        <tr><td>Staff</td><td>Deriva daqui uma política: domínio sem excepções verificadas, validação antes da escrita, isolamento da operação falível em <code>REQUIRES_NEW</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a regra por omissão é essa e não “reverter sempre”?»</li>
+      <li>«Onde é que se define <code>noRollbackFor</code> e para quê?»</li>
+      <li>«O que faz o <code>EntityManager</code> depois de uma <code>PersistenceException</code>?»</li>
+      <li>«Como distingue um erro de negócio de um erro técnico na fronteira HTTP?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Apanhar excepções dentro do método transaccional e assumir que o <em>commit</em> corre normalmente.</li>
+      <li>Pôr <code>rollbackFor = Exception.class</code> em todo o lado como reflexo, sem perceber a regra.</li>
+      <li>Reutilizar o <code>EntityManager</code> após uma excepção de persistência.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-8" data-box="qa" data-area="spring" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O que é que <code>@Transactional(readOnly = true)</code> muda de facto — no Hibernate, no JDBC e no PostgreSQL? Vale a pena pô-lo em todos os métodos de leitura?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Actua em três camadas com efeitos diferentes. No Hibernate, põe a sessão em <code>FlushMode.MANUAL</code>: não há <em>flush</em> automático antes das consultas nem no <em>commit</em>, o que elimina o custo de <em>dirty checking</em> proporcional ao número de entidades geridas. Numa consulta que carregue 50 000 entidades e faça 20 consultas, isso são 20 varrimentos de 50 000 objectos que deixam de acontecer — já vi este único atributo cortar 60% do tempo de um relatório.</p>
+      <p>No JDBC, o Spring chama <code>Connection.setReadOnly(true)</code>. No PostgreSQL isso traduz-se em <code>SET TRANSACTION READ ONLY</code>: a base de dados rejeita qualquer escrita com <code>ERROR: cannot execute UPDATE in a read-only transaction</code>. É uma rede de segurança real, não um adorno. E é também o sinal que os <em>routers</em> de réplica usam: com <code>LazyConnectionDataSourceProxy</code> e um <code>AbstractRoutingDataSource</code>, a marca de leitura permite encaminhar o pedido para uma réplica de leitura, o que só funciona se as fronteiras estiverem correctamente anotadas.</p>
+      <p>Vale a pena pôr em todos os métodos de leitura? Sim, com uma condição: que sejam mesmo de leitura. O modo <code>MANUAL</code> significa que uma alteração acidental a uma entidade gerida <em>não</em> é persistida — o que é bom, mas silencioso. Se alguém escrever lógica de escrita dentro de um método <code>readOnly</code> e o teste correr contra a mesma transacção, o defeito não aparece até a base de dados o rejeitar em produção. E há uma armadilha operacional: um método de leitura marcado <code>readOnly</code> ainda abre uma transacção e prende uma ligação; para uma consulta única, o custo do <code>BEGIN</code>/<code>COMMIT</code> extra é medível em cargas acima de 10 000 pedidos por segundo. Nesses casos vale a pena não abrir transacção de todo e deixar o <em>auto-commit</em> agir.</p>
+      <p>Uma nota que impressiona: <code>readOnly</code> em PostgreSQL não implica <em>snapshot</em> estável. Continua a ser <code>READ COMMITTED</code>, portanto duas consultas na mesma transacção podem ver estados diferentes. Para um relatório que exige coerência entre várias consultas é preciso <code>REPEATABLE READ</code> explícito.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É uma optimização» ou «impede escritas», sem saber onde.</td></tr>
+        <tr><td>Mid</td><td>Menciona o <em>flush mode</em> e a marca no JDBC, sem consequências quantificadas.</td></tr>
+        <tr><td>Sénior</td><td>Distingue as três camadas, quantifica a poupança de <em>dirty checking</em>, e refere o encaminhamento para réplicas.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta que não dá coerência de <em>snapshot</em>, o custo do <code>BEGIN</code> em alta cadência, e o risco de escritas silenciosamente ignoradas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se eu alterar uma entidade dentro de um método <code>readOnly</code>, o que acontece?»</li>
+      <li>«Como encaminha leituras para uma réplica sem mudar o código de negócio?»</li>
+      <li>«E o atraso de replicação — como lida com leitura-após-escrita?»</li>
+      <li>«Quando é que prefere não abrir transacção nenhuma?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <code>readOnly</code> dá isolamento ou coerência entre consultas.</li>
+      <li>Marcar como <code>readOnly</code> métodos que escrevem e descobrir só em produção.</li>
+      <li>Não saber que o Hibernate desliga o <em>flush</em> automático.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Chamadas remotas dentro do bloco transaccional. Com HikariCP a 20 ligações e uma chamada HTTP de 800 ms dentro de <code>@Transactional</code>, a capacidade máxima do caminho é 20 ÷ 0,8 = 25 pedidos por segundo, independentemente de CPU ou memória. Acima disso, o <em>pool</em> esgota-se e o <code>connection-timeout</code> propaga o erro a todos os outros <em>endpoints</em>. Padrão correcto: transacção 1 para gravar a intenção, chamada externa fora de qualquer transacção, transacção 2 para gravar o resultado.</p></aside>
+
+<h2 id="sec-12-4" class="h2"><span class="secnum">12.4</span> Lazy loading fora da transacção e DTOs<a class="anchor" href="#sec-12-4" aria-label="ligação">#</a></h2>
+
+<p>Uma associação <em>lazy</em> é materializada por um <em>proxy</em> gerado pelo Hibernate que guarda uma referência à sessão que o criou. Fechada a sessão, o primeiro acesso a um método do <em>proxy</em> lança <code>LazyInitializationException: could not initialize proxy — no Session</code>. É a excepção mais frequente de todo o ecossistema JPA e é, na verdade, um sintoma útil: significa que o código está a decidir o que carregar depois de a fronteira transaccional ter fechado, isto é, no sítio errado.</p>
+
+<p>O Spring Boot tem, desde sempre, uma resposta por omissão a isto: <code>spring.jpa.open-in-view=true</code>, o <em>Open Session In View</em>. Um filtro abre a sessão no início do pedido HTTP e fecha-a no fim, pelo que a serialização da resposta ainda encontra sessão aberta e os <em>proxies</em> resolvem-se. O arranque regista um aviso a assinalá-lo. O que ele compra é conveniência; o que custa é que a decisão de emitir SQL passa para a camada de apresentação, onde ninguém olha para ela, e que a ligação à base de dados fica reservada durante toda a serialização — incluindo a escrita da resposta no <em>socket</em> de um cliente lento.</p>
+
+<p>A alternativa é decidir o grafo no serviço e devolver um DTO. Existem três formas de o obter, com custos diferentes: consulta com <em>constructor expression</em> (<code>select new …</code>), que traz só as colunas necessárias numa consulta; projecção por interface do Spring Data, que gera o <code>SELECT</code> a partir dos <em>getters</em> declarados e é o caminho mais curto para projecções simples; e o mapeamento manual da entidade carregada com o grafo certo, útil quando é preciso lógica de domínio para calcular o resultado. Uma projecção reduz normalmente 30 a 70% das colunas transportadas e elimina o custo de <em>snapshot</em> por não criar entidades geridas.</p>
+
+<figure class="listing java" id="lst-12-7"><div class="lhead"><span class="lnum">Listagem 12.7</span>
+<span class="lcap">Projecção para <em>record</em> com agregação na base de dados; sem entidades geridas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public record ResumoEncomenda(String referencia, String cliente,
+                              long linhas, BigDecimal total) { }
+
+public interface EncomendaConsultas extends Repository&lt;Encomenda, Long&gt; {
+
+    @Query("""
+           select new com.acme.enc.ResumoEncomenda(
+                    e.referencia, c.nome, count(l.id),
+                    coalesce(sum(l.quantidade * a.precoUnitario), 0))
+             from Encomenda e
+             join e.cliente c
+             left join e.linhas l
+             left join l.artigo a
+            where e.criadaEm &gt;= :desde
+            group by e.referencia, c.nome
+            order by e.referencia
+           """)
+    List&lt;ResumoEncomenda&gt; resumo(@Param("desde") Instant desde, Pageable pageable);
+
+    // Projeccao por interface: o Spring Data deriva as colunas dos getters.
+    interface LinhaCompacta {
+        String getReferencia();
+        Instant getCriadaEm();
+        @Value("#{target.cliente.nome}") String getCliente();
+    }
+
+    List&lt;LinhaCompacta&gt; findByEstado(Estado estado, Pageable pageable);
+}</code></pre></figure>
+
+<div class="qa" id="q-12-9" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Apanhamos <code>LazyInitializationException</code> ao serializar a resposta. Um colega propõe pôr as associações a <code>EAGER</code>; outro propõe confirmar que o <code>open-in-view</code> está ligado. O que faz e porquê?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Recuso as duas e trato a excepção como diagnóstico correcto de um erro de desenho: o código está a decidir que dados precisa depois de fechar a transacção. A correcção é declarar o grafo no serviço — <code>@EntityGraph</code>, <code>join fetch</code> ou, preferencialmente, uma projecção para DTO — e devolver da camada de serviço um objecto já completo, que não depende de sessão nenhuma para ser serializado.</p>
+      <p><code>EAGER</code> é a pior das três opções. Torna global uma decisão local: a associação passa a ser carregada em <em>todas</em> as consultas que devolvam a entidade, incluindo as 40 onde não é precisa, e nem sempre por <em>join</em> — quando o Hibernate não pode juntar, resolve com uma consulta por linha, ou seja, converte a excepção num N+1 invisível. Além disso <code>EAGER</code> não é reversível por consulta: não há forma de dizer «desta vez não».</p>
+      <p>O <em>open-in-view</em> tem custo mais insidioso. Mantém a ligação JDBC reservada até ao fim da escrita da resposta; num pedido de 120 ms cuja serialização e envio ocupam 40 ms, cerca de um terço do tempo de ligação é gasto fora da base de dados. Com um <em>pool</em> de 20 ligações e clientes móveis lentos, a capacidade cai proporcionalmente. E, sobretudo, deixa o SQL a ser emitido pelo serializador Jackson: nenhum teste de contagem de instruções no serviço apanha o que a apresentação dispara. Em todos os projectos que arranquei, <code>spring.jpa.open-in-view=false</code> é a primeira linha de configuração — não como optimização, mas porque transforma erros silenciosos em falhas ruidosas em teste.</p>
+      <p>Quando é que a escolha contrária é defensável? Numa aplicação monolítica com renderização do lado do servidor, tráfego baixo (dezenas de pedidos por segundo) e prazo curto, o <em>open-in-view</em> poupa trabalho real de mapeamento e o custo não se nota. A decisão tem de ser tomada e registada, não herdada por omissão. E há uma opção intermédia útil ao desactivá-lo: <code>Hibernate.initialize(...)</code> ou <code>Hibernate.isInitialized(...)</code> no serviço para os casos raros em que o grafo é dinâmico.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe <code>EAGER</code>, ou diz «basta manter a sessão aberta».</td></tr>
+        <tr><td>Mid</td><td>Prefere <code>join fetch</code> mas não explica o custo do <em>open-in-view</em> nem porque é que <code>EAGER</code> é pior.</td></tr>
+        <tr><td>Sénior</td><td>Trata a excepção como sinal de desenho, propõe grafo explícito ou DTO, e quantifica a ligação retida pelo <em>open-in-view</em>.</td></tr>
+        <tr><td>Staff</td><td>Enquadra como política de projecto, refere que o SQL migra para a camada de apresentação e escapa aos testes, e diz quando o contrário é aceitável.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como detecta acessos <em>lazy</em> tardios antes de chegarem a produção?»</li>
+      <li>«E se o grafo necessário depender de um parâmetro do pedido?»</li>
+      <li>«Qual é o efeito do <em>open-in-view</em> em <em>endpoints</em> que devolvem <em>streaming</em>?»</li>
+      <li>«O que muda com <code>@Transactional</code> no controlador em vez do serviço?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Serializar entidades JPA directamente para JSON e chamar-lhe API.</li>
+      <li>Resolver com <code>@JsonIgnore</code> nas associações, escondendo o problema em vez de o corrigir.</li>
+      <li>Desconhecer que o <em>open-in-view</em> está ligado por omissão no Spring Boot.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-12-10" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Quando é que devolve entidades e quando devolve DTOs? Dê-me o critério e o custo de cada escolha, incluindo o caso de um <em>endpoint</em> de exportação que devolve 500 000 registos.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O critério é a intenção de escrita. Se o caso de uso vai modificar o estado, preciso de entidades geridas — é o <em>dirty checking</em> que produz o <code>UPDATE</code> mínimo e é o contexto de persistência que garante o mapa de identidade e o controlo de versões. Se o caso de uso apenas lê para devolver, entidades são desperdício puro: pago o <em>snapshot</em>, pago a gestão do contexto, transporto colunas que não vou usar e exponho o modelo interno na fronteira HTTP.</p>
+      <p>Os números tornam a decisão fácil. Uma entidade <code>Encomenda</code> com 18 colunas ocupa, com <em>snapshot</em>, à volta de 2× o espaço dos dados; uma projecção de 4 colunas transporta talvez 20% dos <em>bytes</em> e não cria <em>snapshot</em> nenhum. Numa listagem de 5 000 registos isso é a diferença entre dezenas de MB de <em>heap</em> transitório e alguns MB. Acrescenta-se que o DTO congela o contrato da API: renomear uma coluna deixa de partir clientes.</p>
+      <p>O caso da exportação de 500 000 registos é diferente dos dois anteriores e é onde se vê o nível. Nem entidades nem uma <code>List</code> de DTOs: 500 000 objectos em memória são um incidente. Uso <code>Stream</code> com <em>cursor</em> do lado do servidor — <code>@QueryHints(@QueryHint(name = HINT_FETCH_SIZE, value = "1000"))</code>, transacção de leitura aberta durante a travessia, e <code>em.detach()</code> ou <code>em.clear()</code> periódico se ainda assim passarem entidades, para o contexto não crescer. A resposta é escrita em <em>streaming</em> para o <code>OutputStream</code>, não construída em memória. O PostgreSQL só usa <em>cursor</em> se o <em>auto-commit</em> estiver desligado e o <code>fetchSize</code> for maior que zero — sem isso o <em>driver</em> traz o conjunto todo e o <em>heap</em> explode antes da primeira linha escrita.</p>
+      <p>Quando é que a escolha contrária é a certa? Em CRUD interno de baixo tráfego, com um modelo pequeno e uma única equipa a consumir a API, mapear tudo para DTOs acrescenta código sem benefício mensurável — e a duplicação de classes é um custo real de manutenção. A regra que aplico: entidades atravessam a fronteira do serviço só em aplicações internas com menos de 50 pedidos por segundo; em tudo o resto, DTO.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Uso sempre entidades, é mais rápido de escrever», sem noção de acoplamento nem de custo.</td></tr>
+        <tr><td>Mid</td><td>Sabe que DTOs desacoplam a API do modelo, mas não distingue leitura de escrita nem quantifica.</td></tr>
+        <tr><td>Sénior</td><td>Usa a intenção de escrita como critério, quantifica <em>snapshot</em> e colunas, e resolve a exportação com <em>streaming</em>.</td></tr>
+        <tr><td>Staff</td><td>Refere o <code>fetchSize</code> e o <em>auto-commit</em> como condição para o <em>cursor</em> do PostgreSQL, o <code>clear()</code> periódico, e diz quando o DTO não compensa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como evita o <code>OutOfMemoryError</code> num <em>export</em> de 500 000 linhas?»</li>
+      <li>«Projecção por interface ou <em>constructor expression</em> — qual e porquê?»</li>
+      <li>«Como versiona o DTO quando o modelo evolui?»</li>
+      <li>«O que acontece à transacção durante um <em>streaming</em> de 4 minutos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Carregar 500 000 entidades e mapear com <code>stream()</code> em memória.</li>
+      <li>Expor entidades com associações <em>lazy</em> directamente no JSON.</li>
+      <li>Não saber que o <em>driver</em> PostgreSQL só faz <em>cursor</em> sob condições específicas.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-12-5" class="h2"><span class="secnum">12.5</span> Locking optimista e pessimista<a class="anchor" href="#sec-12-5" aria-label="ligação">#</a></h2>
+
+<p>O problema de base é a actualização perdida. Duas transacções lêem o mesmo saldo de 100, ambas decidem subtrair 30, ambas escrevem 70; uma das subtracções desapareceu. Nenhum nível de isolamento abaixo de <code>REPEATABLE READ</code> impede isto, e mesmo esse impede-o abortando, não coordenando. Em JPA há duas famílias de resposta e a escolha entre elas é uma das perguntas mais comuns de nível sénior.</p>
+
+<p>O <em>locking</em> optimista assume que os conflitos são raros. Uma coluna <code>@Version</code> — <code>int</code>, <code>short</code>, ou um <code>timestamp</code> — é incrementada pelo Hibernate a cada <code>UPDATE</code>, e a cláusula <code>where</code> inclui a versão lida. Se nenhuma linha for afectada, houve conflito e é lançada <code>OptimisticLockException</code>, que o Spring traduz para <code>ObjectOptimisticLockingFailureException</code>. Não há <em>locks</em> mantidos, não há espera, não há <em>deadlocks</em>: o custo do conflito é pago só quando ele acontece, sob a forma de retentativa.</p>
+
+<p>O <em>locking</em> pessimista assume que os conflitos são frequentes ou que a retentativa é inaceitável. <code>LockModeType.PESSIMISTIC_WRITE</code> traduz-se em <code>SELECT … FOR UPDATE</code> no PostgreSQL: a linha fica bloqueada até ao fim da transacção e qualquer outra transacção que a queira bloquear espera. Elimina a retentativa e introduz espera, contenção e a possibilidade de <em>deadlock</em>. É obrigatório definir <code>jakarta.persistence.lock.timeout</code> — sem ele, o PostgreSQL espera indefinidamente e uma transacção esquecida bloqueia toda a fila.</p>
+
+<figure class="listing java" id="lst-12-8"><div class="lhead"><span class="lnum">Listagem 12.8</span>
+<span class="lcap"><code>@Version</code> com retentativa: o <em>retry</em> tem de envolver a transacção, não estar dentro dela.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class ReservaService {
+
+    private final StockService stock;
+
+    // O retry vive FORA da fronteira transaccional: quando a excepcao e lancada,
+    // a transaccao ja foi revertida e o contexto de persistencia esta invalido.
+    @Retryable(retryFor = ObjectOptimisticLockingFailureException.class,
+               maxAttempts = 4,
+               backoff = @Backoff(delay = 25, multiplier = 2.0, random = true))
+    public void reservar(long artigoId, int quantidade) {
+        stock.debitar(artigoId, quantidade);
+    }
+
+    @Recover
+    public void desistir(ObjectOptimisticLockingFailureException ex,
+                         long artigoId, int quantidade) {
+        throw new ContencaoExcessivaException(artigoId, ex);
+    }
+}
+
+@Service
+class StockService {
+
+    @Transactional
+    public void debitar(long artigoId, int quantidade) {
+        Artigo a = repo.findById(artigoId).orElseThrow();
+        if (a.getStock() &lt; quantidade) {
+            throw new StockInsuficienteException(artigoId);
+        }
+        a.setStock(a.getStock() - quantidade);
+        // UPDATE artigo SET stock=?, versao=versao+1 WHERE id=? AND versao=?
+        // 0 linhas afectadas =&gt; OptimisticLockException no flush.
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-12-11" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique-me o <em>locking</em> optimista com <code>@Version</code>: que SQL é gerado, onde é lançada a excepção, e onde é que o <em>retry</em> tem de estar. Que taxa de conflito torna esta abordagem má?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O Hibernate acrescenta a versão lida à cláusula <code>where</code> do <code>UPDATE</code>: <code>update artigo set stock=?, versao=? where id=? and versao=?</code>. Se o número de linhas afectadas for zero, alguém escreveu entretanto e a versão já não corresponde; o Hibernate lança <code>OptimisticLockException</code>, que o Spring traduz para <code>ObjectOptimisticLockingFailureException</code>. Nota importante sobre o momento: a excepção é lançada no <em>flush</em>, que normalmente acontece no <em>commit</em> — ou seja, depois do último <code>return</code> do método de negócio, já no aconselhamento do <em>proxy</em>.</p>
+      <p>Daí decorre a regra que quase toda a gente erra: o <em>retry</em> não pode estar dentro do método transaccional. Quando a excepção chega, a transacção já foi marcada para <em>rollback</em> e o contexto de persistência está inutilizável; repetir lá dentro repete com o mesmo estado obsoleto. O <em>retry</em> tem de envolver a fronteira transaccional — outro <em>bean</em> com <code>@Retryable</code> a chamar o <em>bean</em> transaccional, como na Listagem 12.8 — para que cada tentativa abra uma transacção nova, releia a entidade e reveja a decisão. E precisa de <em>backoff</em> com aleatoriedade: sem ela, N clientes em conflito repetem em sincronia e a taxa de sucesso não melhora.</p>
+      <p>Sobre a taxa de conflito: com probabilidade de conflito p e k tentativas, a probabilidade de falha final é aproximadamente p elevado a k. Com p = 5% e 3 tentativas, a falha residual é de cerca de 1 em 8 000 — perfeitamente aceitável, e o custo médio é de 1,05 transacções por operação. Com p = 40%, três tentativas deixam 6,4% de falhas e o custo médio sobe para cerca de 1,6 transacções, com trabalho útil desperdiçado; aí o optimista deixou de ser adequado. A fronteira prática que uso é 10 a 15% de conflito medido: abaixo, optimista; acima, ou se passa a pessimista, ou — melhor — reformula-se a operação para não haver leitura-modificação-escrita, com um <code>UPDATE artigo SET stock = stock - ? WHERE id = ? AND stock &gt;= ?</code> atómico que resolve o problema sem <em>lock</em> nem versão.</p>
+      <p>Dois detalhes que distinguem candidatos. Primeiro, alterar uma colecção filha não incrementa a versão do agregado por omissão; se a regra de negócio for do agregado, é preciso <code>LockModeType.OPTIMISTIC_FORCE_INCREMENT</code> na raiz. Segundo, com <code>@Version</code> ligado é preciso <code>hibernate.jdbc.batch_versioned_data=true</code> para que os <code>UPDATE</code> versionados sejam agrupados em lote — o <em>driver</em> tem de reportar contagens por instrução para o Hibernate detectar o conflito.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Descreve <code>@Version</code> como «um contador» sem saber o SQL nem o que acontece no conflito.</td></tr>
+        <tr><td>Mid</td><td>Sabe o <code>where versao = ?</code> e que há excepção, mas põe o <em>retry</em> dentro da transacção.</td></tr>
+        <tr><td>Sénior</td><td>Explica o <em>flush</em> no <em>commit</em>, coloca o <em>retry</em> fora com <em>backoff</em> aleatório, e liga a escolha à taxa de conflito com números.</td></tr>
+        <tr><td>Staff</td><td>Propõe a reformulação atómica em SQL como alternativa superior, refere <code>OPTIMISTIC_FORCE_INCREMENT</code> para o agregado e o efeito no <em>batching</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como mede a taxa de conflito em produção?»</li>
+      <li>«E se a entidade for actualizada por um <em>job</em> em lote ao mesmo tempo?»</li>
+      <li>«O cliente devolve a versão no <code>PUT</code> — que problemas traz isso?»</li>
+      <li>«Porque é que o <em>backoff</em> precisa de <em>jitter</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Repetir dentro do mesmo método transaccional.</li>
+      <li>Apanhar a excepção e ignorá-la, perdendo a escrita silenciosamente.</li>
+      <li>Não perceber que a excepção surge no <em>commit</em> e não na linha do <code>setter</code>.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing sql" id="lst-12-9"><div class="lhead"><span class="lnum">Listagem 12.9</span>
+<span class="lcap">Fila de trabalho em PostgreSQL 17: <code>SKIP LOCKED</code> dá N consumidores sem contenção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- lock_timeout evita que um consumidor fique preso indefinidamente.
+SET LOCAL lock_timeout = '3s';
+
+UPDATE tarefa t
+   SET estado      = 'EM_CURSO',
+       tomada_em   = now(),
+       trabalhador = :trabalhador
+ WHERE t.id IN (
+         SELECT id
+           FROM tarefa
+          WHERE estado = 'PENDENTE'
+            AND disponivel_em &lt;= now()
+          ORDER BY prioridade DESC, disponivel_em
+          FOR UPDATE SKIP LOCKED
+          LIMIT 50)
+RETURNING t.id, t.carga;
+
+-- Indice que torna o SELECT interno um varrimento de indice parcial:
+CREATE INDEX CONCURRENTLY idx_tarefa_fila
+    ON tarefa (prioridade DESC, disponivel_em)
+ WHERE estado = 'PENDENTE';</code></pre></figure>
+
+<div class="qa" id="q-12-12" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos 12 instâncias a consumir a mesma tabela de tarefas e cada tarefa tem de ser processada exactamente por uma. Optimista ou pessimista? Escreva-me a estratégia e diga onde é que ela parte.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Optimista está errado aqui por construção. Com 12 consumidores a competir pela mesma cabeça da fila, a probabilidade de conflito na tarefa mais prioritária tende para 11/12: onze transacções em cada doze fazem trabalho que é deitado fora. Este é o caso em que o pessimista ganha, mas não na forma ingénua: <code>SELECT … FOR UPDATE</code> simples faria os onze consumidores <em>esperarem</em> pela mesma linha, transformando 12 instâncias numa fila serial.</p>
+      <p>A construção correcta é <code>FOR UPDATE SKIP LOCKED</code>, como na Listagem 12.9. Cada consumidor pede um lote de 50 tarefas ignorando as linhas já bloqueadas por outros; os 12 consumidores obtêm 12 conjuntos disjuntos sem esperar nem um pelo outro, num único percurso do índice. Em JPA isto é <code>LockModeType.PESSIMISTIC_WRITE</code> com <code>jakarta.persistence.lock.timeout = -2</code> (<code>SKIP_LOCKED</code>) no <code>@QueryHints</code>, mas nesta operação prefiro SQL nativo: o <code>UPDATE … RETURNING</code> reclama e devolve o lote numa só ida e volta, o que o JPA não sabe exprimir.</p>
+      <p>Números que uso para dimensionar: lote de 50 e <code>lock_timeout</code> de 3 s dão uma cadência estável até algumas milhares de tarefas por segundo numa instância PostgreSQL modesta. O índice parcial sobre <code>estado = 'PENDENTE'</code> é essencial — sem ele, o <code>ORDER BY</code> percorre a tabela inteira, incluindo os milhões de tarefas já concluídas, e a fila degrada linearmente com o histórico.</p>
+      <p>Onde é que isto parte, e é a parte da resposta que o entrevistador espera. Primeiro, «exactamente uma vez» não existe: se o consumidor morrer depois de reclamar e antes de concluir, a tarefa fica <code>EM_CURSO</code> para sempre. É preciso um <em>lease</em> — <code>tomada_em</code> mais um varredor que devolve a <code>PENDENTE</code> as tarefas paradas há mais do que o dobro do tempo esperado de processamento — e isso significa que a garantia real é «pelo menos uma vez», exigindo idempotência no processamento. Segundo, PostgreSQL não é uma fila: com dezenas de milhares de mensagens por segundo, a inflação de tuplos mortos e a pressão de <em>autovacuum</em> tornam-se o gargalo, e a partir daí Kafka ou SQS custam menos. Terceiro, o cabeçalho da fila fica quente: se todas as tarefas tiverem a mesma prioridade e o mesmo instante, os 12 consumidores competem pelas mesmas primeiras linhas do índice e o <code>SKIP LOCKED</code> gasta tempo a saltar — mitiga-se com uma coluna de partição aleatória e um filtro por <em>bucket</em> por consumidor.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe <code>synchronized</code> ou um <em>lock</em> na aplicação, ignorando que há 12 processos.</td></tr>
+        <tr><td>Mid</td><td>Propõe <code>SELECT … FOR UPDATE</code> sem <code>SKIP LOCKED</code> e não vê que serializa os consumidores.</td></tr>
+        <tr><td>Sénior</td><td>Usa <code>SKIP LOCKED</code> com lote e <code>lock_timeout</code>, justifica o índice parcial e explica porque o optimista falha aqui.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o <em>lease</em> e a idempotência, diz explicitamente que a garantia é «pelo menos uma vez», e nomeia o limite de escala a partir do qual a base de dados deixa de ser a ferramenta certa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O consumidor morre a meio — o que acontece à tarefa?»</li>
+      <li>«Como evita que o <em>autovacuum</em> se torne o gargalo?»</li>
+      <li>«Que <em>lock_timeout</em> escolhe e porquê?»</li>
+      <li>«A partir de que débito trocava isto por Kafka?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Prometer «exactamente uma vez» sem idempotência nem <em>lease</em>.</li>
+      <li><code>FOR UPDATE</code> sem <em>timeout</em>, com risco de bloqueio indefinido.</li>
+      <li>Não indexar o predicado da fila e assumir que o <code>LIMIT</code> resolve.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-12-6" class="h2"><span class="secnum">12.6</span> Batching, caches e performance de escrita<a class="anchor" href="#sec-12-6" aria-label="ligação">#</a></h2>
+
+<p>Por omissão, o Hibernate envia uma instrução por ida e volta. Inserir 10 000 linhas com 0,4 ms de latência gasta 4 s só em rede. Com <code>hibernate.jdbc.batch_size=50</code> as instruções são agrupadas em 200 idas e voltas — cerca de 80 ms. É a optimização com melhor razão entre benefício e esforço em todo o JPA, e falha silenciosamente por três razões que o entrevistador testa.</p>
+
+<p>A primeira: <code>GenerationType.IDENTITY</code> desliga o <em>batching</em> de inserções por completo. O Hibernate precisa do identificador para pôr a entidade no contexto, e uma coluna <code>identity</code> só o revela depois da execução — logo não pode adiar a instrução. A correcção é <code>GenerationType.SEQUENCE</code> com <code>allocationSize</code> de 50 e um <em>pooled optimizer</em>, que reserva 50 identificadores por ida e volta à sequência. A segunda: sem <code>order_inserts=true</code> e <code>order_updates=true</code>, o Hibernate agrupa apenas instruções consecutivas do mesmo tipo, e uma alternância entre duas entidades reduz os lotes a um elemento. A terceira, específica do PostgreSQL: o <em>driver</em> só converte um lote de <code>INSERT</code> numa instrução multi-valores se a URL tiver <code>reWriteBatchedInserts=true</code>; sem isso o ganho existe mas é uma fracção do possível.</p>
+
+<p>Sobre <em>caches</em>: a de primeiro nível é o contexto de persistência, obrigatória, com âmbito de transacção, e o seu perigo em escritas em massa é crescer sem limite — daí o <code>flush()</code> e <code>clear()</code> a cada lote. A de segundo nível é opcional, partilhada por todas as sessões da instância, e configura-se por região com uma estratégia de concorrência (<code>READ_ONLY</code>, <code>NONSTRICT_READ_WRITE</code>, <code>READ_WRITE</code>, <code>TRANSACTIONAL</code>). Só compensa em dados com razão de leitura para escrita acima de 10:1, conjunto pequeno e tolerância a dados ligeiramente obsoletos — tabelas de referência, configuração, catálogos de produto. Nunca em dados transaccionais quentes.</p>
+
+<p>A armadilha da segunda <em>cache</em> é a invalidação. Consultas JPQL de modificação em massa (<code>update Artigo set …</code>) e SQL nativo não passam pelo contexto de persistência: não fazem <em>dirty checking</em>, não incrementam <code>@Version</code>, e não invalidam nem a <em>cache</em> de primeiro nem a de segundo nível a menos que se declarem as tabelas afectadas. O resultado é um contexto que continua a devolver o valor antigo depois de a base de dados ter sido alterada. E numa aplicação com 8 instâncias, uma <em>cache</em> de segundo nível local a cada instância significa 8 cópias divergentes, a não ser que haja invalidação distribuída — o que reintroduz o problema que a <em>cache</em> devia resolver.</p>
+
+<figure class="listing yaml" id="lst-12-10"><div class="lhead"><span class="lnum">Listagem 12.10</span>
+<span class="lcap">Configuração mínima que faz o <em>batching</em> funcionar mesmo e falha cedo no resto.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>spring:
+  datasource:
+    url: jdbc:postgresql://db:5432/enc?reWriteBatchedInserts=true
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 2000      # falhar em 2 s, nao esperar 30
+  jpa:
+    open-in-view: false             # o SQL decide-se no servico, nao na serializacao
+    hibernate:
+      ddl-auto: validate            # o esquema vem do Flyway; aqui so se confirma
+    properties:
+      hibernate:
+        jdbc.batch_size: 50
+        order_inserts: true
+        order_updates: true
+        batch_versioned_data: true  # necessario para agrupar UPDATE com @Version
+        default_batch_fetch_size: 50
+        query.fail_on_pagination_over_collection_fetch: true
+        jdbc.time_zone: UTC
+        generate_statistics: false  # true apenas em testes de orcamento de SQL</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Inserção de 100 000 linhas num PostgreSQL na mesma zona de disponibilidade: uma a uma via JPA, cerca de 45 s; com <code>batch_size=50</code> e sequência com <code>allocationSize=50</code>, cerca de 4 s; com <code>reWriteBatchedInserts=true</code>, cerca de 2,5 s; com <code>JdbcTemplate.batchUpdate</code> sem contexto de persistência, cerca de 1,8 s; com <code>COPY</code> através do <code>CopyManager</code> do <em>driver</em>, cerca de 0,6 s. A ordem de grandeza entre os extremos é 75×, e é por isso que carregamentos em massa não pertencem ao JPA.</p></aside>
+
+<div class="qa" id="q-12-13" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Configurei <code>hibernate.jdbc.batch_size=50</code> e o número de idas e voltas não baixou nada. Diagnostique. E depois diga-me quando é que ligaria a <em>cache</em> de segundo nível e quando é que isso é má ideia.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Verifico três coisas, por ordem de probabilidade. Primeira e mais provável: a chave primária usa <code>GenerationType.IDENTITY</code>. O Hibernate tem de conhecer o identificador para registar a entidade no contexto de persistência, e uma coluna <code>identity</code> só o devolve depois de a instrução correr — por isso o <em>batching</em> de inserções é desactivado, sem aviso. A correcção é <code>SEQUENCE</code> com <code>allocationSize</code> igual ao tamanho do lote e o optimizador agrupado, que reserva blocos de identificadores em vez de um por linha.</p>
+      <p>Segunda: falta <code>order_inserts</code> e <code>order_updates</code>. O Hibernate só agrupa instruções consecutivas idênticas; se o código intercalar <code>Encomenda</code> e <code>LinhaEncomenda</code>, cada lote tem um elemento. Terceira: o <em>driver</em> PostgreSQL não reescreve o lote em instrução multi-valores sem <code>reWriteBatchedInserts=true</code> na URL. Há ainda um quarto caso que apanha muita gente: com <code>@Version</code>, os <code>UPDATE</code> só são agrupados se <code>batch_versioned_data=true</code>. E confirmo tudo por medição — contando instruções e não lendo configuração.</p>
+      <p>Sobre a <em>cache</em> de segundo nível: ligo-a quando a razão leitura/escrita está acima de 10:1, o conjunto cabe confortavelmente em memória, e a aplicação tolera dados obsoletos durante segundos. Tabelas de referência, catálogos, configuração de <em>feature flags</em>. Nesses casos <code>READ_ONLY</code> ou <code>NONSTRICT_READ_WRITE</code> chegam e o ganho é real: uma consulta de 3 ms passa a acerto de memória de microssegundos.</p>
+      <p>É má ideia em três situações. Em dados transaccionais quentes, onde a taxa de invalidação anula o benefício e a estratégia <code>READ_WRITE</code> acrescenta <em>soft locks</em> e complexidade. Numa aplicação com 8 instâncias sem invalidação distribuída, porque passam a existir 8 verdades divergentes — e a alternativa, uma <em>cache</em> distribuída, acrescenta uma ida e volta de rede que muitas vezes é da mesma ordem de grandeza da consulta que se queria evitar. E sempre que existam escritas por SQL nativo ou por JPQL em massa, que não invalidam nada: nesse caso a <em>cache</em> devolve dados que a base de dados já não tem. A minha ordem de preferência é: primeiro corrigir consultas e índices, depois <em>cache</em> aplicacional explícita com chave e TTL controlados (Redis, com invalidação por evento), e só depois considerar a de segundo nível — que é a que dá menos controlo sobre a invalidação.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe porque é que o <em>batching</em> não actua; sugere aumentar o valor.</td></tr>
+        <tr><td>Mid</td><td>Menciona <code>IDENTITY</code> ou <code>order_inserts</code>, mas não os dois, e trata a <em>cache</em> de segundo nível como sempre boa.</td></tr>
+        <tr><td>Sénior</td><td>Enumera as causas por ordem, refere <code>reWriteBatchedInserts</code>, e dá critérios quantitativos para a <em>cache</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>batch_versioned_data</code>, o problema das N instâncias divergentes, a invalidação em falta com SQL nativo, e a ordem de preferência entre soluções.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que <code>allocationSize</code> escolhe e o que perde com um valor alto?»</li>
+      <li>«Como evita o <code>OutOfMemoryError</code> ao inserir 1 milhão de linhas com JPA?»</li>
+      <li>«O que faz a <em>cache</em> de consultas e porque é que raramente compensa?»</li>
+      <li>«Como invalida a <em>cache</em> quando um <em>job</em> externo escreve na tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Ligar a <em>cache</em> de segundo nível como optimização por omissão, sem medir.</li>
+      <li>Não saber que <code>IDENTITY</code> desliga o <em>batching</em>.</li>
+      <li>Inserir centenas de milhares de linhas pelo contexto de persistência sem <code>flush</code> e <code>clear</code>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-12-7" class="h2"><span class="secnum">12.7</span> Migrações de esquema e evolução segura<a class="anchor" href="#sec-12-7" aria-label="ligação">#</a></h2>
+
+<p>A primeira regra é curta: <code>spring.jpa.hibernate.ddl-auto</code> em produção só pode ter dois valores, <code>validate</code> ou <code>none</code>. <code>update</code> aplica alterações não revistas, não versionadas, sem <em>rollback</em> e sem ordem determinística entre instâncias que arrancam ao mesmo tempo; <code>create-drop</code> apaga dados. O esquema pertence a ficheiros de migração versionados no mesmo repositório do código, e <code>validate</code> serve para falhar o arranque quando o mapeamento e o esquema divergem — que é exactamente o momento em que se quer falhar.</p>
+
+<p>Flyway e Liquibase resolvem o mesmo problema com filosofias opostas. Flyway executa ficheiros SQL numerados, guarda o histórico numa tabela com <em>checksums</em>, e é transparente: o que está no ficheiro é o que corre na base de dados. Liquibase descreve mudanças em XML, YAML ou JSON, com abstracção sobre o dialecto, geração de <em>rollback</em> e comparação de esquemas. A escolha resume-se a: uma base de dados só (quase sempre PostgreSQL) e uma equipa que sabe SQL — Flyway; várias bases de dados alvo, ou necessidade de <em>rollback</em> gerado e de <em>changelogs</em> compostos — Liquibase.</p>
+
+<p>A parte que separa níveis não é a ferramenta, é a compatibilidade durante o <em>deploy</em>. Num <em>rolling deploy</em> em Kubernetes, versões N e N+1 do código correm em simultâneo durante minutos contra o mesmo esquema. Qualquer migração destrutiva aplicada no arranque da N+1 parte a N que ainda serve tráfego. O padrão é <em>expand and contract</em>, em três <em>deploys</em>: expandir (acrescentar a coluna nova, com escrita dupla e leitura da antiga), migrar (preencher os dados e passar a ler da nova) e contrair (remover a antiga), com pelo menos um <em>deploy</em> completo entre cada fase. Renomear uma coluna directamente é a forma mais rápida de causar um incidente.</p>
+
+<p>E há a mecânica de bloqueios do PostgreSQL, que é onde as migrações matam serviços saudáveis. <code>ALTER TABLE ADD COLUMN</code> com valor por omissão deixou de reescrever a tabela a partir do PostgreSQL 11 e é praticamente instantâneo, mas ainda pede <code>ACCESS EXCLUSIVE</code>; se houver uma transacção longa a ler a tabela, o <code>ALTER</code> espera — e todas as consultas que chegam <em>atrás</em> dele na fila esperam também, o que transforma uma migração de 3 ms numa paragem de 40 s. Por isso toda a migração começa com <code>SET lock_timeout</code>: mais vale falhar e repetir do que bloquear a fila. <code>CREATE INDEX CONCURRENTLY</code> constrói sem bloquear escritas, mas não pode correr dentro de uma transacção — em Flyway exige <code>executeInTransaction=false</code> — e pode deixar um índice inválido se falhar, que é preciso remover e recriar. Adicionar <code>NOT NULL</code> a uma tabela grande faz-se em dois passos: restrição <code>CHECK … NOT VALID</code>, que só bloqueia brevemente, e depois <code>VALIDATE CONSTRAINT</code>, que percorre a tabela com um bloqueio fraco.</p>
+
+<figure class="listing sql" id="lst-12-11"><div class="lhead"><span class="lnum">Listagem 12.11</span>
+<span class="lcap">Fase «expand» de uma migração sem paragem, com <em>lock timeout</em> e índice concorrente.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- V37__encomenda_expandir_moeda.sql
+-- Falhar depressa em vez de bloquear a fila de consultas atras do ALTER.
+SET lock_timeout = '2s';
+
+-- PostgreSQL 11+: adicionar coluna com DEFAULT nao reescreve a tabela.
+ALTER TABLE encomenda ADD COLUMN moeda char(3) DEFAULT 'EUR';
+
+-- NOT NULL em duas fases: NOT VALID e rapido; VALIDATE usa bloqueio fraco.
+ALTER TABLE encomenda
+  ADD CONSTRAINT encomenda_moeda_nn CHECK (moeda IS NOT NULL) NOT VALID;
+ALTER TABLE encomenda VALIDATE CONSTRAINT encomenda_moeda_nn;
+
+-- V38__encomenda_indice_moeda.sql   (Flyway: executeInTransaction=false)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_encomenda_moeda_criada
+    ON encomenda (moeda, criada_em DESC);
+
+-- V41__encomenda_contrair.sql  — so depois de N+1 estar em todos os pods
+-- e de nenhuma versao anterior escrever na coluna antiga.
+ALTER TABLE encomenda DROP COLUMN divisa_legada;</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Flyway com SQL puro dá transparência total e zero abstracção: lê-se o ficheiro e sabe-se o que corre, mas cada dialecto de base de dados exige o seu ficheiro e o <em>rollback</em> é escrito à mão. Liquibase dá <em>rollback</em> gerado, pré-condições e independência de dialecto, ao preço de uma camada de indirecção que esconde o SQL real — precisamente o que se quer ver quando uma migração bloqueia uma tabela de 200 GB às 3 da manhã. Para uma equipa com um só PostgreSQL, Flyway; para um produto instalado em cliente com Oracle, SQL Server e PostgreSQL, Liquibase.</p></aside>
+
+<div class="qa" id="q-12-14" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Precisa de renomear a coluna <code>divisa</code> para <code>moeda</code> numa tabela de 80 milhões de linhas, num serviço com <em>rolling deploy</em> em Kubernetes e sem janela de manutenção. Descreva o plano completo, incluindo o que corre no arranque da aplicação e o que corre fora dele.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <code>ALTER TABLE … RENAME COLUMN</code> é instantâneo em PostgreSQL, mas é irrelevante: o problema não é o tempo do DDL, é que durante o <em>rolling deploy</em> as versões N e N+1 correm em simultâneo contra o mesmo esquema durante 2 a 10 minutos. Renomear parte a versão N imediatamente. Faço-o em três <em>deploys</em>, com o padrão <em>expand and contract</em>.</p>
+      <p><strong><em>Deploy</em> 1 — expandir.</strong> Migração que acrescenta <code>moeda char(3)</code>, com <code>SET lock_timeout = '2s'</code> antes do <code>ALTER</code>. Em PostgreSQL 11 e superior, acrescentar coluna com valor por omissão não reescreve as 80 milhões de linhas: guarda o valor nos metadados e materializa-o à leitura. O código da versão N+1 escreve nas duas colunas e continua a ler da antiga. Nesta fase nada quebra, porque a coluna nova é opcional.</p>
+      <p><strong>Entre <em>deploys</em> — preencher.</strong> O preenchimento histórico não corre no arranque da aplicação: 80 milhões de <code>UPDATE</code> numa transacção geram um <em>bloat</em> enorme, prendem o <em>autovacuum</em>, e um <em>pod</em> que reinicie a meio deixa a migração num estado indefinido. Corre como <em>job</em> à parte, em lotes de 10 000 linhas por transacção com pausa entre lotes, guiado por chave primária e com um índice ou coluna de controlo para saber onde parou; a 10 000 linhas por segundo, 80 milhões demoram cerca de duas horas e trinta, feitas fora do pico. O <em>job</em> é idempotente e retomável.</p>
+      <p><strong><em>Deploy</em> 2 — mudar a leitura.</strong> Com os dados preenchidos e verificados por uma consulta de contagem de divergências, a aplicação passa a ler de <code>moeda</code> e continua a escrever em ambas. Só agora se acrescentam as restrições: <code>CHECK (moeda IS NOT NULL) NOT VALID</code> seguido de <code>VALIDATE CONSTRAINT</code>, e o índice com <code>CREATE INDEX CONCURRENTLY</code> — que não pode correr dentro de uma transacção e obriga a <code>executeInTransaction=false</code> no Flyway.</p>
+      <p><strong><em>Deploy</em> 3 — contrair.</strong> Removida a escrita dupla e confirmado que nenhuma versão anterior está em execução — o que se verifica pelo <em>rollout</em> concluído, não por suposição —, uma última migração faz <code>DROP COLUMN divisa</code>. Deixo passar pelo menos um ciclo de <em>deploy</em> entre fases, para que a reversão da versão anterior continue a funcionar. É esse o ponto de todo o padrão: em qualquer instante, tanto a versão antiga como a nova funcionam contra o esquema em vigor.</p>
+      <p>Três detalhes operacionais. O Flyway coordena instâncias concorrentes com um <em>advisory lock</em>, pelo que 6 <em>pods</em> a arrancar em simultâneo não aplicam a mesma migração duas vezes — mas os outros cinco ficam à espera, e é por isso que migrações longas atrasam o arranque e podem falhar as sondas de prontidão. O <code>ddl-auto</code> fica em <code>validate</code>, o que faz o arranque falhar se o mapeamento e o esquema divergirem. E cada migração é testada contra uma cópia do esquema real, não contra uma base de dados vazia: o tempo de um <code>ALTER</code> depende dos dados que lá estão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe <code>RENAME COLUMN</code> directo, ou <code>ddl-auto=update</code>, ou uma janela de manutenção.</td></tr>
+        <tr><td>Mid</td><td>Conhece o <em>expand and contract</em> mas junta tudo num <em>deploy</em> e faz o preenchimento no arranque.</td></tr>
+        <tr><td>Sénior</td><td>Três fases separadas por <em>deploys</em>, preenchimento em lotes fora do arranque, <code>lock_timeout</code> e <code>CREATE INDEX CONCURRENTLY</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a reversibilidade entre fases, o <em>advisory lock</em> do Flyway e o seu efeito nas sondas, a verificação de divergências antes de trocar a leitura, e o teste contra esquema real.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se seis <em>pods</em> arrancarem ao mesmo tempo com uma migração pendente?»</li>
+      <li>«Como reverte o <em>deploy</em> 2 se aparecer um defeito?»</li>
+      <li>«Porque é que <code>ADD COLUMN</code> com <code>DEFAULT</code> deixou de reescrever a tabela?»</li>
+      <li>«E se a coluna tiver uma chave estrangeira apontada por outra tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Executar 80 milhões de <code>UPDATE</code> numa migração de arranque.</li>
+      <li>Assumir que o <em>rolling deploy</em> é atómico e que só uma versão corre de cada vez.</li>
+      <li>Editar um ficheiro de migração já aplicado, quebrando o <em>checksum</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-12-8" class="h2"><span class="secnum">12.8</span> Resumo e checklist<a class="anchor" href="#sec-12-8" aria-label="ligação">#</a></h2>
+
+<p>Fecha-se com a pergunta que muitos entrevistadores guardam para o fim: quando é que não se usa JPA? A resposta honesta tem três casos. Carregamentos em massa — inserir ou actualizar mais de algumas dezenas de milhares de linhas passa por <code>JdbcTemplate.batchUpdate</code> ou por <code>COPY</code>, com um factor de 25× a 75× face ao contexto de persistência. Consultas analíticas — agregações com janelas, CTE recursivas, <code>LATERAL</code>, expressões específicas do PostgreSQL: escreve-se SQL, mapeia-se para um <em>record</em>, e não se tenta traduzir para JPQL o que a JPQL não exprime. E leituras de caminho crítico onde cada milissegundo conta e o modelo é pequeno: aí o custo de mapeamento e de contexto não se justifica. JPA continua a ser a ferramenta certa para o que foi desenhado — agregados transaccionais de tamanho moderado, com regras de negócio no domínio — e a maturidade do candidato mede-se por saber onde essa fronteira passa, não por defender ou atacar a ferramenta.</p>
+
+<ul class="lst">
+  <li>O contexto de persistência é mapa de identidade, <em>cache</em> de primeiro nível e unidade de trabalho ao mesmo tempo; o <em>dirty checking</em> custa uma travessia de todas as entidades geridas a cada <em>flush</em>, e é isso que <code>readOnly</code> elimina.</li>
+  <li><code>save()</code> sobre uma entidade com identificador preenchido é um <code>merge</code>: um <code>SELECT</code> a mais e sobreposição total dos campos, incluindo os que vieram a <code>null</code> num JSON parcial.</li>
+  <li>N+1 detecta-se por contagem de instruções, não por leitura de <em>log</em>; a prevenção que dura é um teste com orçamento de instruções, não uma correcção pontual.</li>
+  <li>Nunca paginar com <code>join fetch</code> sobre colecções: o Hibernate pagina em memória. Lote de <em>fetch</em> a 50, ou paginação em dois passos por identificadores.</li>
+  <li>Só <code>RuntimeException</code> e <code>Error</code> revertem por omissão; apanhar excepções dentro da transacção não impede uma <code>UnexpectedRollbackException</code> no <em>commit</em>.</li>
+  <li><code>REQUIRES_NEW</code> consome uma segunda ligação do <em>pool</em> em simultâneo e divide a capacidade do caminho; para <em>rollback</em> parcial sem segunda ligação existe <code>NESTED</code>.</li>
+  <li><code>LazyInitializationException</code> é um erro de desenho, não de configuração: o grafo decide-se no serviço, e <code>open-in-view</code> desliga-se por omissão.</li>
+  <li>Optimista abaixo de 10-15% de conflito, com <em>retry</em> fora da transacção e <em>backoff</em> aleatório; pessimista com <code>SKIP LOCKED</code> e <em>lease</em> para filas; e, sempre que possível, um <code>UPDATE</code> atómico que dispensa ambos.</li>
+  <li><code>GenerationType.IDENTITY</code> desliga o <em>batching</em> de inserções; migrações destrutivas partem o <em>rolling deploy</em> e resolvem-se com <em>expand and contract</em> em três fases.</li>
+</ul>
+
+<p>Checklist para levar para a entrevista e para a revisão de código:</p>
+
+<ul class="lst">
+  <li>Sei dizer quantas instruções SQL emite o meu <em>endpoint</em> mais quente, e tenho um teste que falha se esse número subir.</li>
+  <li>Todas as associações estão declaradas <code>LAZY</code>, e cada caso de uso pede explicitamente o grafo de que precisa.</li>
+  <li><code>spring.jpa.open-in-view=false</code> e <code>ddl-auto=validate</code> estão no ficheiro de configuração de produção.</li>
+  <li><code>hibernate.jdbc.batch_size</code>, <code>order_inserts</code>, <code>order_updates</code> e <code>reWriteBatchedInserts</code> estão definidos, e verifiquei o efeito por contagem, não por leitura de configuração.</li>
+  <li>Nenhuma chamada HTTP, mensagem de fila ou escrita em ficheiro acontece dentro de um bloco <code>@Transactional</code>.</li>
+  <li>Toda a entidade com escrita concorrente tem <code>@Version</code>, e o <em>retry</em> está fora da fronteira transaccional, com <em>jitter</em>.</li>
+  <li>Nenhuma consulta de listagem devolve entidades para serialização directa; há DTO ou projecção.</li>
+  <li>Cada migração começa com <code>lock_timeout</code>, os índices são criados com <code>CONCURRENTLY</code> e nenhuma migração aplicada foi editada depois.</li>
+  <li>Consigo justificar, com um número, cada sítio onde deixei de usar JPA e passei a SQL.</li>
+</ul>
+

@@ -1,0 +1,51 @@
+{"chapter": 19, "questions": [
+  {"q": "Uma tabela de 300 milhões de linhas usa `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` e as inserções degradaram-se à medida que a tabela cresceu. Qual é a explicação mecânica correcta?",
+   "options": [
+     "O tipo `uuid` do PostgreSQL é guardado como texto de 36 bytes, o que torna as comparações lentas.",
+     "Os valores são aleatórios, cada inserção aterra numa folha imprevisível do B-tree, provocando divisões de página e leituras aleatórias quando o índice deixa de caber em `shared_buffers`.",
+     "O `gen_random_uuid()` bloqueia porque tem de consultar uma sequência partilhada para garantir unicidade.",
+     "O índice de chave primária deixa de ser usado acima de 100 milhões de linhas e o planeador passa a fazer varredura sequencial."
+   ],
+   "answer": 1,
+   "explain": "O problema é localidade de escrita: UUIDv4 é aleatório em todos os bits úteis, por isso as inserções espalham-se por todo o índice, dividem páginas e deixam as folhas com 50-70% de ocupação. O tipo `uuid` ocupa 16 bytes binários, não 36 (esse é o erro de guardar em `varchar`); `gen_random_uuid()` não coordena nada, é local; e o planeador não abandona o índice por causa do tamanho da tabela."},
+
+  {"q": "Numa tabela com `soft delete` por `deleted_at`, qual é a consequência que a maioria das equipas não antecipa?",
+   "options": [
+     "As chaves estrangeiras deixam de impedir que uma linha viva referencie um pai já apagado, porque a linha do pai continua a existir.",
+     "O PostgreSQL passa a ignorar automaticamente as linhas com `deleted_at` preenchido nas junções.",
+     "O `autovacuum` remove as linhas marcadas ao fim de um ciclo, o que torna a reposição impossível.",
+     "Os índices deixam de poder ser usados porque `deleted_at` é uma coluna anulável."
+   ],
+   "answer": 0,
+   "explain": "O `soft delete` transfere para a aplicação um invariante que era da base: a chave estrangeira continua satisfeita por um pai marcado como apagado. O motor não conhece a convenção nem filtra nada, o `autovacuum` só recolhe tuplos mortos por MVCC (não linhas marcadas pela aplicação) e uma coluna anulável não impede o uso de índices — inclusive índices parciais, que são a correcção recomendada."},
+
+  {"q": "Numa tabela filha com 50 milhões de linhas, a coluna que referencia o pai não tem índice. O que acontece ao apagar uma linha do pai com `ON DELETE CASCADE`?",
+   "options": [
+     "Nada de especial: a cascata usa o índice da chave primária da tabela filha.",
+     "O PostgreSQL recusa o `DELETE` porque a integridade referencial exige um índice do lado filho.",
+     "A verificação da restrição obriga a uma varredura sequencial completa da tabela filha, com o bloqueio mantido durante todo o tempo.",
+     "A cascata é adiada para o próximo `autovacuum` e o `DELETE` regressa de imediato."
+   ],
+   "answer": 2,
+   "explain": "O PostgreSQL cria índice para a chave primária mas nunca para a coluna que referencia; sem ele, cada apagamento no pai varre toda a tabela filha, transformando uma operação sub-milissegundo em segundos com bloqueio activo. Não é recusado, não usa a PK da filha (a coluna de FK é outra) e a verificação é imediata, não diferida para o `autovacuum`."},
+
+  {"q": "Qual destas colunas está correctamente tipada num modelo PostgreSQL 17 para pagamentos?",
+   "options": [
+     "`amount money NOT NULL`, porque o tipo é dedicado a valores monetários.",
+     "`captured_at timestamp NOT NULL`, porque a aplicação grava sempre em UTC.",
+     "`fx_rate double precision NOT NULL`, porque taxas de câmbio precisam de muitas casas decimais.",
+     "`amount numeric(18,4) NOT NULL` com `captured_at timestamptz NOT NULL`."
+   ],
+   "answer": 3,
+   "explain": "`numeric` dá aritmética decimal exacta com escala suficiente para montantes e `timestamptz` guarda um instante absoluto, imune à configuração de fuso de quem lê. O tipo `money` depende da configuração regional do servidor, `timestamp` sem fuso não fixa instante nenhum (a convenção UTC quebra-se no primeiro cliente com outra configuração) e `double precision` acumula erro de representação binária."},
+
+  {"q": "Num SaaS com 2 000 `tenants` e 40 tabelas, o argumento mais forte contra schema por tenant é:",
+   "options": [
+     "O PostgreSQL só suporta um número limitado de schemas por base de dados.",
+     "Cada migração passa a ser 2 000 operações orquestradas e o catálogo cresce para cerca de 80 000 relações, com impacto no `autovacuum` e nas cópias de segurança.",
+     "Não é possível garantir unicidade dentro de cada schema sem uma coluna `tenant_id`.",
+     "As ligações têm de ser abertas com um utilizador diferente por tenant, o que impede o uso de um pool."
+   ],
+   "answer": 1,
+   "explain": "O custo dominante é operacional: uma alteração de esquema multiplica-se por 2 000, deixando o sistema em estado misto durante horas, e o catálogo com dezenas de milhares de relações penaliza planeamento, `autovacuum` e `pg_dump`. O PostgreSQL não impõe um limite prático de schemas, cada schema tem as suas próprias restrições de unicidade e o `search_path` por transacção permite reutilizar um único pool."}
+]}

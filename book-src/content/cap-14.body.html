@@ -1,0 +1,559 @@
+<p>Perguntar por Quarkus numa entrevista de Java sénior raramente é perguntar por Quarkus. É uma sonda para descobrir se o candidato sabe <em>porque</em> é que o Spring é lento a arrancar e caro em memória — ou seja, se percebe o que acontece entre o <code>main()</code> e o primeiro pedido servido. Quem responde «Quarkus é mais rápido» sem conseguir nomear o mecanismo (varrimento do <em>classpath</em>, construção do contexto e criação de <em>proxies</em> em tempo de execução contra geração de bytecode em tempo de compilação) mostra que nunca olhou para dentro de nenhum dos dois. O outro sinal que esta área mede é maturidade de decisão: um sénior que recomenda mudar 40 serviços para Quarkus porque o arranque desce de 3 s para 40 ms está a optimizar a métrica errada e a ignorar o custo humano da migração. Este capítulo cobre o modelo de arranque, os limites reais do <em>native image</em>, os números de memória que se podem defender, Mutiny contra Reactor, e como fundamentar uma recomendação que sobreviva a três follow-ups.</p>
+
+<h2 id="sec-14-1" class="h2"><span class="secnum">14.1</span> Quarkus vs Spring Boot: modelo de arranque e extensões<a class="anchor" href="#sec-14-1" aria-label="ligação">#</a></h2>
+
+<p>A diferença estrutural entre os dois não é o servidor HTTP nem a API de injecção: é <em>quando</em> se decide o grafo de dependências. O Spring Boot 3.x monta o <code>ApplicationContext</code> no arranque do processo. Isso implica varrer os pacotes indicados por <code>@ComponentScan</code>, ler anotações por reflexão, avaliar centenas de condições de auto-configuração (<code>@ConditionalOnClass</code>, <code>@ConditionalOnMissingBean</code>), instanciar as definições de <em>bean</em> por ordem topológica e gerar <em>proxies</em> — CGLIB para classes <code>@Configuration</code> e para <code>@Transactional</code> sobre classes, JDK dynamic proxies quando o alvo é uma interface. Tudo isto é trabalho que se repete em cada arranque de cada réplica, e escala com o número de classes no <em>classpath</em>, não com o número de <em>beans</em> que a aplicação realmente usa.</p>
+
+<p>O Quarkus desloca esse trabalho para a fase de <em>build</em>, a que chama <em>augmentation</em>. Durante o <code>mvn package</code>, o <code>quarkus-maven-plugin</code> corre os <em>build steps</em> de cada extensão sobre um índice Jandex do <em>classpath</em>, resolve as condições, decide que <em>beans</em> existem e gera bytecode concreto — incluindo as subclasses interceptoras que o Spring criaria em tempo de execução com CGLIB. O que sobra para o arranque é carregar classes já decididas e correr os poucos passos de <em>runtime init</em>. É por isso que o ganho existe mesmo sem <em>native image</em>: em JVM, uma aplicação REST + Hibernate típica arranca em cerca de 0,8 a 1,5 s em Quarkus contra 2 a 4 s em Spring Boot com o mesmo âmbito funcional.</p>
+
+<p>A consequência menos óbvia é sobre as extensões. Em Quarkus, uma biblioteca só participa plenamente no modelo se existir uma extensão que lhe forneça <em>build steps</em>: sem isso, ou funciona por reflexão em modo JVM e falha em <em>native</em>, ou obriga a configuração manual de metadados. O catálogo de extensões oficiais cobre bem o núcleo (Hibernate ORM/Reactive, RESTEasy Reactive, Kafka via SmallRye, Redis, gRPC, OIDC, Micrometer, Flyway), mas a cauda longa do ecossistema Java — bibliotecas internas, SDKs de fornecedores menores, agentes de APM antigos — não tem equivalente. O Spring, pelo contrário, aceita praticamente qualquer JAR porque decide tudo em tempo de execução com o <em>classpath</em> completo à frente. A troca é directa: velocidade e previsibilidade contra amplitude do ecossistema.</p>
+
+<p>Desde o Spring Boot 3.0 a distância encurtou. O motor AOT (<code>spring-boot:process-aot</code>) gera, em tempo de compilação, código Java que substitui a leitura de anotações e as condições de auto-configuração por chamadas explícitas, e pré-gera as classes de <em>proxy</em>. Convém dizê-lo numa entrevista: o Spring adoptou o modelo <em>build-time</em> do Quarkus para o caminho AOT/native, mantendo o modo <em>runtime</em> clássico como omissão. Quem descreve o Spring como «puramente reflexivo» em 2026 está a citar documentação de 2019.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza defensáveis para um serviço REST com Hibernate, 30 a 60 <em>beans</em> aplicacionais e ligação a PostgreSQL: Spring Boot 3.x em JVM arranca em 2–4 s; Quarkus em JVM em 0,8–1,5 s; Quarkus em <em>native</em> em 20–50 ms; Spring Boot em <em>native</em> (AOT + GraalVM) em 50–150 ms. Em <em>native</em> a diferença entre os dois cai para um factor de 2 a 3; em JVM ronda um factor de 3. O número que interessa em produção não é nenhum destes isolado, mas o tempo até <em>readiness</em>, que inclui abrir o <em>pool</em> de ligações, correr o Flyway e aquecer os primeiros caminhos JIT.</p></aside>
+
+<div class="qa" id="q-14-1" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique-me, ao nível do mecanismo, porque é que uma aplicação Quarkus arranca mais depressa do que a mesma aplicação em Spring Boot. E antes de responder «porque é native», assuma que ambas correm na JVM.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o Quarkus faz em tempo de <em>build</em> aquilo que o Spring faz em tempo de arranque: decidir que <em>beans</em> existem, resolver as condições de configuração e gerar o código de ligação entre eles. Em JVM, o Quarkus arranca já com o grafo decidido; o Spring reconstrói esse grafo em cada processo.</p>
+      <p>Concretamente, o arranque de um Spring Boot gasta o tempo em quatro sítios. Primeiro, varrimento do <em>classpath</em>: abrir JARs, ler os metadados das classes candidatas e indexar anotações. Segundo, avaliação das auto-configurações — algumas centenas de classes com condições do tipo <code>@ConditionalOnClass</code>, cada uma a exigir uma tentativa de carregamento de classe. Terceiro, instanciação por reflexão e resolução de dependências. Quarto, geração de <em>proxies</em> CGLIB em tempo de execução, que é geração de bytecode e carregamento de classes adicionais. O quarto ponto é o que muitos candidatos esquecem e é o que explica porque é que activar <code>@Transactional</code> em muitas classes é visível no tempo de arranque.</p>
+      <p>O Quarkus corre a fase de <em>augmentation</em> durante o <code>mvn package</code>: constrói um índice Jandex do <em>classpath</em>, executa os <em>build steps</em> das extensões (que são código que corre no <em>build</em>, não na aplicação) e emite bytecode — incluindo as subclasses de intercepção que substituem os <em>proxies</em> dinâmicos. Em <em>runtime</em>, o que resta é carregar classes conhecidas e correr os passos marcados como <code>@Record(RUNTIME_INIT)</code>, tipicamente abrir sockets e o <em>pool</em> de ligações.</p>
+      <p>O trade-off é a rigidez: o que foi decidido no <em>build</em> não se muda por uma variável de ambiente. Alterar a lista de extensões, activar um perfil que muda o conjunto de <em>beans</em> ou substituir um <em>datasource</em> por outro tipo exige reconstruir o artefacto. No Spring, uma <em>property</em> muda o comportamento no arranque. Onde a escolha contrária ganha é em plataformas internas com <em>plugins</em> descobertos dinamicamente ou aplicações cujo perfil é definido pelo operador no <em>deploy</em>: aí o modelo <em>runtime</em> do Spring é uma funcionalidade, não um defeito.</p>
+      <p>Vale acrescentar que o Spring Boot 3.x tem o seu próprio caminho AOT, que aplica a mesma ideia e recupera boa parte da diferença — mas só quando o <em>pipeline</em> corre <code>process-aot</code>, o que na prática só acontece nas <em>builds</em> nativas ou com configuração explícita.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Quarkus é native e por isso é rápido»; não distingue modo JVM de modo nativo; atribui a diferença ao servidor HTTP.</td></tr>
+        <tr><td>Mid</td><td>Diz «build-time vs runtime» correctamente, mas não sabe nomear o que é feito no arranque do Spring nem o que sobra no arranque do Quarkus.</td></tr>
+        <tr><td>Sénior</td><td>Enumera varrimento, condições, reflexão e geração de <em>proxies</em>; explica <em>augmentation</em>, Jandex e bytecode gerado; dá números de arranque em JVM; identifica a perda de flexibilidade de configuração.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a distinção <em>static init</em> / <em>runtime init</em>, o efeito no <em>live reload</em> em desenvolvimento, e a observação de que o Spring AOT converge para o mesmo modelo — com o custo de o <em>pipeline</em> de CI passar a ter de correr o passo AOT.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se o grafo é decidido no <em>build</em>, como é que o <em>live reload</em> do <code>quarkus:dev</code> funciona?»</li>
+      <li>«Que parte do arranque é que o AOT do Spring <em>não</em> elimina?»</li>
+      <li>«O tempo de arranque afecta o p99 dos pedidos? Em que circunstâncias?»</li>
+      <li>«Como mediria onde é que os 3 s de arranque estão a ser gastos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir tempo de arranque com débito em regime estacionário e afirmar que Quarkus «serve mais pedidos por segundo» sem qualificação.</li>
+      <li>Não saber que o Spring Boot tem AOT desde a versão 3.0.</li>
+      <li>Descrever a injecção de dependências do Quarkus como reflexiva.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-2" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa vem toda de Spring. Que diferenças concretas do modelo de <em>beans</em> CDI/ArC as vão morder na primeira semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São quatro diferenças que geram erros no primeiro dia: âmbitos declarados explicitamente, resolução por tipo e qualificadores em vez de nome, remoção de <em>beans</em> não usados, e intercepção sem <em>proxies</em> dinâmicos.</p>
+      <p>Primeiro, o âmbito. No Spring, uma classe anotada com <code>@Component</code> ou <code>@Service</code> é singleton por omissão. Em CDI, o âmbito faz parte do contrato: <code>@ApplicationScoped</code>, <code>@Singleton</code>, <code>@RequestScoped</code>, <code>@Dependent</code>. O erro clássico é esquecer a anotação e obter <code>@Dependent</code>, que cria uma instância por ponto de injecção — silenciosamente, com estado duplicado. E há uma subtileza que o Spring não tem: <code>@ApplicationScoped</code> é <em>lazy</em> e usa um <em>client proxy</em> gerado no <em>build</em>, enquanto <code>@Singleton</code> não tem <em>proxy</em>; isso muda o comportamento em ciclos de dependência e no momento em que o construtor corre.</p>
+      <p>Segundo, a resolução. O CDI resolve por tipo mais qualificadores. Duas implementações da mesma interface sem qualificador dão erro de <em>ambiguous dependency</em> no <em>build</em>, não no arranque — o que é melhor, mas o candidato tem de saber que a solução é <code>@Named</code> ou um qualificador próprio, e não a ordem de declaração. Não existe equivalente directo a <code>@Primary</code> a não ser <code>@DefaultBean</code> ou <code>@Alternative</code> com prioridade.</p>
+      <p>Terceiro, a remoção de <em>beans</em> não utilizados. O ArC elimina do artefacto <em>beans</em> que ninguém injecta, para reduzir memória e arranque. Se um <em>bean</em> só é usado por reflexão ou só existe pelos seus efeitos secundários (um observador de eventos, um <em>startup task</em>), desaparece e a aplicação comporta-se de forma diferente. A correcção é <code>@Unremovable</code> ou um ponto de injecção real.</p>
+      <p>Quarto, a intercepção. <code>@Transactional</code> em Spring sobre um método privado ou chamado internamente não intercepta, porque o <em>proxy</em> está fora do objecto. Em Quarkus, a intercepção é feita por uma subclasse gerada no <em>build</em>, logo o problema da auto-invocação existe na mesma — mas o compilador avisa em casos que o Spring deixa passar em silêncio. Na prática, a regra permanece: um método interceptado tem de ser chamado por outro <em>bean</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É igual, só mudam os nomes das anotações.»</td></tr>
+        <tr><td>Mid</td><td>Cita <code>@ApplicationScoped</code> vs <code>@Component</code> e pouco mais; não conhece <code>@Dependent</code> nem a remoção de <em>beans</em>.</td></tr>
+        <tr><td>Sénior</td><td>Cobre âmbitos com o perigo do <code>@Dependent</code>, resolução por qualificadores, <em>bean removal</em> e <code>@Unremovable</code>, e o modelo de intercepção sem <em>proxy</em> dinâmico.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito nos testes (<code>@QuarkusTest</code> e <code>@InjectMock</code> contra <code>@MockBean</code>), o custo de formação da equipa em semanas-pessoa, e uma estratégia de convenção interna para evitar a classe de erros do <code>@Dependent</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se injectar um <code>@RequestScoped</code> dentro de um <code>@ApplicationScoped</code>?»</li>
+      <li>«Como se substitui um <em>bean</em> só em testes?»</li>
+      <li>«Porque é que o ArC remove <em>beans</em> e o Spring não?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que a auto-invocação de <code>@Transactional</code> funciona em Quarkus.</li>
+      <li>Desconhecer o âmbito por omissão de CDI e assumir singleton.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing text" id="lst-14-1"><div class="lhead"><span class="lnum">Listagem 14.1</span>
+<span class="lcap">Quarkus: configuração e acesso a dados equivalentes ao exemplo Spring da Listagem 14.2.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code># src/main/resources/application.properties
+quarkus.http.port=8080
+quarkus.datasource.db-kind=postgresql
+quarkus.datasource.username=${DB_USER}
+quarkus.datasource.password=${DB_PASSWORD}
+quarkus.datasource.jdbc.url=jdbc:postgresql://db:5432/orders
+quarkus.datasource.jdbc.max-size=20
+quarkus.hibernate-orm.database.generation=none
+quarkus.flyway.migrate-at-start=true
+quarkus.log.level=INFO
+quarkus.micrometer.export.prometheus.enabled=true
+
+# perfil: sobrepoe-se por prefixo, resolvido no arranque
+%dev.quarkus.hibernate-orm.log.sql=true
+%prod.quarkus.datasource.jdbc.max-size=40
+
+// ------------------------------------------------------------------
+// Order.java — entidade Panache (padrao active record)
+@Entity
+public class Order extends PanacheEntity {
+    public String reference;
+    public BigDecimal amount;
+    @Enumerated(EnumType.STRING) public Status status;
+
+    public static List&lt;Order&gt; pendingOlderThan(Instant t) {
+        return list("status = ?1 and createdAt &lt; ?2", Status.PENDING, t);
+    }
+}
+
+// OrderResource.java
+@Path("/orders")
+public class OrderResource {
+    @GET @Path("/{id}")
+    public Order get(@RestPath Long id) {
+        return Order.findByIdOptional(id)
+                    .orElseThrow(() -&gt; new NotFoundException());
+    }
+
+    @POST @Transactional
+    public Response create(@Valid NewOrder cmd) {
+        Order o = new Order();
+        o.reference = cmd.reference();
+        o.amount = cmd.amount();
+        o.status = Status.PENDING;
+        o.persist();                       // sem repositorio, sem save()
+        return Response.status(201).entity(o).build();
+    }
+}
+</code></pre></figure>
+
+<figure class="listing yaml" id="lst-14-2"><div class="lhead"><span class="lnum">Listagem 14.2</span>
+<span class="lcap">Spring Boot 3.x: a mesma funcionalidade com <code>application.yml</code> e Spring Data JPA.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>server:
+  port: 8080
+spring:
+  datasource:
+    url: jdbc:postgresql://db:5432/orders
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+  jpa:
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    hikari:
+      maximum-pool-size: 40
+</code></pre></figure>
+
+<div class="qa" id="q-14-3" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Comparando as duas listagens: o Panache troca o repositório por <code>Order.persist()</code>. Vale a pena? E que problemas é que o Spring Data resolve que o Panache não resolve?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Vale a pena em serviços pequenos e com modelo de domínio simples, e deixa de valer quando o acesso a dados tem regras próprias que merecem ser testadas isoladamente. Ambos são camadas finas sobre Hibernate ORM; a diferença é onde colocam as consultas.</p>
+      <p>O Panache oferece dois modos: <em>active record</em> (a entidade estende <code>PanacheEntity</code> e traz <code>persist</code>, <code>list</code>, <code>findById</code>) e <em>repository</em> (<code>PanacheRepository&lt;Order&gt;</code>), que é praticamente o modelo do Spring Data sem geração de consultas por nome de método. O ganho mensurável é código: um CRUD com cinco consultas passa tipicamente de 60–80 linhas de repositório para 15–20 linhas na entidade, e a sintaxe abreviada de HQL (<code>list("status = ?1", ...)</code> em vez de <code>from Order o where o.status = ?1</code>) elimina outra dezena de linhas.</p>
+      <p>O Spring Data resolve três coisas que o Panache não resolve directamente. Primeira, derivação de consultas a partir do nome do método (<code>findByStatusAndCreatedAtBefore</code>), validada no arranque — o Panache exige HQL escrito à mão, com o erro a aparecer na primeira execução se o teste não cobrir a consulta. Segunda, projecções em interfaces e DTO com <em>constructor expressions</em> geridas pelo framework. Terceira, e a mais importante para quem tem um portefólio heterogéneo, a mesma abstracção sobre JPA, MongoDB, Redis, Cassandra e JDBC, o que permite reutilizar padrões de teste e paginação entre serviços.</p>
+      <p>Em ambos, o mesmo pecado continua a ser o mais caro: N+1. Nem <code>PanacheEntity.listAll()</code> nem <code>CrudRepository.findAll()</code> resolvem associações <em>lazy</em>; a correcção é a mesma nos dois — <code>join fetch</code> ou <code>@EntityGraph</code> — e é essa a resposta que o entrevistador quer ouvir a seguir. O <em>active record</em> tem ainda um custo de desenho: métodos estáticos na entidade são mais difíceis de substituir por duplos de teste, o que empurra para testes com base de dados real (Testcontainers ou os Dev Services do Quarkus). Numa equipa que já corre Testcontainers em CI isso é neutro; numa que dependa de <em>mocks</em> do repositório, é um custo real.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Panache é mais simples» sem saber que ambos assentam em Hibernate ORM.</td></tr>
+        <tr><td>Mid</td><td>Descreve o <em>active record</em>, não conhece o modo repositório do Panache nem as implicações em testes.</td></tr>
+        <tr><td>Sénior</td><td>Compara os dois modos, quantifica a redução de código, aponta a derivação de consultas por nome e as projecções como o que se perde, e nota que N+1 é indiferente à escolha.</td></tr>
+        <tr><td>Staff</td><td>Liga a escolha à estratégia de testes da equipa e ao número de motores de persistência no portefólio; define a fronteira em que a lógica de consulta deixa de pertencer à entidade.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como detecta um N+1 antes de ir para produção, em qualquer das duas?»</li>
+      <li>«Como testa uma consulta Panache sem base de dados a correr?»</li>
+      <li>«Onde é que a paginação difere entre os dois?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que o Panache substitui o Hibernate em vez de o embrulhar.</li>
+      <li>Defender <em>active record</em> para um agregado com invariantes de domínio complexos sem mencionar o custo de testabilidade.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-2" class="h2"><span class="secnum">14.2</span> Build-time metadata, reflexão e GraalVM native<a class="anchor" href="#sec-14-2" aria-label="ligação">#</a></h2>
+
+<p>O compilador nativo do GraalVM opera sob a hipótese do mundo fechado: tudo o que a aplicação pode executar tem de ser alcançável a partir dos pontos de entrada, estaticamente, no momento da compilação. O analisador percorre o grafo de chamadas, descarta o que não é alcançável e produz um executável que já não tem carregador de classes dinâmico nem compilador JIT. Daí vêm, de uma só vez, os ganhos (arranque em dezenas de milissegundos, RSS baixo, sem aquecimento) e todas as limitações.</p>
+
+<p>As limitações são quatro e valem a pena decorar. A reflexão sobre nomes calculados em tempo de execução é invisível ao analisador: <code>Class.forName(prefixo + sufixo)</code> não é resolúvel, e a classe é eliminada. Os <em>proxies</em> dinâmicos JDK exigem que a lista de interfaces seja conhecida no <em>build</em>. Os recursos do <em>classpath</em> (ficheiros de mensagens, <em>templates</em>, certificados) não são incluídos por omissão — só os que forem declarados por padrão. E a serialização, o JNI e os <em>agents</em> Java precisam de configuração explícita; agentes de APM que instrumentam bytecode em tempo de execução simplesmente não funcionam.</p>
+
+<p>A forma de resolver é a mesma nos dois frameworks, com ergonomia diferente. Em Quarkus, cada extensão contribui os metadados dos seus próprios tipos durante a <em>augmentation</em>; para as classes da aplicação usa-se <code>@RegisterForReflection</code> ou uma <code>ReflectiveClassBuildItem</code>. Em Spring Boot, o AOT infere hints das anotações conhecidas e o resto declara-se num <code>RuntimeHintsRegistrar</code> ou com <code>@RegisterReflectionForBinding</code>. Fora dos frameworks, a rede de segurança é o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos durante uma execução de testes e produz os ficheiros de configuração — com a limitação óbvia de só cobrir os caminhos que os testes exercitaram.</p>
+
+<p>O custo de <em>build</em> é o item que mais surpreende quem nunca o fez em CI. Compilar nativamente não é compilar Java: é uma análise de todo o grafo mais optimização, e consome memória e tempo em proporção ao tamanho da aplicação. Um serviço pequeno leva 2 a 4 minutos; um serviço médio com Hibernate, Kafka e OIDC leva com facilidade 5 a 12 minutos, e precisa de 8 a 16 GB de RAM disponível no <em>runner</em>. Um <em>runner</em> de CI com 4 GB falha com <code>OutOfMemoryError</code> no meio da análise, e a mensagem não é evidente.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O modo JVM e o modo nativo não são o mesmo artefacto: uma <em>build</em> nativa pode falhar apenas em tempo de execução, num caminho de código que o teste de integração em JVM nunca percorre — tipicamente uma <em>exception</em> serializada, um <em>template</em> de e-mail lido do <em>classpath</em> ou um <em>parser</em> de JSON sobre uma classe sem metadados. A regra prática é: se se envia nativo para produção, a suite de integração tem de correr contra o executável nativo (em Quarkus, <code>@QuarkusIntegrationTest</code>), e não só contra a versão JVM. Sem isso, o primeiro <code>ClassNotFoundException</code> aparece ao utilizador.</p></aside>
+
+<figure class="listing java" id="lst-14-3"><div class="lhead"><span class="lnum">Listagem 14.3</span>
+<span class="lcap">Metadados de reflexão: Quarkus à esquerda, o equivalente em Spring Boot AOT.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ---------- Quarkus ----------
+// Tipos so tocados por reflexao (ex.: DTO de um SDK externo)
+@RegisterForReflection(targets = { PaymentCallback.class, RiskScore.class })
+public class ReflectionConfig { }
+
+// Recursos que tem de ir para dentro do executavel
+// application.properties:
+//   quarkus.native.resources.includes=templates/**,messages/*.properties
+//   quarkus.native.additional-build-args=--initialize-at-run-time=com.acme.LegacyCipher
+
+// ---------- Spring Boot 3.x ----------
+public class AppRuntimeHints implements RuntimeHintsRegistrar {
+    @Override
+    public void registerHints(RuntimeHints hints, ClassLoader cl) {
+        hints.reflection()
+             .registerType(PaymentCallback.class,
+                 MemberCategory.INVOKE_DECLARED_CONSTRUCTORS,
+                 MemberCategory.INVOKE_DECLARED_METHODS);
+        hints.resources().registerPattern("templates/*.html");
+        hints.proxies().registerJdkProxy(RiskClient.class);
+    }
+}
+
+@Configuration
+@ImportRuntimeHints(AppRuntimeHints.class)
+class HintsConfig { }
+
+// Alternativa declarativa para tipos usados apenas em (de)serializacao:
+// @RegisterReflectionForBinding({ PaymentCallback.class, RiskScore.class })
+</code></pre></figure>
+
+<div class="qa" id="q-14-4" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Compilámos o serviço para <em>native image</em> e em produção rebenta com <code>ClassNotFoundException</code> num tipo que existe claramente no código. Como é que isso é possível e como se resolve?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o GraalVM compila sob a hipótese do mundo fechado e elimina tudo o que a análise estática não consegue alcançar. Se a única referência ao tipo é reflexiva — <code>Class.forName</code> com um nome construído, desserialização por nome, um <em>proxy</em> dinâmico criado a partir de uma lista lida de configuração — o analisador não vê aresta nenhuma para essa classe e ela não entra no executável. O erro em tempo de execução é honesto: a classe realmente não existe no binário.</p>
+      <p>A resolução tem três passos, por ordem de custo. Primeiro, declarar os metadados: <code>@RegisterForReflection</code> em Quarkus, <code>RuntimeHintsRegistrar</code> ou <code>@RegisterReflectionForBinding</code> em Spring. Segundo, se a origem é uma biblioteca de terceiros, verificar se tem metadados no <em>reachability metadata repository</em> do GraalVM, que o plugin Maven consegue consumir automaticamente — evita escrever configuração à mão para bibliotecas conhecidas. Terceiro, quando não se sabe o que falta, correr a suite de testes com o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos observados e gera os ficheiros de configuração. O agente é rede de segurança, não solução: só cobre os caminhos executados, portanto um caminho de erro raro continua a faltar.</p>
+      <p>O que separa uma resposta sénior de uma resposta correcta mas incompleta é a prevenção. A causa raiz não é o GraalVM, é o <em>pipeline</em>: testou-se o artefacto JVM e enviou-se o artefacto nativo. A correcção estrutural é correr os testes de integração contra o binário nativo — <code>@QuarkusIntegrationTest</code> em Quarkus, um perfil de CI com o executável em Spring — e aceitar que isso acrescenta 5 a 12 minutos por <em>build</em>. Em equipas que fazem 30 <em>merges</em> por dia, a prática usual é correr a <em>build</em> nativa apenas no ramo principal e antes de cada <em>release</em>, mantendo os PR em JVM, o que reduz o custo diário mas aceita descobrir o problema algumas horas mais tarde.</p>
+      <p>Onde a escolha contrária ganha: se a aplicação depende de bibliotecas com muita magia reflexiva ou de agentes de APM que instrumentam bytecode, o custo de manter os metadados é recorrente e não vale os 100 MB de RSS poupados. Nesse caso a alternativa razoável é ficar em JVM com CDS/AppCDS e ajustar as <em>flags</em> de heap.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Sugere adicionar a dependência outra vez ou limpar a cache do Maven; não menciona reflexão.</td></tr>
+        <tr><td>Mid</td><td>Diz «é reflexão, falta a configuração» e nomeia uma anotação, sem falar de recursos, <em>proxies</em>, serialização ou de como descobrir o que falta.</td></tr>
+        <tr><td>Sénior</td><td>Explica o mundo fechado; enumera as quatro categorias de metadados; conhece o <em>tracing agent</em> e o repositório de <em>reachability metadata</em>; aponta o teste de integração nativo como a correcção estrutural, com o custo em minutos.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a política de <em>pipeline</em> (nativo no ramo principal, JVM nos PR), quantifica o custo, e sabe dizer quando a decisão certa é desistir do nativo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o que falta for um ficheiro de <em>template</em> em vez de uma classe?»</li>
+      <li>«O que muda para <em>proxies</em> dinâmicos JDK?»</li>
+      <li>«Como é que o <em>tracing agent</em> pode dar falsa confiança?»</li>
+      <li>«Que memória e tempo é preciso reservar no <em>runner</em> de CI?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não distinguir erro de <em>build</em> de erro de execução no contexto nativo.</li>
+      <li>Prometer nativo em produção sem qualquer teste contra o binário nativo.</li>
+      <li>Ignorar que agentes de instrumentação em tempo de execução deixam de funcionar.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-5" data-box="qa" data-area="devops" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Quer meter compilação nativa no nosso CI. Descreva-me o impacto no <em>pipeline</em> e como o justificaria ao responsável pela plataforma.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O impacto é em três eixos — tempo, recursos e superfície de teste — e a justificação tem de ser feita com o custo da plataforma, não com a elegância do binário.</p>
+      <p>Tempo: a <em>build</em> nativa acrescenta 5 a 12 minutos ao que hoje demora 2 a 3 minutos, para um serviço médio. Se o <em>pipeline</em> corre em cada <em>push</em>, com 30 <em>merges</em> diários isso são 3 a 6 horas de <em>runner</em> por dia por serviço. A mitigação padrão é diferenciada: PR em JVM (rápido), <em>build</em> nativa no ramo principal e em <em>tags</em> de <em>release</em>, com um teste nocturno completo contra o binário.</p>
+      <p>Recursos: o compilador precisa de 8 a 16 GB de RAM e vários núcleos; <em>runners</em> partilhados com 2 vCPU e 4 GB não servem, e a falha manifesta-se como um processo morto, não como um erro claro. Há custo directo de <em>runners</em> maiores a comparar com a poupança em produção.</p>
+      <p>Superfície de teste: a suite de integração passa a ter de existir em duas variantes ou a correr contra o executável. Isso não é gratuito em manutenção — <em>fixtures</em> que dependem de <em>mocks</em> de bytecode não sobrevivem.</p>
+      <p>A justificação quantitativa é do lado da produção. Se o serviço corre 40 réplicas com pedido de 512 MB e o nativo permite descer para 192 MB com margem, poupam-se cerca de 12,8 GB de memória reservada; a 30 GB alocáveis por nó, é aproximadamente meio nó. Multiplicado por 12 serviços, chega para desligar cinco a seis nós. Este é o número que convence — e é também o teste à honestidade da proposta: se o parque tem 4 réplicas de 2 serviços, o ganho não paga a complexidade e a resposta correcta é não fazer.</p>
+      <p>O contra-argumento a antecipar é a alternativa mais barata: em muitos casos, ajustar <code>-XX:MaxRAMPercentage</code>, activar AppCDS e reduzir o pedido de memória com base em observação real captura metade do ganho com zero alterações ao <em>pipeline</em>. Um staff apresenta essa opção primeiro e só depois defende o nativo, se os números o justificarem.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Compila-se com um perfil Maven e está feito»; não menciona tempo nem memória de <em>build</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que demora mais e que é preciso GraalVM, mas não propõe estratégia diferenciada de <em>pipeline</em> nem quantifica.</td></tr>
+        <tr><td>Sénior</td><td>Quantifica minutos e GB, propõe JVM nos PR e nativo no ramo principal, exige testes contra o binário, e traduz a poupança de RSS em nós.</td></tr>
+        <tr><td>Staff</td><td>Apresenta primeiro a alternativa barata (afinação de heap, AppCDS, pedidos realistas), define o limiar de escala a partir do qual o nativo compensa, e assume o custo de manutenção recorrente dos metadados.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que faz <em>rollback</em> se o binário nativo falhar em produção?»</li>
+      <li>«Que observabilidade perde ao deixar de ter agente JVM?»</li>
+      <li>«Qual é o limiar de réplicas a partir do qual isto compensa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor migrar todo o parque de uma vez.</li>
+      <li>Ignorar o custo de <em>runners</em> e apresentar apenas o benefício.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-3" class="h2"><span class="secnum">14.3</span> Consumo de memória, arranque e custo em Kubernetes<a class="anchor" href="#sec-14-3" aria-label="ligação">#</a></h2>
+
+<p>Numa entrevista, os números de memória são uma armadilha de precisão: quem cita valores exactos de um <em>benchmark</em> de marketing perde credibilidade ao primeiro follow-up. A resposta forte dá ordens de grandeza, diz sobre que aplicação foram medidas, e distingue três quantidades que os candidatos misturam — <em>heap</em> usado, memória total da JVM (heap + metaspace + <em>code cache</em> + pilhas de <em>thread</em> + buffers directos) e RSS do processo, que é o que o <em>cgroup</em> do contentor conta e o que provoca o <code>OOMKilled</code>.</p>
+
+<p>O erro operacional mais comum não tem nada a ver com o framework: é dar ao contentor um <em>limit</em> de 512 MB e à JVM um <code>-Xmx</code> igual ou próximo desse valor. O <em>heap</em> é apenas uma parte do RSS; o resto — facilmente 80 a 200 MB numa aplicação com muitas classes e várias dezenas de <em>threads</em> — vive fora dele. A regra defensável é <code>-XX:MaxRAMPercentage</code> entre 50% e 75% do limite, calibrada com observação, e nunca <code>-Xmx</code> fixo escrito à mão num contentor cujo tamanho muda.</p>
+
+<p>Dito isso, a diferença estrutural existe e explica-se: o executável nativo não tem metaspace com milhares de classes carregadas, não tem <em>code cache</em> JIT a crescer durante o aquecimento e não tem estruturas de <em>profiling</em>. O que fica é <em>heap</em> mais o binário mapeado. Daí virem os valores típicos de 30 a 60 MB de RSS para um serviço REST simples nativo, contra 110 a 160 MB em Quarkus JVM e 180 a 280 MB em Spring Boot JVM na mesma aplicação. Em contrapartida, o nativo não beneficia do JIT: em regime estacionário e sob carga sustentada, o débito máximo é tipicamente 10 a 30% inferior ao da JVM aquecida, porque o C2 optimiza com informação de perfil que o compilador estático não tem.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.1</span> Ordens de grandeza para o mesmo serviço REST + Hibernate + PostgreSQL. Valores indicativos, para raciocinar em entrevista, não para citar como medição.</div>
+<div class="tscroll"><table><thead><tr><th>Configuração</th><th>Arranque até <em>ready</em></th><th>RSS em repouso</th><th>Débito em regime</th><th>Tempo de <em>build</em></th></tr></thead><tbody>
+<tr><td>Spring Boot 3.x, JVM</td><td>2–4 s</td><td>180–280 MB</td><td>Referência (100%)</td><td>1–3 min</td></tr>
+<tr><td>Spring Boot 3.x, AOT + native</td><td>50–150 ms</td><td>90–140 MB</td><td>70–90%</td><td>6–15 min</td></tr>
+<tr><td>Quarkus, JVM</td><td>0,8–1,5 s</td><td>110–160 MB</td><td>95–110%</td><td>1–2 min</td></tr>
+<tr><td>Quarkus, native</td><td>20–50 ms</td><td>30–60 MB</td><td>70–90%</td><td>4–10 min</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Nativo troca débito de pico e observabilidade por arranque e densidade. Ganha-se um factor de 3 a 5 em RSS e de 50 a 100 em tempo de arranque; perde-se 10 a 30% de débito sob carga sustentada, perdem-se agentes de APM baseados em instrumentação de bytecode, e perde-se a possibilidade de tirar um <em>heap dump</em> ou anexar um <em>profiler</em> JFR com as ferramentas habituais. Para um serviço de tráfego constante 24×7 com 8 réplicas, o nativo é quase sempre a escolha errada. Para 200 réplicas com escala elástica agressiva ou para funções que arrancam a cada invocação, é quase sempre a certa.</p></aside>
+
+<div class="qa" id="q-14-6" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Em que situações é que o tempo de arranque de um serviço é uma métrica de negócio e não uma curiosidade? Dê-me casos concretos.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O arranque passa a ser métrica de negócio sempre que um utilizador espera por ele ou que dinheiro depende dele. São quatro cenários.</p>
+      <p>Primeiro, <em>serverless</em> com arranque a frio no caminho do pedido. Numa função invocada esporadicamente, um arranque de 4 s é latência que o utilizador sente; 40 ms desaparece no ruído. É aqui que o nativo dá o maior retorno. A alternativa sem nativo existe e deve ser mencionada: instantâneos de <em>snapshot</em> do tipo AWS Lambda SnapStart, ou CRaC, que restauram um processo já inicializado e cortam o arranque para a ordem das centenas de milissegundos sem sair da JVM.</p>
+      <p>Segundo, <em>scale-to-zero</em> em Kubernetes (Knative, KEDA). Um serviço com tráfego intermitente — <em>webhooks</em>, tarefas internas, ambientes de pré-produção — pode ficar a zero réplicas. O arranque entra no p99 do primeiro pedido de cada janela de actividade. Com 3 s de arranque, escalar a zero é inaceitável e paga-se uma réplica permanente; com 50 ms, escalar a zero é trivial e o custo aproxima-se de zero fora do horário.</p>
+      <p>Terceiro, elasticidade sob picos rápidos. Se o tráfego duplica em 60 segundos — abertura de vendas, campanha, evento desportivo — a diferença entre uma réplica útil em 3 s e em 0,05 s determina se o HPA consegue acompanhar. Aqui é preciso ser honesto: o factor limitante costuma ser o tempo de <em>pull</em> da imagem e o agendamento do <em>pod</em>, na ordem das dezenas de segundos, e a imagem nativa também é menor (tipicamente 60–110 MB contra 250–400 MB com JRE), o que ajuda nesse eixo.</p>
+      <p>Quarto, rapidez de recuperação e velocidade de <em>deploy</em>. Um <em>rolling update</em> de 200 réplicas com <em>readiness</em> de 4 s e janelas de estabilização demora dezenas de minutos; a 100 ms, minutos. Isso muda a frequência de <em>deploy</em> que a equipa tolera e encurta a janela de exposição durante um <em>rollback</em>.</p>
+      <p>Onde não importa: serviço interno com número fixo de réplicas, tráfego estável e <em>deploys</em> semanais. Aí, optimizar o arranque de 3 s para 50 ms não altera nenhum indicador. Dizer isto explicitamente é o que marca a resposta como sénior.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Arrancar depressa é sempre melhor.»</td></tr>
+        <tr><td>Mid</td><td>Refere <em>serverless</em> e mais nada; não conhece <em>scale-to-zero</em> nem o efeito no <em>rolling update</em>.</td></tr>
+        <tr><td>Sénior</td><td>Dá três ou mais cenários com números, conhece SnapStart/CRaC como alternativa dentro da JVM, e nomeia explicitamente os casos em que não importa.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta que o <em>pull</em> da imagem e o agendamento dominam a latência de escala, liga a decisão ao custo por réplica e à política de <em>deploy</em>, e propõe medir antes de decidir.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Com <em>scale-to-zero</em>, o que faz às ligações de base de dados no arranque?»</li>
+      <li>«Que parte do tempo até <em>ready</em> é do framework e que parte é do Flyway e do <em>pool</em>?»</li>
+      <li>«SnapStart resolve tudo? O que fica de fora?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir tempo de arranque do processo com tempo até <em>readiness</em>.</li>
+      <li>Não conhecer nenhuma alternativa ao nativo para reduzir arranque frio.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-7" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Dizem-me que passar para Quarkus nativo corta a memória para um terço. Que números é que consegue defender, e o que é que exactamente desaparece?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um factor de 3 a 5 em RSS é defensável para um serviço REST simples; para um serviço com <em>caches</em> grandes em <em>heap</em> o factor cai para perto de 1, porque o que domina é o <em>heap</em> e o <em>heap</em> não muda. A pergunta certa é sempre: que fracção do RSS actual é <em>heap</em>?</p>
+      <p>O que desaparece no nativo é a memória fora do <em>heap</em> que existe para suportar execução dinâmica. Metaspace com os metadados de milhares de classes carregadas — numa aplicação Spring típica são facilmente 60 a 120 MB. <em>Code cache</em> do JIT, que cresce durante o aquecimento e estabiliza em algumas dezenas de MB. Estruturas de perfil do C1/C2 e as próprias <em>threads</em> do compilador. O que fica é <em>heap</em> vivo, pilhas de <em>thread</em> (1 MB por <em>thread</em> de plataforma por omissão) e o binário mapeado.</p>
+      <p>Como se mede sem acreditar em ninguém: <code>Native Memory Tracking</code> na JVM (<code>-XX:NativeMemoryTracking=summary</code> e <code>jcmd VM.native_memory</code>) dá a repartição por categoria; do lado do contentor, <code>container_memory_working_set_bytes</code> é a métrica que o <em>kubelet</em> usa para decidir o <code>OOMKilled</code>. Comparar essas duas fontes durante uma semana de tráfego real é o que permite dizer um número em vez de repetir um <em>benchmark</em>.</p>
+      <p>O trade-off que fecha a resposta: a poupança em memória compra-se com débito. Sem JIT com informação de perfil, o pico sustentado é tipicamente 10 a 30% inferior, o que significa mais réplicas para o mesmo tráfego — e mais réplicas de 50 MB podem custar menos do que menos réplicas de 250 MB, ou não, consoante o serviço seja limitado por CPU ou por memória. Se o serviço é limitado por CPU, o nativo pode aumentar o custo total. Esse cálculo faz-se antes da migração, não depois.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Repete «um terço» sem saber o que compõe o RSS; confunde <em>heap</em> com memória do processo.</td></tr>
+        <tr><td>Mid</td><td>Distingue <em>heap</em> de não-<em>heap</em>, mas não sabe o que o nativo elimina nem como medir.</td></tr>
+        <tr><td>Sénior</td><td>Reparte o RSS por metaspace, <em>code cache</em>, pilhas e <em>heap</em>; condiciona o ganho à fracção de <em>heap</em>; nomeia NMT e <em>working set</em>; refere a perda de débito.</td></tr>
+        <tr><td>Staff</td><td>Transforma a poupança em decisão de custo (CPU-bound vs memory-bound), define o critério de medição prévia e recusa dar um número sem medir.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se puser <code>-Xmx</code> igual ao limite do contentor?»</li>
+      <li>«Como é que <em>virtual threads</em> mudam a conta das pilhas?»</li>
+      <li>«Que ganho consegue sem sair da JVM?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Citar números de <em>benchmark</em> de marketing como medições próprias.</li>
+      <li>Ignorar que serviços dominados por <em>cache</em> em <em>heap</em> não ganham quase nada.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-4" class="h2"><span class="secnum">14.4</span> Reactive com Mutiny e Vert.x<a class="anchor" href="#sec-14-4" aria-label="ligação">#</a></h2>
+
+<p>Por baixo do Quarkus está o Vert.x, e por baixo do Spring WebFlux está o Reactor Netty. Ambos executam um modelo de <em>event loop</em>: um número pequeno de <em>threads</em> (tipicamente proporcional ao número de núcleos) processa todos os eventos de I/O sem bloquear. A regra de ouro é a mesma nos dois mundos e é a única coisa que interessa mesmo numa entrevista: bloquear uma <em>thread</em> de <em>event loop</em> paralisa todos os pedidos que estavam a ser servidos por ela. Uma chamada JDBC síncrona dentro de um método reactivo não é um detalhe de estilo, é um incidente à espera de tráfego.</p>
+
+<p>A diferença de API entre Mutiny e Reactor é sobretudo ergonómica. O Reactor tem <code>Mono&lt;T&gt;</code> (0 ou 1) e <code>Flux&lt;T&gt;</code> (0..N), com uma superfície de centenas de operadores e nomes herdados da programação funcional (<code>flatMap</code>, <code>switchIfEmpty</code>, <code>zipWhen</code>). O Mutiny tem <code>Uni&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> e uma API de navegação explícita: começa-se por dizer sobre <em>o quê</em> se está a agir (<code>.onItem()</code>, <code>.onFailure()</code>, <code>.onCancellation()</code>) e só depois qual a acção (<code>.transform()</code>, <code>.transformToUni()</code>, <code>.retry()</code>). Isso torna o código mais longo e muito mais legível para quem não vive em Reactor, e faz a lista de sugestões do IDE ser navegável em vez de ter 300 entradas.</p>
+
+<p>Do ponto de vista de decisão, há um ponto que não se pode ignorar em 2026: com Java 21 e <em>virtual threads</em>, o argumento de escalabilidade que justificava o estilo reactivo perdeu força. Uma <em>thread</em> virtual bloqueada em I/O não retém uma <em>thread</em> de plataforma, o que permite servir dezenas de milhares de pedidos concorrentes com código imperativo, testável com <em>stack traces</em> legíveis. Quarkus expõe <code>@RunOnVirtualThread</code> e Spring Boot activa-as com <code>spring.threads.virtual.enabled=true</code>. O estilo reactivo continua a ganhar em dois casos: <em>streaming</em> com <em>backpressure</em> ponta a ponta, e composição declarativa de muitas chamadas paralelas com política de erro e tempo limite. Fora disso, é complexidade a pagar.</p>
+
+<figure class="listing java" id="lst-14-4"><div class="lhead"><span class="lnum">Listagem 14.4</span>
+<span class="lcap">A mesma composição — duas chamadas em paralelo, tempo limite e recuperação — em Mutiny e em Reactor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ---------- Quarkus / Mutiny ----------
+@GET @Path("/{id}")
+public Uni&lt;OrderView&gt; view(@RestPath Long id) {
+    Uni&lt;Order&gt;   order = orders.findById(id);
+    Uni&lt;Risk&gt;    risk  = riskClient.score(id)
+            .ifNoItem().after(Duration.ofMillis(200)).recoverWithItem(Risk.unknown())
+            .onFailure().recoverWithItem(Risk.unknown());
+
+    return Uni.combine().all().unis(order, risk)
+              .with(OrderView::of)
+              .onFailure(NotFoundException.class).transform(e -&gt; new WebApplicationException(404));
+}
+
+// Codigo bloqueante tem de sair do event loop:
+@GET @Path("/report") @Blocking            // ou @RunOnVirtualThread com Java 21
+public Report heavyReport() { return legacyJdbcReport(); }
+
+// ---------- Spring WebFlux / Reactor ----------
+@GetMapping("/{id}")
+public Mono&lt;OrderView&gt; view(@PathVariable Long id) {
+    Mono&lt;Order&gt; order = orders.findById(id)
+            .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND)));
+    Mono&lt;Risk&gt;  risk  = riskClient.score(id)
+            .timeout(Duration.ofMillis(200))
+            .onErrorReturn(Risk.unknown());
+
+    return Mono.zip(order, risk).map(t -&gt; OrderView.of(t.getT1(), t.getT2()));
+}
+
+// Codigo bloqueante em WebFlux:
+return Mono.fromCallable(this::legacyJdbcReport)
+           .subscribeOn(Schedulers.boundedElastic());
+</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O Quarkus deixa escolher por método: <code>@Blocking</code> desvia para o <em>pool</em> de <em>worker</em>, <code>@NonBlocking</code> mantém no <em>event loop</em>, <code>@RunOnVirtualThread</code> executa numa <em>thread</em> virtual. Em Spring, a fronteira é a do <em>stack</em>: WebFlux inteiro ou Web MVC inteiro, com <code>publishOn</code>/<code>subscribeOn</code> a mover trabalho para <code>boundedElastic</code>. Um serviço maioritariamente síncrono com dois <em>endpoints</em> de <em>streaming</em> é mais simples de exprimir em Quarkus; um serviço inteiramente reactivo é igualmente natural nos dois.</p></aside>
+
+<div class="qa" id="q-14-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Vem de Reactor e vai escrever Mutiny. O que muda de facto, e como decide hoje entre reactivo e imperativo com <em>virtual threads</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Muda a ergonomia, não o modelo. Mutiny e Reactor implementam ambos <em>Reactive Streams</em> com <em>backpressure</em>, são interoperáveis via <code>Publisher</code>, e o Mutiny até oferece conversores directos. <code>Uni&lt;T&gt;</code> corresponde a <code>Mono&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> a <code>Flux&lt;T&gt;</code>, com uma diferença de contrato relevante: <code>Uni</code> não tem <em>backpressure</em>, porque um único item não precisa dele.</p>
+      <p>A diferença prática é a API de navegação por evento. Em Reactor escolhe-se o operador entre centenas; em Mutiny escreve-se <code>.onItem().transformToUni(...)</code> ou <code>.onFailure(TimeoutException.class).retry().atMost(3)</code>. O código fica 20 a 40% mais longo em caracteres e substancialmente mais fácil de rever numa equipa que não é especialista — que é exactamente o argumento a usar numa entrevista, porque a manutenção é o custo dominante em código reactivo.</p>
+      <p>Sobre a decisão de hoje: com Java 21 em produção, o critério mudou. A justificação clássica do reactivo era não gastar uma <em>thread</em> de plataforma por pedido bloqueado; as <em>threads</em> virtuais resolvem isso mantendo código imperativo com <em>stack traces</em> legíveis, <code>try/finally</code> que funciona e depuração normal. Por isso o meu critério é: imperativo com <em>threads</em> virtuais por omissão; reactivo quando existe <em>streaming</em> real com <em>backpressure</em> ponta a ponta (SSE, Kafka a alimentar um consumidor lento, ficheiros grandes), ou quando a lógica é composição paralela de muitas chamadas com políticas de erro e tempo limite, onde o estilo declarativo é genuinamente mais claro.</p>
+      <p>As duas armadilhas a mencionar: bloquear o <em>event loop</em> continua a ser fatal e não é resolvido por <em>threads</em> virtuais se o código estiver no <em>event loop</em> — em Quarkus marca-se <code>@Blocking</code>; e <code>ThreadLocal</code> usado como contexto (segurança, <em>tenant</em>, MDC de <em>logging</em>) não sobrevive à travessia de operadores reactivos, o que obriga a propagação explícita de contexto e é a origem mais frequente de <em>logs</em> sem <em>trace id</em>. Com <em>threads</em> virtuais, <code>ScopedValue</code> ou o próprio <code>ThreadLocal</code> voltam a funcionar de forma previsível.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São a mesma coisa com outros nomes», ou defende reactivo por ser «mais rápido».</td></tr>
+        <tr><td>Mid</td><td>Mapeia <code>Uni</code>/<code>Mono</code> correctamente, mas não fala de <em>backpressure</em>, de contexto nem do impacto das <em>threads</em> virtuais.</td></tr>
+        <tr><td>Sénior</td><td>Explica a API de navegação, a ausência de <em>backpressure</em> em <code>Uni</code>, o perigo de bloquear o <em>event loop</em> e um critério explícito para escolher entre reactivo e imperativo em Java 21.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta propagação de contexto e observabilidade, o custo de formação da equipa em código reactivo, e uma estratégia de coexistência (reactivo só nos <em>endpoints</em> que o justificam).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como propaga o <em>trace id</em> através de uma cadeia Mutiny?»</li>
+      <li>«O que acontece se chamar JDBC dentro de um <code>Uni</code> sem <code>@Blocking</code>?»</li>
+      <li>«Quando é que <em>virtual threads</em> ainda não chegam?»</li>
+      <li>«Como testa <em>backpressure</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <em>virtual threads</em> tornam seguro bloquear no <em>event loop</em>.</li>
+      <li>Usar <code>ThreadLocal</code> como contexto em código reactivo sem propagação explícita.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-5" class="h2"><span class="secnum">14.5</span> Quando recomendar cada stack numa entrevista<a class="anchor" href="#sec-14-5" aria-label="ligação">#</a></h2>
+
+<p>Esta é a pergunta em que mais candidatos sénior falham, e falham por excesso de convicção. O entrevistador não quer saber qual o framework preferido; quer ver se a recomendação tem critérios, se o custo humano entra na conta e se existe um cenário em que o candidato mudaria de ideias. A estrutura de resposta que funciona tem três partes: as perguntas que faria antes de decidir, a decisão por omissão dado o contexto mais provável, e a condição que inverteria essa decisão.</p>
+
+<p>As perguntas que valem a pena são poucas e concretas: quantos serviços existem e qual o perfil de tráfego (constante ou intermitente); quantas réplicas por serviço e se o custo é dominado por CPU ou por memória; qual a experiência da equipa e a taxa de rotação; que bibliotecas internas e agentes de observabilidade existem e se têm suporte nativo; e qual o prazo — porque uma migração de <em>framework</em> compete directamente com o <em>roadmap</em> de produto.</p>
+
+<p>A decisão por omissão numa scale-up europeia com 15 a 60 serviços em Spring Boot, equipa de 20 a 60 engenheiros e tráfego razoavelmente constante é manter o Spring e não migrar nada. O ganho técnico existe mas é pequeno em relação ao custo: revalidar bibliotecas, reescrever testes, formar toda a gente, e perder velocidade de entrega durante meses. Aquilo que se faz é abrir uma excepção deliberada: novos serviços com perfil claramente intermitente ou <em>serverless</em> nascem em Quarkus (ou em Spring nativo), como piloto controlado, com um dono e com métricas de saída definidas à partida.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.2</span> Critérios de decisão, com o sinal que os torna decisivos.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th>Favorece Spring Boot</th><th>Favorece Quarkus</th></tr></thead><tbody>
+<tr><td>Perfil de tráfego</td><td>Constante, 24×7, réplicas fixas</td><td>Intermitente, <em>scale-to-zero</em>, picos rápidos</td></tr>
+<tr><td>Restrição de custo</td><td>Limitado por CPU</td><td>Limitado por memória, centenas de réplicas</td></tr>
+<tr><td>Ecossistema</td><td>Bibliotecas internas, SDKs invulgares, agentes de APM</td><td>Stack alinhado com extensões existentes</td></tr>
+<tr><td>Equipa</td><td>Experiência profunda em Spring, rotação alta</td><td>Equipa pequena, disposta a investir 2–4 semanas</td></tr>
+<tr><td>Contratação</td><td>Mercado muito maior de candidatos</td><td>Menos relevante em equipas estáveis</td></tr>
+<tr><td>Destino de execução</td><td>Kubernetes clássico, VM</td><td><em>Functions</em>, <em>edge</em>, Knative, dispositivos com pouca RAM</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Uma migração de <em>framework</em> num serviço médio (50 a 120 classes, Hibernate, Kafka, OIDC) custa tipicamente 3 a 8 semanas-pessoa, mais 2 a 4 semanas de curva de aprendizagem por engenheiro que nunca usou CDI. Contra isso, a poupança de infra-estrutura de um serviço com 10 réplicas é da ordem de 1,5 GB de memória reservada — irrelevante. A conta só fecha quando a migração é repetível ao longo de dezenas de serviços ou quando o arranque desbloqueia uma arquitectura nova (escala a zero, <em>functions</em>). É por isso que a resposta honesta a «devíamos migrar?» começa quase sempre por «para quantos serviços?».</p></aside>
+
+<div class="qa" id="q-14-9" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos 30 serviços em Spring Boot 3 e o CTO quer avaliar migrar para Quarkus para cortar custos de cloud. Como conduziria essa avaliação e o que espera concluir?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começaria por separar o objectivo declarado — cortar custos de cloud — da solução proposta, porque na maioria dos parques a migração de <em>framework</em> não é a alavanca mais barata para esse objectivo.</p>
+      <p>Primeiro, medir onde está o custo. Se a factura é dominada por bases de dados geridas, tráfego entre zonas ou armazenamento, mudar de <em>framework</em> não move nada. Se é dominada por computação, é preciso saber se os <em>pods</em> estão limitados por CPU ou por memória, e comparar o pedido de recursos com o uso real: em muitos parques os pedidos estão sobredimensionados por hábito, e ajustá-los com base em observação de duas semanas dá 20 a 40% de redução sem tocar numa linha de código.</p>
+      <p>Segundo, esgotar as alavancas dentro da stack actual: <code>-XX:MaxRAMPercentage</code> calibrado, AppCDS para arranque, remoção de dependências não usadas, consolidação de serviços com 2 réplicas ociosas, e escala automática a sério em vez de réplicas fixas. Isto costuma capturar metade do ganho teórico da migração, em dias.</p>
+      <p>Terceiro, se ainda restar caso, fazer um piloto medido: escolher dois serviços representativos — um do caminho crítico, um intermitente —, migrar, e medir RSS, débito por <em>core</em>, arranque até <em>readiness</em>, tempo de <em>build</em> e horas gastas. Só com esses números se extrapola para 30 serviços. Definir à partida o critério de paragem: se a poupança projectada for inferior a, digamos, dois meses de trabalho de equipa por ano, não se avança.</p>
+      <p>A conclusão que espero é a mais frequente na realidade: manter o Spring Boot no parque existente, adoptar Spring Boot AOT/native apenas onde o arranque tem valor, e usar Quarkus em serviços novos com perfil <em>serverless</em> ou intermitente. E há um ponto que um staff diz em voz alta: recomendar «não migrar» é uma recomendação legítima, e é a que exige mais coragem numa conversa com um CTO entusiasmado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Responde com preferência pessoal por um dos frameworks; não pergunta nada sobre o parque nem sobre a factura.</td></tr>
+        <tr><td>Mid</td><td>Propõe um piloto, mas não questiona se o custo é sequer de computação nem considera alternativas mais baratas.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, esgota alavancas dentro da stack, faz piloto com dois serviços e métricas definidas, extrapola com números e assume o custo humano.</td></tr>
+        <tr><td>Staff</td><td>Separa objectivo de solução, define critério de paragem quantitativo antes de começar, propõe estratégia mista por perfil de serviço, e está disposto a recomendar não migrar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que dois serviços escolheria para o piloto e porquê?»</li>
+      <li>«Como convence a equipa que gosta de Spring?»</li>
+      <li>«E se metade da poupança vier de reduzir pedidos de recursos? Ainda migra?»</li>
+      <li>«Quanto tempo dá ao piloto antes de decidir?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Aceitar a premissa da pergunta sem a questionar.</li>
+      <li>Prometer percentagens de poupança antes de qualquer medição.</li>
+      <li>Não mencionar o custo de formação nem o impacto no <em>roadmap</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-10" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Que riscos de ecossistema é que assume ao escolher Quarkus para um serviço que vai viver cinco anos, e como os mitigaria desde o primeiro <em>commit</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Quatro riscos, todos mitigáveis com desenho, e nenhum deles é «o projecto vai desaparecer» — o Quarkus tem patrocínio empresarial estável e ciclo de <em>releases</em> previsível com versões de suporte alargado.</p>
+      <p>Primeiro, cobertura de extensões. Uma biblioteca sem extensão pode funcionar em JVM e falhar em nativo, ou exigir metadados mantidos à mão. Mitigação: inventariar as dependências antes de começar e, para as que não têm extensão, isolá-las atrás de uma interface de domínio, de modo a que substituí-las seja um adaptador e não uma reescrita.</p>
+      <p>Segundo, observabilidade. Se a organização depende de um agente de APM comercial que instrumenta bytecode, o nativo pode não o suportar. Mitigação: normalizar em OpenTelemetry por instrumentação suportada pelo <em>framework</em> desde o primeiro dia, e validar <em>traces</em>, métricas e <em>logs</em> correlacionados no piloto, não depois.</p>
+      <p>Terceiro, mercado de contratação e rotação. Há muito mais engenheiros com Spring no currículo. Mitigação real: manter a arquitectura interna independente do <em>framework</em> — domínio em Java puro, sem anotações do <em>framework</em> nas entidades de negócio, adaptadores nas fronteiras. Assim, quem chega aprende CDI em dias porque a maior parte do código é Java comum, e uma eventual reversão fica confinada às camadas de fronteira.</p>
+      <p>Quarto, divergência operacional. Ter duas stacks significa dois modelos de configuração, duas imagens base, dois manuais de <em>troubleshooting</em> e duas versões de <em>chart</em>. Mitigação: bibliotecas partilhadas de <em>logging</em> e configuração alinhadas entre as duas, e um limite explícito — por exemplo, no máximo dois serviços na segunda stack até haver decisão formal de a alargar.</p>
+      <p>O trade-off honesto: estas mitigações custam tempo e algumas (domínio sem anotações) são boas práticas independentemente do <em>framework</em>. Se a equipa não estiver disposta a mantê-las, o risco de heterogeneidade supera o ganho e a recomendação passa a ser stack única.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Não há riscos, é Java na mesma.»</td></tr>
+        <tr><td>Mid</td><td>Menciona só o risco de a comunidade ser menor, sem mitigações concretas.</td></tr>
+        <tr><td>Sénior</td><td>Enumera extensões, observabilidade, contratação e custo operacional de duas stacks, com uma mitigação accionável por risco.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o limite explícito de proliferação de stacks, a estratégia de domínio independente do <em>framework</em> como seguro de reversão, e a condição em que recomendaria stack única.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como isola uma biblioteca sem extensão?»</li>
+      <li>«O que muda no manual de plantão com um binário nativo?»</li>
+      <li>«Quantas stacks é demasiado para uma equipa de 40 pessoas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar heterogeneidade de stacks como custo zero.</li>
+      <li>Não ter plano de reversão para uma decisão com horizonte de cinco anos.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-6" class="h2"><span class="secnum">14.6</span> Resumo e checklist<a class="anchor" href="#sec-14-6" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na forma em que é útil dizê-lo em voz alta numa ronda:</p>
+
+<ul class="lst">
+  <li>A diferença estrutural é <em>quando</em> se resolve o grafo de <em>beans</em>: <em>augmentation</em> no <em>build</em> em Quarkus, construção do contexto no arranque em Spring — e o Spring Boot 3.x tem AOT que converge para o mesmo modelo no caminho nativo.</li>
+  <li>Em JVM, o arranque típico é 0,8–1,5 s em Quarkus contra 2–4 s em Spring Boot; em nativo, dezenas de milissegundos contra 50–150 ms. O que interessa em produção é o tempo até <em>readiness</em>, que inclui Flyway e <em>pool</em> de ligações.</li>
+  <li>O <em>native image</em> compila sob mundo fechado: reflexão dinâmica, <em>proxies</em> JDK, recursos do <em>classpath</em>, serialização, JNI e agentes de bytecode exigem metadados ou deixam de funcionar.</li>
+  <li>A <em>build</em> nativa custa 4 a 15 minutos e 8 a 16 GB de RAM no <em>runner</em>; enviar nativo sem testes de integração contra o binário é como enviar sem testes.</li>
+  <li>O ganho de RSS é de um factor 3 a 5 num serviço REST simples e aproxima-se de 1 num serviço dominado por <em>cache</em> em <em>heap</em>; em contrapartida perdem-se 10 a 30% de débito em regime estacionário.</li>
+  <li>O arranque só é métrica de negócio em <em>serverless</em>, <em>scale-to-zero</em>, picos rápidos e <em>rolling updates</em> de centenas de réplicas; SnapStart e CRaC são alternativas dentro da JVM.</li>
+  <li>Mutiny e Reactor implementam o mesmo modelo com ergonomia diferente; com Java 21, o critério por omissão passou a ser imperativo com <em>threads</em> virtuais, e reactivo só para <em>streaming</em> com <em>backpressure</em> ou composição paralela complexa.</li>
+  <li>Uma migração de serviço médio custa 3 a 8 semanas-pessoa mais formação; só compensa se for repetível em dezenas de serviços ou se desbloquear uma arquitectura nova.</li>
+  <li>Recomendar «não migrar» com números é uma resposta forte; recomendar migrar tudo sem medir é a falha mais comum nesta pergunta.</li>
+</ul>
+
+<p>Checklist accionável antes de uma ronda em que este tema possa aparecer:</p>
+
+<ul class="lst">
+  <li>Saber descrever, em 60 segundos e sem notas, os quatro custos do arranque do Spring: varrimento, condições de auto-configuração, instanciação reflexiva e geração de <em>proxies</em>.</li>
+  <li>Ter na ponta da língua um par de números de arranque e de RSS para cada uma das quatro combinações da Tabela 14.1, sempre apresentados como ordens de grandeza.</li>
+  <li>Conseguir listar as quatro categorias de metadados nativos e a anotação ou API correspondente em cada <em>framework</em>.</li>
+  <li>Saber explicar a diferença entre <em>heap</em>, memória total da JVM e RSS, e dizer como se mede cada uma (NMT, <code>container_memory_working_set_bytes</code>).</li>
+  <li>Ter um critério pessoal, formulado numa frase, para escolher entre reactivo e <em>threads</em> virtuais.</li>
+  <li>Preparar uma resposta de «não migrar» com o cálculo de semanas-pessoa contra GB poupados, para o caso de a pergunta vir na forma de proposta do entrevistador.</li>
+  <li>Confirmar que consegue nomear pelo menos três armadilhas de CDI que mordem quem vem de Spring: <code>@Dependent</code> por omissão, remoção de <em>beans</em> e auto-invocação de métodos interceptados.</li>
+</ul>

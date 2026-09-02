@@ -1,0 +1,46 @@
+{"chapter": 11, "questions": [
+  {"q": "Uma equipa copiou o padrão das auto-configurações do Boot e pôs `@ConditionalOnMissingBean` num método `@Bean` de uma `@Configuration` normal da própria aplicação, para permitir que outro módulo sobreponha o `ObjectMapper`. Funciona em duas máquinas e falha na terceira. Porquê?",
+   "options": [
+     "Porque `@ConditionalOnMissingBean` só é avaliada quando o Actuator está no classpath, e a terceira máquina corre um perfil sem Actuator.",
+     "Porque a condição depende da ordem de registo das definições, e entre classes `@Configuration` da aplicação essa ordem não é garantida — só as auto-configurações são processadas depois de todas as definições do utilizador.",
+     "Porque a anotação exige `proxyBeanMethods = false` na classe de configuração; com o valor por defeito a condição é ignorada em silêncio.",
+     "Porque o `ObjectMapper` é registado por um `BeanFactoryPostProcessor` e as condições nunca vêem beans criados por post-processors."],
+   "answer": 1,
+   "explain": "A condição é avaliada contra os beans já registados nesse instante, e o Boot só garante que as classes `@AutoConfiguration` são processadas no fim, depois das definições do utilizador e ordenadas entre si por `after`/`before`. Dentro da aplicação, a ordem depende do nome da classe e do percurso do component scan, pelo que a mesma configuração activa ou não conforme o ambiente. A correcção é mover a classe para um módulo de auto-configuração listado em `AutoConfiguration.imports`, ou trocar a condição por `@ConditionalOnProperty` explícita."},
+
+  {"q": "Em produção, `acme.http.read-timeout` está a 800 ms apesar de existir `ACME_HTTP_READ_TIMEOUT=5s` no `Deployment` e `acme.http.read-timeout: 3s` num `./config/application-prod.yaml` montado por ConfigMap. O `JAVA_TOOL_OPTIONS` do contentor contém `-Dacme.http.read-timeout=800ms`. Qual é o valor efectivo e porquê?",
+   "options": [
+     "3s, porque o ficheiro externo específico do profile é a fonte mais específica e ganha a tudo o resto.",
+     "5s, porque as variáveis de ambiente têm sempre a precedência mais alta no Spring Boot.",
+     "800ms, porque as propriedades de sistema da JVM ficam acima das variáveis de ambiente e dos ficheiros externos na pilha do `Environment`.",
+     "800ms, mas apenas porque o valor está em milissegundos e o binder rejeita `5s` por não ser um `Duration` válido."],
+   "answer": 2,
+   "explain": "A pilha de fontes do `Environment` responde de cima para baixo: argumentos da linha de comandos, depois propriedades de sistema `-D`, depois variáveis de ambiente, depois ficheiros externos específicos do profile e genéricos, e só no fim os empacotados. Um `-D` injectado via `JAVA_TOOL_OPTIONS` é indistinguível de um `-D` na linha de arranque, por isso vence os 5s do ambiente e os 3s do ConfigMap. `5s` é aliás um `Duration` perfeitamente válido — o problema é de precedência, não de conversão."},
+
+  {"q": "Um `@Component` de âmbito `prototype` abre uma ligação a um servidor SFTP no construtor e fecha-a num método anotado com `@PreDestroy`. Os pedidos obtêm sempre uma instância nova via `ObjectProvider.getObject()`. Ao fim de algumas horas o serviço esgota os descritores de ficheiro. Qual é a explicação correcta?",
+   "options": [
+     "O `@PreDestroy` de um prototype só corre no encerramento do contexto, pelo que as ligações se acumulam até ao `SIGTERM`.",
+     "O contentor cria, injecta e esquece um prototype: não guarda referência nem executa `@PreDestroy` ou `destroy-method`, pelo que quem pede a instância tem de fechar o recurso explicitamente.",
+     "O `ObjectProvider` guarda em cache a última instância entregue e impede que o recolector de lixo liberte as anteriores.",
+     "Falta `@Scope(proxyMode = ScopedProxyMode.TARGET_CLASS)`; sem o proxy o Spring não consegue interceptar o fim de vida do objecto."],
+   "answer": 1,
+   "explain": "O ciclo de vida de um prototype termina na inicialização: o contentor não mantém a instância registada, logo nunca chama os callbacks de destruição, nem no encerramento do contexto. Um prototype com recursos é uma fuga garantida a menos que o consumidor os feche, ou que se registe um `DisposableBeanAdapter` à mão. O `proxyMode` só muda a forma como a instância é obtida, não acrescenta destruição, e o `ObjectProvider` não guarda nada em cache."},
+
+  {"q": "Uma equipa pôs `spring.aop.proxy-target-class=false` para forçar proxies dinâmicos JDK. `ServicoPagamentos` implementa `PagamentoPort` e tem métodos `@Transactional`. Um teste que injecta `ServicoPagamentos` pelo tipo concreto passava e agora falha no arranque do contexto. O que aconteceu?",
+   "options": [
+     "O proxy JDK implementa apenas as interfaces do alvo, pelo que o bean no contentor deixa de ser atribuível a `ServicoPagamentos` e a injecção pelo tipo concreto não encontra candidato.",
+     "Os proxies JDK não suportam `@Transactional`, que exige geração de subclasse; o contexto falha ao registar o interceptor transaccional.",
+     "O proxy JDK exige que todos os métodos da classe sejam `final`, e o compilador rejeita a combinação com `@Transactional`.",
+     "Nada mudou no tipo do bean; a falha vem de o Boot 3 ter removido a propriedade `spring.aop.proxy-target-class`, que passou a ser ignorada."],
+   "answer": 0,
+   "explain": "Um proxy dinâmico JDK é um objecto que implementa as interfaces do alvo e delega nele, por isso o tipo visível no contentor passa a ser `PagamentoPort` e não a classe concreta. Injectar ou fazer autowire pelo tipo concreto falha com erro de bean em falta ou de tipo errado — é a razão pela qual o Boot fixa CGLIB como defeito. As transacções continuam a funcionar através da interface; o que se perde é a injecção e o casting pelo tipo concreto."},
+
+  {"q": "Um serviço leva cerca de 90 segundos a arrancar porque pré-carrega uma cache. O `Deployment` tem `livenessProbe` com `initialDelaySeconds: 20`, `periodSeconds: 10` e `failureThreshold: 3`, apontada a `/actuator/health/liveness`. Os pods entram em `CrashLoopBackOff`. Qual é a correcção mais defensável?",
+   "options": [
+     "Apontar a `livenessProbe` a `/actuator/health/readiness`, que só responde quando o carregamento termina.",
+     "Subir `failureThreshold` da `livenessProbe` para 30 e incluir o indicador `db` no grupo de liveness, para que a sonda espere pela base de dados.",
+     "Acrescentar um `startupProbe` com margem suficiente — por exemplo `failureThreshold: 30` e `periodSeconds: 5`, ou seja 150 segundos — que suspende a liveness até o arranque concluir.",
+     "Mover o carregamento para `@PostConstruct`, que corre antes de o servidor abrir a porta e por isso não conta para o tempo até à sonda responder."],
+   "answer": 2,
+   "explain": "O `startupProbe` existe precisamente para dar orçamento de arranque sem inflacionar o `initialDelaySeconds` da liveness: enquanto ele não passar, a liveness e a readiness ficam suspensas, e com 30 tentativas de 5 em 5 segundos há 150 segundos de margem. Reutilizar a readiness como liveness apaga a distinção entre «não pode servir agora» e «está irrecuperável», e incluir a base de dados na liveness converte uma indisponibilidade de 60 segundos do PostgreSQL num reinício simultâneo de todas as réplicas. Mudar a carga para `@PostConstruct` não encurta nada e ainda corre antes de o proxy de AOP existir."}
+]}

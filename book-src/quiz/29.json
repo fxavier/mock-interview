@@ -1,0 +1,60 @@
+{
+  "chapter": 29,
+  "questions": [
+    {
+      "q": "Um serviço grava o pedido em PostgreSQL e, no mesmo método `@Transactional`, chama `kafkaTemplate.send(...)`. A equipa move o `send` para um `TransactionSynchronization` executado em `afterCommit`. O que muda?",
+      "options": [
+        "Passa a haver atomicidade entre a base de dados e o Kafka, porque o envio já só ocorre depois do commit.",
+        "Deixa de haver eventos para pedidos inexistentes, mas continua a poder perder-se o evento de um pedido gravado.",
+        "Nada muda: `afterCommit` corre dentro da mesma transacção da base de dados.",
+        "Passa a ser necessário activar transacções no produtor Kafka para que o `afterCommit` funcione."
+      ],
+      "answer": 1,
+      "explain": "Publicar em `afterCommit` elimina o caso do evento fantasma (evento sem estado gravado), mas se o processo morrer entre o commit e o envio, o pedido existe e ninguém a jusante o sabe. Só o outbox torna a mensagem tão durável quanto o estado, porque a escreve na mesma transacção local. Não há atomicidade entre PostgreSQL e Kafka, e as transacções do produtor Kafka não abrangem a base de dados."
+    },
+    {
+      "q": "Um consumidor Kafka desduplica assim: `if (repo.existsByEventId(id)) return;` numa transacção, e aplica o efeito noutra transacção a seguir. Duas réplicas recebem o mesmo evento após um rebalance. Qual é o problema?",
+      "options": [
+        "Nenhum: `existsByEventId` é suficiente porque o Kafka garante ordem dentro da partição.",
+        "O problema é só de desempenho, por causa da consulta extra antes de cada efeito.",
+        "Há uma janela de corrida entre a verificação e a escrita: ambas podem ver «não existe» e aplicar o efeito duas vezes.",
+        "O problema resolve-se confirmando o deslocamento antes de aplicar o efeito."
+      ],
+      "answer": 2,
+      "explain": "Verificar-e-depois-escrever em transacções separadas é uma condição de corrida clássica: duas réplicas leem «não existe» e ambas aplicam. A idempotência tem de vir da base de dados, com `INSERT` numa chave primária `(consumidor, event_id)` na mesma transacção do efeito, deixando a violação de chave anular o duplicado. Confirmar o deslocamento antes do efeito piora tudo, porque passa a perder mensagens."
+    },
+    {
+      "q": "Um ecrã de detalhe compõe dados de quatro serviços em paralelo, cada um com 99,9% de disponibilidade e p99 de 40 ms. Que afirmação descreve correctamente o resultado?",
+      "options": [
+        "A disponibilidade do ecrã é 99,9%, porque as chamadas são paralelas e não sequenciais.",
+        "A disponibilidade cai para cerca de 99,6% e o p99 aproxima-se do ramo mais lento, não da soma.",
+        "A disponibilidade cai para cerca de 99,6% e o p99 é a soma dos quatro, cerca de 160 ms.",
+        "A disponibilidade sobe, porque o paralelismo permite que uma falha seja compensada pelas outras chamadas."
+      ],
+      "answer": 1,
+      "explain": "O paralelismo afecta a latência, não a disponibilidade: se qualquer dos quatro ramos for obrigatório, a disponibilidade composta é 0,999⁴ ≈ 99,6%. A latência, essa, é a do ramo mais lento (mais a junção), porque as chamadas ocorrem ao mesmo tempo. Recuperar disponibilidade exige degradação por ramo com timeout, ou substituir a composição por uma projecção materializada."
+    },
+    {
+      "q": "Numa saga orquestrada de pedido, o serviço de pagamentos responde `504` ao comando de autorização. Qual é a acção correcta do orquestrador?",
+      "options": [
+        "Iniciar imediatamente as compensações, porque `504` indica que a autorização falhou.",
+        "Repetir o comando de autorização até obter uma resposta com `200`.",
+        "Consultar o pagamento pela chave de idempotência para descobrir o estado real e só depois decidir entre repetir e compensar.",
+        "Marcar a saga como `FAILED` e deixar a resolução para intervenção manual."
+      ],
+      "answer": 2,
+      "explain": "Um `504` é ignorância, não falha: a cobrança pode ter sido feita. Compensar às cegas arrisca estornar o que não existe; repetir às cegas arrisca cobrar duas vezes. A consulta pela chave de idempotência resolve a ambiguidade antes da decisão. Marcar `FAILED` de imediato transforma um caso rotineiro num incidente humano."
+    },
+    {
+      "q": "Uma equipa acrescenta o campo opcional `promoCode` ao evento `OrderPlaced` e implanta o produtor. Dois dos cinco consumidores começam a falhar na desserialização. Qual é a causa mais provável e a correcção?",
+      "options": [
+        "Os consumidores não são tolerantes a campos desconhecidos; a correcção é desserializar ignorando campos não mapeados.",
+        "A alteração é incompatível por natureza; a correcção é criar um tópico `v2` para todas as alterações de esquema.",
+        "Falta um registo de esquemas; sem ele nenhuma alteração de evento é possível.",
+        "O produtor implantou antes dos consumidores; a correcção é implantar sempre os consumidores primeiro."
+      ],
+      "answer": 0,
+      "explain": "Acrescentar um campo opcional é compatível por definição — quebra apenas consumidores configurados para rejeitar campos desconhecidos, e a correcção é o leitor tolerante. Criar um tópico novo por cada campo adicionado multiplica manutenção sem necessidade; o registo de esquemas ajuda a verificar compatibilidade mas não é a causa aqui; e em eventos o produtor implanta primeiro por natureza, o que é precisamente porque se exige compatibilidade progressiva."
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{"chapter": 13, "questions": [
+  {"q": "Um serviço expõe `DELETE /v1/subscricoes/{id}`. A primeira chamada apaga a subscrição e devolve `204`. Um retry automático do cliente, causado por um timeout de rede, chega logo a seguir. Qual é o comportamento que melhor respeita o contrato de HTTP?",
+   "options": [
+    "Devolver `404 Not Found`, porque o recurso já não existe.",
+    "Devolver `204 No Content` outra vez, porque `DELETE` é idempotente e o estado final é o mesmo.",
+    "Devolver `409 Conflict`, para o cliente saber que houve uma tentativa duplicada.",
+    "Devolver `200 OK` com um corpo a indicar que a subscrição já tinha sido apagada."],
+   "answer": 1,
+   "explain": "`DELETE` é idempotente: N chamadas deixam o servidor no mesmo estado que uma, portanto a repetição deve devolver o mesmo sucesso. `404` faz um retry legítimo parecer erro e polui a taxa de 4xx do cliente; `409` promete que uma releitura permite repetir com sucesso, o que aqui é falso; `200` com corpo explicativo introduz um estado que o cliente tem de interpretar sem ganho nenhum."},
+
+  {"q": "Numa cadeia de quatro serviços, cada um configurado com `maxAttempts: 3` no Resilience4j, o serviço mais a jusante começa a falhar. Quantos pedidos, no pior caso, chegam ao serviço em falha por cada pedido original do utilizador?",
+   "options": ["3", "12", "81", "64"],
+   "answer": 2,
+   "explain": "As tentativas multiplicam-se ao longo da cadeia: 3 × 3 × 3 × 3 = 3⁴ = 81 pedidos no pior caso. Este efeito multiplicativo é a razão pela qual a repetição deve viver num único nível da cadeia, com jitter e um orçamento de retries limitado a uma percentagem do débito; 12 (3×4) confunde multiplicação com soma e 64 corresponderia a 4³."},
+
+  {"q": "Um disjuntor do Resilience4j está configurado com `failureRateThreshold: 50`, `slidingWindowSize: 100` e sem `slowCallRateThreshold`. A dependência degrada: deixa de devolver erros mas passa de 80 ms para 750 ms de p99. O que acontece?",
+   "options": [
+    "O circuito abre, porque as chamadas lentas contam como falhas por omissão.",
+    "O circuito permanece fechado e as threads acumulam-se à espera, degradando também pedidos que não usam essa dependência.",
+    "O circuito passa a meio-aberto e limita automaticamente o débito para proteger a dependência.",
+    "O `TimeLimiter` transforma as chamadas lentas em falhas contadas, pelo que o circuito abre sem configuração adicional."],
+   "answer": 1,
+   "explain": "Sem `slowCallDurationThreshold`/`slowCallRateThreshold`, o disjuntor só conta excepções, e uma degradação sem erros mantém-no fechado enquanto as threads e as ligações se esgotam — a saturação alastra a pedidos que nem tocam nessa dependência. O estado meio-aberto só surge após abrir; e o `TimeLimiter`, se não estiver configurado com um timeout menor que 750 ms, também não gera falhas."},
+
+  {"q": "Um endpoint `POST /v1/pagamentos` guarda a chave de idempotência numa tabela própria, mas fá-lo depois de a transacção de negócio ter feito commit. Qual é a consequência exacta?",
+   "options": [
+    "Nenhuma, desde que a tabela tenha uma restrição de unicidade sobre a chave.",
+    "Existe uma janela entre o commit do pagamento e a gravação da chave em que um retry cria um pagamento duplicado.",
+    "A chave nunca é gravada se o pagamento falhar, o que impede repetições legítimas.",
+    "O pagamento fica bloqueado até o registo de idempotência ser confirmado por outra instância."],
+   "answer": 1,
+   "explain": "A restrição de unicidade só protege depois de a linha existir; entre o commit do pagamento e a inserção da chave há uma janela de milissegundos — precisamente onde o timeout do cliente dispara — em que uma repetição não encontra chave nenhuma e cria um segundo pagamento. A correcção é reservar a chave antes (com `ON CONFLICT DO NOTHING` numa transacção própria) e concluir o registo na mesma transacção do efeito de negócio."},
+
+  {"q": "Uma API pública devolve `HTTP 200` com `{\"sucesso\": false, \"erro\": \"SALDO_INSUFICIENTE\"}` para falhas de negócio. Qual é o custo operacional mais grave desta decisão?",
+   "options": [
+    "O corpo da resposta fica maior do que o necessário, aumentando o consumo de largura de banda.",
+    "Os clientes têm de fazer parsing do JSON para descobrir se o pedido falhou, o que aumenta a latência.",
+    "A taxa de erro medida pelo gateway, pelos painéis e pelos SLO fica a 0% enquanto uma fracção real dos pedidos falha.",
+    "O tipo de conteúdo deixa de ser `application/problem+json`, o que quebra os SDKs gerados por OpenAPI."],
+   "answer": 2,
+   "explain": "O código de estado é a única informação que proxies, painéis e alertas sabem ler sem conhecer o domínio; devolver `200` para falhas torna a métrica de disponibilidade cega e um alerta que nunca dispara. O tamanho do corpo e o parsing são irrelevantes em ordem de grandeza, e o tipo de conteúdo é uma consequência menor face à perda de sinal operacional."}
+]}

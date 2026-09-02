@@ -1,0 +1,46 @@
+{"chapter": 17, "questions": [
+  {"q": "Num serviço Spring Boot 3.5 estruturado em hexagonal, a porta de saída do pagamento está declarada como `interface PaymentGateway { PaymentIntent charge(...) throws StripeException; }`, onde `PaymentIntent` e `StripeException` vêm do SDK do fornecedor. Qual é a consequência técnica?",
+   "options": [
+     "Nenhuma relevante: a interface está no interior, logo a regra da dependência é respeitada.",
+     "O núcleo continua a depender do SDK — precisa do jar em compilação — e a inversão é apenas cosmética.",
+     "Impede o Spring de criar o bean do adaptador porque a interface expõe tipos de terceiros.",
+     "Obriga a marcar o serviço de aplicação com `@Transactional(noRollbackFor = StripeException.class)`."],
+   "answer": 1,
+   "explain": "O que define a regra da dependência não é onde a interface está declarada, mas que nomes atravessam a assinatura. Com tipos e excepções do SDK no contrato, o módulo do domínio deixa de compilar sem a dependência do fornecedor. A opção 0 confunde localização com acoplamento; a criação de beans é indiferente aos tipos usados; e o rollback de transacção nada tem a ver com a fronteira arquitectural."},
+
+  {"q": "A regra «um cliente não pode ter mais de cinco subscrições activas» foi implementada como `if (repo.countActive(customerId) < 5) repo.save(newSubscription);` dentro de um método `@Transactional` sobre PostgreSQL 17 com o isolamento por omissão. Dois pedidos concorrentes chegam ao mesmo tempo. O que acontece?",
+   "options": [
+     "A segunda transacção bloqueia na contagem até a primeira fazer commit, e a regra é respeitada.",
+     "Ambas contam quatro, ambas inserem, e o cliente fica com seis subscrições activas.",
+     "A segunda transacção falha com `OptimisticLockException` porque a contagem participa no controlo de versão.",
+     "O PostgreSQL detecta a anomalia e aborta uma das transacções com erro de serialização."],
+   "answer": 1,
+   "explain": "Em read committed, um SELECT de contagem não coloca qualquer bloqueio nem impede inserções concorrentes, por isso as duas transacções lêem o mesmo valor e ambas escrevem. A detecção de anomalias por erro de serialização só existe em serializable, e o bloqueio optimista com @Version protege linhas carregadas, não o resultado de uma agregação. A correcção passa por um constraint na base de dados, bloqueio explícito da linha do cliente, ou aceitar a violação transitória com compensação."},
+
+  {"q": "Uma equipa publica em Kafka dentro do método `@Transactional` que grava o agregado, argumentando que assim o evento e o estado ficam consistentes. Qual é o defeito concreto?",
+   "options": [
+     "O produtor Kafka bloqueia a ligação JDBC e esgota o pool de ligações sob carga.",
+     "O broker pode confirmar a mensagem e a transacção reverter a seguir, publicando um facto que nunca existiu.",
+     "As mensagens perdem a ordenação por chave porque são enviadas antes do commit.",
+     "O Kafka rejeita mensagens produzidas dentro de transacções JDBC sem coordenador XA."],
+   "answer": 1,
+   "explain": "A base de dados e o broker são recursos transaccionais distintos: o envio é confirmado imediatamente e o rollback posterior do JDBC não o desfaz, deixando consumidores a reagir a um evento fantasma. O padrão outbox resolve isto ao gravar o evento na mesma transacção e deixar a publicação para um processo separado, com entrega pelo menos uma vez. As restantes opções descrevem efeitos que não decorrem desta combinação."},
+
+  {"q": "Um ecrã de listagem está a 900 ms no p95 e a proposta na equipa é adoptar event sourcing. Qual é a objecção mais forte e tecnicamente correcta?",
+   "options": [
+     "Event sourcing resolveria a latência mas exige Kafka, que a equipa ainda não usa.",
+     "A loja de eventos só procura eficientemente por identificador de agregado, por isso a listagem continuaria a precisar de uma projecção — e o custo real está no versionamento de eventos e no apagamento de dados pessoais.",
+     "Event sourcing impede consultas paginadas, porque os eventos não têm ordem total.",
+     "A latência só melhoraria depois de a loja de eventos ter snapshots de todos os agregados."],
+   "answer": 1,
+   "explain": "Event sourcing é uma decisão sobre o modelo de escrita e auditoria, não uma técnica de aceleração de leituras: qualquer consulta por atributo continua a exigir uma projecção, que é exactamente o que já se pode construir sem event sourcing. Os custos que raramente são ditos são o versionamento de eventos antigos com upcasters e o apagamento de dados pessoais num registo imutável. Os eventos têm ordem por fluxo, e os snapshots servem o carregamento do agregado, não a listagem."},
+
+  {"q": "Numa revisão de código aparece, dentro de `RenewSubscriptionService` (serviço de aplicação), a expressão `if (subscription.getStatus() == ACTIVE && subscription.getFailures() > 2) { ... }`. Qual é a leitura correcta e a correcção adequada?",
+   "options": [
+     "É orquestração legítima; o serviço de aplicação é o sítio das condições de negócio.",
+     "É lógica de domínio a escapar; a condição deve tornar-se um método com nome de negócio na raiz de agregado.",
+     "Deve mover-se para uma `@Query` no repositório para não carregar o agregado desnecessariamente.",
+     "Deve extrair-se para um serviço de domínio que injecte o repositório e recarregue a subscrição."],
+   "answer": 1,
+   "explain": "Um condicional sobre o estado interno de um único agregado é uma decisão de negócio e pertence à raiz desse agregado, onde o estado pode ficar privado e a regra ter um nome do negócio; deixá-lo no caso de uso garante que reaparece noutro fluxo com um limite ligeiramente diferente. O repositório serve para carregar e gravar, não para alojar regras; e um serviço de domínio só se justifica quando a decisão precisa de mais do que um agregado, e mesmo aí recebe-os como argumentos em vez de injectar repositórios."}
+]}

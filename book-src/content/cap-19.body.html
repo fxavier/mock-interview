@@ -1,0 +1,685 @@
+<p>Uma ronda de modelação relacional mede se o candidato consegue escrever, ao vivo, um esquema que sobrevive a três anos de produção — e depois defender cada decisão contra um requisito novo que o entrevistador acrescenta a meio. O que se avalia não é saber recitar as formas normais: é saber onde é que o modelo guarda cada invariante, quanto custa em bytes e em páginas de índice cada escolha de tipo, e o que se parte quando o requisito muda. Onde os candidatos caem é em três sítios previsíveis: usam <code>uuid</code> aleatório como chave primária de uma tabela de 200 milhões de linhas sem saber o que isso faz ao B-tree, resolvem histórico com um <code>deleted_at</code> e ficam sem resposta quando se pergunta pela unicidade do email, e guardam dinheiro em <code>double precision</code>. Este capítulo trata o modelo como aquilo que é — a última linha de defesa da correcção, porque a aplicação será reescrita duas vezes e os dados ficam.</p>
+
+<h2 id="sec-19-1" class="h2"><span class="secnum">19.1</span> Normalização até 3FN e desnormalização deliberada<a class="anchor" href="#sec-19-1" aria-label="ligação">#</a></h2>
+
+<p>As três primeiras formas normais resolvem um problema só: eliminar a possibilidade de o mesmo facto existir em dois sítios com valores diferentes. A 1FN exige valores atómicos e ausência de grupos repetidos — nada de <code>tags</code> em texto separado por vírgulas, nada de <code>phone1</code>, <code>phone2</code>, <code>phone3</code>. A 2FN elimina dependências parciais de parte de uma chave composta: numa tabela com chave <code>(order_id, product_id)</code>, a coluna <code>product_name</code> depende só de metade da chave e tem de sair. A 3FN elimina dependências transitivas entre atributos não-chave: se <code>city</code> se deduz de <code>postcode</code>, a cidade pertence a uma tabela de códigos postais. A BCNF aperta o caso raro em que existe uma dependência funcional sobre um determinante que não é chave candidata; em entrevista basta reconhecer o caso, não o recitar.</p>
+
+<p>O erro simétrico é normalizar factos históricos. A morada de entrega de uma encomenda de 2023 não é uma referência à morada actual do cliente: é um valor congelado no momento da compra. Copiá-la para a tabela <code>sales_order</code> não viola a 3FN, porque não existe dependência funcional entre a encomenda e a morada corrente — são atributos distintos que por acaso tiveram o mesmo valor um dia. O mesmo vale para o preço unitário na linha de encomenda. Um candidato que apresenta <code>order_line.unit_price</code> como redundância a eliminar está a dizer ao entrevistador que nunca reconciliou uma factura.</p>
+
+<p>A desnormalização deliberada entra depois de existir um número. A regra prática que resiste à pergunta seguinte é: só se desnormaliza um agregado quando o plano de execução do <em>join</em> equivalente já foi medido, quando o rácio de leituras para escritas justifica pagar amplificação de escrita, e quando existe um processo de reconciliação que detecta divergência. Um contador <code>order_count</code> na tabela do cliente poupa uma agregação de 40 ms por pedido no p99, mas cria um ponto de contenção: cada encomenda nova passa a fazer <code>UPDATE</code> da mesma linha do cliente, e num cliente empresarial com 300 encomendas por minuto isso é uma fila de escritores no mesmo <em>tuple</em>.</p>
+
+<figure class="listing sql" id="lst-19-1"><div class="lhead"><span class="lnum">Listagem 19.1</span>
+<span class="lcap">Núcleo em 3FN com valores históricos copiados de propósito (PostgreSQL 17).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE customer (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       citext      NOT NULL,
+    vat_number  text,
+    tier        text        NOT NULL DEFAULT 'STANDARD',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    deleted_at  timestamptz,
+    CONSTRAINT customer_tier_ck CHECK (tier IN ('STANDARD','GOLD','PARTNER'))
+);
+CREATE UNIQUE INDEX customer_email_live_uq ON customer (email) WHERE deleted_at IS NULL;
+
+CREATE TABLE product (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku        text          NOT NULL,
+    name       text          NOT NULL,
+    list_price numeric(12,4) NOT NULL CHECK (list_price &gt;= 0),
+    currency   char(3)       NOT NULL,
+    CONSTRAINT product_sku_uq UNIQUE (sku)
+);
+
+CREATE TABLE sales_order (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id   bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    placed_at     timestamptz NOT NULL DEFAULT now(),
+    paid_at       timestamptz,
+    status        text        NOT NULL,
+    -- cópia deliberada: o que valia no momento da compra, não a morada actual
+    ship_line1    text        NOT NULL,
+    ship_city     text        NOT NULL,
+    ship_postcode text        NOT NULL,
+    CONSTRAINT sales_order_status_ck CHECK (status IN ('NEW','PAID','SHIPPED','CANCELLED')),
+    CONSTRAINT sales_order_paid_ck   CHECK (status &lt;&gt; 'PAID' OR paid_at IS NOT NULL)
+);
+CREATE INDEX sales_order_customer_ix ON sales_order (customer_id, placed_at DESC);
+
+CREATE TABLE order_line (
+    order_id   bigint        NOT NULL REFERENCES sales_order(id) ON DELETE CASCADE,
+    line_no    smallint      NOT NULL,
+    product_id bigint        NOT NULL REFERENCES product(id) ON DELETE RESTRICT,
+    qty        integer       NOT NULL CHECK (qty &gt; 0),
+    unit_price numeric(12,4) NOT NULL CHECK (unit_price &gt;= 0),
+    PRIMARY KEY (order_id, line_no)
+);
+CREATE INDEX order_line_product_ix ON order_line (product_id);</code></pre></figure>
+
+<div class="qa" id="q-19-1" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Recebo esta tabela de um colega: <code>invoice(id, customer_email, customer_name, customer_postcode, customer_city, line_items_csv, total)</code>. Leve-a até à 3FN em voz alta e diga o que ganhou e o que perdeu em cada passo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Três passos, um por forma normal, e um quarto passo que reverte parte do trabalho de propósito.</p>
+      <p>1FN: <code>line_items_csv</code> viola a atomicidade. Sai para <code>invoice_line(invoice_id, line_no, product_id, qty, unit_price)</code> com chave <code>(invoice_id, line_no)</code>. Ganho: as linhas passam a ser indexáveis, agregáveis e validáveis por <em>constraint</em>; deixa de ser possível gravar uma linha com quantidade negativa. Perda: ler uma factura completa passa de uma leitura de uma linha para um <em>join</em>, tipicamente um <code>Nested Loop</code> com <em>index scan</em> de 3 a 6 páginas.</p>
+      <p>2FN e 3FN: <code>customer_name</code> e <code>customer_email</code> dependem do cliente, não da factura, e <code>customer_city</code> depende transitivamente de <code>customer_postcode</code>. Saem para <code>customer</code> e, se o negócio for pan-europeu, <code>postcode</code> fica como tabela de referência. Ganho: uma alteração de email é uma escrita, não um <code>UPDATE</code> sobre 400 mil facturas. Perda: perde-se o dado histórico, que é exactamente o que a facturação precisa.</p>
+      <p>Passo quatro, a desnormalização deliberada: o nome e a morada fiscais impressos na factura voltam para <code>invoice</code>, agora como colunas <code>billing_*</code>, e o <code>total</code> fica materializado com uma verificação nocturna contra a soma das linhas. Não é violação de 3FN — é um facto diferente, o valor no momento da emissão. Uma factura emitida é um documento legal imutável; se o modelo permite que a morada da factura mude por um <code>UPDATE</code> noutra tabela, o modelo está errado, por mais normalizado que esteja.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Recita as definições das formas normais sem as aplicar às colunas dadas, ou parte tudo em tabelas sem justificar nenhuma.</td></tr>
+        <tr><td>Mid</td><td>Normaliza correctamente até 3FN, extrai o cliente e as linhas, mas não vê o problema do documento fiscal histórico.</td></tr>
+        <tr><td>Sénior</td><td>Normaliza, identifica a dependência transitiva do código postal e depois reverte deliberadamente os campos de facturação, explicando que são factos distintos.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais o custo de leitura do modelo final, a estratégia de reconciliação do total materializado e o que muda se a empresa passar a emitir notas de crédito.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se um produto for eliminado do catálogo — a factura antiga ainda tem de imprimir o nome?»</li>
+      <li>«Onde é que valida que o total bate certo com as linhas, e com que frequência?»</li>
+      <li>«O que é a BCNF e este esquema está nela?»</li>
+      <li>«Quantos <em>joins</em> custa agora o ecrã de detalhe da factura?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar <code>line_items_csv</code> «porque a aplicação já sabe fazer o <em>parse</em>».</li>
+      <li>Apontar <code>unit_price</code> na linha como redundância a eliminar.</li>
+      <li>Não distinguir referência corrente de valor histórico em nenhum momento.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-2" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O ecrã de listagem de clientes faz uma agregação sobre 40 milhões de encomendas e está a 900 ms no p95. A equipa quer uma coluna <code>order_count</code> no cliente. Qual é a sua posição?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A posição é: ainda não. Uma agregação de 900 ms sobre 40 milhões de linhas quase sempre significa índice em falta ou plano errado, não falta de desnormalização. Com um índice em <code>(customer_id, placed_at DESC)</code> e um <code>count</code> restrito à janela que o ecrã mostra, o mesmo trabalho cai tipicamente para 5-20 ms por cliente. Desnormalizar antes de esgotar isto é comprar dívida permanente para resolver um problema temporário.</p>
+      <p>Se o número persistir depois de o plano estar correcto — porque o ecrã agrega sobre todo o histórico de todos os clientes visíveis —, há três instrumentos por ordem de custo crescente. Primeiro, vista materializada com <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code>: a divergência é limitada pelo intervalo de <em>refresh</em>, ninguém escreve no caminho crítico, e o custo é uma tabela extra a manter. Segundo, coluna mantida por <em>trigger</em>: consistente na mesma transacção, mas serializa escritas na linha do cliente. Terceiro, contador incremental fora da base, em Redis, com reconciliação periódica: rápido, mas passa a existir uma segunda fonte de verdade e um modo de falha que ninguém vê até divergir.</p>
+      <p>O <em>trade-off</em> decisivo é a contenção. Com <em>trigger</em>, 300 encomendas por minuto de um cliente empresarial tornam-se 300 <code>UPDATE</code> na mesma linha; em <em>MVCC</em> isso são 300 versões da linha, mais trabalho de <em>autovacuum</em> e escritores em fila no bloqueio da linha. Se o rácio for de 200 leituras por escrita e a tolerância a atraso for de um minuto, a vista materializada ganha; se o valor tiver de ser exacto no mesmo pedido — um limite de crédito, por exemplo — não há alternativa à coluna transaccional, e aí aceita-se a contenção e mede-se.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aceita a coluna imediatamente, ou recusa-a por «viola a normalização» sem nenhum número.</td></tr>
+        <tr><td>Mid</td><td>Sugere índice ou cache, mas não distingue consistência transaccional de eventual nem menciona custo de escrita.</td></tr>
+        <tr><td>Sénior</td><td>Exige o plano primeiro, apresenta as três opções com o critério de escolha e nomeia a contenção na linha do cliente.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o mecanismo de detecção de divergência, o que acontece no <em>backfill</em> das 40 milhões de linhas e como se reverte a decisão se falhar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como faz o <em>backfill</em> inicial sem bloquear a tabela?»</li>
+      <li>«Que consulta corre para detectar que o contador divergiu, e com que custo?»</li>
+      <li>«E se a encomenda for cancelada — quem decrementa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <em>trigger</em> sem mencionar a contenção nem o <em>autovacuum</em>.</li>
+      <li>Assumir que a cache em Redis é gratuita em correcção.</li>
+      <li>Nunca pedir o plano de execução antes de mudar o modelo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-2" class="h2"><span class="secnum">19.2</span> Chaves primárias: sequencial, UUID e ULID<a class="anchor" href="#sec-19-2" aria-label="ligação">#</a></h2>
+
+<p>A chave primária é a decisão de modelação com maior alcance, porque se propaga a todas as chaves estrangeiras, a todos os índices que as cobrem, a todas as caches e a todos os contratos de API. Em PostgreSQL 17, <code>bigint GENERATED ALWAYS AS IDENTITY</code> ocupa 8 bytes, é a forma normalizada do antigo <code>bigserial</code> e produz inserções estritamente crescentes; <code>uuid</code> ocupa 16 bytes e, na versão 4, é aleatório em todos os 122 bits úteis. A diferença de 8 bytes por coluna parece irrelevante até se contar quantas vezes a chave aparece.</p>
+
+<p>A aritmética do B-tree é o número que separa quem já mediu de quem repete slogans. Uma página de índice tem 8 kB, com cerca de 8 160 bytes utilizáveis. Uma entrada de folha para <code>bigint</code> custa 8 bytes de cabeçalho de tuplo mais 8 de valor mais 4 do ponteiro de linha, à volta de 20 bytes, dando por volta de 400 entradas por página; para <code>uuid</code> são 8 mais 16 mais 4, à volta de 28 bytes, cerca de 290 entradas. São 100 milhões de linhas em aproximadamente 2,1 GB de índice contra 2,9 GB. Mas o custo maior não é esse: com valores aleatórios, cada inserção vai para uma folha imprevisível, o que provoca divisões de página constantes e deixa as folhas com 50-70% de ocupação — o índice real cresce para 4 GB e o conjunto de páginas tocadas por inserção deixa de caber em <code>shared_buffers</code>. Numa tabela com escrita intensa, é comum ver a taxa de inserção cair para metade ou menos quando o índice ultrapassa a memória disponível, com <em>random I/O</em> onde antes havia acrescento sequencial.</p>
+
+<p>UUIDv7, definido no RFC 9562, resolve exactamente isto: 48 bits iniciais de timestamp em milissegundos seguidos de aleatoriedade, ordenável no tempo. O ULID tem a mesma propriedade com outra codificação textual. Em PostgreSQL 17 não existe gerador de UUIDv7 no núcleo — <code>gen_random_uuid()</code> produz v4 —, portanto gera-se na aplicação (Java 21, com uma biblioteca ou 20 linhas sobre <code>SecureRandom</code>) ou numa função SQL própria. Guardar UUID como <code>varchar(36)</code> é o erro de custo mais alto e mais silencioso: 37 bytes em vez de 16, comparações por texto em vez de por 128 bits, e um índice mais de duas vezes maior.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.1</span> Estratégias de chave primária, para uma tabela de 100 milhões de linhas com três chaves estrangeiras a apontar-lhe.</div>
+<div class="tscroll"><table><thead><tr><th>Estratégia</th><th>Bytes por linha (PK + 3 FK)</th><th>Localidade de escrita</th><th>Índice PK aproximado</th><th>Quando é a escolha certa</th></tr></thead><tbody>
+<tr><td><code>bigint</code> identity</td><td>32</td><td>Acrescento no fim; folhas cheias</td><td>≈ 2,1 GB</td><td>Uma só base a gerar ids; ids nunca expostos ao exterior ou expostos sem risco de enumeração.</td></tr>
+<tr><td><code>uuid</code> v4</td><td>64</td><td>Aleatória; divisões de página, folhas a 50-70%</td><td>≈ 3,5-4 GB</td><td>Ids gerados por vários produtores sem coordenação e sem qualquer ordenação temporal desejável.</td></tr>
+<tr><td><code>uuid</code> v7 / ULID</td><td>64</td><td>Quase sequencial por milissegundo</td><td>≈ 2,9 GB</td><td>Ids gerados no cliente ou em vários serviços, com escrita intensa; o defeito razoável hoje.</td></tr>
+<tr><td><code>varchar(36)</code> com UUID</td><td>148</td><td>Aleatória, com comparação textual</td><td>≈ 7 GB</td><td>Nunca; só existe por migração descuidada de um ORM.</td></tr>
+<tr><td>Chave natural composta</td><td>variável, tipicamente 40-120</td><td>Depende do primeiro atributo</td><td>Muito variável</td><td>Tabelas de associação puras e tabelas de referência estáveis (código ISO, código de moeda).</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Trocar <code>bigint</code> por <code>uuid</code> numa tabela de 100 milhões de linhas referenciada por três tabelas filhas acrescenta cerca de 32 bytes por linha em dados e mais 0,8 GB por cada índice de chave estrangeira. Com quatro índices envolvidos, o custo total ronda 6-8 GB de armazenamento adicional e a mesma proporção de páginas extra a competir por <code>shared_buffers</code>. Passar de v4 para v7 não devolve os bytes, mas devolve a localidade: as divisões de página desaparecem e a densidade das folhas volta a 85-90%.</p></aside>
+
+<figure class="listing sql" id="lst-19-2"><div class="lhead"><span class="lnum">Listagem 19.2</span>
+<span class="lcap">Medir o efeito real da chave: densidade e fragmentação das folhas do B-tree.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS pgcrypto;     -- gen_random_uuid() = UUIDv4
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+CREATE TABLE event_v4 (
+    id         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- UUIDv7 (RFC 9562): 48 bits de tempo + aleatoriedade. PostgreSQL 17 não o gera
+-- em core; o id chega já preenchido pela aplicação.
+CREATE TABLE event_v7 (
+    id         uuid        PRIMARY KEY,
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE event_seq (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- depois da carga: o que interessa é avg_leaf_density e leaf_fragmentation
+SELECT 'v4'  AS k, * FROM pgstatindex('event_v4_pkey')
+UNION ALL
+SELECT 'v7',       * FROM pgstatindex('event_v7_pkey')
+UNION ALL
+SELECT 'seq',      * FROM pgstatindex('event_seq_pkey');
+
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS heap
+FROM pg_class WHERE relname LIKE 'event\_%' AND relkind = 'r';</code></pre></figure>
+
+<div class="qa" id="q-19-3" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A tabela de eventos vai receber 30 mil inserções por segundo e crescer para mil milhões de linhas. A equipa propõe <code>uuid</code> gerado com <code>gen_random_uuid()</code> como chave primária. O que responde?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Respondo que a decisão de gerar o id fora da base é boa e a versão do UUID é má. <code>gen_random_uuid()</code> produz v4, aleatório em todos os bits úteis; a mudança é para UUIDv7, gerado na aplicação, que mantém as garantias de unicidade sem coordenação e acrescenta ordenação temporal.</p>
+      <p>O mecanismo é a localidade de escrita no B-tree. Com v4, cada inserção aterra numa folha aleatória do índice. Com mil milhões de linhas, o índice da chave primária tem 3 a 4 GB; se <code>shared_buffers</code> forem 8 GB numa máquina com outros índices a competir, a folha alvo raramente está em memória e cada inserção paga uma leitura aleatória, mais a escrita da página suja, mais divisões de página quando a folha enche. As folhas estabilizam com 50-70% de ocupação. Com v7, as inserções concentram-se nas últimas folhas: praticamente sem divisões, densidade a 85-90%, e o conjunto de trabalho de escrita reduz-se a algumas dezenas de páginas quentes independentemente do tamanho da tabela.</p>
+      <p>Aos 30 mil por segundo, isto é a diferença entre caber e não caber. Vale a pena acrescentar duas coisas na mesma resposta. Primeira: a 30 mil eventos por segundo, uma tabela única não chega; particiona-se por intervalo em <code>created_at</code>, o que também torna a remoção por retenção um <code>DETACH PARTITION</code> em vez de um <code>DELETE</code> de mil milhões de linhas. Segunda: o custo do v7 é revelar o instante de criação a quem vir o id — se o id for público e o tempo de criação for informação sensível, ou se o requisito for id opaco e não enumerável, então v4 é a escolha certa e paga-se a fragmentação, ou usa-se v7 interno com um identificador público separado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«UUID é sempre melhor porque evita colisões» ou «sequencial é sempre melhor», sem falar de índices.</td></tr>
+        <tr><td>Mid</td><td>Sabe que UUID aleatório fragmenta o índice, mas não explica divisões de página nem relaciona com a memória disponível.</td></tr>
+        <tr><td>Sénior</td><td>Explica a localidade de escrita no B-tree com números, propõe v7 e nomeia o custo de expor o tempo de criação.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta particionamento e retenção, o impacto nas chaves estrangeiras e na replicação, e como migraria uma tabela já em produção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como migra uma tabela de 400 milhões de linhas de v4 para v7 sem parar o serviço?»</li>
+      <li>«Qual é o efeito no volume de WAL e na replicação?»</li>
+      <li>«Porque não usar <code>bigint</code> com uma sequência com <code>CACHE</code> alto?»</li>
+      <li>«O que muda se o id for a chave de particionamento?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Guardar o UUID em <code>varchar(36)</code> ou <code>text</code>.</li>
+      <li>Não saber que <code>gen_random_uuid()</code> é v4.</li>
+      <li>Afirmar que o problema se resolve com <code>REINDEX</code> periódico.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-4" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O domínio já tem identificadores únicos naturais: IBAN para a conta, ISIN para o instrumento, número de contribuinte para a entidade. Porque não usá-los directamente como chaves primárias?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque nenhuma das três propriedades que uma chave primária precisa está garantida por uma chave natural: imutabilidade, estreiteza e disponibilidade no momento da inserção. O padrão é chave <em>surrogate</em> interna como primária e a chave natural como <code>UNIQUE NOT NULL</code>.</p>
+      <p>Imutabilidade: os identificadores naturais mudam. Um IBAN muda quando o banco é adquirido e migra os códigos; um número de contribuinte muda numa fusão de sociedades; um SKU é reatribuído quando o catálogo é reestruturado. Se essa coluna for a chave primária, cada alteração propaga-se por <code>ON UPDATE CASCADE</code> a todas as tabelas filhas — uma escrita de negócio trivial torna-se um <code>UPDATE</code> de milhões de linhas com bloqueios em cadeia.</p>
+      <p>Estreiteza: um IBAN tem até 34 caracteres. Como chave primária propagada a cinco tabelas filhas, são cerca de 35 bytes por linha em cada uma, contra 8 de um <code>bigint</code>. Numa tabela de movimentos com 500 milhões de linhas, são mais de 13 GB só na coluna e outro tanto em cada índice que a inclua, além de comparações de texto com colação em vez de comparação de inteiros.</p>
+      <p>Disponibilidade: a entidade tem de existir no modelo antes de o identificador natural ser conhecido — um cliente em <em>onboarding</em> cria-se antes de o número de contribuinte ser validado. Com chave natural, ou se inventa um valor de sentinela, ou se atrasa a criação da linha.</p>
+      <p>A escolha contrária é legítima em dois casos: tabelas de referência estáveis, onde o código ISO da moeda ou do país é a chave primária e a legibilidade das consultas compensa; e tabelas de associação puras, onde a chave é o par de chaves estrangeiras e não há nada mais a identificar.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Usa-se sempre um id auto-incremento», sem justificação, ou aceita a chave natural sem ver o problema da mutação.</td></tr>
+        <tr><td>Mid</td><td>Menciona que a chave natural pode mudar, mas não quantifica a propagação nem fala de largura.</td></tr>
+        <tr><td>Sénior</td><td>Dá as três propriedades com exemplos do domínio e mantém a chave natural como <code>UNIQUE</code>, com números de custo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta os casos em que a chave natural ganha e discute a estabilidade da chave de negócio nos contratos de integração externos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se o cliente externo integra pelo ISIN, que id expõe na API?»</li>
+      <li>«O que faz quando o mesmo IBAN reaparece com outra entidade?»</li>
+      <li>«Onde põe a validação de formato do IBAN — <code>CHECK</code>, domínio ou aplicação?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar cair a <code>UNIQUE</code> sobre a chave natural depois de criar a <em>surrogate</em>.</li>
+      <li>Usar <code>ON UPDATE CASCADE</code> como resposta ao problema da mutabilidade.</li>
+      <li>Expor a chave sequencial interna numa API pública sem pensar em enumeração.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-3" class="h2"><span class="secnum">19.3</span> Constraints, integridade referencial e a defesa em profundidade<a class="anchor" href="#sec-19-3" aria-label="ligação">#</a></h2>
+
+<p>O argumento contra <em>constraints</em> na base — «a validação está na aplicação» — falha por uma razão empírica: a aplicação não é o único escritor. Ao longo da vida de um sistema escrevem na base o serviço principal, um segundo serviço criado dois anos depois, os <em>scripts</em> de migração, as correcções manuais em incidente, a ferramenta de importação de dados e o pipeline de reprocessamento. A <em>constraint</em> é a única regra que todos esses caminhos atravessam. O custo é conhecido e pequeno: uma chave estrangeira acrescenta uma verificação por índice na inserção do filho e um bloqueio <code>FOR KEY SHARE</code> na linha do pai, tipicamente unidades de microssegundos quando o índice está em memória.</p>
+
+<p>O erro operacional mais frequente com chaves estrangeiras é não indexar a coluna do lado filho. O PostgreSQL cria automaticamente o índice da chave primária, nunca o do lado que referencia. Sem ele, cada <code>DELETE</code> ou <code>UPDATE</code> da chave no pai obriga a uma varredura sequencial completa da tabela filha para verificar a restrição: numa filha de 50 milhões de linhas, um apagamento de uma linha do pai passa de sub-milissegundo para vários segundos, com o bloqueio a ser mantido durante todo esse tempo.</p>
+
+<p><code>ON DELETE CASCADE</code> merece a mesma desconfiança. É correcto quando o filho não tem existência independente do pai — linhas de encomenda, endereços de um perfil — e perigoso quando a cardinalidade é grande ou desconhecida: apagar um <em>tenant</em> com 12 milhões de linhas em cascata é uma única transacção que gera gigabytes de WAL, mantém bloqueios em todas as tabelas envolvidas e não tem ponto de retoma se falhar a meio. Para essas relações usa-se <code>ON DELETE RESTRICT</code> e um processo de eliminação por lotes com transacções curtas, ou apagamento por partição.</p>
+
+<figure class="listing sql" id="lst-19-3"><div class="lhead"><span class="lnum">Listagem 19.3</span>
+<span class="lcap">Invariantes que o modelo garante e a aplicação não consegue: unicidade condicional, não-sobreposição e adição sem bloqueio longo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- Adicionar FK a uma tabela grande sem manter bloqueio durante a validação:
+-- NOT VALID só verifica as linhas novas; VALIDATE varre com bloqueio fraco.
+ALTER TABLE sales_order
+    ADD CONSTRAINT sales_order_customer_fk FOREIGN KEY (customer_id)
+    REFERENCES customer(id) ON DELETE RESTRICT NOT VALID;
+ALTER TABLE sales_order VALIDATE CONSTRAINT sales_order_customer_fk;
+
+-- Um único contrato activo por cliente: unicidade parcial, impossível com UNIQUE
+CREATE TABLE contract (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    started_at  timestamptz NOT NULL,
+    ended_at    timestamptz,
+    CONSTRAINT contract_period_ck CHECK (ended_at IS NULL OR ended_at &gt; started_at)
+);
+CREATE UNIQUE INDEX contract_one_active_uq
+    ON contract (customer_id) WHERE ended_at IS NULL;
+
+-- Preços com períodos que não se podem sobrepor para o mesmo produto
+CREATE TABLE price_period (
+    product_id   bigint        NOT NULL REFERENCES product(id) ON DELETE CASCADE,
+    valid_during tstzrange     NOT NULL,
+    amount       numeric(12,4) NOT NULL CHECK (amount &gt;= 0),
+    EXCLUDE USING gist (product_id WITH =, valid_during WITH &amp;&amp;)
+);
+
+-- Inserções circulares entre duas tabelas: adiar a verificação até ao COMMIT
+ALTER TABLE department
+    ADD CONSTRAINT department_head_fk FOREIGN KEY (head_employee_id)
+    REFERENCES employee(id) DEFERRABLE INITIALLY IMMEDIATE;
+-- na transacção:  SET CONSTRAINTS department_head_fk DEFERRED;</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Uma <code>UNIQUE</code> sobre <code>(email)</code> numa tabela com <em>soft delete</em> impede reutilizar o email de um registo apagado; substituí-la por índice único parcial <code>WHERE deleted_at IS NULL</code> resolve a unicidade mas deixa de proteger contra dois registos apagados idênticos — que é exactamente o que se quer. O erro simétrico, mais caro, é remover a <code>UNIQUE</code> e não criar o índice parcial: a partir daí a base aceita duplicados e a aplicação passa a ter de os tratar em cada leitura.</p></aside>
+
+<div class="qa" id="q-19-5" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O arquitecto quer o esquema sem chaves estrangeiras nem <code>CHECK</code>: «a validação é responsabilidade do domínio e as <em>constraints</em> custam desempenho». Argumente contra ou a favor.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Argumento contra, com uma concessão. A validação de negócio pertence ao domínio; os invariantes estruturais pertencem à base, porque a base é o único ponto por onde passam todos os escritores. Ao fim de três anos, escrevem na tabela o serviço original, um segundo serviço, migrações, correcções manuais em incidente e um importador. A regra que só existe em Java não é aplicada por nenhum destes.</p>
+      <p>O argumento de desempenho é mensurável e pequeno. Uma chave estrangeira custa uma pesquisa por índice na tabela pai por linha inserida e um bloqueio <code>FOR KEY SHARE</code> na linha referenciada — microssegundos quando o índice está em <code>shared_buffers</code>. Um <code>CHECK</code> é uma avaliação de expressão sobre a linha em memória, ruído estatístico. Em inserções em massa, desactiva-se temporariamente com <code>ALTER TABLE ... DISABLE TRIGGER</code> ou carrega-se para uma partição sem restrições e valida-se depois — a solução é operacional, não é apagar a regra.</p>
+      <p>O custo real das <em>constraints</em> é outro e vale a pena nomeá-lo primeiro, porque é o que mostra experiência: rigidez em migrações. Adicionar uma coluna <code>NOT NULL</code> sem valor por omissão a uma tabela de 200 milhões de linhas, ou uma chave estrangeira validada de imediato, mantém um bloqueio longo. A resposta é <code>ADD CONSTRAINT ... NOT VALID</code> seguido de <code>VALIDATE CONSTRAINT</code>, que corre com um bloqueio muito mais fraco, e nunca é «não pôr a restrição».</p>
+      <p>A concessão: regras que dependem de estado externo ou que mudam a cada campanha — limites de desconto, elegibilidade, políticas de preço — não devem ser <code>CHECK</code>. Alterá-las exige migração e não devem ser bloqueadas por uma janela de manutenção. A linha divisória é: se a regra falhar, os dados ficam corrompidos ou apenas indesejados? Corrompidos vai para a base.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Concorda com o arquitecto, ou defende <em>constraints</em> por dogma sem nenhum custo mensurável.</td></tr>
+        <tr><td>Mid</td><td>Defende as <em>constraints</em> pela integridade, mas não sabe quantificar o custo nem lidar com migrações.</td></tr>
+        <tr><td>Sénior</td><td>Argumento dos múltiplos escritores, custo real quantificado, <code>NOT VALID</code>/<code>VALIDATE</code>, e a linha divisória entre invariante e política.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta como isto se aplica em vários serviços sobre a mesma base, o efeito em <em>schema evolution</em> e o processo de aprovação de migrações.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como adiciona uma coluna <code>NOT NULL</code> a 200 milhões de linhas sem indisponibilidade?»</li>
+      <li>«E se dois serviços diferentes escreverem na mesma tabela com regras diferentes?»</li>
+      <li>«Que <em>constraint</em> já teve de remover em produção e porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>«As <em>constraints</em> são lentas» sem nunca ter medido.</li>
+      <li>Não conhecer <code>NOT VALID</code> nem o efeito dos bloqueios em <code>ALTER TABLE</code>.</li>
+      <li>Propor validação só na aplicação num sistema com mais de um escritor.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-6" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um pedido de esquecimento apaga um cliente com <code>ON DELETE CASCADE</code> em sete tabelas, uma delas com 12 milhões de linhas desse cliente. O que espera que aconteça e o que faria diferente?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Espero uma transacção única de longa duração, gigabytes de WAL, bloqueios exclusivos nas sete tabelas até ao <code>COMMIT</code>, replicação em atraso e nenhum ponto de retoma se falhar. Se alguma das tabelas filhas não tiver índice na coluna da chave estrangeira, acrescenta-se uma varredura sequencial completa por cada nível da cascata.</p>
+      <p>Há ainda dois efeitos menos óbvios. O <em>autovacuum</em> tem 12 milhões de tuplos mortos para recolher depois do <code>COMMIT</code>, e o espaço em disco não é devolvido ao sistema de ficheiros — a tabela fica com o mesmo tamanho e espaço livre interno. E a cascata é silenciosa: ninguém no código da aplicação vê quantas linhas foram apagadas, o que torna impossível auditar a operação exigida pelo próprio requisito de conformidade que a motivou.</p>
+      <p>O que faço diferente: <code>ON DELETE RESTRICT</code> nas relações de cardinalidade alta e um processo explícito de eliminação. Apaga-se por lotes de 5 000 a 50 000 linhas, cada lote em transacção própria, da folha para a raiz da árvore de dependências, com registo de progresso numa tabela de trabalho para poder retomar. Se a tabela grande estiver particionada pelo cliente ou pelo <em>tenant</em>, o caminho preferido é <code>DETACH PARTITION</code> seguido de <code>DROP TABLE</code>, que é uma operação de metadados em vez de 12 milhões de apagamentos.</p>
+      <p>Quando a cascata é a escolha certa: relações de composição estrita e cardinalidade pequena e limitada — linhas de encomenda, moradas de um perfil, permissões de um utilizador —, onde o filho não tem existência sem o pai e a contagem é conhecida às dezenas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Funciona, a base trata disso» — não vê nem a duração da transacção nem os bloqueios.</td></tr>
+        <tr><td>Mid</td><td>Vê que será lento e sugere apagar por lotes, mas não fala de WAL, replicação, índices de FK nem auditoria.</td></tr>
+        <tr><td>Sénior</td><td>Descreve transacção longa, WAL, bloqueios, <em>autovacuum</em> e falta de índice na FK; propõe lotes com retoma e nomeia quando a cascata é correcta.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta particionamento com <code>DETACH</code>, a trilha de auditoria da eliminação e a distinção entre apagar e anonimizar quando há obrigação legal de reter.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como sabe se as colunas de chave estrangeira estão indexadas? Escreva a consulta.»</li>
+      <li>«E se a lei obrigar a reter as facturas sete anos?»</li>
+      <li>«Qual o tamanho de lote e como o calibra?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não saber que o PostgreSQL não indexa automaticamente o lado filho da chave estrangeira.</li>
+      <li>Achar que <code>DELETE</code> devolve espaço ao sistema de ficheiros.</li>
+      <li>Confundir apagamento com anonimização perante um requisito de retenção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-4" class="h2"><span class="secnum">19.4</span> Modelar tempo: histórico, soft delete e auditoria<a class="anchor" href="#sec-19-4" aria-label="ligação">#</a></h2>
+
+<p>Três requisitos são frequentemente confundidos num só. «Poder repor um registo apagado» é reversibilidade. «Saber qual era o escalão do cliente em Março» é histórico de estado. «Saber quem alterou o quê e quando» é auditoria. Cada um tem a sua estrutura: reversibilidade resolve-se com um estado no próprio registo, histórico com versões com validade temporal, auditoria com um registo imutável de eventos. Responder aos três com um <code>deleted_at</code> é o erro mais comum desta secção.</p>
+
+<p>O <em>soft delete</em> tem quatro custos concretos. Primeiro, unicidade: qualquer <code>UNIQUE</code> passa a incluir linhas apagadas e tem de se tornar índice único parcial. Segundo, integridade referencial: a chave estrangeira continua a ver a linha apagada, portanto a base deixa de impedir que um registo vivo aponte para um pai apagado — o invariante muda-se para a aplicação, que é onde não devia estar. Terceiro, todas as consultas passam a precisar do predicado; uma esquecida numa junção é uma fuga de dados que passa nos testes porque em ambiente de teste não há registos apagados. Quarto, custo de leitura: numa tabela em que 60% das linhas estão apagadas, cada varredura de índice lê aproximadamente 2,5 vezes mais entradas do que o resultado útil, salvo se todos os índices relevantes forem parciais.</p>
+
+<p>Para histórico, o padrão robusto em PostgreSQL 17 é uma tabela de versões com um intervalo <code>tstzrange</code> e uma restrição <code>EXCLUDE</code> que impede sobreposições — o equivalente prático a uma dimensão de tipo 2 de <em>data warehouse</em>. O PostgreSQL 17 não tem tabelas com versionamento de sistema como as definidas no SQL:2011, portanto a escrita das versões é feita por <em>trigger</em> ou pela camada de aplicação. Vale a pena distinguir tempo de validade — quando o facto foi verdadeiro no mundo — de tempo de transacção — quando a base soube dele; sistemas financeiros e de seguros precisam dos dois, e é a essa modelação bitemporal que uma pergunta de <em>deep dive</em> costuma chegar.</p>
+
+<figure class="listing sql" id="lst-19-4"><div class="lhead"><span class="lnum">Listagem 19.4</span>
+<span class="lcap">Histórico com intervalos sem sobreposição e consulta ao estado numa data.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE customer_version (
+    customer_id  bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    valid_during tstzrange   NOT NULL,   -- tempo de validade (mundo real)
+    recorded_at  timestamptz NOT NULL DEFAULT now(),  -- tempo de transacção
+    recorded_by  text        NOT NULL DEFAULT current_user,
+    email        citext      NOT NULL,
+    tier         text        NOT NULL,
+    EXCLUDE USING gist (customer_id WITH =, valid_during WITH &amp;&amp;),
+    CONSTRAINT customer_version_ck CHECK (NOT isempty(valid_during))
+);
+CREATE INDEX customer_version_ix ON customer_version USING gist (valid_during);
+
+-- Estado do cliente 42 em 1 de Março de 2026
+SELECT tier, email
+FROM   customer_version
+WHERE  customer_id = 42
+  AND  valid_during @&gt; timestamptz '2026-03-01 00:00:00+00';
+
+-- Fechar a versão corrente e abrir a nova, atomicamente
+BEGIN;
+UPDATE customer_version
+   SET valid_during = tstzrange(lower(valid_during), now(), '[)')
+ WHERE customer_id = 42 AND upper_inf(valid_during);
+INSERT INTO customer_version (customer_id, valid_during, email, tier)
+VALUES (42, tstzrange(now(), NULL, '[)'), 'ana@exemplo.pt', 'GOLD');
+COMMIT;</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Soft delete</em> dá reversibilidade imediata e custa correcção: unicidade, integridade referencial e um predicado obrigatório em cada consulta. Apagamento verdadeiro com cópia para uma tabela de arquivo dá um modelo limpo e custa um caminho de reposição escrito à mão. A escolha inverte-se quando a taxa de reposição é significativa — acima de uns poucos por cento das eliminações — ou quando o registo é referenciado por outros vivos; abaixo disso, arquivar e apagar sai mais barato ao longo de três anos.</p></aside>
+
+<div class="qa" id="q-19-7" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O <em>soft delete</em> está implementado com <code>deleted_at</code> em 40 tabelas e um filtro no repositório. Que problemas prevê e como os resolveria sem reescrever o sistema?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Prevejo quatro problemas, por ordem de gravidade. O primeiro é a fuga: basta uma consulta que não passe pelo repositório — um relatório, uma junção escrita à mão, um <em>export</em> — para devolver registos apagados. O segundo é a unicidade: todas as <code>UNIQUE</code> passaram a contar linhas apagadas, portanto reutilizar o email de um cliente eliminado falha com violação de restrição. O terceiro é a integridade: a chave estrangeira continua satisfeita por um pai apagado, logo o modelo já não impede um filho vivo pendurado num pai morto. O quarto é o custo de leitura, que cresce com a fracção de registos apagados.</p>
+      <p>Sem reescrever, ataco por três frentes. Substituo cada <code>UNIQUE</code> afectada por índice único parcial <code>WHERE deleted_at IS NULL</code> e torno parciais os índices das consultas quentes — o que reduz simultaneamente o tamanho do índice e o trabalho de varredura. Crio uma vista por tabela, <code>customer_live</code>, com o predicado embutido, e faço com que tudo o que não é caminho de administração leia a vista; onde houver <em>row level security</em> disponível, uma política com <code>USING (deleted_at IS NULL)</code> aplica o filtro mesmo a quem escreve SQL directamente, o que é a única defesa que não depende de disciplina. E acrescento um teste de arquitectura que falha a compilação quando uma consulta nova toca a tabela base em vez da vista.</p>
+      <p>A médio prazo, separo os três requisitos. Reversibilidade fica no <code>deleted_at</code> com janela de retenção curta, tipicamente 30 dias, e uma tarefa que apaga definitivamente ou arquiva depois disso — o que trava o crescimento da fracção morta. Histórico de estado vai para tabelas de versões. Auditoria vai para um registo próprio, imutável, apenas com acrescento.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não vê problema nenhum: «basta filtrar por <code>deleted_at IS NULL</code>».</td></tr>
+        <tr><td>Mid</td><td>Identifica o risco de esquecer o filtro e sugere uma classe base no ORM; não menciona unicidade nem integridade referencial.</td></tr>
+        <tr><td>Sénior</td><td>Enumera unicidade, integridade, fuga e custo, com correcções concretas (índice parcial, vista, RLS) e uma política de retenção.</td></tr>
+        <tr><td>Staff</td><td>Separa reversibilidade, histórico e auditoria como requisitos distintos e desenha o caminho de migração incremental com o custo de cada etapa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que <em>constraint</em> impede um filho vivo de apontar para um pai apagado?»</li>
+      <li>«E quando o requisito de esquecimento obriga a apagar mesmo?»</li>
+      <li>«Como estima a fracção de linhas mortas por tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confiar apenas no filtro do ORM como garantia.</li>
+      <li>Não ver que a chave estrangeira deixou de garantir o invariante.</li>
+      <li>Manter <em>soft delete</em> indefinidamente, sem janela de retenção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-8" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O negócio precisa de responder a «qual era o preço deste produto a 12 de Março?» e também a «que preço é que o sistema achava, a 12 de Março, que estava em vigor a 1 de Janeiro?». Como modela isto?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São duas perguntas em eixos temporais diferentes, portanto o modelo é bitemporal: cada versão tem um intervalo de tempo de validade — quando o preço vigorou no mundo — e um intervalo de tempo de transacção — quando a base conheceu essa afirmação. A primeira pergunta filtra pelo tempo de validade com o tempo de transacção aberto; a segunda fixa os dois.</p>
+      <p>A implementação em PostgreSQL 17 é uma tabela <code>price_version(product_id, valid_during tstzrange, system_during tstzrange, amount numeric(12,4))</code> com <code>EXCLUDE USING gist</code> sobre <code>(product_id WITH =, valid_during WITH &amp;&amp;)</code> restrito às linhas correntes por índice parcial. Uma correcção retroactiva nunca actualiza uma linha: fecha o <code>system_during</code> da afirmação antiga e insere uma nova com o mesmo <code>valid_during</code> e valor diferente. É por isso que o modelo é apenas de acrescento — a reemissão de uma factura de Janeiro continua a produzir o mesmo resultado que produziu em Janeiro.</p>
+      <p>O custo é real e há que dizê-lo. As consultas ganham dois predicados de intervalo e passam a depender de índices GiST, que são maiores e mais lentos a manter do que B-tree; o número de linhas cresce com cada correcção; e a maioria dos ORM não sabe exprimir isto, portanto estas leituras são SQL escrito à mão. A regra de decisão é: se ninguém alguma vez precisar de reconstruir o que o sistema sabia numa data passada — auditoria financeira, cálculo de sinistros, resolução de disputas —, o tempo de transacção é peso morto e uma tabela de versões unitemporal chega.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Uma coluna <code>updated_at</code> e um <em>trigger</em> de auditoria, sem perceber que são duas perguntas distintas.</td></tr>
+        <tr><td>Mid</td><td>Propõe tabela de histórico com <code>valid_from</code>/<code>valid_to</code>, mas não distingue tempo de validade de tempo de transacção.</td></tr>
+        <tr><td>Sénior</td><td>Modelo bitemporal com dois intervalos, apenas com acrescento, e <code>EXCLUDE</code> a garantir não-sobreposição das versões correntes.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo dos índices GiST, o crescimento de linhas, o efeito no ORM e o critério para não fazer bitemporal.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como impede que existam duas versões correntes sobrepostas?»</li>
+      <li>«Que índice serve a consulta “preço em vigor agora”, que é 99% do tráfego?»</li>
+      <li>«Como faz isto sem <code>tstzrange</code>, se a base for MySQL?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Fazer <code>UPDATE</code> sobre versões passadas numa correcção retroactiva.</li>
+      <li>Guardar intervalos como dois <code>timestamp</code> sem restrição de não-sobreposição.</li>
+      <li>Propor bitemporal em todo o lado, sem critério de custo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-5" class="h2"><span class="secnum">19.5</span> Tipos, precisão e dinheiro<a class="anchor" href="#sec-19-5" aria-label="ligação">#</a></h2>
+
+<p>Dinheiro nunca vai para vírgula flutuante binária. Um <code>double precision</code> tem 53 bits de mantissa e não representa exactamente 0,1; somar mil linhas acumula erro e a reconciliação com o extracto bancário falha por cêntimos que ninguém consegue explicar. As duas representações defensáveis são <code>numeric(p,s)</code>, aritmética decimal exacta com escala fixa, e inteiro em unidades menores — cêntimos em <code>bigint</code>. O <code>numeric</code> é mais lento porque a aritmética é feita em software e não em instruções do processador, tipicamente uma ordem de grandeza acima de <code>bigint</code>, mas em cargas OLTP normais o tempo de aritmética é ruído face ao acesso a páginas. O tipo <code>money</code> do PostgreSQL evita-se: a escala depende da configuração regional do servidor.</p>
+
+<p>A escala escolhe-se pelo pior caso do domínio, não pela moeda. Duas casas chegam para guardar totais em euros, mas não para preços unitários de fornecedores, taxas de câmbio ou cálculo de juros; o padrão prático é <code>numeric(18,4)</code> para montantes e <code>numeric(18,8)</code> para taxas, com o arredondamento a acontecer uma única vez, num sítio explícito e documentado. Do lado do Java, mapeia-se para <code>BigDecimal</code> com <code>RoundingMode</code> explícito, nunca para <code>double</code>, e nunca se constrói um <code>BigDecimal</code> a partir de um literal de vírgula flutuante.</p>
+
+<p>Em tempo, a regra é <code>timestamptz</code> por omissão. Os dois tipos ocupam 8 bytes; a diferença é semântica. <code>timestamptz</code> guarda um instante absoluto em UTC e converte na entrada e na saída conforme o <code>TimeZone</code> da sessão; <code>timestamp</code> guarda um par data-hora sem instante associado, o que significa que duas sessões com fusos diferentes lêem o mesmo valor como momentos distintos. Escrever <code>timestamp</code> «porque guardamos sempre UTC» funciona até alguém ligar-se com outra configuração ou até uma transição de hora de Verão duplicar uma hora local. <code>timestamp</code> sem fuso é correcto exactamente num caso: quando o valor é uma hora de parede sem instante — as 09:00 de abertura de uma loja, que são 09:00 locais em todos os dias do ano.</p>
+
+<figure class="listing sql" id="lst-19-5"><div class="lhead"><span class="lnum">Listagem 19.5</span>
+<span class="lcap">Tipos para dinheiro, tempo e domínios enumerados.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE currency (
+    code        char(3)  PRIMARY KEY,          -- ISO 4217
+    minor_unit  smallint NOT NULL CHECK (minor_unit BETWEEN 0 AND 4),
+    active      boolean  NOT NULL DEFAULT true
+);
+
+CREATE TABLE payment (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id      bigint         NOT NULL REFERENCES sales_order(id) ON DELETE RESTRICT,
+    amount        numeric(18,4)  NOT NULL CHECK (amount &gt; 0),
+    currency      char(3)        NOT NULL REFERENCES currency(code),
+    fx_rate       numeric(18,8),                       -- taxa aplicada, se houver
+    amount_eur    numeric(18,4)  NOT NULL,
+    captured_at   timestamptz    NOT NULL DEFAULT now(),  -- instante absoluto
+    settlement_day date          NOT NULL,               -- dia de negócio, decidido a montante
+    store_opens_at time           NOT NULL DEFAULT '09:00'  -- hora de parede, sem instante
+);
+
+-- Porque não double precision: o erro acumula e a reconciliação falha
+SELECT sum(0.1::double precision) AS flutuante,   -- diferente de 1.0
+       sum(0.1::numeric)          AS decimal_exacto
+FROM   generate_series(1, 10);
+
+-- Domínio fechado sem tipo enum: continua a ser uma tabela, com FK
+CREATE TABLE payment_status (
+    code       text PRIMARY KEY,
+    label_pt   text NOT NULL,
+    is_final   boolean NOT NULL
+);
+ALTER TABLE payment
+    ADD COLUMN status text NOT NULL DEFAULT 'PENDING'
+        REFERENCES payment_status(code);</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p><code>numeric(18,4)</code> ocupa cerca de 12 bytes por valor face aos 8 de <code>bigint</code> ou <code>double precision</code>, e a aritmética decimal em software custa aproximadamente uma ordem de grandeza mais do que a inteira. Numa consulta OLTP que lê 40 linhas, isso são microssegundos contra os 200-800 microssegundos de acesso a páginas: irrelevante. Num agregado analítico sobre 200 milhões de linhas, deixa de o ser — e aí a resposta é pré-agregar, não trocar por <code>double</code>.</p></aside>
+
+<div class="qa" id="q-19-9" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Encontra <code>amount double precision</code> na tabela de pagamentos de um sistema em produção com 80 milhões de linhas. Qual é o impacto e como corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O impacto é erro de representação que se acumula e nunca é reprodutível na mesma ordem. O binário de 64 bits do IEEE 754 tem 53 bits de mantissa e não representa exactamente 0,1 nem 0,01; qualquer soma de valores monetários acumula desvio, e o desvio depende da ordem das parcelas — o que significa que a mesma agregação com outro plano de execução, ou paralelizada por mais <em>workers</em>, dá um resultado ligeiramente diferente. Em reconciliação, isto aparece como diferenças de cêntimos que ninguém consegue atribuir.</p>
+      <p>A correcção é <code>numeric(18,4)</code> — ou <code>bigint</code> em unidades menores, se a equipa já estiver disciplinada quanto à moeda. A migração numa tabela de 80 milhões de linhas não se faz com <code>ALTER TABLE ... TYPE</code>, que reescreve toda a tabela com bloqueio exclusivo. O padrão é: acrescentar <code>amount_num numeric(18,4)</code>, que em PostgreSQL 17 é uma alteração de metadados; escrever nas duas colunas a partir da aplicação; preencher o histórico por lotes de dezenas de milhares de linhas com pausa entre lotes para o <em>autovacuum</em> acompanhar; correr uma verificação que compara as duas colunas com a tolerância esperada; trocar a leitura; e só depois deixar cair a coluna antiga.</p>
+      <p>A parte que separa níveis é o que se faz com os dados já corrompidos. O valor gravado é o valor errado, não há como o recuperar do <code>double</code>; é preciso decidir a fonte de verdade — o extracto do processador de pagamentos, os eventos originais em Kafka, os ficheiros de liquidação — e reconstruir a partir dela, com um relatório das linhas que divergem acima do limite aceite. Migrar o tipo sem reconstruir os valores deixa o erro no sítio, agora com aparência de exactidão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Arredonda-se a duas casas na leitura» ou não vê problema nenhum em <code>double</code> para dinheiro.</td></tr>
+        <tr><td>Mid</td><td>Sabe que deve ser <code>numeric</code>/<code>BigDecimal</code> e propõe <code>ALTER TABLE</code> directo, sem ver o bloqueio nem os dados já errados.</td></tr>
+        <tr><td>Sénior</td><td>Explica a mantissa e a dependência da ordem de soma, faz migração em duas colunas por lotes e valida.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a reconstrução a partir da fonte de verdade, o relatório de divergências e o efeito nos relatórios financeiros já emitidos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que escala escolhe e porquê? E para taxas de câmbio?»</li>
+      <li>«Como mapeia em Java sem cair em <code>new BigDecimal(0.1)</code>?»</li>
+      <li>«Quanto tempo bloqueia um <code>ALTER TABLE ... TYPE</code> nessa tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor o tipo <code>money</code> do PostgreSQL.</li>
+      <li>Achar que arredondar na apresentação resolve o erro acumulado.</li>
+      <li>Migrar o tipo e não tocar nos valores históricos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-10" data-box="qa" data-area="dados" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um relatório diário dá totais diferentes conforme a máquina que o corre. As colunas de data são <code>timestamp</code>. Diagnostique e diga o que muda no modelo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O diagnóstico é que <code>timestamp</code> sem fuso não guarda um instante: guarda um par data-hora sem referência. O valor entra convertido — ou não convertido — segundo o <code>TimeZone</code> de quem escreveu, e sai interpretado segundo o de quem lê. Quando o relatório corta o dia com <code>WHERE created_at &gt;= '2026-03-01'</code>, cada máquina com configuração diferente inclui um conjunto diferente de linhas na fronteira. Em Portugal, com hora de Verão, há ainda uma hora local que se repete e outra que não existe.</p>
+      <p>A mudança é <code>timestamptz</code>: 8 bytes, exactamente como <code>timestamp</code>, mas guarda o instante absoluto em UTC e faz a conversão na entrada e na saída pelo fuso da sessão. As comparações passam a ser entre instantes e deixam de depender de quem corre a consulta. Em Java 21, o correspondente é <code>OffsetDateTime</code> ou <code>Instant</code>, nunca <code>LocalDateTime</code>.</p>
+      <p>Falta a parte de modelação, que é o que distingue a resposta. «Dia» é um conceito de negócio, não uma projecção do instante: um pagamento capturado às 23:40 UTC pertence a que dia contabilístico, no fuso do comerciante ou no da empresa? A resposta é uma coluna <code>date</code> explícita — <code>settlement_day</code> — decidida uma vez pela aplicação, à entrada, com o fuso de negócio conhecido. O relatório agrupa por essa coluna, que é indexável e determinística, em vez de aplicar <code>AT TIME ZONE</code> sobre 80 milhões de linhas em cada execução, o que além de ambíguo impede o uso do índice.</p>
+      <p>Onde <code>timestamp</code> sem fuso continua certo: horas de parede recorrentes — abertura da loja às 09:00, um alarme às 07:00 — que devem permanecer 09:00 locais quando o fuso muda.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Configura-se o mesmo fuso em todas as máquinas» e fica-se por aí.</td></tr>
+        <tr><td>Mid</td><td>Sabe que deve ser <code>timestamptz</code>, mas acha que este guarda o fuso e não fala do dia de negócio.</td></tr>
+        <tr><td>Sénior</td><td>Explica a semântica dos dois tipos, corrige o modelo e introduz a coluna de dia de negócio com o fuso decidido a montante.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o mapeamento em Java, o efeito na hora de Verão, a migração dos dados existentes e o efeito no particionamento por data.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«<code>timestamptz</code> guarda o fuso original? Porque não?»</li>
+      <li>«Como converte a coluna existente sem perder informação?»</li>
+      <li>«E se cada <em>tenant</em> tiver o seu fuso contabilístico?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Acreditar que <code>timestamptz</code> guarda o fuso de origem.</li>
+      <li>Agrupar relatórios com <code>AT TIME ZONE</code> sobre a tabela inteira.</li>
+      <li>Mapear para <code>LocalDateTime</code> em Java e assumir UTC por convenção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-11" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Para o estado do pagamento: tipo <code>ENUM</code> do PostgreSQL, <code>text</code> com <code>CHECK</code>, ou tabela de referência com chave estrangeira?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Tabela de referência, salvo em dois casos. O critério é a frequência de mudança do conjunto e a quantidade de atributos que cada valor carrega.</p>
+      <p>O tipo <code>ENUM</code> é compacto — 4 bytes — e rápido, mas o conjunto vive no catálogo, não nos dados. Acrescentar um valor é <code>ALTER TYPE ... ADD VALUE</code>, uma migração; remover ou renomear um valor é bastante mais penoso e, na prática, obriga a recriar o tipo e a reescrever as colunas que o usam. A ordenação é a de declaração, o que surpreende quem espera ordem alfabética, e inserir um valor no meio exige <code>BEFORE</code>/<code>AFTER</code> explícito. Nenhum <em>driver</em> ou ferramenta o trata de forma uniforme.</p>
+      <p><code>text</code> com <code>CHECK (status IN (...))</code> é o meio-termo mais comum: legível, alterável com uma migração que substitui a restrição, e sem nada além do valor. Custa mais bytes por linha do que o <code>ENUM</code> e não permite anexar atributos ao estado.</p>
+      <p>A tabela de referência ganha quando o estado tem propriedades — se é terminal, se é visível ao cliente, a etiqueta traduzida, se permite reembolso. Essas propriedades são dados: passam a poder ser consultadas em SQL, alteradas sem migração de esquema e usadas em junções, em vez de ficarem espalhadas por <code>switch</code> no código. O custo é uma junção — normalmente irrelevante, porque a tabela tem dezenas de linhas e vive nas páginas em cache — e mais uma chave estrangeira a verificar por inserção.</p>
+      <p>Os dois casos em que não uso tabela: conjuntos verdadeiramente imutáveis e sem atributos, como o lado de uma transacção contabilística, onde <code>CHECK</code> chega; e colunas de altíssimo volume onde os 4 bytes do <code>ENUM</code> face aos 8 ou 12 de um código de texto se traduzem em gigabytes numa tabela de milhares de milhões de linhas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe por gosto, sem mencionar migrações nem atributos do estado.</td></tr>
+        <tr><td>Mid</td><td>Prefere <code>ENUM</code> «porque valida», sem saber o custo de alterar o tipo.</td></tr>
+        <tr><td>Sénior</td><td>Compara os três em migração, atributos, bytes e ferramentas, e escolhe com um critério explícito.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito no mapeamento Java e nos contratos de API, e como evolui o conjunto de estados sem quebrar consumidores.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como remove um valor de um <code>ENUM</code> já usado em produção?»</li>
+      <li>«Onde vive a máquina de estados — na base ou no domínio?»</li>
+      <li>«Como mapeia isto para um <code>enum</code> de Java sem partir com um valor novo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Guardar o ordinal do <code>enum</code> de Java na coluna.</li>
+      <li>Não saber que <code>ALTER TYPE ... ADD VALUE</code> é uma migração de esquema.</li>
+      <li>Duplicar a lista de estados na base e no código sem uma fonte única.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-6" class="h2"><span class="secnum">19.6</span> Multi-tenancy no modelo de dados<a class="anchor" href="#sec-19-6" aria-label="ligação">#</a></h2>
+
+<p>Há três desenhos e a escolha faz-se por três eixos: isolamento exigido pelo contrato, custo operacional por <em>tenant</em> e distribuição do tamanho dos <em>tenants</em>. Discriminador partilhado é uma coluna <code>tenant_id</code> em todas as tabelas, com a mesma tabela a servir todos. Schema por <em>tenant</em> replica o conjunto de tabelas dentro da mesma base. Base por <em>tenant</em> replica tudo.</p>
+
+<p>O discriminador escala em número de <em>tenants</em> e é o único desenho em que uma migração é uma operação. O seu ponto fraco é o isolamento: uma cláusula <code>WHERE</code> em falta é uma fuga de dados entre clientes, e é por isso que a coluna <code>tenant_id</code> não deve ser defendida apenas pelo código. A <em>row level security</em> do PostgreSQL aplica o predicado no motor: com <code>FORCE ROW LEVEL SECURITY</code> e uma política ligada a <code>current_setting('app.tenant_id')</code>, uma consulta escrita à mão numa consola continua isolada. O padrão em Spring Boot 3.x é executar <code>SET LOCAL app.tenant_id = ...</code> no início de cada transacção, a partir de um interceptor, para que o valor não sobreviva à devolução da ligação ao <em>pool</em>.</p>
+
+<p>Schema por <em>tenant</em> dá isolamento perceptível e uma via natural de exportação, e paga-se em catálogo e em migrações. Com 2 000 <em>tenants</em> e 40 tabelas cada, são 80 000 relações mais os índices, com efeito no planeamento, no <em>autovacuum</em> e no tempo de <code>pg_dump</code>; uma migração que demore 200 ms por schema demora mais de 6 horas em série e obriga a orquestração, a acompanhamento de progresso e a tolerar o período em que metade dos <em>tenants</em> tem o esquema novo e a outra metade o antigo. Base por <em>tenant</em> dá o isolamento mais forte e o custo mais alto: um <em>pool</em> de ligações por base, cópias de segurança por base, e qualquer relatório agregado passa a ser um processo externo.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.2</span> Estratégias de multi-tenancy, avaliadas para 2 000 <em>tenants</em> com 40 tabelas por <em>tenant</em>.</div>
+<div class="tscroll"><table><thead><tr><th>Eixo</th><th>Discriminador <code>tenant_id</code></th><th>Schema por <em>tenant</em></th><th>Base por <em>tenant</em></th></tr></thead><tbody>
+<tr><td>Isolamento</td><td>Lógico; depende de RLS ou de disciplina no código</td><td>Por objecto; erro de <code>search_path</code> ainda é possível</td><td>Físico; a mais forte</td></tr>
+<tr><td>Migração de esquema</td><td>1 operação</td><td>2 000 operações orquestradas (&gt; 6 h em série a 200 ms cada)</td><td>2 000 operações e 2 000 janelas de manutenção</td></tr>
+<tr><td>Catálogo e planeamento</td><td>40 relações</td><td>≈ 80 000 relações mais índices; <em>autovacuum</em> e <code>pg_dump</code> sofrem</td><td>40 relações por base, mas 2 000 bases a monitorizar</td></tr>
+<tr><td>Ligações</td><td>Um <em>pool</em></td><td>Um <em>pool</em>, com <code>search_path</code> por transacção</td><td>Um <em>pool</em> por base; ou um <em>proxy</em> pelo meio</td></tr>
+<tr><td>Agregação entre <em>tenants</em></td><td>Uma consulta</td><td><code>UNION ALL</code> gerado ou vista externa</td><td>Processo de exportação e armazém de dados</td></tr>
+<tr><td>Raio de impacto de um erro</td><td>Todos os <em>tenants</em></td><td>Um <em>tenant</em> por objecto afectado</td><td>Um <em>tenant</em></td></tr>
+<tr><td>Quando escolher</td><td>SaaS com muitos <em>tenants</em> pequenos; distribuição homogénea</td><td>Dezenas a poucas centenas de <em>tenants</em>, com exigência contratual de separação</td><td>Poucos <em>tenants</em> grandes, requisitos de residência de dados ou de cifra por cliente</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing sql" id="lst-19-6"><div class="lhead"><span class="lnum">Listagem 19.6</span>
+<span class="lcap">Discriminador com particionamento por hash e isolamento imposto pelo motor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE invoice (
+    tenant_id   uuid          NOT NULL,
+    id          bigint        GENERATED ALWAYS AS IDENTITY,
+    number      text          NOT NULL,
+    total       numeric(18,4) NOT NULL CHECK (total &gt;= 0),
+    issued_at   timestamptz   NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, id)
+) PARTITION BY HASH (tenant_id);
+
+CREATE TABLE invoice_p0 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+CREATE TABLE invoice_p1 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 1);
+-- ... p2 a p7
+
+-- numa tabela particionada, o índice único tem de conter a chave de partição
+CREATE UNIQUE INDEX invoice_number_uq ON invoice (tenant_id, number);
+CREATE INDEX invoice_issued_ix        ON invoice (tenant_id, issued_at DESC);
+
+ALTER TABLE invoice ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoice FORCE  ROW LEVEL SECURITY;   -- aplica-se também ao dono da tabela
+
+CREATE POLICY invoice_tenant_isolation ON invoice
+    USING      (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- em cada transacção da aplicação, antes da primeira consulta:
+--   SET LOCAL app.tenant_id = '3f1c...';   -- LOCAL: morre no COMMIT, não polui o pool</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Com o discriminador, <code>tenant_id</code> deve ser a primeira coluna de praticamente todos os índices. Não é uma questão de estética: torna cada índice uma colecção de intervalos contíguos por <em>tenant</em>, o que mantém as leituras de um <em>tenant</em> pequeno em poucas páginas mesmo quando a tabela global tem mil milhões de linhas, e permite ao planeador eliminar partições quando existe particionamento por <code>tenant_id</code>.</p></aside>
+
+<div class="qa" id="q-19-12" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">SaaS B2B com 2 000 <em>tenants</em>: 1 900 têm menos de 10 mil linhas e 4 têm mais de 300 milhões, e dois clientes exigem por contrato que os seus dados estejam separados. Que estratégia de multi-tenancy propõe?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Proponho um modelo híbrido, porque a distribuição é fortemente assimétrica e a exigência contratual só existe para dois clientes: discriminador <code>tenant_id</code> partilhado como padrão, base dedicada para os dois clientes com cláusula de separação, e uma decisão explícita sobre os quatro <em>tenants</em> gigantes.</p>
+      <p>O padrão é o discriminador com <code>tenant_id uuid</code> como primeira coluna de todas as chaves primárias e de todos os índices, particionamento por hash de <code>tenant_id</code>, e <em>row level security</em> com <code>FORCE</code> para que o isolamento não dependa de nenhuma cláusula <code>WHERE</code> escrita à mão. Isto resolve os 1 900 pequenos com uma migração por implantação e um <em>pool</em> de ligações. Schema por <em>tenant</em> está fora: 2 000 schemas por 40 tabelas são 80 000 relações e uma migração que demora horas.</p>
+      <p>Os quatro gigantes são o problema interessante. Com particionamento por hash, cada um cai numa partição e desequilibra-a; a saída é uma lista de partições dedicadas para esses <em>tenants</em> e hash para o resto, ou uma partição por <em>tenant</em> nos que passem um limite acordado, digamos 50 milhões de linhas. Isso mantém as varreduras e o <em>autovacuum</em> contidos por <em>tenant</em> e dá um caminho de saída barato: se um gigante crescer para lá do que a instância aguenta, extrai-se a partição.</p>
+      <p>Os dois clientes contratuais vão para bases dedicadas com o mesmo esquema e o mesmo código; o encaminhamento é uma <code>DataSource</code> escolhida por <em>tenant</em>, com um catálogo de <em>tenants</em> a mapear identificador para <em>datasource</em>. O custo que digo em voz alta: passa a haver dois caminhos de migração e é preciso um teste que garanta que os dois esquemas convergem, além de relatórios agregados que já não são uma consulta única. É o preço de vender a esses dois clientes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe uma das três estratégias sem olhar à distribuição de tamanhos nem ao requisito contratual.</td></tr>
+        <tr><td>Mid</td><td>Propõe discriminador com <code>tenant_id</code> e filtro no repositório; não menciona RLS, particionamento nem os <em>tenants</em> gigantes.</td></tr>
+        <tr><td>Sénior</td><td>Discriminador com RLS e <code>tenant_id</code> à cabeça dos índices, particionamento, e reconhece a necessidade de tratamento especial para os grandes e os contratuais.</td></tr>
+        <tr><td>Staff</td><td>Desenha o híbrido, o encaminhamento de <code>DataSource</code>, a convergência dos esquemas, o custo operacional dos dois caminhos e o critério para promover um <em>tenant</em> a base dedicada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como move um <em>tenant</em> do partilhado para uma base dedicada sem indisponibilidade?»</li>
+      <li>«Onde põe o <code>SET LOCAL</code> do <em>tenant</em> e o que acontece se o esquecer?»</li>
+      <li>«Qual é o custo da RLS no plano de execução e como o mede?»</li>
+      <li>«Como impede um <em>tenant</em> grande de esgotar o <em>pool</em> partilhado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Isolamento assente apenas em filtros do ORM.</li>
+      <li>Propor schema por <em>tenant</em> para 2 000 <em>tenants</em> sem contar as migrações.</li>
+      <li>Não indexar <code>tenant_id</code> como primeira coluna.</li>
+      <li>Guardar o <code>tenant_id</code> numa variável de sessão sem <code>LOCAL</code>, com <em>pool</em> de ligações.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>A RLS aplica o isolamento no motor e sobrevive a SQL escrito à mão, a novos serviços e a correcções em incidente; em troca, o predicado entra em todos os planos e o depuramento fica menos óbvio, porque uma consulta pode devolver zero linhas por causa de uma variável de sessão em falta. Se a base for escrita por um único serviço bem testado e a auditoria não exigir controlo no motor, um filtro central com teste de arquitectura é mais simples; assim que existe um segundo escritor, a RLS deixa de ser opcional.</p></aside>
+
+<h2 id="sec-19-7" class="h2"><span class="secnum">19.7</span> Resumo e checklist<a class="anchor" href="#sec-19-7" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na forma em que é útil dentro da entrevista:</p>
+
+<ul class="lst">
+<li>Normalizar até 3FN é o ponto de partida; copiar valores históricos — preço, morada de facturação — não é violação de 3FN, é modelar factos diferentes.</li>
+<li>Desnormalizar só depois de o plano de execução estar correcto, com rácio de leitura/escrita conhecido e um mecanismo de detecção de divergência.</li>
+<li>A chave primária propaga-se a todas as chaves estrangeiras e índices: 8 bytes de diferença por linha tornam-se gigabytes e páginas a competir por <code>shared_buffers</code>.</li>
+<li>UUIDv4 destrói a localidade de escrita no B-tree — divisões de página e folhas a 50-70%; UUIDv7 ou ULID devolvem a localidade sem exigir coordenação.</li>
+<li>Chave natural fica como <code>UNIQUE</code>, nunca como primária: os identificadores de negócio mudam, são largos e nem sempre existem no momento da inserção.</li>
+<li>As <em>constraints</em> defendem contra todos os escritores, não só contra a aplicação actual; adicionam-se com <code>NOT VALID</code> seguido de <code>VALIDATE</code> para não bloquear tabelas grandes.</li>
+<li><code>ON DELETE CASCADE</code> só em composição estrita e cardinalidade pequena; o lado filho da chave estrangeira precisa sempre de índice.</li>
+<li>Reversibilidade, histórico e auditoria são três requisitos com três estruturas; <em>soft delete</em> exige índices únicos parciais e uma janela de retenção.</li>
+<li>Dinheiro em <code>numeric</code> ou em unidades menores; tempo em <code>timestamptz</code>, com o dia de negócio como coluna <code>date</code> própria.</li>
+</ul>
+
+<p>Checklist para rever um esquema, próprio ou dado numa entrevista:</p>
+
+<ul class="lst">
+<li>Cada tabela tem chave primária declarada e ela é estreita, imutável e disponível na inserção.</li>
+<li>Se a chave é <code>uuid</code>, é v7 ou ULID, é do tipo <code>uuid</code> e não de texto, e existe razão para não ser <code>bigint</code>.</li>
+<li>Toda a coluna de chave estrangeira tem índice; todo o <code>CASCADE</code> tem cardinalidade máxima conhecida.</li>
+<li>Cada invariante estrutural tem <code>NOT NULL</code>, <code>CHECK</code>, <code>UNIQUE</code> ou <code>EXCLUDE</code> — e cada <code>UNIQUE</code> foi revista contra o <em>soft delete</em>.</li>
+<li>Nenhuma coluna monetária é <code>double precision</code>, <code>real</code> ou <code>money</code>; a escala aguenta taxas e preços unitários.</li>
+<li>Todas as colunas de instante são <code>timestamptz</code>; as horas de parede estão identificadas e justificadas.</li>
+<li>Existe resposta escrita para «qual era o valor a 12 de Março» ou existe decisão explícita de não a suportar.</li>
+<li>Em multi-tenancy, <code>tenant_id</code> é a primeira coluna dos índices e o isolamento não depende de nenhuma cláusula <code>WHERE</code> escrita à mão.</li>
+<li>Cada migração pendente foi avaliada quanto ao bloqueio que adquire e ao tempo que o mantém na maior tabela afectada.</li>
+</ul>

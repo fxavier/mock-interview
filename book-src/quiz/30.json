@@ -1,0 +1,46 @@
+{"chapter": 30, "questions": [
+  {"q": "Um tópico tem 24 partições e o produtor escreve com `enable.idempotence=true` e `max.in.flight.requests.per.connection=5`. Que garantia de ordenação existe?",
+   "options": [
+     "Ordem total no tópico, porque a idempotência numera todas as mensagens do produtor.",
+     "Ordem total dentro de cada partição, incluindo em caso de retentativa, porque o broker reordena pela sequência do produtor.",
+     "Nenhuma ordem garantida, porque com `max.in.flight` acima de 1 as mensagens podem ser reordenadas.",
+     "Ordem apenas entre mensagens enviadas no mesmo lote (`batch.size`)."],
+   "answer": 1,
+   "explain": "A idempotência atribui um PID e um número de sequência por partição; o broker rejeita ou reordena pedidos fora de sequência, o que torna seguro manter até 5 pedidos em voo sem perder ordem dentro da partição. Ordem total no tópico nunca existe, porque partições diferentes são logs independentes. Sem idempotência é que `max.in.flight` acima de 1 admitiria reordenação numa retentativa; o `batch.size` só afecta agrupamento, não garantias."},
+
+  {"q": "O consumidor tem `enable.auto.commit=true`, `auto.commit.interval.ms=5000` e cada mensagem demora 300 ms a processar. O pod é morto com SIGKILL a meio de um lote. Qual é o resultado mais provável?",
+   "options": [
+     "Todas as mensagens do lote serão reprocessadas, porque nada foi confirmado.",
+     "Mensagens já confirmadas mas ainda não processadas são perdidas, porque o commit automático confirma o lote devolvido pelo `poll()`.",
+     "Nada se perde nem se repete: o commit automático é transaccional com o processamento.",
+     "O grupo bloqueia até `session.timeout.ms` e depois reprocessa a partir do início do tópico."],
+   "answer": 1,
+   "explain": "O commit automático confirma periodicamente o offset do último lote devolvido pelo `poll()`, não do último efectivamente processado, pelo que a queda pode deixar trabalho confirmado por fazer — perda silenciosa. Reprocessar tudo seria o comportamento de commit manual após o efeito. Não há transacção entre commit e processamento, e `auto.offset.reset` só entraria se não houvesse offset guardado."},
+
+  {"q": "Um serviço lê `pedidos`, escreve em `pedidos-validados` e faz um `INSERT` no PostgreSQL. A equipa activa transacções Kafka com `transactional.id` fixo e `isolation.level=read_committed` nos consumidores. Que garantia passa a existir de ponta a ponta?",
+   "options": [
+     "Exactly-once entre Kafka e PostgreSQL, porque o offset e o INSERT ficam na mesma transacção.",
+     "At-most-once, porque a transacção Kafka reverte o INSERT em caso de falha.",
+     "Exactly-once entre os tópicos Kafka, mas at-least-once para o INSERT, que continua a precisar de deduplicação.",
+     "Nenhuma garantia adicional, porque `read_committed` só afecta a latência de leitura."],
+   "answer": 2,
+   "explain": "A transacção do Kafka é atómica sobre escritas em tópicos Kafka e sobre o commit dos offsets consumidos, e nada mais. Um `INSERT` no PostgreSQL fica fora dessa fronteira: se o processo cair entre o INSERT e o commit da transacção Kafka, a mensagem é reprocessada e o INSERT repete-se, pelo que é preciso uma chave de deduplicação. `read_committed` tem efeito real — esconde registos de transacções não confirmadas e limita a leitura ao Last Stable Offset."},
+
+  {"q": "Um consumidor entra em ciclo de rebalance: processa cerca de 4 minutos por lote e é expulso do grupo, mesmo com a rede saudável. Qual é a correcção certa?",
+   "options": [
+     "Aumentar `session.timeout.ms` para 600000, porque é o timeout que expulsa o membro.",
+     "Baixar `max.poll.records` (ou subir `max.poll.interval.ms`), porque o membro é expulso por demorar demasiado entre chamadas a `poll()`.",
+     "Baixar `heartbeat.interval.ms` para 500 ms para o coordenador saber que o membro está vivo.",
+     "Mudar `auto.offset.reset` para `latest` para saltar o lote lento."],
+   "answer": 1,
+   "explain": "Os batimentos são enviados por uma thread de fundo e continuam durante o processamento, por isso `session.timeout.ms` e `heartbeat.interval.ms` não são a causa: o membro é expulso por exceder `max.poll.interval.ms` entre chamadas consecutivas a `poll()`. A correcção é reduzir o trabalho por lote com `max.poll.records` ou alargar o intervalo máximo. `auto.offset.reset` só se aplica quando não há offset guardado ou ele expirou."},
+
+  {"q": "Um tópico `precos` com `cleanup.policy=compact` alimenta uma vista local em cada serviço. Que afirmação está correcta?",
+   "options": [
+     "Um consumidor que leia do início obtém o histórico completo de alterações de cada preço.",
+     "Um registo com valor nulo é um tombstone: marca a chave para eliminação e desaparece após `delete.retention.ms`.",
+     "A compactação é síncrona com a escrita, pelo que nunca se vêem duas versões da mesma chave.",
+     "Compactação e `retention.ms` são mutuamente exclusivas, pelo que o tópico cresce sem limite."],
+   "answer": 1,
+   "explain": "O tombstone (valor nulo) é o mecanismo de eliminação por chave num log compactado, e `delete.retention.ms` define a janela em que os consumidores ainda o conseguem ver antes de a chave desaparecer. A compactação mantém pelo menos o último valor por chave, logo o histórico de transições não é recuperável; actua de forma assíncrona sobre segmentos fechados, pelo que se podem ler versões antigas; e as políticas combinam-se com `cleanup.policy=compact,delete`."}
+]}

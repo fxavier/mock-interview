@@ -1,0 +1,46 @@
+{"chapter": 12, "questions": [
+  {"q": "Uma entidade `Encomenda` implementa `equals` e `hashCode` sobre o campo `id`, gerado por sequência. O código cria a encomenda com `new`, adiciona-a a um `HashSet` do agregado pai e só depois chama `persist`. Que defeito surge?",
+   "options": [
+     "Nenhum: o `HashSet` recalcula os códigos de dispersão quando o elemento é alterado.",
+     "Depois do `flush`, o `id` deixa de ser nulo, o `hashCode` muda e o elemento fica num *bucket* errado — `contains` devolve `false` sobre o próprio objecto que lá está.",
+     "O `persist` falha com `IdentifierGenerationException` porque o `id` ainda é nulo no momento da inserção no `HashSet`.",
+     "O Hibernate substitui automaticamente `equals` e `hashCode` por comparação de identidade no *proxy*, pelo que o comportamento é sempre correcto."],
+   "answer": 1,
+   "explain": "O `HashSet` calcula o *bucket* no momento da inserção e nunca o recalcula. Com o `hashCode` dependente de um `id` que passa de `null` a um valor no `flush`, o elemento fica inacessível: `contains` e `remove` falham e `orphanRemoval` pode apagar o que não devia. A correcção é uma chave de negócio imutável no `equals` e um `hashCode` constante por classe. As restantes opções inventam comportamentos que nem o `HashSet` nem o Hibernate têm."},
+
+  {"q": "É preciso importar 2 milhões de linhas de um ficheiro CSV para PostgreSQL num serviço Spring Boot 3.5. O primeiro protótipo usa `repository.saveAll(lista)` com `hibernate.jdbc.batch_size=50`. Qual é a avaliação correcta?",
+   "options": [
+     "É a abordagem certa: com `batch_size` definido, o JPA atinge o mesmo débito que o `COPY` do PostgreSQL.",
+     "Basta aumentar `batch_size` para 5 000 para resolver tanto o débito como o consumo de memória.",
+     "O contexto de persistência acumula 2 milhões de entidades e respectivos *snapshots*; para volumes destes usa-se `JdbcTemplate.batchUpdate` ou o `CopyManager`, com uma ordem de grandeza de diferença.",
+     "O problema resolve-se envolvendo o `saveAll` em `@Transactional(readOnly = true)` para desligar o *dirty checking*."],
+   "answer": 2,
+   "explain": "Com 2 milhões de entidades geridas, o contexto de persistência guarda cada objecto mais o seu *snapshot* e o *dirty checking* varre tudo a cada *flush*: é `OutOfMemoryError` antes de ser lentidão. Aumentar o `batch_size` agrava a memória e não toca no problema estrutural; `readOnly` numa escrita é contraditório e o PostgreSQL rejeitaria as inserções. Carregamentos em massa saem do contexto de persistência: `batchUpdate` ou `COPY`, com ganhos entre 25× e 75×."},
+
+  {"q": "Depois de definir `hibernate.jdbc.batch_size=50`, `order_inserts=true` e `order_updates=true`, a contagem de idas e voltas ao inserir entidades continua igual. A chave primária está declarada com `@GeneratedValue(strategy = GenerationType.IDENTITY)`. Porquê?",
+   "options": [
+     "Porque `IDENTITY` obriga o Hibernate a executar cada `INSERT` imediatamente para obter o identificador gerado, o que desactiva o *batching* de inserções.",
+     "Porque `order_inserts` só actua em entidades com `@Version` e a entidade não a tem.",
+     "Porque `batch_size` acima de 20 é ignorado pelo *driver* PostgreSQL.",
+     "Porque o *batching* só funciona com `@Transactional(propagation = REQUIRES_NEW)`."],
+   "answer": 0,
+   "explain": "O Hibernate precisa do identificador para registar a entidade no mapa de identidade, e uma coluna `identity` só o devolve depois de a instrução correr — logo não pode adiar nem agrupar os `INSERT`. A correcção é `GenerationType.SEQUENCE` com `allocationSize` igual ao tamanho do lote. `order_inserts` não depende de `@Version`, o *driver* não ignora o tamanho do lote, e a propagação não tem qualquer relação com o agrupamento JDBC."},
+
+  {"q": "Uma consulta JPQL faz `join fetch` de duas colecções da mesma raiz, ambas mapeadas como `List` sem `@OrderColumn`. O que acontece e qual é a correcção adequada?",
+   "options": [
+     "Corre normalmente; o Hibernate deduplica as linhas do produto cartesiano de forma transparente desde a versão 6.",
+     "Lança `MultipleBagFetchException` no arranque; corrige-se trazendo uma colecção por `join fetch` e a outra por lote, com `default_batch_fetch_size`.",
+     "Lança `LazyInitializationException` na primeira leitura; corrige-se ligando o `open-in-view`.",
+     "Lança `MultipleBagFetchException`; corrige-se mudando `FetchType` das duas colecções para `EAGER`."],
+   "answer": 1,
+   "explain": "Duas *bags* — `List` sem índice de ordem — não podem ser trazidas na mesma consulta porque o produto cartesiano tornaria impossível reconstruir as multiplicidades; o Hibernate falha na criação do repositório com `MultipleBagFetchException`. A saída sã é trazer uma colecção por `join fetch` e as restantes por lote de *fetch*. Passar a `EAGER` mantém o mesmo conflito e alastra-o a todas as consultas; o `open-in-view` é irrelevante aqui."},
+
+  {"q": "Um método executa `@Modifying @Query(\"update Artigo a set a.stock = a.stock - 1 where a.id = :id\")` e, na mesma transacção, faz depois `repository.findById(id)` para devolver o novo valor. O valor devolvido está errado. Porquê?",
+   "options": [
+     "Porque a consulta de modificação em massa não passa pelo contexto de persistência: a entidade já carregada continua na *cache* de primeiro nível com o valor antigo e o `findById` devolve-a sem tocar na base de dados.",
+     "Porque `@Modifying` obriga a `REQUIRES_NEW` e a alteração ainda não foi confirmada.",
+     "Porque o nível de isolamento `READ COMMITTED` impede ler o que a própria transacção escreveu.",
+     "Porque `@Modifying` executa a instrução apenas no `commit`, depois do `findById`."],
+   "answer": 0,
+   "explain": "As instruções de modificação em massa em JPQL ou SQL nativo são enviadas directamente à base de dados: não fazem *dirty checking*, não incrementam `@Version` e não sincronizam o contexto de persistência. O `findById` devolve a instância gerida obsoleta a partir da *cache* de primeiro nível. Resolve-se com `clearAutomatically = true` e `flushAutomatically = true` em `@Modifying`, ou recarregando após `em.clear()`. Uma transacção vê sempre as suas próprias escritas, e `@Modifying` não muda a propagação nem adia a execução."}
+]}

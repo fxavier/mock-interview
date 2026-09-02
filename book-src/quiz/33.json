@@ -1,0 +1,46 @@
+{"chapter": 33, "questions": [
+  {"q": "Um serviço em ECS é implantado com canário a 5% durante 5 minutos. O serviço recebe 8 pedidos por segundo. O <em>workflow</em> promove para 100% porque nenhum alarme disparou. Qual é o problema?",
+   "options": [
+     "O canário devia observar 5% do tráfego durante pelo menos 60 minutos para o alarme ser válido.",
+     "A janela só expõe cerca de 120 pedidos, o que não dá sinal estatístico para distinguir uma taxa de erro de 0,1% de uma de 2%.",
+     "O ECS não suporta encaminhamento por peso no ALB, pelo que os 5% não são reais.",
+     "O canário só funciona se a versão nova e a antiga usarem esquemas de base de dados diferentes."],
+   "answer": 1,
+   "explain": "5% de 8 pedidos por segundo durante 5 minutos são cerca de 120 pedidos: com essa amostra, uma taxa de erro de 2% produz 2 ou 3 falhas, indistinguíveis do ruído. Alargar a janela para 60 minutos ajuda mas torna o <em>lead time</em> impraticável; em serviços de baixo tráfego a escolha correcta é blue-green com reposição rápida, ou sondas sintéticas que gerem carga determinística. O ALB suporta pesos por grupo-alvo, e o canário é ortogonal ao esquema da base de dados."},
+
+  {"q": "Uma migração Flyway adiciona `NOT NULL` a uma coluna existente de uma tabela PostgreSQL com 80 milhões de linhas, e corre no arranque da aplicação com 6 réplicas. Qual é o efeito mais provável?",
+   "options": [
+     "Nada de especial: o PostgreSQL valida a restrição com um bloqueio partilhado que permite leituras e escritas.",
+     "As 6 réplicas corrompem a tabela de histórico do Flyway por escreverem em simultâneo.",
+     "A varredura completa mantém um bloqueio ACCESS EXCLUSIVE durante minutos e as réplicas em espera excedem a sonda de arranque, entrando em ciclo de reinícios.",
+     "O Flyway divide automaticamente a operação em lotes para evitar bloqueios longos."],
+   "answer": 2,
+   "explain": "Adicionar `NOT NULL` a uma coluna existente obriga a uma varredura completa sob ACCESS EXCLUSIVE, que bloqueia leituras e escritas durante minutos numa tabela desse tamanho. O Flyway serializa as réplicas com um bloqueio consultivo — não há corrupção — mas as cinco em espera podem exceder o limite da sonda de arranque e ser reiniciadas em ciclo. O caminho seguro é ADD CONSTRAINT ... CHECK ... NOT VALID seguido de VALIDATE CONSTRAINT, num passo do <em>pipeline</em> e não no arranque."},
+
+  {"q": "O `backend \"s3\"` de uma raiz Terraform tem `bucket`, `key`, `region` e `encrypt = true`, mas nem `dynamodb_table` nem `use_lockfile`. Dois engenheiros correm `apply` ao mesmo tempo. O que acontece?",
+   "options": [
+     "O S3 serializa as escritas do objecto de estado, pelo que o segundo `apply` espera pelo primeiro.",
+     "Não há bloqueio: ambos leem o mesmo estado inicial e a última escrita vence, deixando um estado que não descreve nenhuma das duas intenções.",
+     "O Terraform detecta a concorrência pelo `lineage` do estado e aborta os dois `apply`.",
+     "O versionamento do <em>bucket</em> impede a segunda escrita e devolve um erro de conflito."],
+   "answer": 1,
+   "explain": "Sem `dynamodb_table` (mecanismo clássico) ou `use_lockfile = true` (bloqueio nativo do S3 por escrita condicional, desde o Terraform 1.10) não existe qualquer serialização: os dois processos leem o mesmo estado e o último a escrever sobrepõe-se, ficando recursos criados que o estado não conhece. O versionamento do <em>bucket</em> permite recuperar a versão anterior mas não previne o conflito, e o `lineage` só identifica a origem do estado."},
+
+  {"q": "Um serviço Java com Spring Boot serve 1 200 pedidos por segundo constantes com p99 de 120 ms, e a equipa quer reduzir custo passando para AWS Lambda. Qual é a objecção tecnicamente mais forte?",
+   "options": [
+     "O Lambda não permite ligações a bases de dados em sub-redes privadas.",
+     "A tráfego constante o Lambda é tipicamente mais caro que Fargate, e o arranque a frio da JVM (2-6 s) degrada o p99 sempre que a concorrência sobe.",
+     "O Lambda tem um limite de 100 invocações concorrentes por conta, insuficiente para essa carga.",
+     "O Spring Boot não pode ser empacotado como função Lambda."],
+   "answer": 1,
+   "explain": "O modelo do Lambda é vantajoso em cargas esporádicas e caro em tráfego constante — 1 200 pedidos por segundo dão cerca de 3 mil milhões de invocações mensais. Somando o arranque a frio da JVM, que só é mitigado com SnapStart ou imagem nativa, a proposta piora o p99 e a factura. O Lambda liga-se a sub-redes privadas, o Spring Boot pode ser empacotado como função, e o limite de concorrência por região é da ordem dos milhares e ajustável."},
+
+  {"q": "Depois de repor a versão anterior de um serviço, os pedidos continuam a falhar. A versão revertida lê a coluna `email`, que a migração da versão nova removeu com `DROP COLUMN`. Que regra foi violada?",
+   "options": [
+     "A migração devia ter corrido no arranque da aplicação em vez de num passo do <em>pipeline</em>.",
+     "Faltou um `terraform apply` para reconciliar o esquema com o estado declarado.",
+     "O esquema tem de ser compatível com a versão N-1 e a versão N em simultâneo; a contracção só ocorre quando nenhuma versão em execução lê o elemento antigo.",
+     "O <em>rollback</em> devia ter incluído a reposição de uma cópia de segurança da base de dados."],
+   "answer": 2,
+   "explain": "Numa implantação progressiva convivem duas versões do código com um único esquema, pelo que qualquer alteração destrutiva tem de ficar para a fase de contracção, dias ou semanas depois, confirmada por métricas de leituras residuais. Onde a migração corre não muda a incompatibilidade, o Terraform não gere esquemas de tabelas, e repor uma cópia de segurança perderia todas as escritas entretanto confirmadas — a prevenção por expand/contract é a única resposta barata."}
+]}

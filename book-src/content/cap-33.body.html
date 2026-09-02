@@ -1,0 +1,830 @@
+<p>Esta é a ronda em que o entrevistador descobre se o candidato já foi responsável por um serviço em produção ou se apenas escreveu código que outra pessoa entregou. A pergunta nunca é «sabe o que é o GitHub Actions»: é «quanto tempo demora um <em>commit</em> seu a chegar a produção, o que pode falhar em cada passo e como se desfaz». Onde os candidatos caem é em três sítios previsíveis: descrevem o <em>pipeline</em> sem um único tempo, tratam a migração de base de dados como se fosse implantável ao mesmo tempo que o código, e falam de Terraform sem nunca terem pensado no ficheiro de estado como o recurso partilhado mais perigoso da equipa. Este capítulo cobre o percurso completo — <em>build</em>, gates, estratégia de <em>release</em>, migrações compatíveis para trás, os serviços AWS que aparecem em qualquer desenho e a infraestrutura declarada em código — com os números que tornam a resposta credível.</p>
+
+<h2 id="sec-33-1" class="h2"><span class="secnum">33.1</span> Pipeline de um serviço Java: etapas e gates<a class="anchor" href="#sec-33-1" aria-label="ligação">#</a></h2>
+
+<p>Um <em>pipeline</em> de um serviço Java bem afinado tem seis etapas e dois orçamentos de tempo distintos. O primeiro orçamento é o do ciclo de <em>feedback</em> ao autor do <em>pull request</em>: compilar, testes unitários e análise estática têm de terminar em menos de 10 minutos, porque acima disso o autor muda de tarefa e o custo de contexto anula o valor do <em>feedback</em>. O segundo é o <em>lead time</em> total, do <em>merge</em> em <code>main</code> até tráfego real na nova versão: 20 a 40 minutos é o que uma equipa saudável apresenta, e a maior fatia não é <em>build</em>, é a janela de observação do canário.</p>
+
+<p>As etapas são: (1) <em>build</em> e testes unitários com o Maven ou Gradle em cache, tipicamente 2 a 4 minutos num projecto de 60 a 120 mil linhas com <code>-T 1C</code>; (2) testes de integração com Testcontainers a levantar PostgreSQL e Kafka reais, 4 a 8 minutos; (3) análise estática e de dependências — SpotBugs, a verificação de estilo e um <em>scan</em> de vulnerabilidades das dependências transitivas; (4) construção da imagem OCI e publicação no ECR, com o <em>digest</em> <code>sha256</code> como identificador de saída; (5) implantação em <em>staging</em> com testes de fumo e um contrato de API verificado; (6) promoção para produção com estratégia progressiva. Cada etapa é um <em>gate</em>: falha, pára a linha, e não existe botão para «continuar mesmo assim» sem registo de quem carregou.</p>
+
+<p>A palavra que distingue um sénior é <em>imutável</em>. O artefacto que passou nos testes é exactamente o mesmo objecto binário que vai para produção, referenciado por <em>digest</em> e não por etiqueta móvel. Tudo o que muda entre ambientes é configuração injectada em arranque. Reconstruir a imagem por ambiente invalida todos os testes anteriores, e é a causa mais comum do clássico «em <em>staging</em> funcionava».</p>
+
+<figure class="listing yaml" id="lst-33-1"><div class="lhead"><span class="lnum">Listagem 33.1</span>
+<span class="lcap">Workflow de integração contínua: <em>gates</em> paralelos, credenciais AWS por OIDC e saída por <em>digest</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>name: ci
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+concurrency:                       # cancela execucoes antigas do mesmo ramo
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: 123456789012.dkr.ecr.eu-west-1.amazonaws.com
+  IMAGE: pagamentos-api
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15            # falhar em 15 min, nao ficar pendurado 6 h
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven             # ~90 s poupados por execucao
+      - name: Compilar e testes unitarios
+        run: ./mvnw -B -T 1C -DskipITs verify
+      - name: Testes de integracao (Testcontainers)
+        run: ./mvnw -B failsafe:integration-test failsafe:verify
+      - name: Analise estatica e dependencias
+        run: ./mvnw -B spotbugs:check dependency-check:check
+      - uses: actions/upload-artifact@v4
+        if: always()               # relatorios tambem quando falha
+        with:
+          name: relatorios
+          path: target/*-reports/
+
+  imagem:
+    needs: verificar
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write              # OIDC: sem chaves estaticas no repositorio
+      contents: read
+    outputs:
+      digest: ${{ steps.publicar.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gh-ci-pagamentos
+          aws-region: eu-west-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - id: publicar
+        run: |
+          docker buildx build --provenance=true --push \
+            -t "$REGISTRY/$IMAGE:$GITHUB_SHA" .
+          d=$(docker buildx imagetools inspect "$REGISTRY/$IMAGE:$GITHUB_SHA" \
+                --format '{{.Manifest.Digest}}')
+          echo "digest=$d" &gt;&gt; "$GITHUB_OUTPUT"   # o digest e o contrato entre CI e CD
+</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 33.1</span> Gates de um serviço Java, o que cada um apanha e o orçamento de tempo antes de o <em>pipeline</em> deixar de ser usado.</div>
+<div class="tscroll"><table><thead><tr><th>Gate</th><th>O que corre</th><th>Apanha</th><th>Tempo alvo</th><th>Se falhar</th></tr></thead><tbody>
+<tr><td>Compilação e unitários</td><td>Maven <code>-T 1C</code>, JUnit 5, Mockito</td><td>Regressão de lógica pura</td><td>2-4 min</td><td>Bloqueia o PR</td></tr>
+<tr><td>Integração</td><td>Testcontainers: PostgreSQL 17, Kafka, LocalStack</td><td>Mapeamento JPA, SQL, serialização</td><td>4-8 min</td><td>Bloqueia o PR</td></tr>
+<tr><td>Estática e SCA</td><td>SpotBugs, verificação de estilo, CVE nas dependências</td><td>Fugas de recursos, CVE crítico novo</td><td>1-3 min</td><td>Bloqueia se severidade alta</td></tr>
+<tr><td>Contrato</td><td>Testes de contrato do consumidor, diff do OpenAPI</td><td>Quebra incompatível de API</td><td>1-2 min</td><td>Bloqueia se quebra</td></tr>
+<tr><td>Fumo em <em>staging</em></td><td>6-12 cenários ponta a ponta</td><td>Configuração, segredos, rede</td><td>3-5 min</td><td>Pára a promoção</td></tr>
+<tr><td>Canário em produção</td><td>Tráfego real a 5%, SLO observado</td><td>Tudo o resto</td><td>10-20 min</td><td><em>Rollback</em> automático</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Referências que tornam a resposta credível: <em>feedback</em> ao PR abaixo de 10 minutos, <em>lead time</em> de <em>merge</em> a produção de 20 a 40 minutos, frequência de implantação de várias vezes por dia por serviço, taxa de falha de alteração abaixo de 15% e tempo de reposição abaixo de 30 minutos. Um <em>pipeline</em> de 55 minutos não é lento por causa do Maven: em regra, 60% a 70% do tempo está em testes de integração mal paralelizados e em <em>runners</em> sem cache de camadas Docker.</p></aside>
+
+<div class="qa" id="q-33-1" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Descreva o <em>pipeline</em> do seu serviço Java desde o <em>commit</em> até tráfego real em produção, com os tempos de cada etapa e onde ele costuma falhar.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São seis etapas com dois orçamentos separados: menos de 10 minutos de <em>feedback</em> ao autor do <em>pull request</em> e 20 a 40 minutos de <em>merge</em> a tráfego real. No serviço de pagamentos: compilação e unitários em 3 minutos, integração com Testcontainers em 6, análise estática e verificação de CVE em 2 em paralelo com a integração, construção e publicação da imagem em 2, implantação em <em>staging</em> com fumo em 4, e canário em produção com 15 minutos de observação. O total é de 32 minutos, dos quais metade é espera deliberada.</p>
+      <p>O mecanismo que sustenta isto é o artefacto imutável: a imagem é construída uma vez e identificada pelo <em>digest</em> <code>sha256</code>, nunca por uma etiqueta como <code>latest</code> ou <code>v1.2</code>, que podem ser reapontadas. A configuração muda por ambiente através de variáveis e do Parameter Store; o binário não. Isto transforma «funciona em <em>staging</em>» de esperança em consequência lógica.</p>
+      <p>Onde falha na prática: primeiro, testes de integração instáveis — se 1 em 40 execuções falha por corrida temporal, com 20 implantações diárias há uma paragem falsa por dia e a equipa aprende a repetir sem ler, o que destrói o valor de todos os <em>gates</em>. A resposta é quarentena automática de testes instáveis e um painel de instabilidade, não repetição cega. Segundo, a migração de base de dados acoplada ao <em>deploy</em>, que torna o <em>rollback</em> impossível. Terceiro, os <em>runners</em> sem cache, que duplicam o tempo de <em>build</em>.</p>
+      <p>O <em>trade-off</em> de encurtar: mover os testes de integração para depois da promoção reduz o <em>lead time</em> em 6 minutos mas aumenta a taxa de falha de alteração. Só faz sentido quando o canário é rápido e a reposição é automática e testada — ou seja, quando se troca custo de prevenção por custo de detecção, com a detecção provada.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Fazemos <em>push</em> e o Jenkins trata do resto»; não sabe quanto tempo demora nem o que corre em cada passo.</td></tr>
+        <tr><td>Mid</td><td>Enumera as etapas correctamente, sem tempos, sem distinguir artefacto de configuração; reconstrói a imagem por ambiente.</td></tr>
+        <tr><td>Sénior</td><td>Tempos por etapa, artefacto imutável por <em>digest</em>, gates com critério de bloqueio, identifica o gargalo real e o <em>trade-off</em> de o remover.</td></tr>
+        <tr><td>Staff</td><td>Liga o desenho às métricas DORA da organização, quantifica o custo da instabilidade dos testes e explica que política mudou para o <em>lead time</em> descer.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde estão os 55 minutos do <em>pipeline</em> anterior e o que cortou primeiro?»</li>
+      <li>«O que faz com um teste que falha 1 em 40 vezes?»</li>
+      <li>«Como impede que alguém publique manualmente uma imagem no ECR?»</li>
+      <li>«Quantas implantações por dia e qual é a taxa de falha de alteração?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Descrever o <em>pipeline</em> sem um único número de tempo.</li>
+      <li>Reconstruir a imagem em cada promoção de ambiente.</li>
+      <li>Repetição automática de <em>jobs</em> falhados como política, sem registo de instabilidade.</li>
+      <li>Um passo manual obrigatório de aprovação sem SLA e sem quem o faça fora de horas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-2" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Que testes correm em cada <em>gate</em> do <em>pipeline</em> e porque é que não correm todos em todos os <em>gates</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A regra de alocação é custo por defeito apanhado. Cada tipo de teste tem um preço em minutos e uma classe de defeitos que só ele apanha; corre-se o mais barato primeiro e o mais caro apenas quando o barato já não apanha nada.</p>
+      <ul class="lst">
+        <li>No PR: unitários (milissegundos por teste, sem contexto Spring) e testes de fatia — <code>@DataJpaTest</code>, <code>@WebMvcTest</code>. Apanham lógica e mapeamento.</li>
+        <li>No PR, em paralelo: integração com Testcontainers contra PostgreSQL 17 e Kafka reais. Apanha SQL inválido, migração que não aplica, serialização de eventos. Custa 4 a 8 minutos e é o <em>gate</em> mais valioso de um serviço Java com JPA.</li>
+        <li>No PR: testes de contrato do consumidor e <em>diff</em> do OpenAPI. Apanham quebras de compatibilidade que nenhum teste interno vê.</li>
+        <li>Depois da promoção a <em>staging</em>: 6 a 12 cenários de fumo ponta a ponta. Apanham configuração errada, segredo em falta, regra de rede fechada — coisas que por definição não existem em ambiente de teste.</li>
+        <li>Em produção, contínuo: sondas sintéticas e os SLO do canário. Apanham degradação de dependências externas.</li>
+      </ul>
+      <p>O que <em>não</em> se põe no <em>gate</em> de PR: a suite completa ponta a ponta com interface, os testes de carga e os testes de recuperação. Uma suite ponta a ponta de 40 minutos com 3% de instabilidade produz mais paragens falsas do que defeitos apanhados; passa a correr de noite, com relatório para a equipa e sem bloquear.</p>
+      <p>O número que decide é o rácio entre defeitos apanhados e paragens falsas. Um <em>gate</em> que em três meses bloqueou 40 vezes e apanhou 2 defeitos reais está a custar mais do que vale — ou se estabiliza, ou sai do caminho crítico. O <em>trade-off</em> inverso aplica-se a sistemas com custo de falha muito alto — pagamentos, saúde — onde se aceita um <em>pipeline</em> de 50 minutos porque um defeito em produção custa três ordens de grandeza mais.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Corremos os testes todos»; não distingue unitário de integração nem sabe o custo em minutos.</td></tr>
+        <tr><td>Mid</td><td>Descreve a pirâmide de testes de cor, sem ligar cada nível a um <em>gate</em> nem a um tempo.</td></tr>
+        <tr><td>Sénior</td><td>Aloca por custo e por classe de defeito, usa Testcontainers no PR, tira a suite ponta a ponta do caminho crítico com justificação medida.</td></tr>
+        <tr><td>Staff</td><td>Apresenta o rácio defeitos/paragens falsas por <em>gate</em> e a política de quarentena; discute quando a organização deve aceitar um <em>pipeline</em> mais lento.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Testcontainers levanta um PostgreSQL por classe de teste? Como controla o tempo?»</li>
+      <li>«Como testa a migração Flyway antes de ela chegar a produção?»</li>
+      <li>«Que percentagem de cobertura exige e porquê essa?»</li>
+      <li>«Um teste de contrato falhou por causa do consumidor, não do seu serviço. O que acontece?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Cobertura como <em>gate</em> único, sem falar de que defeitos são apanhados.</li>
+      <li>Base de dados partilhada e persistente para os testes de integração, com estado entre execuções.</li>
+      <li>Testes ponta a ponta com interface a bloquear cada PR.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-3" data-box="qa" data-area="seguranca" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como é que o <em>pipeline</em> obtém credenciais para a AWS e como é que a aplicação obtém os segredos em produção? Nada de chaves no repositório.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São dois problemas distintos com duas soluções distintas, e confundi-los é o erro típico. O <em>pipeline</em> autentica-se por federação OIDC: o GitHub emite um <em>token</em> de identidade por execução, a AWS confia no fornecedor OIDC do GitHub e o <code>sts:AssumeRoleWithWebIdentity</code> devolve credenciais temporárias válidas por 1 hora. Não existe <code>AWS_ACCESS_KEY_ID</code> guardado em lado nenhum, e portanto não há nada para rodar nem para vazar.</p>
+      <p>A peça que separa quem já o fez de quem leu sobre isso é a condição de confiança na <em>role</em>. A política tem de restringir <code>token.actions.githubusercontent.com:sub</code> ao repositório <em>e</em> ao ramo ou ambiente concreto, por exemplo <code>repo:acme/pagamentos:ref:refs/heads/main</code>. Sem essa condição, ou com um <em>wildcard</em> no início do valor, qualquer repositório do GitHub pode assumir a <em>role</em> — é uma escalada de privilégios remota, não uma imprecisão.</p>
+      <p>Em produção, a aplicação não recebe segredos por variável de ambiente do <em>pipeline</em>. A tarefa ECS ou o <em>pod</em> tem uma identidade própria (<em>task role</em>, ou uma conta de serviço com IRSA no EKS) e lê do Secrets Manager ou do Parameter Store em arranque, ou o próprio ECS injecta o valor a partir do ARN declarado na <em>task definition</em>. Vantagem: rotação sem novo <em>deploy</em>, auditoria por CloudTrail de quem leu o quê, e o <em>pipeline</em> deixa de ter acesso aos segredos de produção — só tem acesso a implantar.</p>
+      <p>Números que fecham a resposta: credenciais de 1 hora em vez de chaves permanentes; rotação da palavra-passe do RDS gerida pelo Secrets Manager a cada 30 dias sem intervenção; e ambientes protegidos do GitHub com revisores obrigatórios para produção, de modo a que a <em>role</em> de produção só seja assumível a partir de execuções aprovadas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Chaves de utilizador IAM guardadas como segredos do repositório, rodadas «quando alguém sai».</td></tr>
+        <tr><td>Mid</td><td>Conhece os segredos do GitHub e o Secrets Manager, mas não distingue identidade do <em>pipeline</em> de identidade da aplicação.</td></tr>
+        <tr><td>Sénior</td><td>OIDC com <em>role</em> e política de confiança restrita ao repositório/ramo, identidade própria da carga de trabalho, rotação sem <em>deploy</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta separação de contas AWS por ambiente, permissões mínimas por <em>role</em> de implantação e o raio de explosão de cada credencial comprometida.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva a condição da política de confiança. O que acontece se usar <code>repo:acme/*</code>?»</li>
+      <li>«Como impede que um PR de um <em>fork</em> aceda aos segredos?»</li>
+      <li>«Um segredo foi impresso nos <em>logs</em> do <em>build</em>. Quais são os passos seguintes?»</li>
+      <li>«Porquê Secrets Manager e não Parameter Store?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Segredos de produção acessíveis a partir de qualquer execução do <em>pipeline</em>.</li>
+      <li>Política de confiança OIDC sem restrição de <code>sub</code>.</li>
+      <li>Palavra-passe da base de dados dentro da imagem ou do <code>application.yml</code> versionado.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-2" class="h2"><span class="secnum">33.2</span> Estratégias de release: blue-green, canary e feature flags<a class="anchor" href="#sec-33-2" aria-label="ligação">#</a></h2>
+
+<p>Há três eixos independentes que os candidatos costumam misturar: como o código chega às máquinas (<em>deploy</em>), como o tráfego passa a vê-lo (<em>release</em>) e como a funcionalidade fica visível ao utilizador (<em>feature flag</em>). Blue-green e canário resolvem o segundo eixo; os interruptores de funcionalidade resolvem o terceiro. Separar os três é o que permite implantar 20 vezes por dia sem que nenhuma dessas implantações mude o comportamento visível.</p>
+
+<p><em>Blue-green</em> mantém duas frotas completas. A nova versão sobe na frota inactiva, passa os testes de fumo e o <em>listener</em> do balanceador comuta 100% do tráfego de uma vez. A reposição é uma comutação inversa em segundos — é a sua grande vantagem. Custa uma segunda frota durante a janela de transição (mais 100% de capacidade computacional durante 10 a 30 minutos) e, sobretudo, expõe todos os utilizadores ao mesmo tempo: um defeito que só aparece com tráfego real atinge toda a base antes de haver dados suficientes para decidir.</p>
+
+<p>O canário desloca o tráfego por degraus — 5%, 25%, 50%, 100% — com uma janela de observação por degrau ligada a métricas concretas: taxa de erro 5xx, p99 de latência, taxa de excepções por instância, e uma métrica de negócio como autorizações por minuto. Se qualquer uma sair do limiar, o degrau anterior é reposto automaticamente. O custo é tempo: 4 degraus com 5 minutos cada acrescentam 20 minutos ao <em>lead time</em>. O benefício é que o raio de explosão de uma versão má fica em 5% dos utilizadores durante 5 minutos, em vez de 100% durante o tempo que a equipa demora a reparar.</p>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Canário exige que exista sinal estatístico na janela. Com 4 000 pedidos por segundo, 5% de tráfego durante 5 minutos são 60 000 pedidos: uma subida da taxa de erro de 0,1% para 0,5% é detectada com confiança. Com 8 pedidos por segundo, os mesmos 5% durante 5 minutos são 120 pedidos — não distinguem 0,1% de 2%. Em serviços de baixo tráfego, o canário é teatro: vale mais blue-green com reposição rápida e sondas sintéticas a gerar carga determinística durante a janela.</p></aside>
+
+<div class="lab" id="lab-33-1" data-box="lab" data-lang="yaml">
+  <div class="labhead"><span class="labttl">Exercício 33.1 — Workflow de implantação canária com reposição automática</span>
+    <div class="labpills"><span class="qpill">GitHub Actions</span><span class="qpill">30 min</span></div></div>
+  <div class="labbody">
+    <p>O serviço <code>pagamentos-api</code> corre em ECS Fargate, atrás de um <em>Application Load Balancer</em> com dois grupos-alvo: <code>tg-stable</code> e <code>tg-canary</code>. Escreva o <em>workflow</em> de produção que: (1) é desencadeado pelo sucesso do <em>workflow</em> <code>ci</code> em <code>main</code>; (2) guarda a revisão da <em>task definition</em> actualmente em serviço, para poder repô-la; (3) regista uma nova revisão com a imagem identificada por <em>digest</em>; (4) sobe o serviço canário e encaminha 5% do tráfego; (5) observa 10 minutos as métricas de erro e latência através de um alarme CloudWatch; (6) promove para 100% se o alarme estiver <code>OK</code>; (7) repõe automaticamente o tráfego e a revisão anterior se qualquer passo falhar, e nunca deixa o sistema em estado intermédio.</p>
+    <p>Restrições: sem chaves AWS estáticas; duas implantações não podem correr em simultâneo; a reposição tem de correr mesmo que o <em>job</em> principal seja cancelado por <em>timeout</em>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing yaml" id="lst-33-2"><div class="lhead"><span class="lnum">Listagem 33.2</span>
+        <span class="lcap">Implantação canária em ECS com deslocação de peso no ALB e reposição garantida.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="yaml"><code>name: deploy-prod
+on:
+  workflow_run:
+    workflows: [ ci ]
+    types: [ completed ]
+    branches: [ main ]
+
+concurrency:
+  group: deploy-prod             # nunca duas implantacoes simultaneas
+  cancel-in-progress: false      # a segunda espera, nao mata a primeira
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  CLUSTER: prod
+  SERVICE: pagamentos-api
+  RULE_ARN: arn:aws:elasticloadbalancing:eu-west-1:123456789012:listener-rule/app/pag/aa/bb
+  TG_STABLE: arn:aws:elasticloadbalancing:eu-west-1:123456789012:targetgroup/tg-stable/11
+  TG_CANARY: arn:aws:elasticloadbalancing:eu-west-1:123456789012:targetgroup/tg-canary/22
+  ALARME: pagamentos-api-canario-saude
+
+jobs:
+  canario:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: producao         # revisores obrigatorios + segredos do ambiente
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gh-deploy-prod
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: anterior                     # 2) fotografia para repor
+        run: |
+          td=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+                 --query 'services[0].taskDefinition' --output text)
+          echo "taskdef=$td" &gt;&gt; "$GITHUB_OUTPUT"
+
+      - id: registar                     # 3) nova revisao com digest imutavel
+        run: |
+          aws ecs describe-task-definition --task-definition "$SERVICE" \
+            --query 'taskDefinition' --output json &gt; base.json
+          jq --arg img "$IMG" '.containerDefinitions[0].image = $img
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)' base.json &gt; nova.json
+          arn=$(aws ecs register-task-definition --cli-input-json file://nova.json \
+                  --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=$arn" &gt;&gt; "$GITHUB_OUTPUT"
+        env:
+          IMG: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/pagamentos-api@${{ github.event.workflow_run.head_sha }}
+
+      - name: Subir o canario e esperar estabilidade      # 4)
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE-canary" \
+            --task-definition "${{ steps.registar.outputs.arn }}" \
+            --desired-count 2 --force-new-deployment
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE-canary"
+
+      - name: Encaminhar 5% do trafego
+        run: ./ci/peso.sh 95 5                            # modify-rule com ForwardConfig
+
+      - name: Observar 10 minutos                          # 5)
+        run: |
+          for i in $(seq 1 20); do
+            estado=$(aws cloudwatch describe-alarms --alarm-names "$ALARME" \
+                       --query 'MetricAlarms[0].StateValue' --output text)
+            if [ "$estado" = "ALARM" ]; then
+              echo "::error::canario em ALARM ao minuto $((i/2))"; exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Promover para 100%                           # 6)
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "${{ steps.registar.outputs.arn }}" --force-new-deployment
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          ./ci/peso.sh 100 0
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE-canary" \
+            --desired-count 0
+
+      - name: Repor                                        # 7) corre em falha OU cancelamento
+        if: failure() || cancelled()
+        run: |
+          ./ci/peso.sh 100 0                               # trafego fora do canario primeiro
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "${{ steps.anterior.outputs.taskdef }}" --force-new-deployment
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE-canary" \
+            --desired-count 0
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          echo "::error::reposta a revisao ${{ steps.anterior.outputs.taskdef }}"
+</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A ordem da reposição é o ponto que separa respostas: primeiro tira-se o tráfego do canário, só depois se mexe nas tarefas. Repor a revisão antes de mover o peso deixa utilizadores a bater numa frota a ser destruída.</li>
+        <li><code>if: failure() || cancelled()</code> e não apenas <code>failure()</code>: o <em>timeout</em> de 40 minutos cancela o <em>job</em>, e sem <code>cancelled()</code> o sistema ficaria com 5% do tráfego numa versão não validada, indefinidamente.</li>
+        <li><code>concurrency</code> com <code>cancel-in-progress: false</code>: cancelar uma implantação a meio é precisamente como se produz o estado intermédio que se quer evitar.</li>
+        <li>A imagem é referida por <code>@sha256:…</code>, não por etiqueta. Uma etiqueta pode ser reapontada entre a validação e a promoção; o <em>digest</em> não.</li>
+        <li>Casos limite a mencionar: um alarme com dados insuficientes devolve <code>INSUFFICIENT_DATA</code>, não <code>OK</code> — tratá-lo como sucesso é um erro; e a reposição do código não repõe a base de dados, o que obriga à disciplina de migrações da secção seguinte.</li>
+        <li>Alternativa aceite: delegar tudo no CodeDeploy com <code>CodeDeployDefault.ECSCanary10Percent5Minutes</code> e um <em>hook</em> de validação. Menos código, menos controlo sobre a métrica de decisão.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-4" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Blue-green ou canário para este serviço? E, na prática, o que é exactamente um <em>rollback</em> no seu sistema — quanto tempo demora e quem o desencadeia?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A escolha depende de três variáveis: volume de tráfego, custo de expor um defeito a 100% dos utilizadores e custo de manter capacidade duplicada. Com tráfego alto (acima de algumas centenas de pedidos por segundo) e defeitos que só aparecem sob carga real, canário. Com tráfego baixo, com necessidade de comutação instantânea ou com um estado que não tolera duas versões simultâneas, blue-green.</p>
+      <p>O <em>rollback</em> tem de ser definido em termos operacionais, não conceptuais: no serviço de pagamentos é a reposição do peso do balanceador para 100% na frota estável e a reposição da revisão anterior da <em>task definition</em>. Demora 45 segundos a tirar o tráfego e cerca de 3 minutos a estabilizar a frota. É desencadeado automaticamente por um alarme CloudWatch composto — taxa de 5xx acima de 0,5% durante 2 minutos, <em>ou</em> p99 acima de 400 ms, <em>ou</em> queda de autorizações por minuto superior a 20% face à mediana da semana. Ninguém tem de estar acordado para carregar num botão.</p>
+      <p>A restrição que torna tudo isto real é o que o <em>rollback</em> não repõe: dados. Se a versão nova escreveu num formato novo, ou removeu uma coluna, ou publicou eventos com um esquema incompatível, reverter o código não reverte os efeitos. É por isso que a regra é que toda a versão implantada tem de ser compatível para trás com a anterior — o <em>rollback</em> só é barato porque essa disciplina existe.</p>
+      <p>O sinal de nível staff é dizer que se pratica: um exercício mensal em que se repõe uma versão em produção deliberadamente, para medir o tempo real e descobrir que o <em>script</em> de reposição partiu há três semanas. Uma reposição nunca testada é uma hipótese, não um plano.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Define blue-green e canário como no manual; «<em>rollback</em> é fazer <em>deploy</em> da versão anterior», sem tempo nem gatilho.</td></tr>
+        <tr><td>Mid</td><td>Escolhe canário sem verificar se há tráfego para gerar sinal; <em>rollback</em> manual accionado por quem está de plantão.</td></tr>
+        <tr><td>Sénior</td><td>Liga a escolha a volume e custo de exposição, dá tempos de reposição, gatilho automático com limiares concretos, e nota que dados não se repõem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o exercício periódico de reposição, a compatibilidade para trás como invariante organizacional e o efeito nos consumidores a jusante.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O serviço faz 8 pedidos por segundo. O canário serve para alguma coisa?»</li>
+      <li>«O alarme está em <code>INSUFFICIENT_DATA</code>. Promove ou repõe?»</li>
+      <li>«A versão nova já consumiu 200 mil mensagens Kafka. Como é o <em>rollback</em>?»</li>
+      <li>«Quantas vezes repuseram uma versão nos últimos 90 dias?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Chamar canário a «implantar primeiro em <em>staging</em>».</li>
+      <li>Reposição que depende de alguém ler um alerta e correr comandos à mão.</li>
+      <li>Ignorar que a base de dados e as mensagens já consumidas não voltam atrás.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-5" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Quando é que usa um <em>feature flag</em> em vez de uma estratégia de <em>deploy</em>, e qual é o custo que os interruptores impõem ao código e aos testes?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O interruptor de funcionalidade resolve um problema que nenhuma estratégia de <em>deploy</em> resolve: separar o momento em que o código chega a produção do momento em que o comportamento muda, e permitir que essa mudança seja dirigida a um subconjunto escolhido — 2% dos comerciantes, um mercado, uma conta interna — em vez de ser proporcional ao tráfego. Também é o único mecanismo que permite desligar uma funcionalidade em 10 segundos sem implantar nada.</p>
+      <p>Uso-o em três casos: migração progressiva de um caminho crítico (o novo motor de fraude corre em paralelo, com o resultado comparado mas descartado, durante duas semanas antes de decidir); libertação coordenada com marketing ou com o lado regulatório; e como travão de emergência para funcionalidades caras que se podem degradar sob carga.</p>
+      <p>O custo é real e mensurável. Cada interruptor booleano duplica os caminhos possíveis: 10 interruptores independentes dão 1024 combinações, das quais os testes cobrem duas. Na prática testa-se só o estado esperado a seguir e o estado actual, e aceita-se que as restantes combinações são desconhecidas. Além disso, um interruptor lido num <em>hot path</em> tem de ser avaliado em memória, com actualização assíncrona — uma chamada de rede por pedido para avaliar um interruptor acrescenta 5 a 20 ms de p99 e cria uma dependência nova no caminho crítico.</p>
+      <p>A disciplina que separa sénior de mid é a remoção: cada interruptor nasce com dono e data de remoção, e a limpeza é uma tarefa no <em>sprint</em>, não boa vontade. Uma base de código com 60 interruptores dos quais 45 estão permanentemente a <code>true</code> há um ano tem 45 ramos mortos que ninguém ousa apagar. O <em>trade-off</em>: para alterações pequenas e reversíveis, o interruptor é mais caro do que vale — implanta-se e usa-se o canário.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata interruptor e canário como sinónimos; usa <code>if</code> com propriedade lida de ficheiro que exige reinício.</td></tr>
+        <tr><td>Mid</td><td>Sabe o que é e usa-o, mas não fala de explosão combinatória, de custo de leitura nem de remoção.</td></tr>
+        <tr><td>Sénior</td><td>Distingue <em>deploy</em> de <em>release</em>, dá casos de uso concretos, avalia em memória, impõe dono e data de remoção.</td></tr>
+        <tr><td>Staff</td><td>Discute o interruptor como dívida com juro, mede a idade média dos interruptores e explica quando não vale a pena usá-los.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O serviço de interruptores está em baixo. O que faz a aplicação?»</li>
+      <li>«Como garante que o mesmo utilizador vê sempre o mesmo lado do interruptor?»</li>
+      <li>«Como testa o caminho novo antes de o ligar a alguém?»</li>
+      <li>«Quantos interruptores tem hoje e qual é o mais antigo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Chamada de rede síncrona por pedido para avaliar o interruptor.</li>
+      <li>Sem comportamento por omissão definido quando o fornecedor de interruptores falha.</li>
+      <li>Interruptores sem dono nem data de remoção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-6" data-box="qa" data-area="devops" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como versiona os artefactos e como é que a mesma versão é promovida de <em>staging</em> para produção sem ser reconstruída?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O artefacto é construído uma vez, no <em>merge</em> para <code>main</code>, e identificado por três coisas: o <em>digest</em> <code>sha256</code> da imagem, que é a identidade real; o <em>hash</em> do <em>commit</em>, que é a etiqueta legível; e uma versão semântica gerada automaticamente para efeitos de comunicação. A promoção entre ambientes altera apenas a referência ao <em>digest</em> na <em>task definition</em> ou no manifesto — nunca dispara um novo <em>build</em>.</p>
+      <p>Etiquetas móveis como <code>latest</code> ou <code>main</code> não servem de identidade porque podem ser reapontadas entre a validação e a promoção; e no ECR convém activar a imutabilidade de etiquetas, para que nem por engano se possa sobrepor <code>v1.4.2</code>. A referência final é da forma <code>registo/pagamentos-api@sha256:9f3c…</code>.</p>
+      <p>Para bibliotecas partilhadas em Java a lógica é a mesma com outro nome: publica-se uma versão fixa no repositório interno, sem <code>SNAPSHOT</code> em nada que chegue a produção, porque um <code>SNAPSHOT</code> é por definição uma referência móvel — dois <em>builds</em> da mesma versão podem trazer bytes diferentes e a reprodutibilidade desaparece.</p>
+      <p>O que torna isto verificável é a proveniência: o <em>pipeline</em> assina o artefacto e regista que <em>commit</em>, que execução e que testes o produziram; a implantação recusa qualquer <em>digest</em> sem proveniência válida. É o que impede que uma imagem construída na máquina de alguém chegue a produção.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Constrói a imagem em cada ambiente, usa <code>latest</code>, não sabe o que é um <em>digest</em>.</td></tr>
+        <tr><td>Mid</td><td>Etiqueta com o <em>hash</em> do <em>commit</em> e promove por etiqueta, sem imutabilidade nem <em>digest</em>.</td></tr>
+        <tr><td>Sénior</td><td>Um <em>build</em>, promoção por <em>digest</em>, etiquetas imutáveis no ECR, sem <code>SNAPSHOT</code> em produção, configuração externa.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta proveniência assinada, verificação na admissão e a política que impede implantar artefactos não produzidos pelo <em>pipeline</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Alguém publicou <code>v1.4.2</code> duas vezes com conteúdos diferentes. Como impede isso?»</li>
+      <li>«Onde vive a configuração que difere entre <em>staging</em> e produção?»</li>
+      <li>«Como sabe qual é o <em>commit</em> que está agora em produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Um <em>pipeline</em> por ambiente, cada um a compilar do zero.</li>
+      <li>Dependências <code>SNAPSHOT</code> em versões que chegam a produção.</li>
+      <li>Não conseguir mapear a versão em produção para um <em>commit</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-3" class="h2"><span class="secnum">33.3</span> Migrações de base de dados em pipeline<a class="anchor" href="#sec-33-3" aria-label="ligação">#</a></h2>
+
+<p>Esta é a secção onde a maioria dos candidatos falha, porque a intuição errada é forte: se o código é implantado com a migração, e o código é reposto, a migração devia ser revertida. Não é. Durante uma implantação progressiva existem, por construção, duas versões do código a falar com <em>um</em> esquema de base de dados. O esquema tem de ser compatível com ambas — a versão antiga e a nova — durante toda a janela, que pode ir de 20 minutos a duas semanas se houver um interruptor de funcionalidade pelo meio.</p>
+
+<p>A técnica é <em>expand/contract</em>, em três fases separadas por implantações independentes. <strong>Expandir</strong>: acrescenta-se o novo elemento — coluna, tabela, índice — sempre de forma aditiva e opcional. A coluna nova é anulável ou tem valor por omissão; o código antigo ignora-a e continua a funcionar. <strong>Migrar</strong>: o código novo escreve nos dois sítios e lê preferencialmente do novo, enquanto um processo de <em>backfill</em> em lotes preenche as linhas históricas. <strong>Contrair</strong>: só depois de nenhuma versão em execução ler o elemento antigo — dias ou semanas depois, confirmado por métricas, não por memória — é que se remove a coluna velha, numa migração que não coincide com nenhuma alteração de comportamento.</p>
+
+<p>Em PostgreSQL há operações que parecem inócuas e bloqueiam a tabela. <code>ALTER TABLE … ADD COLUMN</code> com valor por omissão constante é barato desde a versão 11 (metadados, sem reescrita), mas adicionar uma restrição <code>NOT NULL</code> a uma coluna existente faz uma varredura completa com <code>ACCESS EXCLUSIVE</code>; num tabelão de 80 milhões de linhas são vários minutos de indisponibilidade. O caminho seguro é <code>ADD CONSTRAINT … CHECK (…) NOT VALID</code> seguido de <code>VALIDATE CONSTRAINT</code>, que usa um bloqueio mais fraco. Índices criam-se sempre com <code>CREATE INDEX CONCURRENTLY</code>, que não pode correr dentro de uma transacção — logo, o <em>script</em> Flyway correspondente tem de ser marcado como não transaccional.</p>
+
+<figure class="listing sql" id="lst-33-3"><div class="lhead"><span class="lnum">Listagem 33.3</span>
+<span class="lcap">Renomear uma coluna em três migrações Flyway, sem janela de indisponibilidade nem <em>rollback</em> impossível.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- V41__expandir_email_normalizado.sql   (vai com a versao N; o codigo N-1 ignora)
+ALTER TABLE comerciante ADD COLUMN email_normalizado text;   -- anulavel: aditivo e barato
+CREATE INDEX CONCURRENTLY idx_comerciante_email_norm         -- fora de transacao
+  ON comerciante (email_normalizado);
+-- No Flyway: este script precisa de executeInTransaction=false no cabecalho ou na config.
+
+-- V42__backfill_email_normalizado.sql   (vai com a versao N+1, que escreve nas duas colunas)
+-- Lotes de 10 000 linhas; 8 M de linhas = ~800 lotes, ~4 min com 300 ms por lote.
+-- Corre como tarefa idempotente fora do arranque da aplicacao, nao no callback do Flyway.
+UPDATE comerciante
+   SET email_normalizado = lower(btrim(email))
+ WHERE email_normalizado IS NULL
+   AND id IN (SELECT id FROM comerciante
+               WHERE email_normalizado IS NULL ORDER BY id LIMIT 10000);
+
+-- V43__contrair_email.sql   (semanas depois, com metricas a confirmar 0 leituras de "email")
+ALTER TABLE comerciante
+  ADD CONSTRAINT ck_email_norm CHECK (email_normalizado IS NOT NULL) NOT VALID;  -- lock fraco
+ALTER TABLE comerciante VALIDATE CONSTRAINT ck_email_norm;                       -- varre sem bloquear escritas
+ALTER TABLE comerciante DROP COLUMN email;                                       -- so agora
+</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Correr as migrações no arranque da aplicação (<code>spring.flyway.enabled=true</code> por omissão) parece cómodo e é a origem de dois incidentes clássicos. Primeiro, numa implantação com 6 réplicas, seis instâncias tentam migrar em simultâneo — o Flyway usa um bloqueio consultivo em PostgreSQL e sobrevive, mas as cinco restantes ficam à espera e podem exceder o tempo da sonda de arranque, gerando um ciclo de reinícios. Segundo, uma migração longa transforma um <em>deploy</em> de 3 minutos num de 25 sem que ninguém decida isso. A alternativa é um passo próprio no <em>pipeline</em>, antes da implantação, com <code>validate</code> em arranque e <code>migrate</code> em <em>job</em> separado.</p></aside>
+
+<div class="qa" id="q-33-7" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Precisa de renomear uma coluna usada por um serviço com 6 réplicas, implantado de forma progressiva, sem janela de indisponibilidade. Descreva as migrações e as implantações, por ordem.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não se renomeia. Um <code>ALTER TABLE … RENAME COLUMN</code> é atómico do lado da base de dados e instantaneamente incompatível com as réplicas que ainda correm o código antigo: a partir do <em>commit</em> dessa transacção, metade da frota falha em todas as consultas àquela coluna. Faz-se <em>expand/contract</em> em três implantações separadas.</p>
+      <ul class="lst">
+        <li><strong>Implantação 1 (expandir).</strong> Migração aditiva: <code>ADD COLUMN email_normalizado text</code>, anulável, mais o índice com <code>CREATE INDEX CONCURRENTLY</code>. O código desta versão nem sabe que a coluna existe. É reversível de forma trivial porque nada a usa.</li>
+        <li><strong>Implantação 2 (migrar).</strong> O código passa a escrever nas duas colunas e a ler da nova com recurso à antiga quando a nova é nula. Em paralelo, um <em>backfill</em> em lotes de 10 000 linhas, com pausa entre lotes para não saturar as réplicas de leitura nem inflacionar o atraso de replicação. Em 8 milhões de linhas, cerca de 800 lotes e 4 a 10 minutos de trabalho efectivo.</li>
+        <li><strong>Verificação.</strong> Uma consulta de reconciliação confirma zero linhas com a coluna nova nula, e uma métrica conta as leituras que ainda recorreram à coluna antiga. Só quando essa métrica está a zero há vários dias é que se avança.</li>
+        <li><strong>Implantação 3 (contrair).</strong> O código deixa de escrever na coluna antiga; numa quarta implantação, ou na mesma se a janela for aceitável, faz-se <code>DROP COLUMN</code>. A remoção é uma alteração de esquema sem alteração de comportamento — se algo falhar, falha isolado.</li>
+      </ul>
+      <p>O invariante que sustenta tudo: durante uma implantação progressiva, o esquema tem de ser compatível com a versão N-1 <em>e</em> com a versão N em simultâneo. É o que torna o <em>rollback</em> de código seguro sem <em>rollback</em> de esquema — que, na prática, não existe, porque reverter um <code>DROP COLUMN</code> devolve a estrutura mas não os dados.</p>
+      <p>O <em>trade-off</em> é custo: três a quatro implantações e duas semanas de calendário para o que «devia ser uma linha de SQL». Aceita-se porque a alternativa é uma janela de indisponibilidade agendada, que numa plataforma de pagamentos europeia custa mais em contrato de nível de serviço do que as duas semanas de trabalho.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>RENAME COLUMN</code> e implanto o código ao mesmo tempo»; não vê o problema das duas versões concorrentes.</td></tr>
+        <tr><td>Mid</td><td>Conhece expand/contract em teoria mas junta o <em>backfill</em> e o <code>DROP</code> na mesma implantação; ignora bloqueios do PostgreSQL.</td></tr>
+        <tr><td>Sénior</td><td>Três fases em implantações separadas, escrita dupla, <em>backfill</em> em lotes, índice concorrente, critério medido para contrair.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a métrica de leituras residuais como <em>gate</em>, o efeito no atraso de replicação e a política da equipa que impede migrações destrutivas de chegarem ao <em>pipeline</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como faz o <em>backfill</em> sem disparar o atraso das réplicas de leitura?»</li>
+      <li>«E se a coluna antiga for lida por um <em>job</em> de <em>batch</em> noutro repositório?»</li>
+      <li>«Porque é que <code>CREATE INDEX CONCURRENTLY</code> não pode estar numa transacção?»</li>
+      <li>«Quanto tempo espera entre a fase 2 e a fase 3, e o que mede para decidir?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Assumir que reverter o código reverte o esquema.</li>
+      <li><code>UPDATE</code> único sobre milhões de linhas numa transacção.</li>
+      <li>Adicionar <code>NOT NULL</code> directamente a uma coluna existente num tabelão.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-8" data-box="qa" data-area="devops" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Quem corre as migrações Flyway: a aplicação no arranque ou um passo do <em>pipeline</em>? Justifique com o que acontece em cada caso numa implantação com 6 réplicas.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um passo próprio do <em>pipeline</em>, antes da implantação do código, com a aplicação a correr apenas <code>flyway:validate</code> no arranque. O motivo é controlo: a migração passa a ter <em>logs</em>, tempo medido, autorização e reposição próprios, em vez de estar escondida dentro do arranque de um contentor.</p>
+      <p>Com migração no arranque e 6 réplicas, o comportamento é o seguinte: as seis instâncias arrancam quase em simultâneo, o Flyway pede um bloqueio consultivo em PostgreSQL, uma migra e cinco esperam. Não há corrupção — mas se a migração demorar 90 segundos e a sonda de <em>readiness</em> tiver um limite de 60, as cinco em espera são declaradas não saudáveis, reiniciadas, e entra-se num ciclo em que o orquestrador combate a própria migração. Além disso, na estratégia canária a versão nova migra o esquema que a versão antiga ainda está a usar, sem que ninguém tenha decidido o momento.</p>
+      <p>Com um passo dedicado, a ordem é explícita: migração aditiva, verificação, implantação do código, e no fim do ciclo a migração de contracção. O <code>validate</code> no arranque continua a ser essencial — garante que a aplicação recusa arrancar contra um esquema mais antigo do que aquele para que foi compilada, o que é exactamente o sinal que se quer em caso de ordem trocada.</p>
+      <p>O <em>trade-off</em>: para uma equipa pequena, com um único serviço e uma réplica, a migração no arranque poupa infraestrutura de <em>pipeline</em> e o risco é baixo. Deixa de o ser assim que há mais de uma réplica, mais de um serviço a partilhar a base de dados, ou implantação progressiva — ou seja, no primeiro dia em que o sistema importa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«O Spring Boot trata disso no arranque»; desconhece o bloqueio e o efeito nas sondas.</td></tr>
+        <tr><td>Mid</td><td>Prefere o passo no <em>pipeline</em> mas não explica o mecanismo do bloqueio nem o papel do <code>validate</code>.</td></tr>
+        <tr><td>Sénior</td><td>Separa <code>migrate</code> de <code>validate</code>, descreve o ciclo de reinícios, ordena migração aditiva antes do código e a contracção depois.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta autorização e auditoria da migração, ensaio prévio contra uma cópia de produção e o critério para uma migração exigir janela negociada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Uma migração falhou a meio. Qual é o estado da tabela de histórico do Flyway?»</li>
+      <li>«Como testa a migração contra volume realista antes de produção?»</li>
+      <li>«Dois serviços partilham a base de dados. Quem é dono das migrações?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Editar um <em>script</em> Flyway já aplicado em produção em vez de criar um novo.</li>
+      <li><code>flyway.cleanDisabled=false</code> em qualquer ambiente ligado a dados reais.</li>
+      <li>Migrações sem ensaio prévio contra um volume comparável ao de produção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-4" class="h2"><span class="secnum">33.4</span> AWS para backend: computação, dados, filas e rede<a class="anchor" href="#sec-33-4" aria-label="ligação">#</a></h2>
+
+<p>Nas entrevistas europeias, a AWS aparece com um vocabulário previsível e um conjunto restrito de decisões: onde correr o processo, como guardar o estado relacional, como passar mensagens e como isolar a rede. O que é avaliado não é a memorização de nomes de serviços, mas a capacidade de justificar a escolha com uma restrição do sistema — carga, latência, equipa disponível — e de dizer quando a escolha se inverte.</p>
+
+<p>Na computação, o eixo é o de controlo contra sobrecarga operacional. O Lambda tem um problema específico e conhecido com Java: o arranque a frio de uma JVM com Spring Boot custa 2 a 6 segundos, e mesmo com SnapStart ou com uma imagem nativa GraalVM o modelo de execução — sem <em>pooling</em> de ligações partilhado, uma invocação por contentor — encaixa mal com um serviço de API sustentado. O ECS Fargate é o ponto natural para a maioria dos serviços Java: sem plano de controlo de Kubernetes para manter, sem nós para actualizar, e uma tarefa é conceptualmente um processo. O EKS ganha quando já existe uma plataforma interna, quando se precisa de operadores, políticas de admissão e <em>service mesh</em>, ou quando a portabilidade multi-nuvem é um requisito real e não uma aspiração de <em>slide</em>.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 33.2</span> ECS Fargate, EKS e Lambda para um serviço Java: quando cada um é a escolha certa e quando deixa de ser.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th>ECS Fargate</th><th>EKS</th><th>Lambda</th></tr></thead><tbody>
+<tr><td>Arranque de uma instância nova</td><td>40-90 s (imagem + JVM)</td><td>30-60 s com nós quentes</td><td>2-6 s a frio; 0,2-0,8 s com SnapStart</td></tr>
+<tr><td>Modelo de custo</td><td>vCPU e GiB por segundo, sempre a correr</td><td>Nós EC2 mais 0,10 USD/h de plano de controlo</td><td>Por invocação e GiB-segundo; zero em repouso</td></tr>
+<tr><td>Sobrecarga operacional</td><td>Baixa: sem nós, sem plano de controlo</td><td>Alta: versões, complementos, <em>autoscaler</em>, políticas</td><td>Muito baixa em infraestrutura, alta em desenho</td></tr>
+<tr><td>Ligações à base de dados</td><td><em>Pool</em> Hikari estável por tarefa</td><td><em>Pool</em> estável por <em>pod</em></td><td>Um <em>pool</em> por contentor: exige RDS Proxy</td></tr>
+<tr><td>Adequação a Java/Spring</td><td>Alta</td><td>Alta</td><td>Média: melhor com Quarkus/nativo</td></tr>
+<tr><td>Quando é a escolha certa</td><td>API sustentada, equipa pequena, 1 a 30 serviços</td><td>Plataforma partilhada, dezenas de serviços, necessidade de operadores</td><td>Eventos esporádicos, <em>glue</em>, picos raros, tarefas curtas</td></tr>
+<tr><td>Quando deixa de ser</td><td>Precisa de agendamento fino, <em>sidecars</em> complexos ou portabilidade real</td><td>Menos de 10 serviços e ninguém dedicado à plataforma</td><td>Tráfego constante (mais caro que Fargate) ou p99 sensível a arranque</td></tr>
+</tbody></table></div></div>
+
+<p>No estado relacional, a confusão frequente é entre disponibilidade e escala de leitura. O RDS Multi-AZ mantém uma réplica síncrona noutra zona de disponibilidade que <strong>não serve tráfego</strong>: existe para sobreviver à perda de uma zona, com uma comutação de 60 a 120 segundos (mais rápida na variante com duas réplicas legíveis). As <em>read replicas</em> são assíncronas, servem leituras e escalam a capacidade de consulta, mas introduzem atraso de replicação de dezenas de milissegundos a segundos e não garantem leitura das próprias escritas. São ortogonais: uma é para disponibilidade, a outra para carga.</p>
+
+<p>Na mensageria, os quatro nomes que aparecem resolvem problemas diferentes: SQS é uma fila com um consumidor lógico e semântica de pelo menos uma entrega; SNS é difusão de um para muitos sem retenção; EventBridge é encaminhamento por regras sobre o conteúdo do evento, com esquema e alvos heterogéneos; MSK (Kafka gerido) é um registo particionado e retido, com ordem por partição e capacidade de reprocessar do início. Na rede, o padrão esperado é uma VPC com sub-redes públicas apenas para o balanceador e o NAT, sub-redes privadas para as tarefas e sub-redes isoladas para o RDS, com grupos de segurança que se referenciam mutuamente em vez de listarem blocos CIDR.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza úteis: comutação Multi-AZ do RDS em 60-120 s; atraso típico de uma <em>read replica</em> entre 20 ms e 2 s, com picos de minutos durante um <em>backfill</em>; SQS padrão com débito praticamente ilimitado contra 300 mensagens por segundo por grupo em FIFO (3 000 com <em>batching</em>); e um NAT Gateway a 0,045 USD/h mais cerca de 0,045 USD por GB processado — o que faz de 20 TB mensais de tráfego para o S3 sem VPC endpoint uma factura de perto de 900 USD que desaparece com um <em>gateway endpoint</em> gratuito.</p></aside>
+
+<div class="qa" id="q-33-9" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos um serviço Spring Boot com 900 pedidos por segundo e p99 de 150 ms, e uma equipa de sete pessoas sem plataforma dedicada. ECS, EKS ou Lambda? Justifique e diga o que mudaria a sua resposta.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>ECS Fargate. Com tráfego sustentado de 900 pedidos por segundo, o Lambda está fora por duas razões independentes: o custo por invocação a esse ritmo ultrapassa largamente o de tarefas sempre a correr, e o arranque a frio de uma JVM com Spring Boot — 2 a 6 segundos sem SnapStart — envenena um p99 de 150 ms sempre que a concorrência sobe. O EKS está fora porque sete pessoas sem plataforma dedicada vão gastar uma fatia significativa do tempo em actualizações de versão, complementos, <em>autoscaler</em> e políticas de rede, trabalho que não produz funcionalidade.</p>
+      <p>O Fargate dá o modelo mental certo para um serviço Java: uma tarefa é um processo com <em>pool</em> Hikari estável, escala horizontal por métrica de utilização ou por profundidade de fila, e a única infraestrutura a manter é a <em>task definition</em>. Dimensionamento típico: 1 vCPU e 2 GiB por tarefa, com o <em>heap</em> a 70% do limite do contentor, entre 6 e 20 tarefas conforme a hora, atrás de um ALB.</p>
+      <p>O que muda a resposta, por ordem de probabilidade: (1) a organização passar de 7 para 40 serviços com uma equipa de plataforma real — aí o EKS amortiza-se, porque o custo fixo passa a ser dividido; (2) surgir uma necessidade genuína de operadores, políticas de admissão ou <em>service mesh</em> com mTLS entre serviços; (3) o padrão de tráfego passar a picos raros — um processamento nocturno, um <em>webhook</em> com 50 invocações por dia — onde o Lambda a custo zero em repouso ganha claramente; (4) o requisito de portabilidade se tornar contratual.</p>
+      <p>Uma nota que costuma valer pontos: se a única razão para considerar o Lambda for o custo, vale a pena fazer a conta explicitamente. Uma carga constante de 900 pedidos por segundo com 100 ms de execução e 1 GiB corresponde a cerca de 2,3 mil milhões de invocações por mês; a factura do Lambda fica na ordem das dezenas de milhares de dólares, contra alguns milhares em Fargate para a mesma capacidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe por preferência pessoal ou porque «Kubernetes é o padrão da indústria», sem referir carga nem equipa.</td></tr>
+        <tr><td>Mid</td><td>Escolhe ECS com argumentos correctos mas genéricos; não quantifica o arranque a frio nem o custo do Lambda.</td></tr>
+        <tr><td>Sénior</td><td>Liga a decisão a carga, p99, dimensão da equipa e custo; enuncia condições concretas que invertem a escolha.</td></tr>
+        <tr><td>Staff</td><td>Trata o EKS como custo fixo de plataforma que só se amortiza acima de N serviços, e discute o caminho de migração se essa condição se cumprir.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o requisito for escalar de 0 a 5 000 pedidos por segundo em 30 segundos?»</li>
+      <li>«Como escala as tarefas: por CPU, por pedidos por alvo, ou por profundidade de fila?»</li>
+      <li>«Quantas ligações abre ao PostgreSQL com 20 tarefas e por que valor limita o <em>pool</em>?»</li>
+      <li>«Em Lambda com Java, o que faria para o arranque a frio deixar de importar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor EKS para 7 serviços sem alguém dedicado à plataforma.</li>
+      <li>Ignorar o arranque a frio da JVM ao propor Lambda para uma API sensível a latência.</li>
+      <li>Não ter noção do custo relativo entre invocações e capacidade contínua.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-10" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Qual é a diferença entre RDS Multi-AZ e <em>read replicas</em>, e qual das duas resolve «a base de dados está no limite de CPU nas leituras de relatório»?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Resolvem problemas ortogonais. Multi-AZ é disponibilidade: uma cópia com replicação síncrona noutra zona, que não aceita ligações e existe apenas para assumir o lugar da primária. A comutação demora 60 a 120 segundos, o ponto de acesso DNS é reapontado e a aplicação tem de sobreviver a perder todas as ligações do <em>pool</em> ao mesmo tempo. Não acrescenta um único ciclo de CPU para leituras.</p>
+      <p><em>Read replicas</em> são escala de leitura: replicação assíncrona, aceitam ligações, e podem ser promovidas manualmente. O preço é o atraso — dezenas de milissegundos em regime normal, segundos ou minutos durante um <em>backfill</em> — e a perda de leitura das próprias escritas: um cliente que faz <code>POST</code> e imediatamente <code>GET</code> contra a réplica pode não ver o que acabou de escrever.</p>
+      <p>Para o problema enunciado, a resposta é réplica de leitura, com uma condição: encaminhar para lá apenas as consultas que toleram dados com atraso, tipicamente relatórios e exportações, através de um segundo <code>DataSource</code> e de <code>@Transactional(readOnly = true)</code> com encaminhamento explícito. Nunca as leituras do caminho de escrita.</p>
+      <p>Antes disso, porém, um sénior verifica se o problema é mesmo capacidade: uma consulta de relatório a fazer varredura sequencial de 40 milhões de linhas por falta de um índice composto consome mais CPU do que todo o tráfego transaccional junto. Acrescentar uma réplica custa 100% de uma instância por mês para esconder um índice em falta. A ordem correcta é: medir com <code>pg_stat_statements</code>, corrigir o plano, e só depois adicionar capacidade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que a réplica Multi-AZ serve leituras.</td></tr>
+        <tr><td>Mid</td><td>Distingue as duas correctamente mas propõe réplica de leitura sem investigar o plano de execução nem falar de atraso.</td></tr>
+        <tr><td>Sénior</td><td>Ortogonalidade clara, tempos de comutação, consequências do atraso, encaminhamento selectivo e diagnóstico antes de capacidade.</td></tr>
+        <tr><td>Staff</td><td>Discute o custo mensal contra o ganho, o efeito da comutação no <em>pool</em> de ligações e quando a resposta certa é separar a carga analítica para fora do OLTP.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como configura dois <code>DataSource</code> em Spring sem que alguém escreva por engano na réplica?»</li>
+      <li>«O atraso subiu para 4 minutos. O que investiga primeiro?»</li>
+      <li>«Como se comporta o Hikari durante uma comutação Multi-AZ?»</li>
+      <li>«Quando é que Aurora muda esta análise?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Encaminhar leituras do caminho crítico para a réplica sem pensar em consistência.</li>
+      <li>Comprar capacidade antes de olhar para os planos de execução.</li>
+      <li>Assumir comutação instantânea e sem impacto no <em>pool</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-11" data-box="qa" data-area="sd" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">SQS, SNS, EventBridge ou MSK: como escolhe, e o que perde em cada um? Dê um caso concreto em que trocaria Kafka por SQS.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Cada um resolve um problema diferente e a escolha decide-se por três perguntas: preciso de reler o histórico, preciso de ordem, e quantos consumidores independentes há?</p>
+      <ul class="lst">
+        <li><strong>SQS</strong>: fila de trabalho para um consumidor lógico, pelo menos uma entrega, retenção até 14 dias, mas a mensagem desaparece quando é confirmada — não há releitura. Traz de graça o essencial da operação: fila de mensagens mortas, visibilidade configurável, escala automática sem particionamento. FIFO garante ordem por grupo, ao custo de 300 mensagens por segundo por grupo (3 000 com <em>batching</em>).</li>
+        <li><strong>SNS</strong>: difusão um-para-muitos, sem retenção nem releitura; usa-se para notificar N subscritores de um facto, muitas vezes com SQS em cada subscritor (padrão <em>fanout</em>) para dar durabilidade a cada consumidor.</li>
+        <li><strong>EventBridge</strong>: encaminhamento por regras sobre o conteúdo do evento, com registo de esquemas, alvos heterogéneos e integração com serviços AWS. É a escolha quando o valor está no desacoplamento por regra declarativa e o volume é moderado; o custo por evento torna-se relevante acima de alguns milhares por segundo.</li>
+        <li><strong>MSK/Kafka</strong>: registo particionado e retido. Único que dá ordem por chave, releitura do início, múltiplos grupos de consumidores independentes sobre o mesmo fluxo, e débito de centenas de milhares de mensagens por segundo. O preço é operacional: partições, grupos de consumidores, rebalanceamentos, e uma factura fixa mesmo com pouco tráfego.</li>
+      </ul>
+      <p>Caso concreto em que trocaria Kafka por SQS: um fluxo de envio de e-mails transaccionais com 60 mensagens por segundo, um consumidor, sem necessidade de ordem nem de releitura. Em Kafka isso exige um <em>cluster</em>, gestão de <em>offsets</em>, tratamento manual de mensagens envenenadas e um mecanismo próprio de repetição com atraso. Em SQS, a fila de mensagens mortas ao fim de 5 tentativas e a visibilidade com <em>backoff</em> resolvem o mesmo problema com uma linha de configuração e uma factura de dezenas de dólares.</p>
+      <p>A inversão: assim que aparece um segundo consumidor com necessidades diferentes sobre o mesmo fluxo, ou a necessidade de reprocessar três dias de eventos depois de corrigir um <em>bug</em>, o Kafka passa a ser a escolha óbvia — reprocessar em SQS obriga a republicar a partir de uma fonte que muitas vezes já não existe.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata todos como «filas»; propõe Kafka por omissão para qualquer integração assíncrona.</td></tr>
+        <tr><td>Mid</td><td>Descreve os serviços correctamente mas não usa releitura, ordem e número de consumidores como critério de decisão.</td></tr>
+        <tr><td>Sénior</td><td>Critério em três eixos, limites numéricos do FIFO, padrão SNS+SQS, e um caso concreto de troca em cada sentido.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo total de propriedade do Kafka gerido, a evolução de esquema entre produtores e consumidores e a estratégia de migração entre os dois modelos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como garante idempotência com entrega pelo menos uma vez?»</li>
+      <li>«Precisa de ordem por cliente e de 5 000 mensagens por segundo. SQS FIFO chega?»</li>
+      <li>«Como faz a fila de mensagens mortas em Kafka?»</li>
+      <li>«O consumidor está 4 horas atrasado. O que faz primeiro?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Kafka como resposta por omissão sem falar de custo operacional.</li>
+      <li>Não saber que o SQS padrão não garante ordem nem entrega única.</li>
+      <li>Desenhar consumidores sem idempotência.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-5" class="h2"><span class="secnum">33.5</span> Terraform: estado, módulos e ambientes<a class="anchor" href="#sec-33-5" aria-label="ligação">#</a></h2>
+
+<p>O Terraform é declarativo, mas o objecto que interessa numa entrevista é imperativo e frágil: o ficheiro de estado. É o mapeamento entre os recursos declarados e os identificadores reais na nuvem, contém valores sensíveis em texto simples e é escrito por qualquer pessoa que corra <code>apply</code>. Três perguntas revelam imediatamente experiência real: onde está o estado, como se impede que dois <code>apply</code> concorram, e o que se faz quando o estado diverge da realidade.</p>
+
+<p>O estado vive num <em>bucket</em> S3 com versionamento activo e cifra ativada, com uma chave por ambiente e por componente, nunca no repositório. O bloqueio impede a corrupção por escrita concorrente: historicamente fazia-se com uma tabela DynamoDB, e desde o Terraform 1.10 existe bloqueio nativo no próprio S3 através de escritas condicionais, activado com <code>use_lockfile = true</code> — que dispensa a tabela e é hoje o caminho recomendado. Sem bloqueio, dois <code>apply</code> simultâneos produzem um estado que não descreve nem uma nem outra intenção, e a recuperação passa por importar recursos à mão.</p>
+
+<p>Na organização do código, a divisão que sobrevive ao tempo é: módulos reutilizáveis versionados (a <em>rede</em>, o <em>serviço ECS</em>, a <em>base de dados</em>) e uma raiz por ambiente em directório próprio, cada uma com o seu <em>backend</em>, as suas variáveis e idealmente a sua conta AWS. A alternativa dos <em>workspaces</em> parece mais limpa mas partilha o mesmo <em>backend</em> e o mesmo código: como a diferença entre <em>staging</em> e produção não é só o valor de duas variáveis, acaba-se com <code>count = terraform.workspace == "prod" ? 3 : 1</code> espalhado pelo código, que é a pior forma de exprimir uma diferença de arquitectura. Os <em>workspaces</em> mantêm-se úteis para ambientes efémeros idênticos — um por <em>pull request</em>, destruído no fim.</p>
+
+<figure class="listing hcl" id="lst-33-4"><div class="lhead"><span class="lnum">Listagem 33.4</span>
+<span class="lcap">Raiz de ambiente: <em>backend</em> S3 com versionamento, cifra e bloqueio nativo, versões fixadas e etiquetas por omissão.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="hcl"><code>terraform {
+  required_version = "~&gt; 1.10"          # use_lockfile exige 1.10 ou superior
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.70"               # fixar o minor: um upgrade nao entra sozinho
+    }
+  }
+
+  backend "s3" {
+    bucket       = "acme-tfstate-prod"  # bucket por conta/ambiente, versionamento ligado
+    key          = "pagamentos/ecs/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    kms_key_id   = "alias/tfstate"
+    use_lockfile = true                 # bloqueio nativo por escrita condicional no S3
+                                        # (substitui a tabela DynamoDB)
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+
+  assume_role {
+    role_arn = "arn:aws:iam::123456789012:role/terraform-prod"   # conta separada por ambiente
+  }
+
+  default_tags {
+    tags = {
+      Ambiente   = "prod"
+      Servico    = "pagamentos-api"
+      Equipa     = "pagamentos"
+      CentroCusto = "cc-4711"           # sem isto nao ha atribuicao de custo por equipa
+      GeridoPor  = "terraform"
+    }
+  }
+}
+
+module "servico" {
+  source  = "git::ssh://git@github.com/acme/tf-modules.git//ecs-servico?ref=v3.2.1"
+  # ref fixo numa etiqueta: um modulo em "main" muda producao sem ninguem alterar codigo
+
+  nome            = "pagamentos-api"
+  imagem          = var.imagem_digest    # digest, nunca etiqueta movel
+  cpu             = 1024
+  memoria         = 2048
+  desejadas_min   = 6
+  desejadas_max   = 20
+  subredes        = data.aws_subnets.privadas.ids
+  bd_secret_arn   = data.aws_secretsmanager_secret.bd.arn
+}
+</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um <code>terraform apply</code> corrido do portátil de alguém com credenciais de administrador é a origem da maioria dos incidentes de infraestrutura. O <em>plan</em> tem de correr no <em>pipeline</em> em cada <em>pull request</em>, com o resultado publicado como comentário; o <em>apply</em> corre depois do <em>merge</em>, com a <em>role</em> assumida por OIDC, e ninguém tem permissões de escrita interactivas em produção. Um <em>plan</em> em produção que mostre 14 alterações não pedidas não é ruído: é a medida da divergência acumulada.</p></aside>
+
+<div class="qa" id="q-33-12" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Onde vive o estado do Terraform, como impede dois <code>apply</code> concorrentes e o que faz quando alguém alterou um recurso à mão na consola da AWS?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O estado vive num <em>bucket</em> S3 dedicado por conta, com versionamento activo, cifra com KMS e acesso público bloqueado, e uma chave por componente e ambiente — por exemplo <code>pagamentos/ecs/terraform.tfstate</code>. O versionamento não é decorativo: é o mecanismo de recuperação quando um <code>apply</code> corre mal, porque permite repor a versão anterior do objecto.</p>
+      <p>Para o bloqueio, o mecanismo actual é <code>use_lockfile = true</code> no <em>backend</em> S3, disponível desde o Terraform 1.10, que usa escritas condicionais do S3 para criar um ficheiro de bloqueio ao lado do estado. Antes disso usava-se uma tabela DynamoDB com <code>LockID</code> como chave, ainda comum em bases de código mais antigas. O que o bloqueio garante é serialização: um segundo <code>apply</code> falha imediatamente com a identidade de quem detém o bloqueio, em vez de intercalar escritas e produzir um estado que não corresponde a nada.</p>
+      <p>A divergência — o <em>drift</em> — trata-se em três passos. Primeiro, detectar de forma sistemática: um <em>job</em> nocturno corre <code>terraform plan -detailed-exitcode</code> em todas as raízes e o código de saída 2 abre um alerta. Não se descobre divergência no dia do <em>deploy</em>. Segundo, decidir a direcção: ou a alteração manual foi legítima e é codificada (e importada com <code>terraform import</code> ou um bloco <code>import</code>, se for um recurso novo), ou foi indevida e o <code>apply</code> seguinte repõe a declaração. Terceiro, remover a causa: se a alteração manual foi possível, é porque alguém tem permissões de escrita interactivas em produção — a correcção estrutural é retirá-las e deixar apenas leitura, com a escrita a passar exclusivamente pelo <em>pipeline</em>.</p>
+      <p>Duas armadilhas frequentes: apagar recursos do estado com <code>state rm</code> para «resolver» um conflito, o que os torna órfãos e continua a pagá-los; e guardar o estado num repositório Git, onde as palavras-passe geradas ficam em texto simples no histórico para sempre.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Estado local ou no repositório; não sabe o que acontece com dois <code>apply</code> em simultâneo.</td></tr>
+        <tr><td>Mid</td><td>S3 mais DynamoDB de cor, sem versionamento, sem plano para divergência além de «corremos o <code>apply</code>».</td></tr>
+        <tr><td>Sénior</td><td><em>Backend</em> S3 cifrado e versionado, bloqueio explicado, detecção periódica de divergência, decisão consciente entre importar e repor.</td></tr>
+        <tr><td>Staff</td><td>Remove a causa retirando permissões interactivas, separa contas por ambiente e define quem pode aprovar um <code>apply</code> em produção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O estado ficou corrompido a meio de um <code>apply</code>. Passos concretos?»</li>
+      <li>«Como cria o <em>bucket</em> de estado, se ele próprio precisa de estado?»</li>
+      <li>«Um segredo gerado pelo Terraform está no estado. Isso é aceitável?»</li>
+      <li>«Qual é a diferença entre <code>state rm</code>, <code>import</code> e <code>taint</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Estado versionado em Git ou partilhado por rede.</li>
+      <li>Um único ficheiro de estado para toda a organização.</li>
+      <li><code>state rm</code> como resposta habitual a conflitos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-33-13" data-box="qa" data-area="devops" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como estrutura o Terraform para quatro ambientes: <em>workspaces</em> ou directório por ambiente? E como versiona os módulos partilhados?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Directório por ambiente, com uma raiz independente e um <em>backend</em> próprio para cada um, e idealmente uma conta AWS por ambiente. A razão não é estética: com raízes separadas, o raio de explosão de um <code>apply</code> errado fica contido num ambiente, o estado de produção não é sequer acessível a partir da raiz de <em>staging</em>, e as diferenças reais de arquitectura ficam explícitas no código em vez de escondidas em condicionais.</p>
+      <p>Os <em>workspaces</em> falham em ambientes duradouros por partilharem código e <em>backend</em>. Como <em>staging</em> nunca é uma cópia à escala de produção — não tem réplicas de leitura, tem uma zona de disponibilidade, não tem WAF — o código enche-se de <code>terraform.workspace == "prod" ? … : …</code>, e um engano no ambiente activo aplica em produção o que se pretendia para <em>staging</em>. Onde os <em>workspaces</em> são a ferramenta certa é em ambientes efémeros e idênticos: um por <em>pull request</em>, criado e destruído pelo <em>pipeline</em>.</p>
+      <p>Os módulos partilhados vivem num repositório próprio, com etiquetas semânticas, e são consumidos por referência fixa: <code>source = "git::…//ecs-servico?ref=v3.2.1"</code> ou por um registo de módulos. Apontar para <code>main</code> significa que o próximo <code>apply</code> em produção — que pode ser feito por outra pessoa, por outra razão — traz alterações de infraestrutura que ninguém pediu. Com etiqueta fixa, actualizar um módulo é um <em>pull request</em> visível, com <em>plan</em> revisto, e a promoção faz-se ambiente a ambiente.</p>
+      <p>Sobre a granularidade do estado: um estado por ambiente <em>e</em> por componente com ciclo de vida distinto — rede, dados, serviços. Um estado único por ambiente faz com que um <code>plan</code> demore 4 a 8 minutos, que um erro no serviço bloqueie alterações à rede, e que o raio de explosão inclua a base de dados. O <em>trade-off</em> é a ligação entre estados, feita com <code>terraform_remote_state</code> ou, melhor, por fontes de dados que consultam a AWS directamente e evitam acoplamento a ficheiros de estado alheios.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Copia e cola a pasta inteira por ambiente, com divergência entre elas; ou um único estado gigante.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <em>workspaces</em> por serem «o mecanismo oficial», sem ver o problema das condicionais nem do <em>backend</em> partilhado.</td></tr>
+        <tr><td>Sénior</td><td>Raiz por ambiente, módulos com etiqueta fixa, estado separado por ciclo de vida, e reconhece o caso legítimo dos <em>workspaces</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta conta AWS por ambiente, política de promoção de versões de módulos e o custo de manutenção de módulos internos face a usar os públicos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como garante que <em>staging</em> não diverge silenciosamente de produção?»</li>
+      <li>«Como passa o identificador da VPC da raiz de rede para a raiz do serviço?»</li>
+      <li>«Quanto tempo demora o <code>plan</code> de produção hoje?»</li>
+      <li>«Um módulo v4 tem uma alteração incompatível. Como faz a promoção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Módulos referenciados por <code>main</code> ou por caminho local partilhado.</li>
+      <li>Condicionais por <em>workspace</em> a decidir arquitectura.</li>
+      <li>Ambientes que só diferem por terem sido esquecidos em momentos distintos.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-6" class="h2"><span class="secnum">33.6</span> Custo, quotas e o que perguntam sobre FinOps<a class="anchor" href="#sec-33-6" aria-label="ligação">#</a></h2>
+
+<p>Numa scale-up europeia, a factura da nuvem é frequentemente o segundo maior custo depois dos salários, e um sénior de backend é esperado saber o que o seu serviço custa. A pergunta raramente é «como poupar dinheiro»; é «qual é o custo por transacção do seu serviço e o que o domina». Quem responde com uma ordem de grandeza e uma decomposição em três parcelas — computação, dados, transferência — está acima da média, porque a maioria não sabe sequer se o seu serviço custa 200 ou 20 000 dólares por mês.</p>
+
+<p>As parcelas que dominam em serviços Java típicos, por ordem de frequência com que surpreendem: computação sobredimensionada (tarefas com 4 vCPU a usar 12% de CPU porque alguém copiou o valor de outro serviço); ambientes de não produção a correr 24 horas por dia, quando são usados 40 horas por semana; NAT Gateway a processar tráfego que devia passar por <em>VPC endpoints</em>; <em>logs</em> retidos indefinidamente no CloudWatch a custo de ingestão mais armazenamento; e <em>snapshots</em> e volumes órfãos de recursos destruídos fora do Terraform.</p>
+
+<p>As quotas são o outro lado da mesma conversa e aparecem sobretudo como pergunta de incidente. Limites por conta e por região — número de endereços IP elásticos, invocações concorrentes de Lambda, ligações ao RDS em função da classe da instância, número de tarefas Fargate — não são erros do sistema, são a razão pela qual uma escala automática pára a meio de um pico. A resposta esperada é que essas quotas estão inventariadas, monitorizadas com alarme a 80% de utilização e pedidas com antecedência antes de eventos previsíveis.</p>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Etiquetagem é a pré-condição de toda a conversa de custo. Sem <code>default_tags</code> no fornecedor Terraform a atribuir <em>Serviço</em>, <em>Equipa</em>, <em>Ambiente</em> e centro de custo a cada recurso, a factura é um número agregado sobre o qual não se pode agir. Com etiquetas, a mesma factura passa a ser uma lista ordenada de serviços com dono, e a conversa deixa de ser «temos de poupar 20%» e passa a ser «este serviço custa 3 400 USD por mês e processa 12 milhões de transacções».</p></aside>
+
+<div class="qa" id="q-33-14" data-box="qa" data-area="devops" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">A factura AWS da equipa subiu 40% em dois meses sem aumento de tráfego. Como investiga e que três medidas propõe primeiro?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro, atribuir antes de cortar. Uso o Cost Explorer agrupado por serviço, depois por etiqueta de equipa e ambiente, comparando o mês actual com o de há três meses, e isolo as duas ou três linhas responsáveis pela subida. Sem etiquetas coerentes esta análise é impossível — se for esse o caso, o primeiro trabalho é impor <code>default_tags</code> no Terraform e uma política que recuse recursos sem dono.</p>
+      <p>O que normalmente aparece: (1) ambientes de não produção a correr permanentemente — desligar <em>staging</em> e os ambientes de desenvolvimento fora do horário de trabalho corta cerca de 65% dessas horas, das 168 semanais para 60; (2) tráfego de saída pelo NAT Gateway que devia usar <em>VPC endpoints</em> — um <em>gateway endpoint</em> para S3 e DynamoDB é gratuito e elimina tanto os 0,045 USD por GB processado como uma dependência de disponibilidade; (3) retenção de <em>logs</em> sem limite, onde reduzir de infinito para 30 dias em CloudWatch com arquivo em S3 costuma cortar mais de metade dessa rubrica.</p>
+      <p>As três medidas que proporia por esta ordem, com critério de decisão explícito: reduzir os ambientes de não produção fora de horas (ganho imediato, risco praticamente nulo, reversível); adicionar <em>VPC endpoints</em> e rever a retenção de <em>logs</em> (ganho grande, risco baixo, uma semana de trabalho); e só depois redimensionar a computação com base em percentis de utilização observados durante 14 dias, nunca em médias — dimensionar pela média produz saturação no pico, e o objectivo é reduzir custo sem tocar no p99.</p>
+      <p>O que deixaria para o fim, apesar de ser o que costuma ser proposto primeiro: compromissos de capacidade a um ano. São desconto real de 20% a 40%, mas fixam a arquitectura durante 12 meses — comprar reservas antes de redimensionar é comprar desperdício com desconto. O indicador que uso para fechar a conversa é o custo por transacção: se a factura sobe mas o custo por transacção desce, o sistema está a escalar bem e a conversa é outra.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Passamos tudo para instâncias mais pequenas» sem medir; ou desconhece por completo o custo do serviço.</td></tr>
+        <tr><td>Mid</td><td>Conhece o Cost Explorer e propõe medidas genéricas, sem etiquetagem, sem ordem por risco nem números.</td></tr>
+        <tr><td>Sénior</td><td>Atribui por etiqueta antes de cortar, identifica as rubricas típicas com números, ordena por risco e reversibilidade.</td></tr>
+        <tr><td>Staff</td><td>Introduz custo por transacção como métrica de produto, adia compromissos até haver dimensionamento estável e institui uma política de etiquetagem obrigatória.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quanto custa o seu serviço por mês e por transacção?»</li>
+      <li>«Como desliga <em>staging</em> à noite sem partir os testes nocturnos?»</li>
+      <li>«Que quotas da conta estão perto do limite hoje?»</li>
+      <li>«Quando é que vale a pena passar de Fargate para EC2 com Spot?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Cortar capacidade com base em médias de utilização.</li>
+      <li>Comprar compromissos de um ano antes de redimensionar.</li>
+      <li>Não conseguir dizer uma ordem de grandeza do custo do próprio serviço.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-33-7" class="h2"><span class="secnum">33.7</span> Resumo e checklist<a class="anchor" href="#sec-33-7" aria-label="ligação">#</a></h2>
+
+<p>O fio condutor deste capítulo é um só: entregar depressa é uma consequência de conseguir desfazer depressa. Todas as práticas — artefacto imutável, canário com alarme, expand/contract, estado bloqueado — existem para tornar a reposição barata e previsível, e é isso que o entrevistador procura ouvir.</p>
+
+<ul class="lst">
+  <li>Dois orçamentos de tempo: menos de 10 minutos de <em>feedback</em> ao PR, 20 a 40 minutos de <em>merge</em> a tráfego real. Sem números, a resposta não conta.</li>
+  <li>O artefacto é construído uma vez e promovido por <em>digest</em> <code>sha256</code>. Etiquetas móveis e <code>SNAPSHOT</code> destroem a reprodutibilidade.</li>
+  <li>Cada <em>gate</em> tem de justificar o seu custo pelo rácio entre defeitos apanhados e paragens falsas; a suite ponta a ponta sai do caminho crítico.</li>
+  <li>Canário exige tráfego suficiente para gerar sinal; abaixo de algumas centenas de pedidos por segundo, blue-green com reposição rápida é mais honesto.</li>
+  <li>O <em>rollback</em> define-se em segundos e com gatilho automático. O que ele nunca repõe é dados — e é por isso que existe expand/contract.</li>
+  <li>Migrações em três fases e implantações separadas, com o esquema compatível com as versões N-1 e N em simultâneo; <code>migrate</code> no <em>pipeline</em>, <code>validate</code> no arranque.</li>
+  <li>ECS Fargate para a maioria dos serviços Java; EKS quando existe equipa de plataforma e dezenas de serviços; Lambda para eventos esporádicos, não para APIs sustentadas com JVM.</li>
+  <li>Multi-AZ é disponibilidade, réplicas são leitura; e antes de comprar capacidade, olhar para os planos de execução.</li>
+  <li>Estado do Terraform em S3 cifrado e versionado, com bloqueio (<code>use_lockfile</code>), raiz por ambiente e módulos com etiqueta fixa.</li>
+</ul>
+
+<p>Checklist accionável antes da entrevista:</p>
+
+<ul class="lst">
+  <li>Escrever, num papel, o <em>pipeline</em> do serviço actual com o tempo de cada etapa e o tempo total.</li>
+  <li>Saber dizer, sem hesitar, quanto demora uma reposição e quem a desencadeia.</li>
+  <li>Ter uma história de migração expand/contract com números: linhas, lotes, dias entre fases.</li>
+  <li>Preparar a justificação ECS/EKS/Lambda para o próprio sistema, com a condição que inverteria a escolha.</li>
+  <li>Ser capaz de escrever de cor um <em>backend</em> S3 com <code>encrypt</code>, <code>key</code> por ambiente e bloqueio.</li>
+  <li>Ter uma ordem de grandeza do custo mensal do serviço e do custo por transacção.</li>
+  <li>Saber nomear três quotas AWS que já limitaram, ou podiam limitar, o sistema actual.</li>
+  <li>Preparar um incidente de <em>pipeline</em> ou de infraestrutura em que a decisão foi do próprio candidato, com o que se mediu antes e depois.</li>
+</ul>

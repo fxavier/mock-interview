@@ -1,0 +1,46 @@
+{"chapter": 22, "questions": [
+  {"q": "Um serviço em PostgreSQL 17 executa, dentro de uma transacção em `READ COMMITTED`, dois `SELECT count(*) FROM lancamento WHERE conta_id = 7` separados por 300 ms de processamento em Java. Entretanto outra sessão faz `INSERT` de uma linha para a conta 7 e `COMMIT`. Qual é o resultado?",
+   "options": [
+     "Os dois `SELECT` devolvem o mesmo valor, porque a transacção fixa um `snapshot` no `BEGIN`.",
+     "O segundo `SELECT` devolve mais uma linha: é uma leitura fantasma, e desapareceria em `REPEATABLE READ`.",
+     "A segunda sessão fica bloqueada até o primeiro `SELECT` terminar, por causa dos `next-key locks`.",
+     "A primeira transacção aborta com SQLSTATE 40001 assim que a segunda faz `COMMIT`."],
+   "answer": 1,
+   "explain": "Em `READ COMMITTED` o snapshot é tomado no início de cada instrução, não da transacção, por isso o segundo `SELECT` vê a linha inserida e commitada entretanto — o conjunto que satisfaz o predicado mudou, logo é leitura fantasma. Em `REPEATABLE READ` o snapshot fica fixado na primeira leitura e o fantasma não aparece. Leitores não bloqueiam escritores em MVCC, e o aborto 40001 só ocorre em conflitos de escrita ou em `SERIALIZABLE`."},
+
+  {"q": "A regra é «uma sala não pode ter duas reservas sobrepostas». O código valida com um `SELECT` de sobreposição e depois insere, tudo em `REPEATABLE READ`. Duas reservas concorrentes ficaram ambas gravadas. Qual é a correcção mais robusta em PostgreSQL?",
+   "options": [
+     "Envolver o método num bloco `synchronized` no serviço Java.",
+     "Baixar o isolamento para `READ COMMITTED`, que relê a versão mais recente antes de inserir.",
+     "Criar uma restrição `EXCLUDE USING gist (sala_id WITH =, periodo WITH &&)` e tratar o erro 23P01.",
+     "Adicionar `SELECT ... FOR UPDATE` sobre as linhas de reserva devolvidas pela validação."],
+   "answer": 2,
+   "explain": "É write skew: as duas transacções lêem o mesmo estado e escrevem em linhas diferentes, pelo que nenhum nível abaixo de `SERIALIZABLE` o detecta. A restrição `EXCLUDE` move o invariante para o motor, onde nenhum caminho de escrita o pode contornar. `synchronized` não funciona com várias instâncias, baixar o isolamento agrava, e `FOR UPDATE` não bloqueia linhas que ainda não existem."},
+
+  {"q": "Um `endpoint` decrementa stock com `SELECT ... FOR UPDATE` seguido de `UPDATE`, e entre os dois chama o `gateway` de pagamentos por HTTP com `timeout` de 3 segundos. Qual é a consequência mais grave em produção?",
+   "options": [
+     "O `lock` da linha é mantido durante a chamada HTTP, limitando o produto a ~1 reserva a cada 3 s e esgotando a `pool` HikariCP.",
+     "O `FOR UPDATE` expira automaticamente ao fim de `deadlock_timeout` e o `UPDATE` falha com 40P01.",
+     "A chamada HTTP participa na transacção, pelo que um `ROLLBACK` desfaz a cobrança.",
+     "O PostgreSQL promove o `lock` de linha a `lock` de tabela, bloqueando também os `SELECT`."],
+   "answer": 0,
+   "explain": "Os `locks` de linha só são libertados no fim da transacção, por isso a latência do terceiro passa a ser o tempo de serialização daquele produto e as ligações ficam presas até esgotar a `pool`. Não há expiração automática de `FOR UPDATE` sem `lock_timeout` configurado, a chamada HTTP não é transaccional e não é desfeita por `ROLLBACK`, e o PostgreSQL não promove `locks` de linha a `locks` de tabela."},
+
+  {"q": "Uma tabela de eventos com 2 mil milhões de linhas vai ser particionada por mês em `criado_em`, e existe hoje um índice `UNIQUE (id_externo)` usado para deduplicação. O que acontece?",
+   "options": [
+     "O índice único global é mantido automaticamente pelo PostgreSQL sobre todas as partições.",
+     "O `UNIQUE` deixa de ser exprimível como está: a chave de partição tem de fazer parte de qualquer índice único da tabela particionada.",
+     "O índice passa a ser criado por partição, mas a unicidade global continua garantida pelo planeador.",
+     "A criação da tabela particionada falha, porque não é permitido ter índices únicos com partições por intervalo."],
+   "answer": 1,
+   "explain": "No PostgreSQL, qualquer `PRIMARY KEY` ou `UNIQUE` numa tabela particionada tem de incluir a coluna de partição, porque cada índice é local à sua partição e não há forma de garantir unicidade entre ficheiros distintos. A deduplicação por `id_externo` passa a exigir outra solução — uma tabela auxiliar não particionada, ou incluir a data na chave. Nada nisto impede a criação da tabela particionada em si."},
+
+  {"q": "Um serviço grava uma encomenda em PostgreSQL e publica `EncomendaPaga` em Kafka. Quer eliminar tanto a perda de eventos como a leitura prematura pelo consumidor. Qual é a solução correcta e qual é a garantia obtida?",
+   "options": [
+     "Publicar em Kafka dentro do bloco `@Transactional`, obtendo atomicidade entre a base e o `broker`.",
+     "Usar `@TransactionalEventListener(AFTER_COMMIT)`, que garante durabilidade do evento mesmo se a JVM morrer.",
+     "Gravar o evento numa tabela `outbox` na mesma transacção e publicá-lo por um processo separado, com garantia «pelo menos uma vez».",
+     "Configurar `2PC` entre PostgreSQL e Kafka com um coordenador XA, obtendo «exactamente uma vez»."],
+   "answer": 2,
+   "explain": "O `outbox` transforma a dupla escrita numa única transacção local: ou há estado e evento, ou não há nenhum. O relay publica depois, com entrega «pelo menos uma vez», o que obriga o consumidor a ser idempotente por chave. Publicar dentro da transacção não é atómico e expõe o evento antes do `COMMIT`; o `AFTER_COMMIT` resolve a visibilidade mas perde o evento se o processo morrer; e `2PC` com um `broker` não dá «exactamente uma vez» de ponta a ponta."}
+]}

@@ -1,0 +1,712 @@
+<p>Uma ronda de JVM não pergunta o que é o <em>garbage collector</em>: pergunta o que o candidato faz às três da manhã quando o p99 de um serviço salta de 40 ms para 900 ms e o painel de GC mostra pausas de 1,2 s. O que separa os níveis é a ordem das operações — quem é sénior mede antes de mexer, sabe que número procurar e sabe qual é a flag que não vai resolver nada. Onde os candidatos caem é em três sítios: descrevem a divisão jovem/velha como se fosse o modelo de todos os recolectores, confundem <code>OutOfMemoryError</code> com <em>OOMKilled</em> do <em>kernel</em>, e recitam flags que copiaram de um blogue de 2013 sem saberem que metade foi removida do JDK. Este capítulo percorre o caminho completo — da classe carregada ao código nativo, do <em>layout</em> de memória ao recolector, da pausa lida no <em>log</em> ao diagnóstico de cada variante de OOM — e termina onde a maioria dos incidentes reais acontece hoje: uma JVM dentro de um contentor com um limite de memória que ninguém calculou.</p>
+
+<h2 id="sec-9-1" class="h2"><span class="secnum">9.1</span> Da classe ao código nativo: carregamento, verificação e JIT<a class="anchor" href="#sec-9-1" aria-label="ligação">#</a></h2>
+
+<p>Uma classe atravessa três fases antes de o primeiro <em>bytecode</em> correr: carregamento (obter os <em>bytes</em> e criar o objecto <code>Class</code>), ligação (verificação do <em>bytecode</em>, preparação dos campos estáticos com valores por omissão, resolução de referências simbólicas) e inicialização (execução do <code>&lt;clinit&gt;</code>, que corre no primeiro uso activo e apenas uma vez, protegido por um bloqueio por classe). A verificação é a fase que garante que o <em>bytecode</em> não viola as regras da máquina virtual — é também a fase que custa tempo de arranque e a razão pela qual desligá-la em produção com <code>-Xverify:none</code> deixou de ser opção: a flag está obsoleta e é ignorada.</p>
+
+<p>O carregamento é feito por uma hierarquia de três <em>class loaders</em> com delegação ao pai primeiro. O <em>bootstrap</em> carrega <code>java.base</code> e os módulos essenciais e é o único que devolve <code>null</code> em <code>getClassLoader()</code>. O <em>platform loader</em> carrega os módulos da plataforma que não estão no <em>bootstrap</em>. O <em>application loader</em> carrega o <em>classpath</em> e o <em>module path</em> da aplicação. A delegação parent-first é o que impede uma classe <code>java.lang.String</code> colocada num JAR de substituir a real. Servidores de aplicações e plataformas de <em>plugins</em> invertem parcialmente a delegação para isolar versões, e é daí que vêm dois problemas clássicos de entrevista: <code>ClassCastException</code> entre duas cópias da mesma classe carregada por <em>loaders</em> diferentes — a identidade de um tipo é o par (nome, <em>loader</em>) — e a fuga de metaspace, porque uma classe só é descarregada quando o seu <em>loader</em> se torna inalcançável.</p>
+
+<p>Executado o <em>bytecode</em>, entra o compilador. A JVM começa a interpretar, conta invocações e iterações de ciclo, e promove os métodos quentes: C1 compila depressa e produz código médio com instrumentação de perfil; C2 compila devagar e produz código agressivamente optimizado a partir desse perfil. Com <em>tiered compilation</em> — ligada por omissão — um método sobe tipicamente nível 0 (interpretador) para 3 (C1 com perfil completo) e daí para 4 (C2). As optimizações que fazem a diferença são <em>inlining</em> (que abre a porta a todas as outras), análise de escape com substituição escalar, desdobramento de ciclos e desvirtualização de chamadas monomórficas. Todas são especulativas: quando a assunção falha — carrega-se uma segunda implementação de uma interface que até aí era monomórfica, um ramo nunca tomado passa a ser tomado — o código é desoptimizado, a execução volta ao interpretador e o método é recompilado com o novo perfil.</p>
+
+<figure class="listing text" id="lst-9-1"><div class="lhead"><span class="lnum">Listagem 9.1</span>
+<span class="lcap">Excerto de <code>-Xlog:jit+compilation=debug</code> e desoptimização por armadilha rara.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>  4312  721       3       com.acme.pricing.RuleEngine::evaluate (214 bytes)
+  4498  902       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)
+  6120  902       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)   made not entrant
+[6.120s][info][deoptimization] Uncommon trap: reason=class_check action=maybe_recompile
+                             compile_id=902 compiler=c2 level=4
+                             method=com/acme/pricing/RuleEngine.evaluate ()D @ 48
+  6380  915       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)
+
+# CodeCache: size=245760Kb used=238904Kb max_used=239100Kb free=6856Kb
+# CodeCache is full. Compiler has been disabled.</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O arranque é dominado por carregar e ligar milhares de classes, não por compilar. Um serviço Spring Boot 3.x típico carrega 12 000 a 18 000 classes ao arrancar. O CDS (arquivo de classes partilhado) e as variantes de arquivo da aplicação gravam essas classes já analisadas num ficheiro mapeado em memória e cortam 20% a 40% do tempo de arranque sem alterar uma linha de código — a diferença mais barata que existe entre <code>3,8 s</code> e <code>2,5 s</code> de <em>startup</em>.</p></aside>
+
+<div class="qa" id="q-9-1" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Descreva a hierarquia de <em>class loaders</em> e a delegação. Depois explique-me porque é que, no nosso servidor, cada <em>redeploy</em> a quente aumenta o metaspace em cerca de 40 MB e ao fim de nove <em>redeploys</em> a aplicação morre.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São três <em>loaders</em> com delegação ao pai primeiro: <em>bootstrap</em> (<code>java.base</code> e módulos essenciais, devolve <code>null</code>), <em>platform</em> e <em>application</em>. Cada pedido sobe a cadeia antes de descer: o <em>loader</em> só procura nos seus próprios recursos depois de o pai declarar que não conhece a classe. Isto garante que os tipos da plataforma são únicos e que a identidade de uma classe é o par (nome binário, <em>class loader</em>) — duas cópias da mesma classe carregadas por <em>loaders</em> diferentes são tipos distintos e o <em>cast</em> entre elas lança <code>ClassCastException</code> com uma mensagem que parece absurda porque os dois nomes são iguais.</p>
+      <p>O crescimento de 40 MB por <em>redeploy</em> é uma fuga de <em>class loader</em>. Um <em>redeploy</em> a quente cria um <em>loader</em> novo para a aplicação e descarta o antigo. As classes do <em>loader</em> antigo — e o próprio metaspace que ocupam — só são libertadas quando o <em>loader</em> se torna inalcançável, o que exige que nada fora da aplicação lhe segure uma referência, directa ou indirecta. Como uma classe referencia o seu <em>loader</em> e um objecto referencia a sua classe, basta um único objecto sobrevivente para reter todo o grafo.</p>
+      <p>As fontes habituais são quatro: um <code>ThreadLocal</code> preenchido num <em>thread</em> de um <em>pool</em> partilhado que sobrevive ao <em>redeploy</em>; um <em>thread</em> criado pela aplicação e nunca terminado, cujo <code>contextClassLoader</code> aponta para o <em>loader</em> antigo; um <em>singleton</em> estático de uma biblioteca carregada pelo pai (drivers JDBC registados no <code>DriverManager</code>, <em>appenders</em> de <em>logging</em>, <em>caches</em> de MBeans no <em>registry</em> JMX) que guarda um objecto da aplicação; e proxies dinâmicos ou classes geradas em tempo de execução que continuam referenciadas.</p>
+      <p>O diagnóstico é directo: <code>jcmd &lt;pid&gt; VM.classloader_stats</code> mostra quantos <em>loaders</em> existem e quanto metaspace cada um retém — se houver dez <em>loaders</em> da aplicação depois de nove <em>redeploys</em>, está provado. A confirmação faz-se com um <em>heap dump</em> e o caminho para as raízes GC do <em>loader</em> antigo no Eclipse MAT. O <em>trade-off</em> operacional é conhecido e desagradável: corrigir cada fuga é caro e frágil, pelo que a esmagadora maioria das equipas abandonou o <em>redeploy</em> a quente e passou a substituir o processo — em contentores, o custo de reiniciar é de segundos e a classe de problema desaparece por construção. O <em>redeploy</em> a quente só se justifica quando o arranque custa minutos e não há forma de o reduzir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Enumera os três <em>loaders</em> sem delegação; atribui o crescimento a «falta de memória» e propõe aumentar <code>-XX:MaxMetaspaceSize</code>.</td></tr>
+        <tr><td>Mid</td><td>Explica a delegação parent-first correctamente e diz «é uma fuga de <em>classloader</em>», mas não sabe nomear o mecanismo de retenção nem como o provar.</td></tr>
+        <tr><td>Sénior</td><td>Liga identidade de tipo ao par (nome, <em>loader</em>), explica a cadeia objecto → classe → <em>loader</em>, nomeia pelo menos duas fontes concretas de retenção e o comando de diagnóstico.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o julgamento de engenharia: quantifica o custo de perseguir fugas contra o de eliminar o <em>redeploy</em> a quente, e define a política da equipa (processo novo por <em>deploy</em>, <em>MaxMetaspaceSize</em> como alarme e não como remédio).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que definir <code>-XX:MaxMetaspaceSize</code> não resolve a fuga — e mesmo assim vale a pena defini-lo?»</li>
+      <li>«O que é o <em>compressed class space</em> e como se esgota separadamente do metaspace?»</li>
+      <li>«Como isolaria duas versões da mesma biblioteca no mesmo processo?»</li>
+      <li>«Porque é que um <code>ThreadLocal</code> num <em>pool</em> retém mais do que o valor guardado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Dizer que o metaspace está no <em>heap</em> e que uma GC completa o liberta sempre.</li>
+      <li>Propor <code>System.gc()</code> periódico como mitigação.</li>
+      <li>Não distinguir descarregamento de classes de recolha de objectos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-2" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um <em>benchmark</em> nosso corre a 180 ns por operação durante os primeiros dois minutos e depois estabiliza em 310 ns, sempre com a mesma carga. O que está a acontecer na JVM e como o confirmaria?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A degradação depois de um bom período inicial é o padrão clássico de desoptimização por perfil incompleto: o C2 compilou o caminho quente assumindo que um ponto de chamada era monomórfico, ou que um ramo nunca era tomado, e essa assunção deixou de ser verdadeira. Quando a segunda implementação da interface entra em uso, o código compilado é marcado <code>made not entrant</code>, a execução volta ao interpretador via armadilha rara e o método é recompilado — agora sem poder fazer <em>inlining</em> da chamada, que passa a ser bimórfica ou megamórfica. Os 180 ns eram uma medição de um mundo que não existe em produção; os 310 ns são o número verdadeiro.</p>
+      <p>Vale a pena separar isto das três causas alternativas, porque a resposta de nível sénior é o processo de eliminação, não o palpite. A primeira alternativa é o <em>code cache</em> cheio: com <em>tiered compilation</em> o espaço reservado é de 240 MB por omissão e, quando enche, a JVM desliga o compilador e tudo volta ao interpretador — a degradação aí é de um factor 5 a 20, não de 1,7, e o <em>log</em> escreve <code>CodeCache is full</code>. A segunda é o estado do GC: se o conjunto vivo cresce, as pausas e a fracção de CPU gasta em GC sobem e a latência média sobe com elas. A terceira é o próprio <em>benchmark</em> a medir menos trabalho no início — <em>caches</em> frias, tabelas vazias, um <code>HashMap</code> com dois elementos que ao fim de dois minutos tem duzentos mil.</p>
+      <p>A confirmação faz-se por observação, não por dedução. <code>-Xlog:deoptimization</code> e o registo de compilação mostram o método e a razão da armadilha; <code>-XX:+PrintInlining</code> mostra a decisão de <em>inlining</em> antes e depois; <code>jcmd &lt;pid&gt; Compiler.codecache</code> dá a ocupação do <em>code cache</em>; e um <em>flight recording</em> com <code>-XX:StartFlightRecording=settings=profile</code> separa tempo de GC de tempo aplicacional em minutos, sem instrumentação.</p>
+      <p>O <em>trade-off</em> de correcção é o que interessa ao entrevistador: forçar monomorfismo (uma implementação por ponto de chamada quente, <em>call sites</em> separados, classes finais) recupera o <em>inlining</em> mas acopla o desenho ao compilador e não sobrevive à evolução do código. Vale a pena quando o método está no caminho crítico e a diferença é de 40% ou mais; não vale quando o custo total do método é 3% do tempo de pedido. E o corolário metodológico: qualquer medição de latência tem de ser feita depois de aquecimento, com todas as implementações reais carregadas, ou está a medir uma JVM que nunca vai existir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É o JIT» sem mecanismo, ou atribui tudo ao GC sem verificar.</td></tr>
+        <tr><td>Mid</td><td>Descreve <em>tiered compilation</em> e aquecimento, mas explica só a subida de desempenho, não a descida posterior.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia desoptimização por armadilha rara, liga-a à perda de <em>inlining</em> monomórfico, enumera as alternativas e diz que flag ou comando usa para as excluir.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério de decisão sobre corrigir ou não, e reformula a prática de <em>benchmarking</em> da equipa (aquecimento, perfis realistas, medição em produção com JFR contínuo).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é a diferença entre C1 e C2 e quando é que vale a pena <code>-XX:TieredStopAtLevel=1</code>?»</li>
+      <li>«O que é substituição escalar e que condição a torna impossível?»</li>
+      <li>«Como mediria o custo real de aquecimento num serviço que reinicia dez vezes por dia?»</li>
+      <li>«Um <em>heap</em> maior pode piorar a latência? Porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir <em>interpretador</em> com «Java é lento porque é interpretado».</li>
+      <li>Medir latência sem aquecimento e apresentar o resultado como definitivo.</li>
+      <li>Propor flags de compilação sem antes olhar para o <em>log</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-2" class="h2"><span class="secnum">9.2</span> Layout de memória: heap, metaspace, stack e off-heap<a class="anchor" href="#sec-9-2" aria-label="ligação">#</a></h2>
+
+<p>A memória residente de um processo Java é a soma de sete parcelas, e apenas uma delas se controla com <code>-Xmx</code>. O <em>heap</em> guarda os objectos. O metaspace, que é memória nativa e não <em>heap</em>, guarda metadados de classes; dentro dele, o <em>compressed class space</em> tem um limite próprio de 1 GB por omissão. Cada <em>thread</em> tem uma pilha com 1 MB reservado por omissão em Linux de 64 bits. O <em>code cache</em> guarda o código compilado. As estruturas do GC ocupam entre 1% e 15% do <em>heap</em>, consoante o recolector. Os <em>buffers</em> directos e os ficheiros mapeados vivem fora do <em>heap</em>. E o <em>allocator</em> nativo do sistema (a <em>glibc</em>, em imagens baseadas em Debian) reserva arenas por <em>thread</em> que podem crescer centenas de MB sem que nada em Java o veja.</p>
+
+<p>Dentro do <em>heap</em>, um objecto tem um cabeçalho de 12 <em>bytes</em> quando os ponteiros de classe estão comprimidos (8 de <em>mark word</em> mais 4 de <em>klass pointer</em>), alinhado a 8, pelo que a instância mais pequena ocupa 16 <em>bytes</em>. As referências ocupam 4 <em>bytes</em> em vez de 8 enquanto o <em>heap</em> couber abaixo de 32 GB — é por isso que subir de <code>-Xmx31g</code> para <code>-Xmx33g</code> pode reduzir a capacidade útil: perdem-se os <em>oops</em> comprimidos e todas as referências duplicam de tamanho. Um <code>Long</code> em caixa custa 16 <em>bytes</em> mais 4 ou 8 de referência contra 8 <em>bytes</em> de um <code>long</code> primitivo; um <code>HashMap</code> com um milhão de entradas <code>Long</code>→<code>Long</code> consome à volta de 80 MB, contra menos de 20 MB numa estrutura primitiva. Este é o cálculo que um sénior faz de cabeça quando alguém propõe guardar dez milhões de linhas «em memória».</p>
+
+<p>Para saber para onde foi a memória que não está no <em>heap</em>, a ferramenta é o <em>Native Memory Tracking</em>: arranca-se com <code>-XX:NativeMemoryTracking=summary</code> (custo de 5% a 10% em desempenho e alguns MB de metadados) e consulta-se com <code>jcmd</code>. A distinção entre <em>reserved</em> e <em>committed</em> é a parte que os candidatos falham: o que conta para a memória residente e para o limite do contentor é o <em>committed</em>, não o <em>reserved</em>.</p>
+
+<figure class="listing text" id="lst-9-2"><div class="lhead"><span class="lnum">Listagem 9.2</span>
+<span class="lcap">Resumo de <code>jcmd 1 VM.native_memory summary</code> num serviço com RSS de 1,9 GB e <code>-Xmx1200m</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>Native Memory Tracking:
+Total: reserved=3891MB, committed=1874MB
+
+-                 Java Heap (reserved=1200MB, committed=1200MB)
+-                     Class (reserved=1096MB, committed=  148MB)
+                            (classes #24817)
+                            (  instance classes #23204, array classes #1613)
+-                    Thread (reserved= 412MB, committed=  412MB)
+                            (thread #401)
+                            (stack: reserved=410MB, committed=410MB)
+-                      Code (reserved= 247MB, committed=   96MB)
+-                        GC (reserved=  78MB, committed=   78MB)
+-                  Compiler (reserved=   6MB, committed=    6MB)
+-                  Internal (reserved=   3MB, committed=    3MB)
+-                    Symbol (reserved=  28MB, committed=   28MB)
+-        Native Memory Tracking (reserved=   9MB, committed=    9MB)
+
+# 401 threads x 1MB de pilha = 412MB committed. O heap e as pilhas juntos
+# ja excedem 1,6GB; o limite do contentor era 2Gi -> OOMKilled iminente.</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Orçamento típico não-<em>heap</em> de um serviço Spring Boot 3.x com 200 <em>threads</em>: metaspace 110-180 MB, <em>code cache</em> committed 60-120 MB, pilhas 200 MB reservados (o <em>committed</em> real é muito menor porque só as páginas tocadas contam), estruturas do G1 ≈ 5% do <em>heap</em>, símbolos e internos 30-50 MB, arenas da <em>glibc</em> 50-300 MB. Regra de bolso: reservar 400 a 600 MB para tudo o que não é <em>heap</em>, e validar com NMT em vez de acreditar na regra.</p></aside>
+
+<div class="qa" id="q-9-3" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O contentor tem limite de 2 GiB, arrancamos com <code>-Xmx1200m</code>, o <em>heap</em> usado nunca passa de 700 MB e mesmo assim o <em>pod</em> é morto com <em>exit code</em> 137. Onde está a memória?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><em>Exit code</em> 137 é <code>SIGKILL</code> dado pelo <em>kernel</em> ao exceder o limite do <em>cgroup</em>: não é um <code>OutOfMemoryError</code> da JVM e por isso não há <em>heap dump</em>, não há <em>stack trace</em> e o <em>heap</em> pode estar folgado. O que excedeu 2 GiB foi a memória residente total, e o <em>heap</em> é apenas uma das sete parcelas que a compõem.</p>
+      <p>A ordem de investigação começa pelas parcelas grandes e mensuráveis. Primeiro, o número de <em>threads</em>: 400 <em>threads</em> a 1 MB de pilha reservada são 400 MB, e com <em>pools</em> mal limitados chega-se lá sem esforço — <code>jcmd &lt;pid&gt; Thread.print | grep -c '^&quot;'</code> dá o número em segundos. Segundo, metaspace e <em>compressed class space</em>, que num serviço com muitos proxies dinâmicos passam facilmente de 200 MB. Terceiro, <em>buffers</em> directos e ficheiros mapeados: o Netty e os clientes HTTP modernos alocam <em>off-heap</em>, e <code>-XX:MaxDirectMemorySize</code> herda o valor de <code>-Xmx</code> se não for definido — ou seja, permite por omissão mais 1200 MB invisíveis no painel de <em>heap</em>. Quarto, o <em>code cache</em>. Quinto, as arenas da <em>glibc</em>, que abrem até oito por CPU e retêm memória libertada; <code>MALLOC_ARENA_MAX=2</code> ou a troca para <em>jemalloc</em> costuma cortar 100 a 300 MB.</p>
+      <p>O instrumento que fecha o diagnóstico é o NMT com <code>-XX:NativeMemoryTracking=summary</code> e <code>jcmd VM.native_memory summary</code>, comparando o total <em>committed</em> com o RSS lido em <code>/proc/self/status</code>. Se o NMT explica quase todo o RSS, a culpa está numa parcela da JVM e sabe-se qual. Se sobram várias centenas de MB que o NMT não vê, a origem é código nativo fora da JVM — JNI, compressão, drivers, ou as tais arenas.</p>
+      <p>A correcção não é «aumentar o limite». É escolher entre três coisas com custos diferentes: limitar o que cresce (tamanho dos <em>pools</em> de <em>threads</em>, <code>-XX:MaxDirectMemorySize</code> explícito, <code>-XX:MaxMetaspaceSize</code> como alarme), reduzir a reserva por <em>thread</em> com <code>-Xss512k</code> quando as pilhas são rasas, ou dar mais memória ao contentor porque o serviço legitimamente precisa dela. A decisão depende do número: se o NMT mostra 412 MB em pilhas com 400 <em>threads</em> e o serviço serve 200 pedidos por segundo, o problema é o modelo de concorrência, não o limite do <em>pod</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde 137 com <code>OutOfMemoryError</code> e procura o <em>heap dump</em> que não existe; propõe subir o limite às cegas.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há memória fora do <em>heap</em> e menciona metaspace, mas não sabe medi-la nem enumerar as restantes parcelas.</td></tr>
+        <tr><td>Sénior</td><td>Distingue RSS de <em>heap</em>, enumera as parcelas com ordens de grandeza, usa NMT e <code>jcmd</code>, e escolhe a correcção com base no número medido.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a diferença entre <em>reserved</em> e <em>committed</em>, o efeito das arenas do <em>allocator</em> nativo, e define o orçamento de memória do serviço como contrato (limite = <em>heap</em> + não-<em>heap</em> medido + 15% de margem).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o RSS pode ser maior do que o total <em>committed</em> do NMT?»</li>
+      <li>«Que efeito tem <code>-XX:+AlwaysPreTouch</code> no RSS e na latência?»</li>
+      <li>«Como limitaria a memória directa usada por um cliente HTTP baseado em Netty?»</li>
+      <li>«Com <em>virtual threads</em>, o que acontece a esta conta das pilhas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <code>-Xmx</code> limita a memória do processo.</li>
+      <li>Não saber que <code>-XX:MaxDirectMemorySize</code> tem por omissão o valor de <code>-Xmx</code>.</li>
+      <li>Pedir um <em>heap dump</em> para diagnosticar um <em>OOMKilled</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-4" data-box="qa" data-area="jvm" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Este método aloca um objecto temporário por iteração e mesmo assim o perfil não mostra pressão de alocação. Explique-me o mecanismo e diga-me em que condições ele deixa de funcionar.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O mecanismo é análise de escape seguida de substituição escalar. Depois de o C2 fazer <em>inlining</em> do construtor e dos métodos usados, prova que a referência ao objecto não escapa ao âmbito do método compilado; nesse caso não aloca objecto nenhum — decompõe-o nos seus campos e mantém-nos em registos ou na pilha. O resultado é zero <em>bytes</em> alocados no <em>heap</em> e, por consequência, zero pressão no <em>eden</em>. Como efeito secundário, qualquer bloqueio sobre um objecto que não escapa é eliminado, porque nenhum outro <em>thread</em> o pode observar.</p>
+      <p>As condições que o quebram são todas práticas e todas testáveis. A primeira é o <em>inlining</em> falhar: se o construtor ou um método chamado excede o orçamento de <em>bytecodes</em> a inserir, ou se a chamada é megamórfica, a análise não tem o grafo completo e o objecto é alocado. A segunda é o objecto escapar de facto — guardado num campo, devolvido, passado a um método não inserido, colocado numa colecção, ou atribuído a um <code>static</code>. A terceira é o método nunca chegar ao nível 4: código morno interpretado ou compilado só por C1 aloca sempre. A quarta é o tamanho: <em>arrays</em> de dimensão não constante, ou objectos com muitos campos, deixam de ser candidatos viáveis.</p>
+      <p>A verificação é experimental, nunca por leitura de código. Um <em>benchmark</em> JMH com o perfilador de alocação (<code>-prof gc</code>) dá <em>bytes</em> alocados por operação: se o valor é 0 B/op, houve substituição escalar; se é 32 B/op, não houve. Em produção, o JFR com o evento de amostragem de alocação mostra o mesmo em agregado. Ambos são mais fiáveis do que ler o <em>log</em> de <em>inlining</em>, que diz o que o compilador tentou e não o que ficou.</p>
+      <p>O <em>trade-off</em> é sobre quanto desenho se sacrifica a esta optimização. Escrever código que ajuda a análise de escape — objectos pequenos e locais, evitar guardar referências temporárias, não passar <em>lambdas</em> por interfaces megamórficas no caminho quente — é gratuito quando é apenas disciplina. Deixa de valer a pena quando exige aplanar abstracções úteis: o ganho típico de eliminar 32 <em>bytes</em> por operação num serviço que aloca 300 MB/s é uma redução de alguns pontos percentuais na frequência de GC jovem, o que num sistema com pausas de 15 ms não paga a perda de legibilidade. Vale sempre a pena em ciclos internos de <em>parsing</em>, serialização e matemática, onde a mesma optimização corta 40% do tempo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Os objectos pequenos são alocados na pilha» como se fosse uma regra da linguagem.</td></tr>
+        <tr><td>Mid</td><td>Nomeia a análise de escape e diz que depende do JIT, sem citar a dependência do <em>inlining</em> nem como verificar.</td></tr>
+        <tr><td>Sénior</td><td>Liga <em>inlining</em> → análise de escape → substituição escalar, enumera as condições que a quebram e mede com JMH ou JFR.</td></tr>
+        <tr><td>Staff</td><td>Quantifica o ganho contra a alocação total do serviço e diz explicitamente quando não vale a pena desenhar para o compilador.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como distingue eliminação de bloqueio de <em>biased locking</em>?»</li>
+      <li>«O que é um TLAB e porque é que alocar no <em>eden</em> custa poucos nanossegundos?»</li>
+      <li>«Porque é que a hipótese geracional fraca torna a colecção jovem barata?»</li>
+      <li>«Que evento do JFR usaria para medir a alocação por <em>call site</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que a análise de escape é garantida pela especificação.</li>
+      <li>Optimizar alocação sem medir a taxa de alocação actual do serviço.</li>
+      <li>Ignorar que o custo dominante da alocação jovem é a promoção, não a alocação.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-3" class="h2"><span class="secnum">9.3</span> Recolectores: G1, ZGC, Parallel e Serial<a class="anchor" href="#sec-9-3" aria-label="ligação">#</a></h2>
+
+<p>Todos os recolectores da HotSpot exploram a mesma observação empírica — a esmagadora maioria dos objectos morre jovem — e diferem no que sacrificam: latência de pausa, débito, ou memória. O Serial usa um único <em>thread</em> e é a escolha ergonómica quando a JVM detecta um CPU e pouca memória; num contentor de 256 MiB com um único núcleo é genuinamente o melhor, porque não paga sincronização entre <em>threads</em> de GC. O Parallel usa vários <em>threads</em> mas pára o mundo para tudo: dá o melhor débito por CPU e as piores pausas, que crescem linearmente com o conjunto vivo — num <em>heap</em> de 32 GB com 20 GB vivos, uma colecção completa é de vários segundos.</p>
+
+<p>O G1 é o recolector por omissão desde o JDK 9 e divide o <em>heap</em> em regiões de 1 a 32 MB (por omissão, aproximadamente <em>heap</em>/2048 arredondado a uma potência de dois). Marca concorrentemente e evacua em pausas <em>stop-the-world</em> cujo tamanho controla escolhendo quantas regiões coloca em cada colecção, guiado por <code>-XX:MaxGCPauseMillis</code> (200 ms por omissão). Objectos maiores do que metade de uma região são <em>humongous</em> e vão directamente para regiões contíguas na geração velha — com regiões de 4 MB, qualquer <em>array</em> acima de 2 MB. Excesso de objectos <em>humongous</em> fragmenta o <em>heap</em> e provoca colecções completas.</p>
+
+<p>O ZGC é concorrente em quase tudo o que interessa: usa ponteiros coloridos e barreiras de leitura para mover objectos enquanto a aplicação corre, e as suas pausas são de dezenas a centenas de microssegundos, praticamente independentes do tamanho do <em>heap</em> — a mesma pausa em 8 GB e em 2 TB. Desde o JDK 21 tem modo geracional, que se tornou o comportamento por omissão nas versões seguintes e reduziu drasticamente o custo em CPU face à versão não geracional. O que se paga é débito (tipicamente 5% a 15% abaixo do G1 no mesmo trabalho, por causa das barreiras) e memória (precisa de folga para evacuar; abaixo de 20% a 25% de espaço livre começa a haver falhas de alocação).</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 9.1</span> Escolha de recolector por perfil de serviço.</div>
+<div class="tscroll"><table><thead><tr><th>Recolector</th><th>Pausa típica</th><th>Custo</th><th>Quando é a escolha certa</th><th>Quando deixa de ser</th></tr></thead><tbody>
+<tr><td>Serial</td><td>10 ms a 1 s (cresce com o vivo)</td><td>Nenhum paralelismo</td><td>1 CPU, <em>heap</em> &lt; 512 MB, <em>jobs</em> curtos, <em>sidecars</em></td><td>Assim que houver 2+ CPUs e <em>heap</em> acima de 1 GB</td></tr>
+<tr><td>Parallel</td><td>100 ms a vários segundos</td><td>Latência</td><td>Lotes, ETL, <em>jobs</em> Spark: maximizar débito por CPU</td><td>Quando existe um SLO de latência p99 por pedido</td></tr>
+<tr><td>G1</td><td>20-200 ms, controlável</td><td>≈ 5-10% do <em>heap</em> em estruturas</td><td>Serviços com <em>heap</em> de 2-32 GB e p99 tolerante a 100-200 ms</td><td>Quando o SLO p99 desce abaixo de 20 ms ou o <em>heap</em> passa de 32 GB</td></tr>
+<tr><td>ZGC (geracional)</td><td>&lt; 1 ms, independente do <em>heap</em></td><td>5-15% de débito e 20-25% de folga</td><td><em>Heaps</em> grandes com p99 apertado: <em>trading</em>, <em>ad serving</em>, <em>caches</em> em processo</td><td>Lotes, CPU escassa, ou <em>heaps</em> pequenos onde o G1 já cumpre</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Trocar G1 por ZGC num serviço com <em>heap</em> de 4 GB e p99 de 80 ms costuma ser negativo: as pausas do G1 já representam menos de 5 ms do p99, e o ZGC devolve 5% a 15% menos débito, o que se traduz em mais um ou dois <em>pods</em>. A troca compensa quando a componente de pausa do p99 é dominante — <em>heap</em> acima de 16 GB, ou pausas de evacuação acima de 50 ms visíveis no histograma de latência — e quando há CPU sobrante para a pagar.</p></aside>
+
+<div class="qa" id="q-9-5" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos um serviço com <em>heap</em> de 24 GB, SLO de p99 abaixo de 25 ms e pausas do G1 a chegar aos 180 ms. Muda para ZGC? Justifique com números e diga-me o que perde.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Sim, este é o caso de manual para ZGC — mas só depois de confirmar que a pausa é a causa do p99, e não uma correlação. A verificação faz-se sobrepondo o histograma de latência de pedidos ao <em>log</em> de GC: se os pedidos acima de 25 ms coincidem com as janelas de pausa e desaparecem entre elas, a pausa é a causa. Se o p99 está a 25 ms em permanência e as pausas ocorrem 4 vezes por minuto, então quase nenhum pedido apanha uma pausa e o problema é outro — quase sempre uma dependência externa ou contenção de bloqueios.</p>
+      <p>Confirmada a causa, os números favorecem a mudança: com 24 GB de <em>heap</em>, as pausas de evacuação do G1 são proporcionais à quantidade de dados copiados e não descem abaixo de algumas dezenas de milissegundos sem reduzir tanto a geração jovem que a promoção dispara. O ZGC geracional traz pausas sub-milissegundo independentes do tamanho do <em>heap</em>, o que remove a componente de GC do p99 quase por completo.</p>
+      <p>O que se perde é concreto e mensurável: 5% a 15% de débito por causa das barreiras de leitura, o que a capacidade constante significa 5% a 15% mais instâncias; e memória, porque o ZGC precisa de folga para evacuar — com um conjunto vivo de 16 GB num <em>heap</em> de 24 GB (67% de ocupação) a margem é curta e as falhas de alocação aparecem sob picos. Na prática sobe-se o <em>heap</em> para 32 GB, o que atravessa a fronteira dos <em>oops</em> comprimidos e aumenta o consumo real de todos os objectos. Perde-se ainda familiaridade operacional: o <em>log</em>, as métricas e os <em>runbooks</em> do ZGC são diferentes dos do G1.</p>
+      <p>A alternativa que um sénior avalia antes de mudar de recolector é reduzir o que o GC tem de fazer. Um conjunto vivo de 16 GB num serviço de pedidos costuma ser uma <em>cache</em> em processo; movê-la para Redis, ou limitá-la por tamanho e não por contagem, encolhe o <em>heap</em> para 8 GB e faz o G1 cumprir 25 ms sem trocar nada. A ordem correcta é: medir o conjunto vivo, tentar reduzi-lo, e só depois pagar débito por latência.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«ZGC é mais moderno, logo é melhor» sem custo nem verificação.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o ZGC tem pausas baixas e o G1 não, mas não nomeia o custo em débito nem a necessidade de folga.</td></tr>
+        <tr><td>Sénior</td><td>Verifica a causalidade pausa↔p99, quantifica o custo em débito e em memória, e menciona a fronteira dos 32 GB.</td></tr>
+        <tr><td>Staff</td><td>Propõe primeiro reduzir o conjunto vivo, define o critério de reversão e o plano de medição (uma semana em <em>canary</em> com o mesmo tráfego).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o ZGC geracional é mais barato em CPU do que o não geracional?»</li>
+      <li>«O que é uma falha de alocação em ZGC e como aparece no <em>log</em>?»</li>
+      <li>«Como mediria o conjunto vivo sem provocar uma pausa em produção?»</li>
+      <li>«Em que caso preferiria Parallel a G1 hoje?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Mudar de recolector sem primeiro correlacionar pausas com latência de pedidos.</li>
+      <li>Ignorar o custo em débito e prometer «latência melhor sem custo».</li>
+      <li>Não saber que aumentar o <em>heap</em> acima de 32 GB desliga os <em>oops</em> comprimidos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-6" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Explique-me porque é que uma colecção da geração jovem é barata mesmo num <em>heap</em> grande, e o que faz com que deixe de ser.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É barata porque o custo de uma colecção por cópia é proporcional ao que sobrevive, não ao que morreu. Se num <em>eden</em> de 2 GB sobrevivem 40 MB, copiam-se 40 MB e o resto do espaço é recuperado só por mudança de ponteiros — daí que a taxa de sobrevivência, e não o tamanho do <em>heap</em>, seja a variável que determina a pausa. A hipótese geracional fraca (a maioria dos objectos morre jovem) faz com que a taxa de sobrevivência típica de um serviço de pedidos ande nos 2% a 5%.</p>
+      <p>Para saber o que está vivo sem varrer o <em>heap</em> velho, o recolector precisa de saber que referências vêm da geração velha para a jovem. É isso que a barreira de escrita e as estruturas de <em>remembered set</em> ou <em>card table</em> registam: cada escrita de uma referência num objecto velho marca a zona correspondente como suja, e a colecção jovem examina apenas essas zonas em vez de toda a geração velha. Custa alguns nanossegundos por escrita de referência e alguns por cento do <em>heap</em> em memória, e é o que torna o resto possível.</p>
+      <p>Deixa de ser barata em três situações. A primeira é a taxa de sobrevivência subir: uma <em>cache</em> que retém tudo o que é alocado leva a taxa a 40% ou 60%, e então copia-se centenas de MB por colecção. A segunda é a promoção prematura — <em>survivor spaces</em> demasiado pequenos para o tamanho da geração jovem, ou <code>MaxTenuringThreshold</code> demasiado baixo, fazem com que objectos que morreriam na colecção seguinte sejam copiados para a geração velha, o que aumenta a pausa jovem e força colecções velhas mais frequentes. A terceira são referências velho→jovem em massa: uma estrutura de longa duração actualizada a alta frequência suja muitas zonas e a fase de <em>scan</em> deixa de ser barata.</p>
+      <p>Em termos operacionais, as duas medições que resolvem quase tudo são a taxa de alocação (tamanho do <em>eden</em> a dividir pelo intervalo entre colecções jovens — 512 MB a cada 2 s são 256 MB/s) e a taxa de promoção (crescimento da ocupação da geração velha por colecção). Uma taxa de promoção que sobe monotonamente é o sinal de fuga; uma taxa de alocação alta com promoção baixa é apenas lixo barato e não justifica intervenção.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Descreve eden/survivor/old como sequência de caixas, sem explicar porque é que a pausa é pequena.</td></tr>
+        <tr><td>Mid</td><td>Diz «copia só o que sobrevive», mas não sabe como o recolector encontra as referências da geração velha.</td></tr>
+        <tr><td>Sénior</td><td>Explica custo proporcional ao vivo, barreira de escrita e <em>card table</em>/<em>remembered set</em>, e nomeia promoção prematura como causa de degradação.</td></tr>
+        <tr><td>Staff</td><td>Traduz tudo em duas métricas operacionais (taxa de alocação e taxa de promoção) e diz que decisão toma consoante os valores.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como calcula a taxa de alocação a partir de um <em>log</em> de GC?»</li>
+      <li>«O que faz <code>-Xmn</code> num G1 e porque é que raramente se deve usar?»</li>
+      <li>«Que sintoma no <em>log</em> revela promoção prematura?»</li>
+      <li>«Porque é que o ZGC geracional recuperou esta ideia depois de a ter dispensado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Dizer que a colecção jovem varre todo o <em>heap</em>.</li>
+      <li>Não conhecer o custo da barreira de escrita.</li>
+      <li>Propor aumentar o <em>eden</em> sem olhar para a taxa de sobrevivência.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-4" class="h2"><span class="secnum">9.4</span> Ler uma pausa de GC e afinar sem adivinhar<a class="anchor" href="#sec-9-4" aria-label="ligação">#</a></h2>
+
+<p>Sem <em>log</em> de GC não há afinação, há adivinhação. O registo unificado do JDK moderno liga-se com <code>-Xlog:gc*,gc+heap=debug,safepoint:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=5,filesize=20M</code>: custa menos de 1% de desempenho, cabe em 100 MB de disco e é a única fonte que permite reconstruir um incidente depois de o <em>pod</em> ter sido substituído. Deve estar sempre ligado em produção, tal como <code>-XX:+HeapDumpOnOutOfMemoryError</code>.</p>
+
+<p>Ler o <em>log</em> é reconhecer quatro tipos de linha. <code>Pause Young (Normal)</code> é a colecção jovem de rotina. <code>Pause Young (Concurrent Start)</code> inicia a marcação concorrente da geração velha, disparada quando a ocupação atinge o limiar de arranque. <code>Pause Young (Mixed)</code> inclui regiões velhas escolhidas pela marcação anterior. <code>Pause Full (Allocation Failure)</code> é o modo de falha: o G1 não conseguiu evacuar e caiu para uma colecção completa. A linha <code>To-space exhausted</code> é o aviso imediatamente anterior — não havia regiões livres para copiar os sobreviventes.</p>
+
+<p>A pausa que não aparece no <em>log</em> de GC é o tempo até ao <em>safepoint</em>. Todas as pausas exigem que os <em>threads</em> aplicacionais parem em pontos seguros; se um <em>thread</em> está num ciclo contado sem <em>poll</em> de <em>safepoint</em>, numa chamada JNI longa, ou bloqueado à espera de páginas de memória, o «tempo para <em>safepoint</em>» pode ser dez vezes maior do que a pausa de GC propriamente dita. É por isso que <code>safepoint</code> vai no mesmo <code>-Xlog</code>: uma pausa reportada de 12 ms com 300 ms de tempo até ao <em>safepoint</em> é um problema completamente diferente e nenhuma flag de GC o resolve.</p>
+
+<figure class="listing text" id="lst-9-3"><div class="lhead"><span class="lnum">Listagem 9.3</span>
+<span class="lcap">Excerto de <em>log</em> G1 com esgotamento de <em>to-space</em> e colecção completa subsequente.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>[2025-08-14T02:41:07.118+0000][118.412s][info][gc] GC(214) Pause Young (Normal)
+    (G1 Evacuation Pause) 6144M-&gt;3980M(8192M) 38.204ms
+[2025-08-14T02:41:09.902+0000][121.196s][info][gc] GC(215) Pause Young (Concurrent Start)
+    (G1 Humongous Allocation) 6220M-&gt;4402M(8192M) 41.870ms
+[2025-08-14T02:42:31.664+0000][202.958s][info][gc] GC(238) To-space exhausted
+[2025-08-14T02:42:31.664+0000][202.958s][info][gc] GC(238) Pause Young (Normal)
+    (G1 Evacuation Pause) 8064M-&gt;7810M(8192M) 902.551ms
+[2025-08-14T02:42:32.570+0000][203.864s][info][gc] GC(239) Pause Full
+    (G1 Compaction Pause) 7810M-&gt;5904M(8192M) 3204.118ms
+[2025-08-14T02:42:36.001+0000][207.295s][info][safepoint] Safepoint "G1CollectFull",
+    Time since last: 906118 ns, Reaching safepoint: 284119 ns, At safepoint: 3204118 ns</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Baixar <code>-XX:MaxGCPauseMillis</code> de 200 para 50 não torna o GC mais rápido: o G1 encolhe a geração jovem para caber no alvo, as colecções passam a ser três a quatro vezes mais frequentes, a fracção de CPU gasta em GC sobe e objectos que morreriam no <em>eden</em> são promovidos, o que aumenta as colecções mistas e as completas. Em vários incidentes reais, o p99 piora depois desta alteração «de latência».</p></aside>
+
+<div class="qa" id="q-9-7" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Olhe para a Listagem 9.3 e diga-me, em voz alta, o que aconteceu a este serviço entre os 118 e os 207 segundos, e qual é a primeira coisa que muda.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A leitura é uma progressão de três passos. Aos 118 s, colecção jovem normal: 6144 MB antes, 3980 MB depois, num <em>heap</em> de 8192 MB, 38 ms — saudável, recupera 2,1 GB. Aos 121 s, arranca a marcação concorrente com a causa <code>G1 Humongous Allocation</code>: alguém está a alocar objectos maiores do que metade de uma região, que vão directos para a geração velha. Aos 202 s, o <em>heap</em> está a 8064 MB de 8192 MB e a colecção não tem para onde copiar — <code>To-space exhausted</code>, pausa de 902 ms que recupera 254 MB. Um segundo depois, colecção completa de 3,2 s que só devolve o <em>heap</em> a 5904 MB.</p>
+      <p>As duas conclusões são independentes. A primeira: o conjunto vivo cresceu de 3980 MB para 5904 MB em 85 segundos e o valor depois da colecção completa é o limite inferior real da ocupação — não há lixo escondido depois de uma compactação. Um crescimento de 22 MB/s no vivo é fuga ou <em>cache</em> sem limite, não pressão de alocação normal. A segunda: as alocações <em>humongous</em> estão a fragmentar a geração velha, o que explica o esgotamento de <em>to-space</em> antes de o <em>heap</em> estar realmente cheio.</p>
+      <p>A linha de <em>safepoint</em> fecha o diagnóstico: 284 µs para atingir o <em>safepoint</em> e 3,2 s dentro dele. Ou seja, o problema é o trabalho de GC e não a paragem dos <em>threads</em> — se fossem 200 ms para atingir o <em>safepoint</em>, a investigação seria outra (ciclos contados, JNI, memória a ser trocada para disco).</p>
+      <p>A primeira coisa que muda não é uma flag: é obter o <em>heap dump</em> e identificar o que está a crescer. Aumentar <code>-Xmx</code> compra tempo — de 85 segundos para talvez 200 — e nada mais, se for fuga. Se o <em>dump</em> mostrar que o vivo é legítimo, aí sim há duas alterações defensáveis: subir <code>-XX:G1HeapRegionSize</code> para 16 ou 32 MB para que os <em>arrays</em> grandes deixem de ser <em>humongous</em>, e baixar <code>-XX:InitiatingHeapOccupancyPercent</code> para que a marcação concorrente comece mais cedo e as colecções mistas tenham tempo de libertar espaço antes do esgotamento. As duas atacam sintomas diferentes e não se aplicam ao mesmo tempo sem medir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Está a fazer muito GC, é preciso mais <em>heap</em>»; não lê os valores antes/depois.</td></tr>
+        <tr><td>Mid</td><td>Lê os números correctamente e identifica a colecção completa, mas não repara na causa <em>humongous</em> nem no crescimento do vivo.</td></tr>
+        <tr><td>Sénior</td><td>Extrai o conjunto vivo pós-compactação, calcula a taxa de crescimento, liga <code>To-space exhausted</code> a fragmentação por <em>humongous</em> e lê a linha de <em>safepoint</em>.</td></tr>
+        <tr><td>Staff</td><td>Ordena as acções (prova antes de flags), distingue mitigação de correcção e diz qual das duas flags aplicaria e sob que evidência.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Com <em>heap</em> de 8 GB, qual é o tamanho de região por omissão e a partir de que dimensão um objecto é <em>humongous</em>?»</li>
+      <li>«Porque é que a colecção completa do G1 é o modo de falha e não uma operação normal?»</li>
+      <li>«Que métrica exportaria para alertar antes de isto acontecer?»</li>
+      <li>«O que muda nesta análise se o recolector fosse ZGC?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor flags antes de identificar o que ocupa o <em>heap</em>.</li>
+      <li>Ignorar a ocupação depois da colecção completa, que é o número mais informativo do excerto.</li>
+      <li>Confundir tempo até ao <em>safepoint</em> com duração da pausa.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-8" data-box="qa" data-area="jvm" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Que processo segue para afinar o GC de um serviço novo? Quero a sequência de passos e o critério de paragem, não uma lista de flags.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O processo tem cinco passos e começa por não afinar nada. Passo um: definir o objectivo em números — «p99 do <em>endpoint</em> de autorização abaixo de 40 ms com 1 800 pedidos por segundo, e menos de 5% de CPU em GC». Sem alvo, qualquer alteração parece boa. Passo dois: instrumentar — <code>-Xlog:gc*</code> com <em>safepoint</em>, JFR contínuo, e o histograma de latência do serviço na mesma janela temporal.</p>
+      <p>Passo três: extrair as quatro medidas que descrevem o serviço. Conjunto vivo, lido depois de uma colecção completa ou de um ciclo concorrente completo. Taxa de alocação, do tamanho do <em>eden</em> sobre o intervalo entre colecções jovens. Taxa de promoção, do crescimento da geração velha por ciclo. Distribuição de pausas (p50, p99, máximo), não a média. Com estes quatro números, o dimensionamento faz-se sem experimentar: um <em>heap</em> saudável fica entre 2,5 e 4 vezes o conjunto vivo — abaixo de 2 vezes, o GC trabalha permanentemente; acima de 5, desperdiça-se memória e as pausas de compactação crescem.</p>
+      <p>Passo quatro: alterar uma variável de cada vez, na ordem do maior efeito. Primeiro o tamanho do <em>heap</em> e <code>-Xms</code> igual a <code>-Xmx</code> para eliminar redimensionamentos. Depois o recolector, se o perfil o justificar. Só no fim flags finas como <code>InitiatingHeapOccupancyPercent</code> ou <code>G1HeapRegionSize</code>. Cada alteração corre pelo menos um ciclo de tráfego completo — se o pico é à sexta-feira, um teste de terça não conta.</p>
+      <p>Passo cinco, o critério de paragem: parar quando o GC deixa de estar no caminho crítico, e não quando os números «parecem bons». Operacionalmente, isso é a fracção de CPU em GC abaixo de 5% e a componente de pausa a explicar menos de 10% do orçamento de p99. A partir daí, o próximo milissegundo é mais barato de conquistar noutro sítio — menos alocação por pedido, menos uma chamada remota, um índice em falta. Vale a pena dizer explicitamente o que não se faz: copiar conjuntos de flags de outros serviços, e afinar em ambiente de teste com um décimo do tráfego e um perfil de dados diferente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Enumera flags favoritas; não define objectivo nem mede antes.</td></tr>
+        <tr><td>Mid</td><td>Sabe activar o <em>log</em> de GC e ler pausas, mas não extrai conjunto vivo nem taxas, e altera várias coisas ao mesmo tempo.</td></tr>
+        <tr><td>Sénior</td><td>Define alvo numérico, extrai as quatro medidas, dimensiona o <em>heap</em> a partir do conjunto vivo e altera uma variável de cada vez.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério de paragem e a análise de custo de oportunidade — onde está o milissegundo seguinte mais barato — e a política de não afinar em ambientes não representativos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como mede o conjunto vivo sem forçar uma colecção completa em produção?»</li>
+      <li>«Porque é que <code>-Xms</code> igual a <code>-Xmx</code> é quase sempre a escolha em contentores?»</li>
+      <li>«Que alarme define para detectar degradação de GC antes do utilizador?»</li>
+      <li>«Como testaria uma alteração de flags sem risco?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afinar sem <em>log</em> de GC activo.</li>
+      <li>Usar médias de pausa em vez de percentis e máximos.</li>
+      <li>Aplicar cinco flags de uma vez e declarar vitória.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-5" class="h2"><span class="secnum">9.5</span> OutOfMemoryError: diagnosticar cada variante<a class="anchor" href="#sec-9-5" aria-label="ligação">#</a></h2>
+
+<p><code>OutOfMemoryError</code> não é um erro, são oito erros diferentes que partilham o nome da classe. A mensagem depois dos dois pontos identifica a região de memória que se esgotou, e cada região tem um diagnóstico, uma ferramenta e uma correcção próprios. Confundir «Java heap space» com «Metaspace» leva a uma semana perdida a analisar <em>heap dumps</em> onde não há nada para ver.</p>
+
+<p>Um caso merece destaque porque é o mais comum e o menos compreendido: «Java heap space» pode significar fuga (o conjunto vivo cresce monotonamente), sub-dimensionamento (o conjunto vivo é legítimo e maior do que o <em>heap</em>) ou uma única alocação absurda (uma consulta sem <code>LIMIT</code> que traz três milhões de linhas). Distinguem-se pelo gráfico de ocupação após colecção: uma serra ascendente é fuga, um patamar alto e estável é sub-dimensionamento, um salto vertical isolado é a alocação única. A ferramenta é sempre a mesma — <em>heap dump</em> com <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code> e análise da árvore de dominadores no Eclipse MAT — mas o que se procura muda.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 9.2</span> Variantes de <code>OutOfMemoryError</code>, causa dominante e primeiro passo.</div>
+<div class="tscroll"><table><thead><tr><th>Mensagem</th><th>Região</th><th>Causa dominante</th><th>Primeiro passo</th></tr></thead><tbody>
+<tr><td>Java heap space</td><td><em>Heap</em></td><td>Fuga, sub-dimensionamento ou alocação única enorme</td><td><em>Heap dump</em> e árvore de dominadores</td></tr>
+<tr><td>GC overhead limit exceeded</td><td><em>Heap</em></td><td>Mais de 98% do tempo em GC a recuperar menos de 2%</td><td>Igual a «Java heap space»: é o mesmo problema, detectado mais cedo</td></tr>
+<tr><td>Metaspace</td><td>Nativa</td><td>Fuga de <em>class loader</em>, geração dinâmica de classes</td><td><code>jcmd VM.classloader_stats</code></td></tr>
+<tr><td>Compressed class space</td><td>Nativa</td><td>Mais de 1 GB de metadados comprimíveis; centenas de milhares de classes</td><td>Contar classes; considerar <code>-XX:-UseCompressedClassPointers</code></td></tr>
+<tr><td>Direct buffer memory</td><td><em>Off-heap</em></td><td><em>Buffers</em> Netty/NIO não libertados, <code>-XX:+DisableExplicitGC</code></td><td>NMT, métricas de <em>pool</em> de <em>buffers</em>, JFR</td></tr>
+<tr><td>unable to create native thread</td><td>Nativa/SO</td><td>Limite de <em>threads</em> do <em>cgroup</em> ou <code>ulimit</code>, pilhas grandes</td><td>Contar <em>threads</em>; rever dimensionamento de <em>pools</em></td></tr>
+<tr><td>Requested array size exceeds VM limit</td><td><em>Heap</em></td><td><em>Array</em> pedido acima do máximo endereçável</td><td>Ler o código: é sempre um <em>bug</em> de cálculo de tamanho</td></tr>
+<tr><td>Native memory allocation (mmap) failed</td><td>Nativa</td><td>RSS a bater no limite do <em>cgroup</em> ou no SO</td><td>NMT e memória do contentor; não é problema de <em>heap</em></td></tr>
+</tbody></table></div></div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>jmap -histo:live</code> força uma colecção completa antes de contar — num <em>heap</em> de 16 GB com G1, isso é uma pausa de vários segundos em produção. Para inspecção segura usa-se <code>jcmd &lt;pid&gt; GC.class_histogram</code> sem a variante <em>live</em>, ou o JFR. E um <em>heap dump</em> de 8 GB demora dezenas de segundos a escrever, com o processo parado durante boa parte disso: em Kubernetes, retirar o <em>pod</em> do <em>load balancer</em> antes de o recolher evita transformar um diagnóstico numa interrupção.</p></aside>
+
+<div class="qa" id="q-9-9" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um serviço em produção lança <code>OutOfMemoryError: Java heap space</code> aproximadamente de doze em doze horas, sempre com o mesmo padrão. Descreva o que faz, por ordem, desde o alerta até à correcção.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro estabilizar, depois diagnosticar. Estabilizar é garantir que o processo morre de forma limpa e reproduzível: <code>-XX:+HeapDumpOnOutOfMemoryError</code> com um caminho num volume persistente, <code>-XX:+ExitOnOutOfMemoryError</code> para que a JVM não fique num estado zombie a servir erros durante horas, e reinício automático. Uma JVM que continua a correr depois de um OOM de <em>heap</em> é pior do que uma que morre: as <em>threads</em> falham umas a seguir às outras e o <em>load balancer</em> continua a enviar tráfego.</p>
+      <p>Depois, provar que é fuga e não sub-dimensionamento. O gráfico de ocupação do <em>heap</em> depois de cada colecção durante as doze horas responde: se o mínimo após colecção sobe de 1,2 GB para 3,4 GB monotonamente, é retenção. Se o mínimo é estável e a aplicação só falha em picos, é dimensionamento ou uma alocação pontual. A periodicidade de doze horas é ela própria uma pista forte — sugere uma tarefa agendada, uma rotação de <em>token</em> que reconstrói uma estrutura sem libertar a anterior, ou um ciclo de negócio.</p>
+      <p>Com o <em>heap dump</em> recolhido no momento do OOM, a análise é a árvore de dominadores: qual é o objecto único que, se fosse recolhido, libertaria a maior fracção do <em>heap</em>. Na prática, quatro suspeitos cobrem a maioria dos casos: uma <em>cache</em> em processo sem limite de tamanho ou sem expiração; uma colecção estática que acumula (listeners, métricas por chave de alta cardinalidade, um <code>Map</code> indexado por identificador de pedido); acumulação por <code>ThreadLocal</code> em <em>threads</em> de <em>pool</em>; e retenção indirecta, como uma <em>substring</em> ou um <em>stream</em> que mantém vivo o <em>buffer</em> completo de origem.</p>
+      <p>A correcção define-se pelo tipo. Fuga: limitar a estrutura (Caffeine com <code>maximumWeight</code> e expiração em vez de um <code>HashMap</code>), remover a acumulação, ou limpar o <code>ThreadLocal</code> no <code>finally</code>. Sub-dimensionamento: subir o <em>heap</em> — o que é uma correcção legítima quando o vivo é legítimo. Alocação única: paginar a consulta e impor um limite. O que fecha o incidente não é o <em>fix</em>, é o alarme que impede a repetição: ocupação após colecção acima de 70% durante 15 minutos consecutivos, que dispara horas antes do OOM e dá tempo para agir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aumentar <code>-Xmx</code> e reiniciar; sem <em>dump</em>, sem hipótese, sem alarme.</td></tr>
+        <tr><td>Mid</td><td>Recolhe <em>heap dump</em> e olha para o histograma de classes; conclui «há muitos <code>byte[]</code>» sem chegar ao retentor.</td></tr>
+        <tr><td>Sénior</td><td>Estabiliza primeiro, distingue fuga de dimensionamento pelo gráfico pós-colecção, usa a árvore de dominadores e nomeia os padrões de retenção habituais.</td></tr>
+        <tr><td>Staff</td><td>Usa a periodicidade como pista, escolhe a correcção pelo tipo de causa e fecha com um alarme antecipado e um limite explícito na estrutura culpada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o histograma de classes engana e a árvore de dominadores não?»</li>
+      <li>«Como recolhe um <em>heap dump</em> de um <em>pod</em> que é morto e substituído em segundos?»</li>
+      <li>«Que diferença faz uma referência fraca ou <em>soft</em> neste cenário?»</li>
+      <li>«Como testaria a correcção antes de a pôr em produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar a JVM viva depois de um OOM de <em>heap</em>.</li>
+      <li>Recolher o <em>dump</em> depois do reinício, quando já não há evidência.</li>
+      <li>Não instalar alarme sobre a ocupação após colecção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-10" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Recebemos <code>OutOfMemoryError: Direct buffer memory</code> num serviço com o <em>heap</em> a 30%. Explique-me como essa memória é libertada e o que pode ter corrido mal.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <code>ByteBuffer</code> directo aloca memória nativa e guarda no <em>heap</em> apenas um objecto pequeno com um <em>cleaner</em> associado. A memória nativa só é devolvida quando esse objecto pequeno é recolhido e o <em>cleaner</em> corre. Daí a inversão contra-intuitiva: com o <em>heap</em> a 30%, as colecções são raras, os objectos que representam os <em>buffers</em> permanecem vivos por inércia, e a memória nativa acumula-se até bater no limite. Quanto mais folgado está o <em>heap</em>, mais tarde a memória directa é libertada.</p>
+      <p>O limite é <code>-XX:MaxDirectMemorySize</code>, que por omissão herda o valor de <code>-Xmx</code>. Se o <em>heap</em> é de 4 GB, o processo pode legitimamente ter mais 4 GB de memória directa antes de a JVM se queixar — muito acima do que qualquer contentor bem dimensionado permite, pelo que o desfecho habitual não é sequer este erro mas um <em>OOMKilled</em>.</p>
+      <p>As causas concretas são quatro. Primeira: <code>-XX:+DisableExplicitGC</code>. O mecanismo de reserva do próprio <code>ByteBuffer</code> chama <code>System.gc()</code> quando não consegue reservar, precisamente para forçar a execução dos <em>cleaners</em>; desligar chamadas explícitas remove essa válvula de escape e transforma pressão temporária em erro. A alternativa correcta, quando se quer evitar pausas completas por <code>System.gc()</code>, é <code>-XX:+ExplicitGCInvokesConcurrent</code>. Segunda: <em>buffers</em> geridos por contagem de referências, como no Netty, com um caminho de erro que não liberta — é uma fuga real e nenhuma GC a resolve. Terceira: <em>pools</em> de <em>buffers</em> dimensionados por <em>thread</em>, que crescem com o número de <em>threads</em>. Quarta: um limite explícito demasiado baixo para o pico de tráfego.</p>
+      <p>O diagnóstico usa NMT (secção <em>Other</em>) e as métricas de <code>BufferPoolMXBean</code>, que dão contagem e <em>bytes</em> de <em>buffers</em> directos e mapeados — expor estas duas métricas é barato e resolve a ambiguidade em minutos. A correcção depende da causa: definir <code>-XX:MaxDirectMemorySize</code> explicitamente (nunca deixar o valor implícito num contentor), remover <code>DisableExplicitGC</code>, activar a detecção de fugas do <em>allocator</em> em <em>staging</em> e limitar os <em>pools</em>. O <em>trade-off</em> de fundo é o que se ganhou ao ir <em>off-heap</em>: menos cópias e menos pressão de GC, ao preço de gestão manual de tempo de vida — e a gestão manual falha nos caminhos de erro.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata como OOM de <em>heap</em> e propõe aumentar <code>-Xmx</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há memória directa fora do <em>heap</em>, mas não sabe como é libertada nem qual é o limite por omissão.</td></tr>
+        <tr><td>Sénior</td><td>Explica a libertação dependente de GC, diz que o limite herda <code>-Xmx</code>, e liga <code>DisableExplicitGC</code> ao problema.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta as métricas a expor, distingue fuga real de libertação tardia e enuncia o <em>trade-off</em> de usar memória directa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual a diferença entre um <em>buffer</em> directo e um ficheiro mapeado em memória, do ponto de vista do RSS?»</li>
+      <li>«Porque é que o Netty usa contagem de referências em vez de confiar no GC?»</li>
+      <li>«Que efeito tem <code>-XX:+ExplicitGCInvokesConcurrent</code> com G1?»</li>
+      <li>«Como reproduzia esta falha em <em>staging</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Acreditar que memória directa é libertada deterministicamente ao sair do âmbito.</li>
+      <li>Usar <code>-XX:+DisableExplicitGC</code> por omissão sem conhecer esta interacção.</li>
+      <li>Não definir <code>-XX:MaxDirectMemorySize</code> num contentor.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-9-1" data-box="lab" data-lang="shell">
+  <div class="labhead"><span class="labttl">Exercício 9.1 — Diagnóstico a partir de <em>log</em> de GC e <em>heap dump</em></span>
+    <div class="labpills"><span class="qpill">Diagnóstico escrito</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Serviço de facturação em Java 21, Spring Boot 3.5, a correr com <code>-Xms8g -Xmx8g -XX:+UseG1GC -XX:G1HeapRegionSize=4m</code> num <em>pod</em> com limite de 10 GiB. O alerta disparou às 02:42; o serviço fez três colecções completas em cinco minutos e o p99 subiu de 55 ms para 4,1 s. O excerto de <em>log</em> é o da Listagem 9.3. A Listagem 9.4 traz o resumo da árvore de dominadores do <em>heap dump</em> recolhido no momento do incidente. Escreva o diagnóstico como o entregaria ao <em>post-mortem</em>: causa provável, evidência que a sustenta, uma hipótese alternativa que ainda não foi excluída, a acção imediata de mitigação e a correcção definitiva. Não são aceites respostas que comecem por alterar flags.</p>
+    <figure class="listing text" id="lst-9-4"><div class="lhead"><span class="lnum">Listagem 9.4</span>
+      <span class="lcap">Resumo da árvore de dominadores (<em>heap dump</em> de 8 GB, 5,9 GB retidos).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="text"><code>Class Name                                        | Objects | Shallow | Retained Heap
+--------------------------------------------------+---------+---------+--------------
+com.acme.billing.InvoiceRenderCache               |       1 |      32 |  4 812 664 320
+ |- java.util.concurrent.ConcurrentHashMap         |       1 |      64 |  4 812 663 984
+ |   |- ConcurrentHashMap$Node[]                   |       1 | 2097168 |  4 810 566 800
+ |       |- com.acme.billing.RenderedInvoice       | 1 284 → |     40  |  4 806 122 112
+ |           |- byte[] (PDF, media 3,7 MB)         | 1 284 → | 4806 MB |  4 806 118 400
+com.acme.billing.LedgerBatchJob                   |       1 |      48 |    412 998 144
+java.lang.Thread[] (http-nio-8080-exec-*)         |     400 |   16000 |    118 220 800
+--------------------------------------------------+---------+---------+--------------
+Total heap: 8 589 934 592   Live after full GC: 5 904 misc MB   Unreachable: 2,1 GB</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <p><strong>Causa provável.</strong> <code>InvoiceRenderCache</code> é uma <em>cache</em> em processo sem limite de tamanho que retém 4,81 GB — 82% do conjunto vivo — sob a forma de 1 284 PDFs em <code>byte[]</code> com média de 3,7 MB. Duas consequências independentes decorrem daí. Primeira, o conjunto vivo cresce monotonamente (3 980 MB → 5 904 MB em 85 s no <em>log</em>), o que esgota o <em>heap</em> de 8 GB. Segunda, cada <code>byte[]</code> de 3,7 MB excede metade da região de 4 MB e é, por definição, uma alocação <em>humongous</em>: vai directamente para regiões contíguas da geração velha, fragmenta-a, e explica tanto a causa <code>G1 Humongous Allocation</code> aos 121 s como o <code>To-space exhausted</code> aos 202 s com o <em>heap</em> ainda a 98%.</p>
+      <p><strong>Evidência.</strong> A ocupação após a colecção completa (5 904 MB) é o conjunto vivo real, porque uma compactação não deixa lixo por recolher; a árvore de dominadores atribui 4,81 GB a um único objecto raiz; a causa de GC nomeada no <em>log</em> é <em>humongous</em>; e a média de 3,7 MB por <em>array</em> está acima do limiar de 2 MB imposto por regiões de 4 MB.</p>
+      <p><strong>Hipótese alternativa não excluída.</strong> Os 400 <em>threads</em> de <em>worker</em> retêm 118 MB e o <code>LedgerBatchJob</code> retém 413 MB. Se o lote noturno correr às 02:40, pode ser ele a alimentar a <em>cache</em> a uma taxa anómala — nesse caso a <em>cache</em> é o mecanismo, mas o gatilho é o lote, e limitar a <em>cache</em> sem limitar o lote apenas move o problema para latência. Fica por confirmar com o registo de invocações do agendador.</p>
+      <p><strong>Mitigação imediata.</strong> Reiniciar de forma rotativa para recuperar o serviço, retirando cada <em>pod</em> do <em>load balancer</em> antes de recolher o <em>dump</em>; suspender o lote noturno se se confirmar a coincidência temporal. Subir o <em>heap</em> só compra tempo proporcional (8 → 12 GB adia o incidente de 85 s para cerca de 170 s de acumulação) e não é correcção.</p>
+      <p><strong>Correcção definitiva.</strong> Substituir o <code>ConcurrentHashMap</code> por uma <em>cache</em> limitada por peso — <code>maximumWeight</code> em <em>bytes</em>, não por número de entradas, porque a variável é o tamanho do PDF — com expiração após escrita e métricas de <em>hit rate</em> e de tamanho expostas. Um limite de 512 MB dá 130 a 140 PDFs em <em>cache</em> e, com o padrão de acesso típico de facturação, mantém uma taxa de acerto útil. Em paralelo, deixar de guardar PDFs no <em>heap</em>: escrever para armazenamento de objectos e guardar a chave, o que remove simultaneamente a fuga e as alocações <em>humongous</em>. A flag <code>-XX:G1HeapRegionSize=16m</code> é a única alteração de JVM defensável e é secundária — trata a fragmentação, não a retenção.</p>
+      <figure class="listing shell" id="lst-9-5"><div class="lhead"><span class="lnum">Listagem 9.5</span>
+        <span class="lcap">Sequência de comandos para confirmar o diagnóstico sem parar o serviço.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="shell"><code># 1. Confirmar o conjunto vivo e a ocupacao por regiao, sem forcar Full GC
+jcmd 1 GC.heap_info
+jcmd 1 VM.native_memory summary | head -30
+
+# 2. Histograma sem a variante :live (que dispararia uma Full GC de varios segundos)
+jcmd 1 GC.class_histogram | head -20
+
+# 3. Gravar 120s de JFR com perfil de alocacao e eventos de GC
+jcmd 1 JFR.start name=diag settings=profile duration=120s filename=/dumps/diag.jfr
+jcmd 1 JFR.check name=diag
+
+# 4. So depois de retirar o pod do balanceador: heap dump completo
+kubectl label pod billing-7d9f4 app.kubernetes.io/ready=false --overwrite
+jcmd 1 GC.heap_dump /dumps/billing-$(date +%s).hprof
+
+# 5. Confirmar quantas alocacoes humongous e de que dimensao
+grep -c "Humongous Allocation" /var/log/app/gc.log
+grep "humongous" /var/log/app/gc.log | tail -5</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A ordem importa mais do que a conclusão: evidência, hipótese, alternativa, mitigação, correcção. Quem começa por propor flags perde a ronda mesmo que a flag esteja certa.</li>
+        <li>O número mais informativo do <em>log</em> é a ocupação depois da colecção completa; quem o ignora não sabe distinguir fuga de pressão de alocação.</li>
+        <li>A ligação entre 3,7 MB por <em>array</em> e regiões de 4 MB é o detalhe que separa sénior de mid — exige saber o limiar de 50% da região.</li>
+        <li>Limitar a <em>cache</em> por número de entradas em vez de por peso é a armadilha plantada: 1 000 entradas de 3,7 MB continuam a ser 3,7 GB.</li>
+        <li>Casos limite a mencionar: a <em>cache</em> pode ser correcta e o <em>heap</em> estar sub-dimensionado — só o <em>hit rate</em> o decide; e um <em>dump</em> de 8 GB é ele próprio um evento de produção, não uma operação gratuita.</li>
+        <li>Resposta forte fecha com prevenção: alarme sobre ocupação após colecção acima de 70% durante 15 minutos, e teste de carga com o perfil de tamanho real dos PDFs.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-9-6" class="h2"><span class="secnum">9.6</span> Flags que valem a pena e flags de culto<a class="anchor" href="#sec-9-6" aria-label="ligação">#</a></h2>
+
+<p>A linha de comando de uma JVM em produção deve caber em dez linhas e cada uma tem de ter justificação. As que valem a pena dividem-se em três grupos: as que definem o orçamento de memória, as que garantem que existe evidência quando algo corre mal, e as que corrigem uma medição concreta. Tudo o resto é herança de outra época ou imitação.</p>
+
+<p>Um conjunto defensável para um serviço em contentor tem: dimensão de <em>heap</em> fixa e igual nos dois extremos, ou percentagem da memória do contentor; <em>log</em> de GC rotativo; <em>heap dump</em> automático em OOM e saída imediata do processo; <em>Native Memory Tracking</em> em modo resumo se a margem de desempenho o permitir; e uma gravação JFR contínua. O <em>trade-off</em> de cada uma é baixo e conhecido — o <em>log</em> de GC custa menos de 1%, o NMT 5% a 10%, o JFR com o perfil por omissão cerca de 1% e com <code>settings=profile</code> 2% a 3%.</p>
+
+<figure class="listing shell" id="lst-9-6"><div class="lhead"><span class="lnum">Listagem 9.6</span>
+<span class="lcap">Linha de base defensável para um serviço Spring Boot em Kubernetes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code>JAVA_TOOL_OPTIONS="\
+ -XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=70 \
+ -XX:MaxMetaspaceSize=256m -XX:MaxDirectMemorySize=256m \
+ -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps \
+ -XX:+ExitOnOutOfMemoryError \
+ -Xlog:gc*,gc+heap=debug,safepoint:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=5,filesize=20M \
+ -XX:StartFlightRecording=name=cont,settings=profile,maxsize=256m,maxage=6h,dumponexit=true,filename=/dumps/app.jfr \
+ -XX:NativeMemoryTracking=summary"
+
+# Verificar o que a JVM decidiu, dentro do contentor, antes de discutir teorias:
+java -XX:+PrintFlagsFinal -version | grep -E "MaxHeapSize|MaxRAMPercentage|ActiveProcessor|UseG1GC|UseZGC"
+    size_t MaxHeapSize      = 1503657984      {product} {ergonomic}
+   double MaxRAMPercentage  = 70.000000       {product} {command line}
+      int ActiveProcessorCount = -1           {product} {default}
+     bool UseG1GC           = true            {product} {ergonomic}</code></pre></figure>
+
+<div class="qa" id="q-9-11" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Se lhe dessem um serviço novo em produção e só pudesse acrescentar cinco flags à JVM, quais escolhia e porquê?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Escolhia cinco que produzem evidência ou fixam o orçamento de memória, nenhuma que tente ser mais esperta do que a ergonomia da JVM. Primeira, <code>-XX:MaxRAMPercentage</code> com um valor explícito entre 65 e 75: o valor por omissão de 25% desperdiça três quartos da memória do contentor e é a causa mais frequente de OOM de <em>heap</em> em Kubernetes. Segunda, <code>-XX:+HeapDumpOnOutOfMemoryError</code> com <code>-XX:HeapDumpPath</code> para um volume que sobreviva ao <em>pod</em> — sem isto, o primeiro incidente não deixa evidência e perde-se um ciclo inteiro de diagnóstico.</p>
+      <p>Terceira, <code>-XX:+ExitOnOutOfMemoryError</code>: uma JVM que sobrevive a um OOM de <em>heap</em> serve erros durante horas e continua a receber tráfego; morrer e ser substituída é o comportamento correcto num orquestrador. Quarta, o <code>-Xlog:gc*</code> com <em>safepoint</em>, ficheiro e rotação — menos de 1% de custo e a única forma de reconstruir o que aconteceu depois de o <em>pod</em> desaparecer. Quinta, <code>-XX:StartFlightRecording</code> contínuo com <code>maxage</code>, que dá perfis de CPU, alocação e bloqueios do período imediatamente anterior ao incidente sem ser preciso reproduzi-lo.</p>
+      <p>O que fica deliberadamente de fora é tão informativo quanto o que entra. Recolector: manter o G1 por omissão até haver uma medição que justifique a troca. <code>-Xmn</code>, <code>NewRatio</code>, <code>SurvivorRatio</code>: o G1 dimensiona a geração jovem dinamicamente e fixá-la desliga essa adaptação. <code>ParallelGCThreads</code> e <code>ConcGCThreads</code>: derivam do número de CPUs visíveis e só se mexem quando a detecção está errada. <code>-XX:+UseCompressedOops</code>: já é o comportamento por omissão abaixo de 32 GB.</p>
+      <p>O <em>trade-off</em> a explicitar é entre observabilidade e desempenho. O conjunto acima custa entre 1% e 3%, e vale a pena em qualquer serviço com plantão. Num <em>job</em> de lote de dez mil instâncias efémeras, onde 3% são dinheiro real e o custo de um incidente é apenas repetir o <em>job</em>, corta-se o JFR e o NMT e fica-se com o <em>log</em> de GC e o <em>heap dump</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Lista flags de afinação de GC de memória, incluindo flags removidas do JDK.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>-Xmx</code> e <em>heap dump</em>, mas não pensa em <em>log</em> de GC nem em comportamento pós-OOM.</td></tr>
+        <tr><td>Sénior</td><td>Prioriza evidência e orçamento de memória, justifica cada flag com o incidente que ela resolve e nomeia o custo em percentagem.</td></tr>
+        <tr><td>Staff</td><td>Explica o que fica de fora e porquê, e diferencia o conjunto para serviços com plantão e para lotes efémeros.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quando prefere <code>-Xmx</code> absoluto a <code>MaxRAMPercentage</code>?»</li>
+      <li>«Como verifica, dentro do contentor, o que a JVM decidiu para o <em>heap</em>?»</li>
+      <li>«Que flags usaria só temporariamente durante um incidente?»</li>
+      <li>«O que muda nesta lista se o serviço for um <em>job</em> de lote?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor flags que já não existem no JDK actual.</li>
+      <li>Afinar GC antes de garantir que existe <em>log</em> de GC.</li>
+      <li>Não conseguir dizer o custo em desempenho de nenhuma das flags escolhidas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-12" data-box="qa" data-area="jvm" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Encontrou este conjunto herdado: <code>-XX:+UseParNewGC -XX:+AggressiveOpts -XX:+DisableExplicitGC -XX:PermSize=256m -XX:+UseCompressedOops -Xmn2g</code>. Faça a revisão, flag a flag.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Metade destas flags já não existe e a JVM ou as ignora com aviso ou recusa arrancar, o que por si só é um sinal: ninguém validou esta linha de comando numa actualização de JDK. <code>-XX:+UseParNewGC</code> pertencia ao par ParNew/CMS e foi removido com o CMS; hoje não tem significado. <code>-XX:+AggressiveOpts</code> era um saco de optimizações experimentais, foi tornado obsoleto e removido, e nunca teve garantia de efeito. <code>-XX:PermSize</code> refere-se à geração permanente, que desapareceu no Java 8 quando o metaspace a substituiu — o equivalente moderno seria <code>-XX:MaxMetaspaceSize</code>, e mesmo esse serve de alarme e não de afinação. <code>-XX:+UseCompressedOops</code> está ligado por omissão em qualquer <em>heap</em> abaixo de 32 GB; escrevê-lo é ruído.</p>
+      <p>As duas restantes são activas e perigosas. <code>-XX:+DisableExplicitGC</code> transforma <code>System.gc()</code> em <em>no-op</em>, o que parece bom — evita que uma biblioteca provoque uma colecção completa — mas remove a válvula que o mecanismo de <code>ByteBuffer</code> directo usa para forçar a execução dos <em>cleaners</em> quando não consegue reservar memória nativa. Num serviço que use Netty ou NIO intensivamente, é uma causa directa de <code>OutOfMemoryError: Direct buffer memory</code>. Quando o objectivo é apenas evitar a pausa, a flag certa é <code>-XX:+ExplicitGCInvokesConcurrent</code>, que satisfaz o pedido com um ciclo concorrente.</p>
+      <p><code>-Xmn2g</code> é a mais subtil. Fixar a geração jovem desliga o dimensionamento adaptativo do G1: o recolector deixa de poder encolher o <em>eden</em> para cumprir <code>MaxGCPauseMillis</code> ou de o aumentar quando a taxa de sobrevivência é baixa. O resultado depende do serviço e é sempre pior do que a adaptação, excepto num caso — carga rigorosamente constante e um perfil já medido, onde fixar reduz a variância das pausas. Não é o caso de um serviço de pedidos com pico diário.</p>
+      <p>A recomendação é remover as seis e reintroduzir apenas o que uma medição justificar, com uma regra de higiene: cada flag na linha de comando leva um comentário com a data, o incidente que a motivou e o número que a valida. Flags sem dono são removidas na actualização de JDK seguinte. O risco de remover tudo de uma vez mitiga-se com <em>canary</em>: um <em>pod</em> com a linha nova, comparação de p99, taxa de erro e CPU de GC durante um ciclo de tráfego completo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aceita a lista como boa ou remove tudo sem saber o que cada flag fazia.</td></tr>
+        <tr><td>Mid</td><td>Identifica <code>PermSize</code> como obsoleta, mas não vê o perigo de <code>DisableExplicitGC</code> nem o efeito de <code>-Xmn</code> no G1.</td></tr>
+        <tr><td>Sénior</td><td>Classifica cada flag em removida, redundante ou activa, explica o mecanismo de <code>DisableExplicitGC</code> com memória directa e o custo de fixar a geração jovem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a política de higiene (dono, data, número por flag) e o plano de remoção com <em>canary</em> e critérios de comparação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Em que caso é legítimo fixar a geração jovem?»</li>
+      <li>«Como descobre se uma flag ainda existe no JDK que vai usar?»</li>
+      <li>«O que aconteceria a este serviço ao migrar de JDK 8 para 21 com esta linha de comando?»</li>
+      <li>«Que teste faria antes de remover <code>DisableExplicitGC</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Manter flags «porque sempre lá estiveram».</li>
+      <li>Não saber que a geração permanente desapareceu no Java 8.</li>
+      <li>Alterar a linha de comando directamente em produção sem <em>canary</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-7" class="h2"><span class="secnum">9.7</span> JVM em contentores e Kubernetes<a class="anchor" href="#sec-9-7" aria-label="ligação">#</a></h2>
+
+<p>Desde que o suporte a contentores passou a estar activo por omissão, a JVM lê os limites do <em>cgroup</em> em vez dos valores da máquina física. A consequência prática é que <code>-Xmx</code> deixou de ser obrigatório — mas o valor por omissão de <code>-XX:MaxRAMPercentage</code> é 25%, o que num <em>pod</em> de 2 GiB dá um <em>heap</em> de 512 MB e deixa 1,5 GiB por usar. Definir 65% a 75% explicitamente é a alteração de maior retorno em quase todas as plataformas Kubernetes que herdei.</p>
+
+<p>O CPU é o segundo eixo, e o mais mal compreendido. <code>Runtime.availableProcessors()</code> deriva da quota de CPU do <em>cgroup</em>, arredondada para cima: um <em>pod</em> com <code>limits.cpu: 4</code> vê 4 processadores independentemente do <code>requests</code>. Esse número determina o paralelismo do <em>pool</em> comum de <code>ForkJoinPool</code>, o número de <em>threads</em> de GC, o dimensionamento por omissão de <em>pools</em> de Netty e de clientes HTTP, e a escolha ergonómica do recolector. Um <em>pod</em> sem limite de CPU numa máquina de 64 núcleos vê 64 processadores e cria dezenas de <em>threads</em> de GC para um serviço que usa meio núcleo — memória e comutação de contexto desperdiçadas. <code>-XX:ActiveProcessorCount</code> corrige a detecção quando ela está errada.</p>
+
+<p>O terceiro eixo é a interacção com as sondas. Uma pausa de GC de 3 s com um <code>livenessProbe</code> de <code>timeoutSeconds: 1</code> e <code>failureThreshold: 3</code> mata o <em>pod</em> em plena colecção, o que transforma um problema de latência num ciclo de reinícios e agrava a carga nos <em>pods</em> restantes. A regra é dimensionar os limites das sondas acima da pausa máxima observada, e usar <em>readiness</em> — não <em>liveness</em> — para retirar tráfego de um <em>pod</em> em dificuldades.</p>
+
+<figure class="listing yaml" id="lst-9-7"><div class="lhead"><span class="lnum">Listagem 9.7</span>
+<span class="lcap">Orçamento de memória coerente entre <em>cgroup</em> e JVM, com sondas dimensionadas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>resources:
+  requests:
+    memory: "2Gi"          # request = limit: classe Guaranteed, sem despejo por pressao
+    cpu: "1"
+  limits:
+    memory: "2Gi"          # heap 70% = 1434Mi; sobram ~614Mi para metaspace,
+    cpu: "2"               # code cache, pilhas, GC e arenas nativas
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=70
+      -XX:MaxMetaspaceSize=256m -XX:MaxDirectMemorySize=128m
+      -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps
+      -XX:+ExitOnOutOfMemoryError
+  - name: MALLOC_ARENA_MAX
+    value: "2"             # trava o crescimento das arenas da glibc
+readinessProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+  timeoutSeconds: 2
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  timeoutSeconds: 5        # &gt; pausa maxima de GC observada (3,2s no incidente)
+  periodSeconds: 15
+  failureThreshold: 3      # 45s de tolerancia antes de matar o processo
+startupProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  failureThreshold: 30
+  periodSeconds: 5         # 150s para arrancar sem que o liveness interfira</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Num <em>pod</em> de 2 GiB: <code>MaxRAMPercentage=70</code> dá 1 434 MiB de <em>heap</em> e deixa 614 MiB. Desses, um serviço Spring Boot típico consome 150 MiB de metaspace, 90 MiB de <em>code cache</em> committed, 60 MiB de estruturas de GC, 40 MiB de símbolos e 100 a 250 MiB de arenas nativas — margem de 15% a 25%, que é o mínimo aceitável. Com <code>MaxRAMPercentage=85</code> a margem desaparece e o <em>pod</em> é morto sob pico; com o valor por omissão de 25%, o <em>heap</em> de 512 MiB provoca OOM aplicacional com 1,5 GiB por usar.</p></aside>
+
+<div class="qa" id="q-9-13" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como dimensiona a memória de um <em>pod</em> Java? Quero a conta, não uma regra de bolso — e diga-me o que faz se o número não fechar.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A conta parte do conjunto vivo medido, não do limite disponível. Mede-se o conjunto vivo em carga real (ocupação após ciclo completo de GC), multiplica-se por 2,5 a 4 para obter o <em>heap</em>, soma-se o não-<em>heap</em> medido com NMT e acrescenta-se 15% a 20% de margem. Com um conjunto vivo de 400 MB: <em>heap</em> de 1 200 MB, não-<em>heap</em> de 500 MB, total de 1 700 MB, margem de 20% dá um limite de aproximadamente 2 GiB. A partir daí calcula-se a percentagem em vez de a assumir: 1 200 sobre 2 048 são 59%, e é esse o valor de <code>MaxRAMPercentage</code>.</p>
+      <p>Duas decisões acompanham a conta. Primeira, <code>requests.memory</code> igual a <code>limits.memory</code>, o que coloca o <em>pod</em> na classe Guaranteed e o protege de despejo por pressão de memória do nó — a memória de uma JVM não é comprimível e sobrecomprometer memória em Java produz reinícios, não degradação suave. Segunda, <code>-XX:InitialRAMPercentage</code> igual a <code>MaxRAMPercentage</code>: o <em>heap</em> nasce com o tamanho final, evita redimensionamentos e torna a memória do <em>pod</em> previsível desde o primeiro segundo.</p>
+      <p>Se o número não fechar — o não-<em>heap</em> medido é de 900 MB para um serviço de 400 MB de vivo — a resposta não é aumentar o limite antes de perceber porquê. Os três suspeitos, por ordem de probabilidade, são o número de <em>threads</em> (400 <em>threads</em> a 1 MB reservado), memória directa sem limite explícito (herda <code>-Xmx</code>), e arenas da <em>glibc</em>. Cada um tem uma correcção barata: limitar os <em>pools</em> ou passar a <em>virtual threads</em> para trabalho bloqueante, definir <code>-XX:MaxDirectMemorySize</code>, e <code>MALLOC_ARENA_MAX=2</code>.</p>
+      <p>O <em>trade-off</em> final é entre densidade e resiliência. Encostar o limite ao consumo medido maximiza <em>pods</em> por nó e minimiza custo, mas qualquer pico de tráfego ou de tamanho de <em>payload</em> resulta em <em>OOMKilled</em>, que é a pior forma de falhar — sem <em>dump</em>, sem <em>trace</em>, e com o tráfego a ser redistribuído pelos <em>pods</em> que já estavam sob pressão. Uma margem de 20% custa 20% de infra-estrutura e compra a diferença entre degradação e falha em cascata; abaixo de 10% de margem, deixa de haver sistema resiliente e passa a haver sorte.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ponho 2 GB e <code>-Xmx1g</code>» sem medir nem justificar; não distingue <em>requests</em> de <em>limits</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o <em>heap</em> não é tudo e usa <code>MaxRAMPercentage</code>, mas não mede o não-<em>heap</em> nem define margem.</td></tr>
+        <tr><td>Sénior</td><td>Parte do conjunto vivo, mede o não-<em>heap</em> com NMT, calcula a percentagem, iguala <em>requests</em> e <em>limits</em> e explica porquê.</td></tr>
+        <tr><td>Staff</td><td>Diagnostica um orçamento que não fecha com três suspeitos ordenados, e articula o <em>trade-off</em> densidade/resiliência com números.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a memória, ao contrário do CPU, não deve ser sobrecomprometida em Java?»</li>
+      <li>«Que efeito tem <code>-XX:+AlwaysPreTouch</code> nesta conta e no arranque?»</li>
+      <li>«Como automatizaria esta medição para cinquenta serviços?»</li>
+      <li>«O que muda com <em>virtual threads</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar <code>MaxRAMPercentage</code> no valor por omissão de 25% e queixar-se de OOM.</li>
+      <li>Definir <em>limits</em> muito acima de <em>requests</em> para memória.</li>
+      <li>Dimensionar por tentativa e erro sem medir o conjunto vivo.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-9-14" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O mesmo <em>build</em> corre bem na máquina do programador e usa três vezes mais CPU em Kubernetes com <code>limits.cpu: 2</code>. O que investigaria primeiro na JVM?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Investigaria primeiro quantos processadores a JVM julga ter, porque esse número propaga-se para meia dúzia de decisões automáticas. <code>Runtime.availableProcessors()</code> deriva da quota de CPU do <em>cgroup</em>; se o <em>pod</em> não tiver <code>limits.cpu</code> definido, ou se a plataforma usar apenas <em>shares</em>, a JVM pode ver os núcleos todos do nó — 64, por exemplo — e dimensionar em conformidade: <em>threads</em> de GC, paralelismo do <code>ForkJoinPool</code> comum, <em>pools</em> de Netty, <em>threads</em> de compilação e, em casos extremos, a escolha ergonómica do recolector.</p>
+      <p>O efeito é o pior dos dois mundos: dezenas de <em>threads</em> a competir por 2 núcleos de quota. Com a quota do <em>cgroup</em> esgotada dentro de cada período, o <em>kernel</em> aplica <em>throttling</em> — os <em>threads</em> ficam suspensos até ao período seguinte — e uma pausa de GC que devia demorar 30 ms passa a demorar centenas de milissegundos porque os <em>threads</em> de GC são interrompidos a meio. A métrica que o prova é o tempo de <em>throttling</em> do <em>cgroup</em>, e é a primeira coisa que olharia depois de contar os processadores.</p>
+      <p>A verificação é directa: correr <code>java -XX:+PrintFlagsFinal -version</code> dentro do contentor e ler <code>ActiveProcessorCount</code>, <code>ParallelGCThreads</code> e <code>MaxHeapSize</code>; ou expor <code>Runtime.getRuntime().availableProcessors()</code> numa métrica. Se o valor não corresponder à quota, define-se <code>-XX:ActiveProcessorCount=2</code> e reavalia-se.</p>
+      <p>A segunda hipótese, se o número de processadores estiver correcto, é o custo fixo do arranque a dominar: um <em>pod</em> que reinicia com frequência paga repetidamente carregamento de classes e compilação JIT, e uma quota de 2 núcleos torna esse período três a cinco vezes mais longo do que numa máquina de programador com 10 núcleos livres. Nesse caso a correcção é outra — arquivo de classes partilhado, <code>-XX:TieredStopAtLevel=1</code> para processos de vida curta, ou uma <code>startupProbe</code> generosa que evite reinícios durante o aquecimento. O <em>trade-off</em> de fixar <code>ActiveProcessorCount</code> é que passa a ser um valor manual que ninguém actualiza quando o <em>limit</em> muda: vale a pena gerá-lo a partir do mesmo valor no <em>chart</em>, não escrevê-lo à mão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Culpa «o Kubernetes ser mais lento» sem mecanismo.</td></tr>
+        <tr><td>Mid</td><td>Sabe que existe <em>throttling</em> de CPU, mas não liga o número de processadores visíveis ao dimensionamento interno da JVM.</td></tr>
+        <tr><td>Sénior</td><td>Explica a cadeia quota → <code>availableProcessors()</code> → <em>threads</em> de GC e <em>pools</em> → <em>throttling</em>, e verifica com <code>PrintFlagsFinal</code>.</td></tr>
+        <tr><td>Staff</td><td>Considera a hipótese alternativa do custo de arranque, escolhe a correcção adequada a cada uma e nota o risco de manutenção de <code>ActiveProcessorCount</code> fixo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é calculado o número de processadores a partir da quota do <em>cgroup</em>?»</li>
+      <li>«Porque é que <em>throttling</em> de CPU agrava desproporcionadamente as pausas de GC?»</li>
+      <li>«Que impacto tem isto no <code>ForkJoinPool.commonPool()</code> e nos <em>parallel streams</em>?»</li>
+      <li>«Como reduziria o tempo de arranque de 4 s para menos de 2 s?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não saber que a JVM lê os limites do <em>cgroup</em>.</li>
+      <li>Aumentar o limite de CPU sem olhar para o número de <em>threads</em> criadas.</li>
+      <li>Comparar desempenho de contentor com máquina local sem igualar a quota.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-9-8" class="h2"><span class="secnum">9.8</span> Resumo e checklist<a class="anchor" href="#sec-9-8" aria-label="ligação">#</a></h2>
+
+<p>O fio condutor deste capítulo é um só: numa ronda de JVM, a evidência precede a flag. Quem chega com um processo — medir, formular hipótese, excluir alternativas, alterar uma variável — passa mesmo sem saber de cor todos os limiares; quem chega com uma lista de flags falha à primeira pergunta de seguimento.</p>
+
+<ul class="lst">
+  <li>A identidade de uma classe é o par (nome, <em>class loader</em>); classes só são descarregadas quando o <em>loader</em> se torna inalcançável, e é daí que vem toda a fuga de metaspace.</li>
+  <li>O JIT é especulativo: <em>inlining</em> monomórfico, análise de escape e desdobramento assentam em perfis que podem ser invalidados, e a desoptimização explica degradações que aparecem depois de minutos de bom desempenho.</li>
+  <li><code>-Xmx</code> controla uma de sete parcelas de memória. RSS é <em>heap</em> + metaspace + <em>code cache</em> + pilhas + estruturas de GC + memória directa + arenas nativas, e só o NMT o desmonta.</li>
+  <li>Referências ocupam 4 <em>bytes</em> abaixo de 32 GB de <em>heap</em> e 8 acima; subir de 31 para 33 GB pode reduzir a capacidade útil.</li>
+  <li>O custo de uma colecção jovem é proporcional ao que sobrevive, não ao tamanho do <em>heap</em>; taxa de sobrevivência e promoção prematura são as variáveis que a estragam.</li>
+  <li>G1 para 2-32 GB com p99 tolerante a 100-200 ms; ZGC quando a pausa domina o p99 e há CPU para pagar 5% a 15% de débito; Parallel para lotes; Serial para um núcleo.</li>
+  <li>No <em>log</em> de GC, o número mais informativo é a ocupação depois de uma colecção completa: é o conjunto vivo real e distingue fuga de sub-dimensionamento.</li>
+  <li><code>OutOfMemoryError</code> são oito erros distintos, e <em>exit code</em> 137 não é nenhum deles — é o <em>kernel</em> a matar o processo por RSS, sem <em>dump</em> e sem <em>trace</em>.</li>
+  <li>Em Kubernetes, o valor por omissão de <code>MaxRAMPercentage</code> é 25% e o número de processadores visíveis deriva da quota de CPU: as duas causas mais frequentes de incidentes de JVM em contentores.</li>
+</ul>
+
+<h3>Checklist accionável</h3>
+
+<ul class="lst">
+  <li>Confirmar que <code>-Xlog:gc*</code> com <em>safepoint</em>, ficheiro e rotação está activo em todos os serviços de produção, e que os ficheiros sobrevivem à substituição do <em>pod</em>.</li>
+  <li>Garantir <code>-XX:+HeapDumpOnOutOfMemoryError</code> com caminho em volume persistente e <code>-XX:+ExitOnOutOfMemoryError</code>.</li>
+  <li>Medir o conjunto vivo em carga real e dimensionar o <em>heap</em> entre 2,5 e 4 vezes esse valor; nunca dimensionar por tentativa e erro.</li>
+  <li>Correr <code>jcmd VM.native_memory summary</code> uma vez por serviço e registar o orçamento não-<em>heap</em> real em vez de estimar.</li>
+  <li>Definir <code>MaxRAMPercentage</code> entre 65% e 75%, <code>InitialRAMPercentage</code> igual, e <code>requests.memory</code> igual a <code>limits.memory</code>.</li>
+  <li>Definir explicitamente <code>-XX:MaxDirectMemorySize</code> e <code>-XX:MaxMetaspaceSize</code> em qualquer serviço em contentor.</li>
+  <li>Verificar dentro do contentor, com <code>-XX:+PrintFlagsFinal</code>, o que a JVM decidiu para <em>heap</em>, recolector e número de processadores.</li>
+  <li>Dimensionar <code>livenessProbe</code> acima da pausa máxima de GC observada e usar <code>readinessProbe</code> para retirar tráfego.</li>
+  <li>Auditar a linha de comando a cada actualização de JDK: remover flags removidas, redundantes ou sem dono documentado.</li>
+  <li>Instalar alarme sobre a ocupação após colecção acima de 70% durante 15 minutos e sobre a fracção de CPU em GC acima de 5%.</li>
+  <li>Ensaiar em voz alta a leitura de um <em>log</em> de GC real e um diagnóstico de OOM em cinco minutos: é o formato exacto da pergunta na ronda.</li>
+</ul>

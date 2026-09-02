@@ -1,0 +1,724 @@
+<p>Esta é a ronda em que o entrevistador descobre se o candidato escreve Java 21 ou escreve Java 8 num compilador de Java 21. As perguntas de linguagem moderna medem três coisas ao mesmo tempo: se o candidato conhece o mecanismo por baixo do açúcar sintáctico (apagamento, construtor canónico, exaustividade verificada em compilação), se sabe onde a funcionalidade <em>não</em> se aplica, e se consegue justificar uma migração de <em>codebase</em> com números em vez de entusiasmo. Onde os candidatos caem é sempre no mesmo sítio: recitam «os <em>records</em> são imutáveis e poupam <em>boilerplate</em>» e depois não sabem dizer por que razão um <em>record</em> não serve como entidade JPA, ou usam <code>Optional</code> como parâmetro de método sem perceber que acabaram de duplicar o número de caminhos que o chamador tem de testar. Este capítulo trata cada funcionalidade como uma decisão de <em>design</em> de API com custo, não como um truque de sintaxe.</p>
+
+<h2 id="sec-5-1" class="h2"><span class="secnum">5.1</span> Genéricos e apagamento de tipos<a class="anchor" href="#sec-5-1" aria-label="ligação">#</a></h2>
+
+<p>Os genéricos em Java são uma funcionalidade exclusivamente de compilação. O compilador verifica os tipos, insere as conversões (<em>casts</em>) necessárias e depois apaga (<em>erasure</em>) os parâmetros de tipo: <code>List&lt;String&gt;</code> e <code>List&lt;Integer&gt;</code> partilham um único objecto <code>Class</code> em <em>runtime</em>. Um parâmetro de tipo sem limite é substituído por <code>Object</code>; um parâmetro limitado, <code>&lt;T extends Number&gt;</code>, é substituído por <code>Number</code>. Esta decisão de 2004 foi de compatibilidade binária: código compilado para Java 1.4 continuou a correr sem recompilação, ao contrário do que aconteceu em C#, que reificou os genéricos ao custo de partir a compatibilidade da <em>runtime</em>.</p>
+
+<p>A consequência prática é uma lista fechada de operações ilegais que aparece em quase todas as entrevistas: não se pode fazer <code>new T()</code> nem <code>new T[n]</code>, não se pode testar <code>o instanceof T</code>, não se pode declarar um campo <code>static T</code>, não se pode apanhar nem lançar um subtipo genérico de <code>Throwable</code>, e não se podem sobrecarregar dois métodos cuja assinatura só difira no argumento de tipo — depois do apagamento têm a mesma assinatura e o ficheiro não compila. A solução idiomática é passar um <em>type token</em>, <code>Class&lt;T&gt;</code>, ou capturar o tipo através de uma subclasse anónima, que é o truque por trás de <code>TypeReference</code> do Jackson e de <code>ParameterizedTypeReference</code> do Spring.</p>
+
+<p>Há um detalhe que separa quem leu a especificação de quem só usou a funcionalidade: os métodos-ponte (<em>bridge methods</em>). Quando uma classe implementa <code>Comparable&lt;Money&gt;</code>, o compilador gera, além de <code>compareTo(Money)</code>, um método sintético <code>compareTo(Object)</code> que faz o <em>cast</em> e delega. É por isso que uma chamada por reflexão a <code>getDeclaredMethods()</code> devolve mais métodos do que os escritos no ficheiro, e é por isso que uma biblioteca de <em>proxy</em> mal configurada pode chamar o método-ponte e falhar com <code>ClassCastException</code> num sítio onde não há nenhum <em>cast</em> visível no código-fonte.</p>
+
+<figure class="listing java" id="lst-5-1"><div class="lhead"><span class="lnum">Listagem 5.1</span>
+<span class="lcap">O que o apagamento torna ilegal e como se contorna.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>final class Cache&lt;T&gt; {
+
+    // ILEGAL: private static T partilhado;      -> T não existe fora da instância
+    private final Class&lt;T&gt; token;                // solução: type token explícito
+    private final T[] ranhuras;
+
+    @SuppressWarnings("unchecked")
+    Cache(Class&lt;T&gt; token, int n) {
+        this.token = token;
+        // ILEGAL: this.ranhuras = new T[n];
+        this.ranhuras = (T[]) java.lang.reflect.Array.newInstance(token, n);
+    }
+
+    boolean contem(Object o) {
+        // ILEGAL: return o instanceof T;
+        return token.isInstance(o);
+    }
+}
+
+// ILEGAL: as duas assinaturas colidem depois do apagamento -> void put(List)
+// void put(List&lt;String&gt;  l) { }
+// void put(List&lt;Integer&gt; l) { }
+
+List&lt;String&gt;  s = new ArrayList&lt;&gt;();
+List&lt;Integer&gt; i = new ArrayList&lt;&gt;();
+assert s.getClass() == i.getClass();             // true: uma só Class&lt;ArrayList&gt;</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O apagamento não elimina a verificação, adia-a. <code>List&lt;String&gt; l = (List&lt;String&gt;) (List&lt;?&gt;) listaDeInteiros;</code> compila com aviso e só rebenta com <code>ClassCastException</code> na primeira leitura, num <em>stack trace</em> que aponta para uma linha onde não há <em>cast</em> nenhum — a conversão foi inserida pelo compilador no ponto de uso. Em código de fronteira (desserialização, cache genérica, JDBC) vale a pena usar <code>Collections.checkedList(l, String.class)</code> em testes: a falha passa a ocorrer no <code>add</code> que a causou.</p></aside>
+
+<div class="qa" id="q-5-1" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique o apagamento de tipos e diga-me três coisas concretas que ele torna impossíveis em Java. Depois diga-me o que se perde e o que se ganha em relação a uma <em>runtime</em> com genéricos reificados.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Os genéricos são verificados no compilador e apagados no <em>bytecode</em>: um parâmetro de tipo sem limite torna-se <code>Object</code>, um parâmetro limitado torna-se o seu limite, e o compilador insere os <em>casts</em> nos pontos de leitura. Em <em>runtime</em> existe uma única classe <code>ArrayList</code>; <code>new ArrayList&lt;String&gt;().getClass() == new ArrayList&lt;Integer&gt;().getClass()</code> devolve <code>true</code>.</p>
+      <p>Três impossibilidades concretas: primeiro, <code>new T()</code> e <code>new T[n]</code> — não há informação de tipo para invocar o construtor nem para o <em>array store check</em> da JVM, e por isso os <em>arrays</em> genéricos se criam por <code>Array.newInstance(Class&lt;T&gt;, n)</code> com <em>cast</em> não verificado. Segundo, <code>o instanceof T</code> e <code>catch (T e)</code> — o teste de tipo em <em>runtime</em> não tem alvo, e daí a proibição de subtipos genéricos de <code>Throwable</code>. Terceiro, sobrecarregar por argumento de tipo: <code>put(List&lt;String&gt;)</code> e <code>put(List&lt;Integer&gt;)</code> apagam para a mesma assinatura e o ficheiro não compila.</p>
+      <p>O que se ganha é compatibilidade binária: em 2004, todo o código compilado para 1.4 continuou a correr sem recompilação e as bibliotecas puderam ser generificadas de forma incremental. O que se perde tem três faces. Não há especialização por tipo primitivo — <code>List&lt;Integer&gt;</code> guarda referências para objectos <em>boxed</em>, com 16 bytes de cabeçalho por elemento além dos 4 ou 8 bytes da referência, contra 4 bytes num <code>int[]</code>; é essa a razão de existirem <code>IntStream</code>, <code>LongStream</code> e as colecções primitivas de Eclipse Collections ou fastutil. Não há despacho por tipo genérico em <em>runtime</em>. E a fronteira com <em>frameworks</em> obriga a <em>type tokens</em>: <code>ParameterizedTypeReference&lt;List&lt;Pagamento&gt;&gt;</code> no <code>RestClient</code> existe só para transportar a informação que o apagamento deitou fora.</p>
+      <p>O <em>trade-off</em> inverte-se quando o projecto Valhalla entregar tipos-valor e genéricos especializados: aí <code>List&lt;int&gt;</code> passará a ser possível sem <em>boxing</em>. Até lá, a decisão de <em>design</em> num sistema com colecções de milhões de elementos é evitar o genérico e usar <em>arrays</em> primitivos ou <em>streams</em> primitivas nos caminhos quentes — 40 milhões de <code>Integer</code> em <em>heap</em> custam facilmente 640 MB contra 160 MB num <code>int[]</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Os genéricos servem para não fazer <em>cast</em>.» Não sabe que a informação desaparece em <em>runtime</em>.</td></tr>
+        <tr><td>Mid</td><td>Define apagamento correctamente e dá um exemplo (<code>new T[]</code>), mas não explica porquê nem conhece a motivação de compatibilidade.</td></tr>
+        <tr><td>Sénior</td><td>Mecanismo, três impossibilidades com a razão de cada uma, <em>type tokens</em> como contorno, e o custo do <em>boxing</em> com ordem de grandeza.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta métodos-ponte, o impacto em bibliotecas de <em>proxy</em> e reflexão, e sabe dizer em que condições Valhalla altera a decisão de <em>design</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que não se pode declarar <code>class MinhaExcepcao&lt;T&gt; extends Exception</code>?»</li>
+      <li>«O que é um método-ponte e quando é que o candidato o viu num <em>stack trace</em>?»</li>
+      <li>«Como é que o Jackson desserializa para <code>List&lt;Pagamento&gt;</code> se o tipo foi apagado?»</li>
+      <li>«Quanta memória poupa passar de <code>List&lt;Long&gt;</code> para <code>long[]</code> em 10 milhões de elementos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que <code>List&lt;String&gt;.class</code> existe ou que a JVM conhece o argumento de tipo.</li>
+      <li>Dizer que o apagamento «não tem impacto em performance» sem mencionar <em>boxing</em>.</li>
+      <li>Propor reflexão sobre <code>getGenericSuperclass()</code> sem saber que só funciona para tipos escritos na declaração, não para variáveis locais.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-5-2" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Este método compila com um aviso: <code>static &lt;T&gt; List&lt;T&gt; de(T... itens)</code>. O que é poluição do <em>heap</em>, porque é que o compilador avisa aqui, e quando é legítimo pôr <code>@SafeVarargs</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Poluição do <em>heap</em> (<em>heap pollution</em>) é o estado em que uma variável de um tipo parametrizado aponta para um objecto que não é desse tipo. Como o apagamento removeu a verificação, o problema só se manifesta mais tarde, num <code>ClassCastException</code> gerado por um <em>cast</em> que o compilador inseriu.</p>
+      <p>Com <em>varargs</em> genéricos o compilador tem de criar um <em>array</em> para transportar os argumentos, mas <em>arrays</em> genéricos não existem: cria um <code>Object[]</code> — um <em>array</em> do tipo apagado. Esse <em>array</em> é covariante e verificável em <em>runtime</em>, ao contrário das colecções genéricas, e portanto pode ser exposto. Se o método devolver ou guardar <code>itens</code> num campo, o chamador recebe um <code>Object[]</code> disfarçado de <code>T[]</code> e pode escrever lá dentro um <code>String</code> onde o outro lado espera <code>Pagamento</code>. Daí o aviso <em>possible heap pollution from parameterized vararg type</em>.</p>
+      <p><code>@SafeVarargs</code> é uma promessa do autor, não uma verificação: só a deve pôr quem garante que o método (a) nunca guarda nem devolve o <em>array</em> de <em>varargs</em>, e (b) nunca o passa a código que o possa expor. <code>List.of(...)</code> e <code>Arrays.asList(...)</code> qualificam-se porque copiam o conteúdo. A anotação só é aplicável a métodos que não possam ser sobrepostos — <code>static</code>, <code>final</code>, e desde o Java 9 também <code>private</code> — precisamente porque uma subclasse podia quebrar a promessa.</p>
+      <p>O <em>trade-off</em>: silenciar o aviso com <code>@SuppressWarnings("unchecked")</code> esconde o problema no local de definição <em>e</em> no de chamada, enquanto <code>@SafeVarargs</code> documenta a garantia e cala o aviso apenas onde é devido. Quando a garantia não se consegue dar, a alternativa correcta é mudar a assinatura para <code>List&lt;T&gt;</code> e obrigar o chamador a <code>List.of(...)</code>: custa uma alocação por chamada, uns 40 bytes, e elimina a classe de bugs inteira.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe o que é poluição do <em>heap</em>; propõe <code>@SuppressWarnings</code> para «tirar o aviso».</td></tr>
+        <tr><td>Mid</td><td>Sabe que o aviso existe e que <code>@SafeVarargs</code> o remove, mas não explica o <code>Object[]</code> nem as condições da promessa.</td></tr>
+        <tr><td>Sénior</td><td>Explica a criação do <em>array</em> apagado, a covariância dos <em>arrays</em>, as duas condições para a anotação e as restrições de aplicabilidade.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a alternativa de <em>design</em> (assinatura com <code>List&lt;T&gt;</code>), com o custo de alocação, e cita casos reais na JDK.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva um método com <code>@SafeVarargs</code> que, apesar disso, provoca <code>ClassCastException</code> no chamador.»</li>
+      <li>«Porque é que <code>@SafeVarargs</code> não se pode pôr num método de instância não-final?»</li>
+      <li>«Porque é que os <em>arrays</em> são covariantes e as colecções genéricas não?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar <code>@SafeVarargs</code> como equivalente a <code>@SuppressWarnings</code>.</li>
+      <li>Não saber que os <em>varargs</em> criam um <em>array</em>, e que esse <em>array</em> é alocado a cada chamada.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-2" class="h2"><span class="secnum">5.2</span> Wildcards, variância e PECS<a class="anchor" href="#sec-5-2" aria-label="ligação">#</a></h2>
+
+<p>Os tipos genéricos em Java são invariantes: <code>List&lt;Integer&gt;</code> não é subtipo de <code>List&lt;Number&gt;</code>, embora <code>Integer</code> seja subtipo de <code>Number</code>. Sem esta regra, seria possível colocar um <code>Double</code> numa <code>List&lt;Integer&gt;</code> através de uma referência <code>List&lt;Number&gt;</code>. Os <em>arrays</em>, por herança do Java 1.0, são covariantes e pagam a factura em <em>runtime</em>: escrever num <code>Object[]</code> que na verdade é um <code>String[]</code> lança <code>ArrayStoreException</code>.</p>
+
+<p>Os <em>wildcards</em> reintroduzem a variância onde ela é segura. <code>? extends T</code> dá covariância de leitura: lê-se <code>T</code>, não se escreve nada além de <code>null</code>. <code>? super T</code> dá contravariância de escrita: escreve-se <code>T</code>, lê-se <code>Object</code>. A regra mnemónica é PECS — <em>Producer Extends, Consumer Super</em>: se o parâmetro é a fonte dos dados, <code>extends</code>; se é o destino, <code>super</code>; se é ambos, nenhum dos dois.</p>
+
+<p>Na prática de entrevista, o sinal de senioridade não é recitar PECS mas identificar o custo de <em>não</em> o aplicar numa API pública. Uma assinatura <code>void publicar(List&lt;Evento&gt; eventos)</code> obriga todos os chamadores a construir exactamente <code>List&lt;Evento&gt;</code>; <code>List&lt;EventoCriado&gt;</code> não serve. Alargar depois para <code>List&lt;? extends Evento&gt;</code> é compatível com o binário existente mas obriga a recompilar quem sobrepõe o método — por isso a decisão tem de ser tomada na primeira versão da API, não na terceira.</p>
+
+<figure class="listing java" id="lst-5-2"><div class="lhead"><span class="lnum">Listagem 5.2</span>
+<span class="lcap">PECS aplicado: produtor com <code>extends</code>, consumidor com <code>super</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Produtor -&gt; extends ; Consumidor -&gt; super
+static &lt;T&gt; void copiar(List&lt;? super T&gt; destino, List&lt;? extends T&gt; origem) {
+    for (int i = 0; i &lt; origem.size(); i++) destino.set(i, origem.get(i));
+}
+
+// Sem wildcard a API é inutilizável para subtipos:
+static double somaRigida(List&lt;Number&gt; ns) { ... }        // recusa List&lt;Integer&gt;
+
+static double soma(List&lt;? extends Number&gt; ns) {          // aceita List&lt;Integer&gt;, List&lt;Double&gt;
+    double t = 0;
+    for (Number n : ns) t += n.doubleValue();
+    return t;                                            // mas ns.add(1) é ilegal
+}
+
+// Porque é que sort aceita um Comparator do supertipo:
+Comparator&lt;Object&gt; porHash = Comparator.comparingInt(Object::hashCode);
+List&lt;String&gt; nomes = new ArrayList&lt;&gt;(List.of("b", "a"));
+nomes.sort(porHash);   // compila: List.sort(Comparator&lt;? super E&gt;)
+
+// Captura do wildcard: o truque para escrever num List&lt;?&gt;
+static void inverter(List&lt;?&gt; l) { inverterAux(l); }
+private static &lt;T&gt; void inverterAux(List&lt;T&gt; l) { Collections.reverse(l); }</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Wildcards</em> tornam a API flexível e a implementação rígida. Cada <code>? extends</code> fecha a porta à escrita e obriga, em métodos que precisam de ambas as direcções, ao padrão de captura com um método auxiliar genérico privado. A regra prática: aplicar PECS em parâmetros de métodos públicos, nunca em tipos de retorno — <code>List&lt;? extends Evento&gt;</code> devolvido contamina o chamador, que fica sem poder escrever na lista que recebeu e sem perceber porquê.</p></aside>
+
+<div class="qa" id="q-5-3" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tenho <code>void processar(List&lt;Evento&gt; eventos)</code> e um chamador com <code>List&lt;EventoDePagamento&gt;</code> que não compila. Explique porquê e corrija a assinatura. Quando é que a correcção deixa de ser possível?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não compila porque os genéricos são invariantes: <code>List&lt;EventoDePagamento&gt;</code> não é subtipo de <code>List&lt;Evento&gt;</code>. A invariância existe para impedir que, através da referência ao supertipo, alguém insira um <code>EventoDeFactura</code> numa lista que o resto do sistema trata como sendo só de pagamentos.</p>
+      <p>Se <code>processar</code> apenas lê da lista, a lista é produtora e a assinatura correcta é <code>void processar(List&lt;? extends Evento&gt; eventos)</code>. Se tiver de acrescentar elementos, a lista é consumidora e a assinatura é <code>List&lt;? super EventoDePagamento&gt;</code>. Se fizer as duas coisas, nenhum <em>wildcard</em> serve e o parâmetro tem de ficar invariante — sinal, quase sempre, de que o método está a fazer duas coisas e devia ser dividido em duas.</p>
+      <p>A correcção deixa de ser possível — ou deixa de ser barata — em três situações. Primeira, quando o método é <code>public</code> numa biblioteca com consumidores externos: alargar o parâmetro mantém a compatibilidade de código-fonte para quem chama, mas quebra a compatibilidade de código-fonte para quem sobrepõe o método, porque a assinatura sobreposta deixa de corresponder. Segunda, quando o método é parte de uma interface funcional já usada em referências de método — a inferência muda e algumas expressões deixam de compilar. Terceira, quando o parâmetro é usado tanto como fonte como destino, e nesse caso a resposta correcta é reformular a API, por exemplo devolvendo uma nova lista em vez de mutar a recebida.</p>
+      <p>Um número para fechar: numa <em>codebase</em> de 400 mil linhas, a diferença entre aplicar PECS de raiz e corrigir depois é medida em <em>call sites</em> — a alteração compila para os chamadores mas obriga a rever cada implementação da interface, e é isso que transforma uma alteração de uma linha numa migração de várias equipas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe <code>List&lt;Object&gt;</code> ou um <em>cast</em> não verificado; não sabe o que é invariância.</td></tr>
+        <tr><td>Mid</td><td>Aplica <code>? extends</code> correctamente mas não sabe explicar porque é que a escrita fica proibida.</td></tr>
+        <tr><td>Sénior</td><td>Invariância com a razão de segurança, PECS aplicado às duas direcções, e a regra de não usar <em>wildcards</em> em tipos de retorno.</td></tr>
+        <tr><td>Staff</td><td>Fala de compatibilidade de código-fonte para quem sobrepõe, e trata o caso «lê e escreve» como sintoma de má separação de responsabilidades.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que <code>List&lt;? extends Evento&gt;</code> aceita <code>add(null)</code> mas não <code>add(evento)</code>?»</li>
+      <li>«Como é que se escreve num <code>List&lt;?&gt;</code>? Escreva a captura do <em>wildcard</em>.»</li>
+      <li>«Porque é que a assinatura de <code>Collections.max</code> é tão complicada?»</li>
+      <li>«Devolveria <code>List&lt;? extends Evento&gt;</code>? Justifique.»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir <code>? extends</code> com <code>? super</code> e não conseguir derivar a regra a partir do sentido do fluxo de dados.</li>
+      <li>Dizer que «<em>wildcards</em> são para casos avançados» e evitá-los sistematicamente em APIs públicas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-5-4" data-box="qa" data-area="design" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Está a desenhar um <code>Repositorio&lt;T, ID&gt;</code> partilhado por 30 serviços. Que restrições de tipo põe, e como evita que os genéricos transformem a interface numa assinatura ilegível como a de <code>Collections.max</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A regra de partida é minimizar os graus de liberdade: cada parâmetro de tipo tem de justificar-se por uma relação real entre a entrada e a saída, não por «pode vir a ser útil». <code>Repositorio&lt;T extends Entidade&lt;ID&gt;, ID extends Comparable&lt;ID&gt;&gt;</code> impõe duas restrições que geram mensagens de erro de dez linhas; <code>Repositorio&lt;T, ID&gt;</code> sem limites gera zero e não perde quase nada, porque a segurança real vem do contrato de cada implementação e não do compilador.</p>
+      <p>A segunda regra é preferir métodos genéricos a tipos genéricos. Um método genérico infere os argumentos de tipo a partir dos parâmetros e não obriga o utilizador a escrevê-los; um tipo genérico obriga a escrever a declaração em cada campo e em cada variável. Assinaturas como <code>&lt;T extends Object &amp; Comparable&lt;? super T&gt;&gt; T max(Collection&lt;? extends T&gt;)</code> existem por compatibilidade retroactiva com código pré-genéricos, não como modelo a seguir.</p>
+      <p>A terceira é encapsular a complexidade num tipo com nome. Em vez de expor <code>Map&lt;String, List&lt;Function&lt;Pagamento, Optional&lt;Decisao&gt;&gt;&gt;&gt;</code>, define-se <code>record TabelaDeRegras(Map&lt;String, List&lt;Regra&gt;&gt; porCanal)</code> com <code>interface Regra extends Function&lt;Pagamento, Optional&lt;Decisao&gt;&gt;</code>. O tipo com nome aparece no <em>stack trace</em>, na documentação e nas mensagens de erro; a expressão aninhada só aparece nas três.</p>
+      <p>O <em>trade-off</em>: menos restrições de tipo significa que erros que o compilador poderia apanhar passam para testes. Vale a pena aceitar isso numa interface usada por 30 serviços, onde o custo de uma assinatura ilegível é pago 30 vezes por cada leitura; não vale numa biblioteca de baixo nível com poucos utilizadores e invariantes que não podem ser violados, como uma API de unidades físicas, em que o tipo é a única defesa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Enche a assinatura de limites porque «é mais seguro», sem avaliar o custo para os utilizadores.</td></tr>
+        <tr><td>Mid</td><td>Escreve uma interface genérica funcional mas não discute legibilidade nem inferência.</td></tr>
+        <tr><td>Sénior</td><td>Justifica cada parâmetro de tipo, prefere métodos genéricos, e nomeia tipos intermédios em vez de aninhar genéricos.</td></tr>
+        <tr><td>Staff</td><td>Formula a decisão como custo distribuído por 30 equipas e identifica o caso oposto em que os limites de tipo são obrigatórios.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que expõe consultas paginadas sem inventar um segundo tipo genérico?»</li>
+      <li>«O que faria diferente se metade dos consumidores fosse Kotlin?»</li>
+      <li>«Quando é que um <em>type token</em> em <em>runtime</em> é preferível a um parâmetro de tipo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Copiar a assinatura do Spring Data sem saber explicar nenhum dos seus parâmetros de tipo.</li>
+      <li>Considerar que legibilidade de assinaturas é uma preocupação estética e não de custo de manutenção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-3" class="h2"><span class="secnum">5.3</span> Records: quando substituem uma classe e quando não<a class="anchor" href="#sec-5-3" aria-label="ligação">#</a></h2>
+
+<p>Um <em>record</em>, final desde o Java 16, é um portador de dados transparente: os componentes declarados são campos <code>private final</code>, existe um construtor canónico com todos eles, acessores com o nome do componente (sem prefixo <code>get</code>), e <code>equals</code>, <code>hashCode</code> e <code>toString</code> derivados de todos os componentes. A classe é implicitamente <code>final</code> e não pode estender outra classe, mas pode implementar interfaces e ter métodos, campos estáticos e construtores adicionais.</p>
+
+<p>A parte que separa uso de compreensão é o construtor compacto. Escrever <code>public Money { ... }</code> — sem lista de parâmetros — dá acesso aos parâmetros do construtor canónico antes de serem atribuídos aos campos, e é aí que se validam e normalizam os valores. Reatribuir <code>amount</code> dentro do construtor compacto altera o que é gravado no campo. Isto é o que permite que um <em>record</em> tenha invariantes fortes, ao contrário da crença de que só serve para DTO anémicos.</p>
+
+<p>A imutabilidade é superficial: um componente <code>List&lt;Linha&gt;</code> é uma referência final para uma lista possivelmente mutável. Um <em>record</em> com invariantes a sério copia no construtor compacto — <code>linhas = List.copyOf(linhas)</code> — ao custo de uma alocação por instância. Vale a pena em objectos de domínio partilhados entre <em>threads</em>; não vale em DTO de fronteira criados e descartados por pedido, onde 5 000 cópias por segundo aparecem no perfil de alocação.</p>
+
+<figure class="listing java" id="lst-5-3"><div class="lhead"><span class="lnum">Listagem 5.3</span>
+<span class="lcap">Construtor compacto: validação e normalização antes da atribuição.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public record Money(BigDecimal amount, Currency currency) implements Comparable&lt;Money&gt; {
+
+    public Money {                                    // construtor compacto
+        Objects.requireNonNull(amount, "amount");
+        Objects.requireNonNull(currency, "currency");
+        // normalização: a reatribuição afecta o campo final
+        amount = amount.setScale(currency.getDefaultFractionDigits(), RoundingMode.UNNECESSARY);
+    }
+
+    public static Money eur(String v) {
+        return new Money(new BigDecimal(v), Currency.getInstance("EUR"));
+    }
+
+    public Money plus(Money outro) {
+        if (!currency.equals(outro.currency))
+            throw new IllegalArgumentException("moedas diferentes: " + currency + " / " + outro.currency);
+        return new Money(amount.add(outro.amount), currency);
+    }
+
+    @Override public int compareTo(Money o) { return amount.compareTo(o.amount); }
+}
+
+// Componente mutável: cópia defensiva ou o record não é imutável
+public record Encomenda(String id, List&lt;Linha&gt; linhas) {
+    public Encomenda {
+        linhas = List.copyOf(linhas);                 // lança NPE se houver null na lista
+    }
+}</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 5.1</span> Portador de dados: <em>record</em>, Lombok e classe escrita à mão.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th><em>Record</em></th><th>Lombok <code>@Value</code></th><th>Classe à mão</th></tr></thead><tbody>
+<tr><td>Linhas para 5 campos</td><td>1</td><td>3 a 5</td><td>60 a 80</td></tr>
+<tr><td>Dependência externa</td><td>Nenhuma</td><td><em>Annotation processor</em>, quebra em cada JDK novo</td><td>Nenhuma</td></tr>
+<tr><td>Herança de classe</td><td>Impossível</td><td>Possível</td><td>Possível</td></tr>
+<tr><td>Mutabilidade parcial</td><td>Impossível</td><td>Possível (<code>@Data</code>)</td><td>Possível</td></tr>
+<tr><td><em>Pattern matching</em> por desconstrução</td><td>Sim</td><td>Não</td><td>Não</td></tr>
+<tr><td>Entidade JPA</td><td>Não (falta construtor sem argumentos e campos não-finais)</td><td>Não com <code>@Value</code></td><td>Sim</td></tr>
+<tr><td>Desserialização com invariantes</td><td>Passa pelo construtor canónico</td><td>Depende do <em>framework</em></td><td>Depende do <em>framework</em></td></tr>
+</tbody></table></div></div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Na serialização Java nativa, um <em>record</em> é desserializado através do construtor canónico, o que faz com que as validações do construtor compacto corram sempre. Uma classe serializável comum é reconstruída sem passar por construtor nenhum, e por isso um objecto com invariantes pode nascer inválido a partir de um fluxo malicioso. É um argumento de segurança a favor de <em>records</em> que quase nenhum candidato traz e que impressiona quando aparece.</p></aside>
+
+<div class="qa" id="q-5-5" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A equipa usa Lombok em todo o lado. Vale a pena migrar os DTO para <em>records</em>? Diga-me o que ganha, o que perde e onde é que o <em>record</em> simplesmente não serve.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Vale a pena para DTO e objectos-valor, e não vale para entidades JPA nem para hierarquias que precisem de herança. A regra de decisão é: o objecto é definido pelo conjunto dos seus componentes e não tem identidade própria? Então é <em>record</em>.</p>
+      <p>Ganha-se três coisas concretas. Primeiro, elimina-se uma dependência de <em>annotation processor</em> que manipula a árvore de sintaxe interna do compilador e que historicamente é o item que bloqueia a actualização do JDK durante semanas em cada versão nova. Segundo, ganha-se desconstrução em <em>pattern matching</em>: <code>case Cartao(var pan, var validade, var valor, var tok)</code> só funciona com <em>records</em>, e é isso que torna o <code>switch</code> exaustivo utilizável em código de domínio. Terceiro, ganha-se semântica garantida pela linguagem: <code>equals</code> compara todos os componentes, sempre, sem <code>@EqualsAndHashCode(exclude = ...)</code> a divergir entre classes.</p>
+      <p>Perde-se três coisas. A herança de classe deixa de existir — mitigável com interfaces <code>sealed</code>, que são geralmente melhor modelação. Os acessores mudam de <code>getValor()</code> para <code>valor()</code>, o que quebra código que dependa da convenção JavaBeans: EL em <em>templates</em>, alguma validação por reflexão, bibliotecas de <em>mapping</em> antigas. E a mutabilidade parcial desaparece, o que é bom até se encontrar o construtor de 14 componentes que ninguém consegue chamar sem trocar dois <code>String</code> de posição — nesse caso, ou se agrupam componentes em <em>records</em> aninhados, ou se mantém um <em>builder</em> escrito à mão.</p>
+      <p>Onde não serve: entidade JPA, porque o Hibernate exige construtor sem argumentos e campos não-finais para <em>proxies</em> e <em>dirty checking</em>; para projecções de leitura, pelo contrário, o <em>record</em> é a escolha certa e o Hibernate 6 e o Spring Data suportam-no directamente através do construtor. Também não serve quando o objecto tem ciclo de vida e identidade — uma <code>Sessao</code> que muda de estado não é um portador de dados, é uma entidade.</p>
+      <p>Estratégia de migração: fazer módulo a módulo, começando pela camada de API (DTO de pedido e resposta), onde a superfície de acoplamento é pequena e o Jackson já suporta <em>records</em> nativamente. Não converter entidades. Não converter numa única <em>pull request</em> de 300 ficheiros: a mudança de <code>getX()</code> para <code>x()</code> gera conflitos em tudo o que estiver em curso.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<em>Records</em> são mais modernos.» Ou recusa a migração por hábito, sem argumentos.</td></tr>
+        <tr><td>Mid</td><td>Cita menos <em>boilerplate</em> e imutabilidade; não conhece a restrição de JPA nem o impacto nos acessores.</td></tr>
+        <tr><td>Sénior</td><td>Regra de decisão explícita, três ganhos e três perdas concretas, e o limite JPA com a razão técnica.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o plano de migração incremental, o risco de conflitos e o argumento do <em>annotation processor</em> como custo de actualização do JDK.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que valida um componente de um <em>record</em>? Escreva o construtor compacto.»</li>
+      <li>«Um <em>record</em> com um <code>List</code> é imutável? Prove o contrário.»</li>
+      <li>«O que acontece ao <code>hashCode</code> se um componente for um <em>array</em>?»</li>
+      <li>«Como suporta evolução de esquema num <em>record</em> usado em mensagens Kafka?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <em>records</em> como entidades JPA e insistir depois de lhe ser dito que o Hibernate precisa de construtor sem argumentos.</li>
+      <li>Afirmar que um <em>record</em> é «profundamente imutável».</li>
+      <li>Não distinguir objecto-valor de entidade com identidade.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-5-6" data-box="qa" data-area="api" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Estes <em>records</em> são o contrato de mensagens que publicamos em Kafka e consumidas por outras quatro equipas. Que problemas antevê e o que muda no <em>design</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O problema central é que um <em>record</em> é um contrato posicional e um tópico Kafka é um contrato de longa duração entre versões que não são libertadas ao mesmo tempo. Um consumidor com a versão antiga do <em>record</em> tem de conseguir ler mensagens produzidas pela versão nova, e vice-versa.</p>
+      <p>Isto tem três consequências. Primeira: acrescentar um componente altera o construtor canónico, e portanto qualquer código que use o construtor posicionalmente parte na recompilação — é uma alteração de código-fonte incompatível, mesmo quando o formato de série (JSON, Avro) é compatível. Segunda: remover ou renomear um componente é sempre incompatível, porque o nome do componente é o nome do campo no JSON. Terceira: a validação no construtor compacto corre na desserialização, o que é bom para invariantes e mau para compatibilidade — uma regra nova rejeita mensagens antigas válidas e enche a <em>dead letter queue</em>.</p>
+      <p>O que muda no <em>design</em>: separar o <em>record</em> de transporte do <em>record</em> de domínio. O de transporte só cresce por adição, com campos <em>nullable</em>, sem validação forte, e é gerado a partir do esquema (Avro ou Protobuf com registo de esquemas e regra de compatibilidade <em>backward</em>). O de domínio, esse, tem invariantes fortes e vive dentro do serviço; a conversão entre os dois é o sítio onde a regra nova é aplicada, e onde uma mensagem antiga pode ser rejeitada com contexto em vez de com um <code>NullPointerException</code> no construtor.</p>
+      <p>O <em>trade-off</em>: manter dois modelos custa uma classe de conversão por tipo de mensagem, e em 20 tipos são 20 conversores e testes. Compensa quando há consumidores externos à equipa. Com um único consumidor interno, publicado no mesmo <em>pipeline</em>, o modelo partilhado é mais barato — até ao dia em que aparece o quinto consumidor, e aí o custo da separação é pago de uma vez só com uma migração de tópico.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não distingue o modelo de transporte do modelo de domínio; assume que serializar o objecto de domínio é normal.</td></tr>
+        <tr><td>Mid</td><td>Fala de versionamento de esquema em geral, sem ligar às propriedades específicas do <em>record</em> (construtor canónico, nomes dos componentes).</td></tr>
+        <tr><td>Sénior</td><td>Identifica compatibilidade de código-fonte vs de série, o risco da validação na desserialização, e propõe a separação com registo de esquemas.</td></tr>
+        <tr><td>Staff</td><td>Quantifica o custo dos conversores, define a regra de compatibilidade a impor no registo e o critério para quando não separar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que regra de compatibilidade configura no registo de esquemas e porquê?»</li>
+      <li>«Como faz uma alteração incompatível sem parar os consumidores?»</li>
+      <li>«Onde põe o <code>@JsonIgnoreProperties(ignoreUnknown = true)</code> e que risco isso traz?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Serializar o objecto de domínio directamente para o tópico e chamar-lhe «menos duplicação».</li>
+      <li>Assumir que acrescentar um campo é sempre compatível, sem distinguir série de código-fonte.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-4" class="h2"><span class="secnum">5.4</span> Sealed types e modelação de domínio fechado<a class="anchor" href="#sec-5-4" aria-label="ligação">#</a></h2>
+
+<p>Uma interface ou classe <code>sealed</code>, final desde o Java 17, declara explicitamente quais os subtipos permitidos. Cada subtipo permitido tem de ser <code>final</code>, <code>sealed</code> ou <code>non-sealed</code>, e tem de estar no mesmo módulo — ou, em código sem módulos, no mesmo pacote. Se todos os subtipos estiverem no mesmo ficheiro, a cláusula <code>permits</code> pode ser omitida e o compilador infere-a.</p>
+
+<p>O valor não está na restrição em si, está no que ela desbloqueia: o compilador passa a saber a lista completa de alternativas e pode verificar a exaustividade de um <code>switch</code>. É a forma de Java exprimir um tipo-soma — o que noutras linguagens se chama <code>enum</code> com dados associados ou união etiquetada. A alternativa clássica em Java era o padrão <em>visitor</em>: uma interface <code>Visitor</code> com um método por subtipo e um <code>accept</code> em cada subtipo, que dá a mesma garantia de exaustividade ao custo de duas dezenas de linhas por tipo e de uma indirecção que dificulta a leitura.</p>
+
+<p>A distinção operacional face a um <code>enum</code> é simples: um <code>enum</code> tem um conjunto fixo de <em>instâncias</em>, uma interface <code>sealed</code> tem um conjunto fixo de <em>tipos</em>, cada um com os seus dados. Um estado de pagamento sem dados associados é um <code>enum</code>; um estado que carrega o montante reservado ou o motivo da recusa é uma interface <code>sealed</code> com <em>records</em>.</p>
+
+<figure class="listing java" id="lst-5-4"><div class="lhead"><span class="lnum">Listagem 5.4</span>
+<span class="lcap">Domínio fechado: interface <code>sealed</code> com <em>records</em> como alternativas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public sealed interface MetodoPagamento
+        permits Cartao, TransferenciaSepa, Carteira {
+
+    Money total();
+}
+
+public record Cartao(String ultimos4, YearMonth validade, Money valor, boolean tokenizado)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor; }
+}
+
+public record TransferenciaSepa(String iban, Money valor, LocalDate dataValor)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor; }
+}
+
+public record Carteira(String fornecedor, Money valor, Money comissao)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor.plus(comissao); }
+}</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O mesmo domínio de quatro alternativas: com <em>visitor</em> são cerca de 90 linhas (interface do visitante, quatro <code>accept</code>, uma implementação por operação); com interface <code>sealed</code> mais <em>records</em> e <code>switch</code> exaustivo são cerca de 25. Mais importante do que a contagem: acrescentar uma quinta alternativa quebra a compilação em <em>todos</em> os <code>switch</code> exaustivos do projecto, com localização exacta, enquanto com um <code>switch</code> que tenha <code>default</code> a quinta alternativa passa despercebida até chegar a produção.</p></aside>
+
+<div class="qa" id="q-5-7" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos um <em>visitor</em> com 6 tipos e 4 operações. Substituía-o por <code>sealed</code> mais <code>switch</code>? E o que responde a quem diz que isso viola o princípio aberto-fechado?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Substituía, e a resposta ao princípio aberto-fechado é que ele se aplica ao eixo errado. Qualquer modelação com tipos e operações escolhe qual dos dois eixos fica aberto: o polimorfismo clássico deixa aberto o conjunto de tipos e fechado o de operações (acrescentar um método à interface obriga a mexer em todos os tipos); os tipos <code>sealed</code> com <code>switch</code> deixam aberto o conjunto de operações e fechado o de tipos. É o problema da expressão, e nenhuma das soluções é livre.</p>
+      <p>Com 6 tipos e 4 operações, a pergunta empírica é qual dos eixos muda mais. Num domínio de pagamentos, os métodos de pagamento mudam uma ou duas vezes por ano e as operações — autorizar, calcular comissão, exportar para contabilidade, mascarar para <em>logs</em> — mudam todos os meses. Nesse caso o conjunto de tipos <em>deve</em> ser fechado, e fechá-lo explicitamente transforma cada alternativa nova num erro de compilação em vez de num <code>default</code> silencioso.</p>
+      <p>Há um ganho adicional que o <em>visitor</em> não dá: os dados ficam onde se lêem. Com desconstrução de <em>records</em>, <code>case Cartao(var ult4, var val, Money v, boolean tok) when !tok -&gt; ...</code> exprime numa linha um teste de tipo, quatro extracções e uma guarda. O <em>visitor</em> obriga a espalhar a mesma lógica por quatro métodos em classes diferentes, o que é precisamente o que torna difícil rever uma regra de negócio.</p>
+      <p>Quando não substituir: se o conjunto de tipos tiver mesmo de ser extensível por terceiros — <em>plugins</em>, módulos de clientes, subtipos noutro módulo Maven — <code>sealed</code> é impossível, porque os subtipos permitidos têm de viver no mesmo módulo. Nesse caso mantém-se o polimorfismo, ou usa-se <code>non-sealed</code> num ramo específico, aceitando que esse ramo deixa de ser verificável em exaustividade e precisa de um <code>default</code>. E, na prática, migrar 6 tipos e 4 operações é uma tarefa de meio dia com testes de caracterização a proteger cada operação.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>switch</code> sobre tipos é código mau, polimorfismo é sempre melhor.» Sem análise dos eixos de mudança.</td></tr>
+        <tr><td>Mid</td><td>Sabe usar <code>sealed</code> e <code>switch</code>, mas responde ao aberto-fechado com uma citação em vez de uma análise.</td></tr>
+        <tr><td>Sénior</td><td>Formula o problema da expressão, escolhe o eixo com base na frequência de mudança observada, e conhece a restrição de módulo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo da migração, os testes de caracterização, e a solução híbrida com <code>non-sealed</code> para o ramo extensível.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que é o problema da expressão? Dê um exemplo em que a escolha é a inversa.»</li>
+      <li>«Onde é que os subtipos permitidos têm de estar e porquê?»</li>
+      <li>«Como testa que não ficou nenhum caso por tratar?»</li>
+      <li>«O que muda se o domínio for um <code>enum</code> em vez de uma interface <code>sealed</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Invocar SOLID como regra absoluta sem identificar qual é o eixo que muda no sistema em causa.</li>
+      <li>Não saber que <code>permits</code> exige o mesmo módulo ou pacote.</li>
+      <li>Manter <code>default</code> no <code>switch</code> e continuar a chamar-lhe exaustivo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-5" class="h2"><span class="secnum">5.5</span> Pattern matching e switch exaustivo<a class="anchor" href="#sec-5-5" aria-label="ligação">#</a></h2>
+
+<p>O <em>pattern matching</em> chegou em três andares: para <code>instanceof</code> no Java 16, para <code>switch</code> e com desconstrução de <em>records</em> no Java 21. Um <em>type pattern</em> testa o tipo e liga uma variável no mesmo gesto; um <em>record pattern</em> vai mais longe e extrai os componentes recursivamente, permitindo padrões aninhados como <code>case Cartao(var ult4, var val, Money(var montante, var moeda), var tok)</code>.</p>
+
+<p>Duas regras do compilador contam em entrevista. A primeira é a dominância: um rótulo que aceite tudo o que um rótulo posterior aceitaria torna o segundo inalcançável e é erro de compilação — <code>case Cartao c</code> antes de <code>case Cartao c when ...</code> não compila. A segunda é a exaustividade: num <code>switch</code> sobre um tipo <code>sealed</code>, se todos os subtipos permitidos estiverem cobertos não é preciso <code>default</code>, e escrever um <code>default</code> desliga a verificação. Um <code>switch</code> com padrões também trata o <code>null</code> de forma diferente do <code>switch</code> clássico: sem um <code>case null</code> explícito, lança <code>NullPointerException</code> em vez de saltar para o <code>default</code>.</p>
+
+<p>Há um detalhe que quase ninguém conhece e que vale a pena ter na algibeira: a exaustividade é verificada em compilação, mas as classes podem ser recompiladas separadamente. Se alguém acrescentar um subtipo permitido e não recompilar o consumidor, o <code>switch</code> compilado deixa de ser exaustivo em <em>runtime</em> e a JVM lança <code>MatchException</code> em vez de cair silenciosamente. Em produção, isso implica tratar mudanças de hierarquia <code>sealed</code> como alterações que exigem recompilação de todos os módulos que a consomem — não é seguro substituir um único JAR.</p>
+
+<figure class="listing java" id="lst-5-5"><div class="lhead"><span class="lnum">Listagem 5.5</span>
+<span class="lcap">Switch exaustivo com desconstrução e guardas, sem <code>default</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>static String encaminhar(MetodoPagamento m) {
+    return switch (m) {
+        // guardas primeiro: o rótulo sem guarda dominaria os seguintes
+        case Cartao(String ult4, YearMonth v, Money valor, boolean tok) when !tok
+                -&gt; "recusa:nao-tokenizado:" + ult4;
+        case Cartao c when c.valor().compareTo(Money.eur("30.00")) &lt;= 0
+                -&gt; "contactless:" + c.ultimos4();
+        case Cartao c
+                -&gt; "3ds:" + c.ultimos4();
+        case TransferenciaSepa(String iban, Money valor, LocalDate data)
+                -&gt; "sct-inst:" + iban;
+        case Carteira w
+                -&gt; "wallet:" + w.fornecedor() + ":" + w.total();
+        // sem default: o compilador verifica a exaustividade sobre os 3 permits
+    };
+}
+
+// switch com padrões e null: sem "case null" lança NullPointerException
+static String seguro(MetodoPagamento m) {
+    return switch (m) {
+        case null -&gt; "desconhecido";
+        case MetodoPagamento p -&gt; encaminhar(p);
+    };
+}</code></pre></figure>
+
+<div class="qa" id="q-5-8" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um colega acrescentou <code>default -&gt; throw new IllegalStateException()</code> a todos os <code>switch</code> sobre tipos <code>sealed</code>, «por segurança». Concorda? O que responde na revisão de código?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não concordo, e o argumento é que esse <code>default</code> troca um erro de compilação por um erro de produção. A única razão para usar <code>sealed</code> é que o compilador conheça a lista completa de alternativas; ao acrescentar <code>default</code>, o <code>switch</code> deixa de estar sujeito à verificação de exaustividade, e o dia em que alguém acrescentar um quarto método de pagamento o projecto compila sem uma única advertência e falha na primeira transacção desse tipo.</p>
+      <p>O valor quantifica-se assim: numa <em>codebase</em> com 40 <code>switch</code> sobre a mesma hierarquia, acrescentar uma alternativa produz 40 erros de compilação com ficheiro e linha, todos resolvidos antes do <em>commit</em>. Com <code>default</code>, produz zero erros e um número desconhecido de caminhos silenciosamente errados — dos quais os que lançam excepção são os felizes; os que devolvem um valor por omissão são os que geram incidentes de reconciliação semanas depois.</p>
+      <p>Há um caso legítimo em que uma cláusula de recurso é necessária: quando o <code>switch</code> é sobre um tipo <code>non-sealed</code> ou sobre <code>Object</code>, onde a exaustividade não pode ser provada. Aí escreve-se <code>case MetodoPagamento outro -&gt; ...</code> ou <code>case Object o -&gt; ...</code>, que é um rótulo total e explícito e continua a ser verificado quanto a dominância — não um <code>default</code> anónimo.</p>
+      <p>Na revisão, a formulação prática é: «o compilador já garante isto; o <code>default</code> desliga a garantia. Se o receio for a recompilação separada, o mecanismo correcto é a <code>MatchException</code> que a JVM lança nesse caso, e a mitigação é a política de <em>build</em> — recompilar todos os módulos que consomem a hierarquia — e não um <code>default</code> em cada ficheiro.»</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Concorda com o <code>default</code>: «é mais defensivo».</td></tr>
+        <tr><td>Mid</td><td>Sabe que o <code>default</code> não é preciso, mas não explica que desliga a verificação nem o que se perde com isso.</td></tr>
+        <tr><td>Sénior</td><td>Erro de compilação vs erro de produção, quantifica em número de <em>call sites</em>, e conhece o rótulo total como alternativa legítima.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>MatchException</code> e recompilação separada, e transforma a discussão em política de <em>build</em> em vez de preferência pessoal.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se um subtipo for acrescentado e o módulo consumidor não for recompilado?»</li>
+      <li>«Qual é a diferença entre <code>default</code> e <code>case Object o</code>?»</li>
+      <li>«Como é que o <code>switch</code> com padrões é compilado? O que é <code>invokedynamic</code> aqui?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não perceber que <code>default</code> anula a verificação de exaustividade.</li>
+      <li>Achar que uma excepção em produção é equivalente a um erro de compilação.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-5-9" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Explique a diferença entre uma guarda <code>when</code> e um <code>if</code> dentro do corpo do <code>case</code>. E o que acontece a este <code>switch</code> se lhe passar <code>null</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A guarda faz parte do rótulo; o <code>if</code> faz parte do corpo. A consequência é que uma guarda falsa faz o <code>switch</code> continuar a avaliar os rótulos seguintes, enquanto um <code>if</code> falso dentro do corpo já não pode voltar atrás — o <code>case</code> foi seleccionado e é preciso decidir ali mesmo o que devolver, normalmente com um <code>else</code> a duplicar lógica que já existe noutro ramo.</p>
+      <p>A segunda consequência é a análise do compilador. Um rótulo com guarda nunca é considerado exaustivo nem dominante, porque o compilador não avalia a condição — por isso <code>case Cartao c when x</code> não cobre <code>Cartao</code> e é obrigatório existir depois um rótulo não guardado para <code>Cartao</code>, ou o <code>switch</code> não compila. A ordem também é imposta: o rótulo sem guarda tem de vir depois dos guardados do mesmo tipo, senão o compilador acusa dominância.</p>
+      <p>Quanto a <code>null</code>: num <code>switch</code> com padrões, o comportamento por omissão é lançar <code>NullPointerException</code> antes de avaliar qualquer rótulo — igual ao <code>switch</code> clássico sobre <code>String</code> ou <code>enum</code>, e deliberadamente compatível com ele. Se existir <code>case null</code>, o <code>null</code> passa a ser tratado por esse rótulo. É possível combinar <code>case null, default -&gt; ...</code> para dar o mesmo tratamento aos dois. Um <code>case Object o</code> sozinho não apanha <code>null</code>: nenhum <em>type pattern</em> apanha, porque o teste é <code>instanceof</code>, que é falso para <code>null</code>.</p>
+      <p>A implicação de <em>design</em>: se o valor pode ser <code>null</code>, isso tem de ser explícito no <code>switch</code> ou tratado antes de lá chegar. Em código de domínio a preferência é eliminar o <code>null</code> na fronteira — construtor compacto com <code>requireNonNull</code> — e deixar o <code>switch</code> falhar ruidosamente se um <code>null</code> chegar, porque nesse ponto o <code>NullPointerException</code> aponta para o construtor que devia ter validado e não para o consumidor.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que guarda e <code>if</code> são equivalentes; não sabe o que acontece com <code>null</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe a sintaxe da guarda mas não a diferença de retrocesso nem o efeito na exaustividade.</td></tr>
+        <tr><td>Sénior</td><td>Explica que a guarda faz parte do rótulo, o efeito na exaustividade e na dominância, e o comportamento com <code>null</code> e <code>case null</code>.</td></tr>
+        <tr><td>Staff</td><td>Liga à decisão de <em>design</em> de eliminar <code>null</code> na fronteira e justifica a compatibilidade com o <code>switch</code> clássico.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Reordene estes <code>case</code> para que compilem.»</li>
+      <li>«Um <code>case Object o</code> apanha <code>null</code>? Porquê?»</li>
+      <li>«Como escreve o mesmo tratamento para <code>null</code> e para o caso por omissão?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que um rótulo guardado contribui para a exaustividade.</li>
+      <li>Assumir que <code>null</code> cai no <code>default</code>, como acontecia no <code>switch</code> clássico sobre <code>String</code>.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-5-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 5.1 — Máquina de estados de pagamento com tipos fechados</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Modele o ciclo de vida de um pagamento a partir de eventos. Há quatro eventos — autorização, captura, reembolso e recusa — e quatro estados — novo, autorizado, capturado e fechado. Escreva <code>Estado reduzir(List&lt;Evento&gt; eventos)</code> que aplica os eventos por ordem e devolve o estado final. Restrições: sem <code>enum</code> (os eventos transportam dados), sem <code>instanceof</code> encadeado, sem <code>default</code> em nenhum <code>switch</code>, uma só passagem pela lista. Transições ilegais lançam <code>IllegalStateException</code>; uma captura superior ao valor autorizado e um reembolso que exceda o capturado também. Exemplo: <code>[Autorizada(50 EUR), Capturada(30 EUR), Reembolsada(10 EUR)]</code> devolve <code>Capturado(30 EUR, 10 EUR)</code>; <code>[Capturada(30 EUR)]</code> lança excepção.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-5-6"><div class="lhead"><span class="lnum">Listagem 5.6</span>
+        <span class="lcap">Interfaces <code>sealed</code>, <em>records</em> e <code>switch</code> aninhado sem <code>default</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public sealed interface Evento {
+    Instant em();
+
+    record Autorizada(Instant em, Money valor, String codigo) implements Evento { }
+    record Capturada(Instant em, Money valor)                 implements Evento { }
+    record Reembolsada(Instant em, Money valor)               implements Evento { }
+    record Recusada(Instant em, String motivo)                implements Evento { }
+}
+
+public sealed interface Estado {
+    record Nova()                                       implements Estado { }
+    record Autorizado(Money reservado)                   implements Estado { }
+    record Capturado(Money capturado, Money reembolsado) implements Estado { }
+    record Fechado(String motivo)                        implements Estado { }
+}
+
+public final class Pagamentos {
+
+    private Pagamentos() { }
+
+    public static Estado reduzir(List&lt;Evento&gt; eventos) {      // O(n), sem cópias
+        Estado s = new Estado.Nova();
+        for (Evento e : eventos) s = aplicar(s, e);
+        return s;
+    }
+
+    static Estado aplicar(Estado s, Evento e) {
+        return switch (s) {
+            case Estado.Nova ignorado -&gt; switch (e) {
+                case Evento.Autorizada(Instant em, Money v, String cod) -&gt; new Estado.Autorizado(v);
+                case Evento.Recusada(Instant em, String motivo)         -&gt; new Estado.Fechado(motivo);
+                case Evento.Capturada c                                 -&gt; throw ilegal(s, e);
+                case Evento.Reembolsada r                               -&gt; throw ilegal(s, e);
+            };
+            case Estado.Autorizado(Money reservado) -&gt; switch (e) {
+                case Evento.Capturada(Instant em, Money v) when v.compareTo(reservado) &lt;= 0
+                        -&gt; new Estado.Capturado(v, new Money(BigDecimal.ZERO, v.currency()));
+                case Evento.Capturada c -&gt; throw new IllegalStateException(
+                        "captura " + c.valor() + " acima do reservado " + reservado);
+                case Evento.Recusada(Instant em, String motivo) -&gt; new Estado.Fechado(motivo);
+                case Evento.Autorizada a                        -&gt; throw ilegal(s, e);
+                case Evento.Reembolsada r                       -&gt; throw ilegal(s, e);
+            };
+            case Estado.Capturado(Money capturado, Money reembolsado) -&gt; switch (e) {
+                case Evento.Reembolsada(Instant em, Money v)
+                        when reembolsado.plus(v).compareTo(capturado) &lt;= 0
+                        -&gt; new Estado.Capturado(capturado, reembolsado.plus(v));
+                case Evento.Reembolsada r -&gt; throw new IllegalStateException(
+                        "reembolso acumulado excede a captura " + capturado);
+                case Evento.Autorizada a -&gt; throw ilegal(s, e);
+                case Evento.Capturada c  -&gt; throw ilegal(s, e);
+                case Evento.Recusada r   -&gt; throw ilegal(s, e);
+            };
+            case Estado.Fechado f -&gt; throw ilegal(s, e);
+        };
+    }
+
+    private static IllegalStateException ilegal(Estado s, Evento e) {
+        return new IllegalStateException(
+                e.getClass().getSimpleName() + " ilegal em " + s.getClass().getSimpleName());
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Uma só passagem, <code>O(n)</code> no número de eventos, <code>O(1)</code> de memória além do estado corrente; cada transição aloca um <em>record</em> pequeno que o <em>escape analysis</em> raramente elimina, mas 4 alocações de 24 a 32 bytes por pagamento são irrelevantes face ao custo de I/O.</li>
+        <li>Zero <code>default</code>: acrescentar um quinto evento (por exemplo <code>Estornada</code>) produz erro de compilação nos três <code>switch</code> internos, com ficheiro e linha. É esse o critério de aceitação do exercício.</li>
+        <li>As guardas <code>when</code> separam invariantes de valor (montante) de invariantes de tipo (transição), e a existência obrigatória do rótulo não guardado a seguir a cada guarda garante que o caso inválido tem mensagem própria.</li>
+        <li>Casos limite a mencionar em voz alta: lista vazia devolve <code>Nova</code>; eventos fora de ordem (o método assume ordenação — se não for garantida, ordenar por <code>em()</code> custa <code>O(n log n)</code> e deve ser decisão explícita); reembolsos parciais múltiplos, cobertos pelo acumulador; captura de valor zero; captura parcial seguida de nova captura, que aqui é ilegal e num sistema real seria um requisito a esclarecer.</li>
+        <li>O que se avalia: se o candidato pergunta pelas regras antes de escrever, se separa estado de evento em vez de misturar os dois numa hierarquia, se usa desconstrução onde ela clarifica e variável simples onde não clarifica, e se justifica a ausência de <code>default</code> em vez de a tratar como estilo.</li>
+        <li>Extensão típica pedida a seguir: tornar o resultado <code>Either</code>-like devolvendo <code>sealed interface Resultado permits Ok, Erro</code> em vez de lançar excepções, e discutir o que muda no chamador (custo de excepção com <em>stack trace</em> na ordem dos microssegundos contra ramificação explícita).</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-5-6" class="h2"><span class="secnum">5.6</span> Optional: uso correcto em APIs<a class="anchor" href="#sec-5-6" aria-label="ligação">#</a></h2>
+
+<p><code>Optional</code> foi desenhado para uma coisa: o valor de retorno de um método que pode legitimamente não ter resultado. Não é um substituto universal de <code>null</code>, não é um contentor de uso geral e não é serializável. Usá-lo fora do papel de retorno é o erro de <em>design</em> mais frequente em código Java pós-8, e é uma pergunta de entrevista precisamente porque separa quem leu a intenção de quem copiou o padrão.</p>
+
+<p>Como campo, <code>Optional</code> acrescenta um objecto por campo por instância — 16 bytes de cabeçalho mais a referência — e impede a serialização Java nativa, porque <code>Optional</code> não implementa <code>Serializable</code>. Como parâmetro, duplica os caminhos que o chamador tem de considerar: em vez de duas hipóteses (valor, ausência) passam a existir três, porque o próprio <code>Optional</code> pode vir a <code>null</code>. Como tipo de retorno de uma colecção é redundante: uma colecção vazia já exprime ausência, e <code>Optional&lt;List&lt;X&gt;&gt;</code> obriga o chamador a desembrulhar duas vezes para chegar ao mesmo <code>isEmpty()</code>.</p>
+
+<p>Detalhe operacional que aparece em revisões de código: <code>orElse(calcularCaro())</code> avalia o argumento sempre, mesmo quando o valor está presente, porque é um argumento de método normal. <code>orElseGet(this::calcularCaro)</code> só avalia quando é preciso. Num caminho quente que chame um serviço remoto no ramo de omissão, a diferença entre os dois é o custo total desse serviço multiplicado por cada chamada — a mesma latência que se estava a tentar evitar.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>optional.get()</code> sem verificação prévia lança <code>NoSuchElementException</code> sem contexto nenhum — nem o identificador da entidade, nem a operação. Desde o Java 10 existe <code>orElseThrow()</code> sem argumentos, com a mesma semântica e um nome que declara a intenção; e <code>orElseThrow(() -&gt; new PagamentoInexistente(id))</code> devolve um erro que a camada de API consegue traduzir num 404 com corpo útil. Em código de produção, um <code>get()</code> numa revisão devia ser bloqueante.</p></aside>
+
+<div class="qa" id="q-5-10" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vejo <code>Optional&lt;String&gt;</code> como campo de uma entidade e <code>void enviar(String destino, Optional&lt;String&gt; copia)</code> como assinatura. Comente as duas decisões e diga o que faria em cada caso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>As duas estão erradas, por razões diferentes. <code>Optional</code> foi introduzido como tipo de retorno para exprimir «este método pode não ter resultado, e o compilador obriga-o a lidar com isso»; nem como campo nem como parâmetro cumpre esse papel.</p>
+      <p>Como campo, os problemas são três. Não é serializável, o que quebra serialização Java nativa e obriga a configuração extra em vários <em>frameworks</em>. Custa um objecto adicional por campo e por instância — cerca de 16 bytes de cabeçalho mais a referência; numa cache com 2 milhões de entidades e três campos <em>optional</em>, são perto de 100 MB de <em>heap</em> gastos a exprimir ausência que uma referência a <code>null</code> exprimia de graça. E não impede que o campo seja <code>null</code>, portanto não elimina o problema que dizia resolver: continua a ser preciso verificar. A alternativa é campo <code>null</code>-ável com um acessor que devolve <code>Optional</code>, ou — melhor — modelar a ausência no domínio, com um subtipo <code>sealed</code> ou um valor por omissão explícito.</p>
+      <p>Como parâmetro, o problema é de contrato. O chamador que não tem cópia tem de escrever <code>Optional.empty()</code>, o que é mais ruidoso do que <code>null</code> e não é verificado por ninguém; e o autor do método tem agora três estados para tratar em vez de dois. A alternativa idiomática é sobrecarregar: <code>enviar(String destino)</code> e <code>enviar(String destino, String copia)</code>. Se houver muitos parâmetros opcionais, o sinal é outro — agrupá-los num <em>record</em> de opções com valores por omissão, ou um <em>builder</em>.</p>
+      <p>Onde <code>Optional</code> é correcto: retorno de pesquisas (<code>findById</code>), operações de <em>parsing</em> que podem falhar sem ser excepcionais, e composição funcional com <code>map</code>, <code>flatMap</code>, <code>filter</code> e <code>or</code>. E há um <em>trade-off</em> a assumir: em caminhos com milhões de chamadas por segundo, a alocação do <code>Optional</code> é real — o <em>escape analysis</em> do C2 costuma eliminá-la quando o método é <em>inlined</em>, mas deixa de o fazer em <em>call sites</em> megamórficos. Aí a assinatura <code>null</code>-ável, anotada com <code>@Nullable</code> e verificada estaticamente, é a escolha pragmática.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que ambas as utilizações são boas práticas porque «evitam <code>null</code>».</td></tr>
+        <tr><td>Mid</td><td>Sabe que é anti-padrão, cita a documentação, mas não explica o custo nem propõe alternativa concreta.</td></tr>
+        <tr><td>Sénior</td><td>Serialização, custo de memória com número, o argumento dos três estados no parâmetro, e alternativas (sobrecarga, <em>record</em> de opções, acessor).</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o comportamento do <em>escape analysis</em> e quando a assinatura <code>null</code>-ável com verificação estática é preferível.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é a diferença entre <code>orElse</code> e <code>orElseGet</code>, e quando é que ela custa dinheiro?»</li>
+      <li>«Devolveria <code>Optional&lt;List&lt;Pagamento&gt;&gt;</code>? Justifique.»</li>
+      <li>«Como trata um campo opcional numa entidade JPA?»</li>
+      <li>«O que acha de <code>Optional</code> em DTO de API REST?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>optional.get()</code> em código de produção sem <code>isPresent()</code> nem justificação.</li>
+      <li>Devolver <code>null</code> a partir de um método cujo tipo de retorno é <code>Optional</code>.</li>
+      <li>Não saber que <code>orElse</code> avalia sempre o argumento.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-7" class="h2"><span class="secnum">5.7</span> O que mudou de Java 8 para 17, 21 e 25<a class="anchor" href="#sec-5-7" aria-label="ligação">#</a></h2>
+
+<p>A pergunta «o que mudou desde o Java 8?» é um teste de perspectiva, não de memória. Um candidato que responda com uma lista de funcionalidades soa a quem leu as <em>release notes</em>; um sénior responde com três eixos — o que mudou na linguagem, o que mudou na plataforma e o que isso custa a migrar — e ilustra cada um com um exemplo do sistema que operou.</p>
+
+<p>Na linguagem, o arco é claro: <code>var</code> (Java 10) para reduzir ruído em declarações locais; <em>text blocks</em> (15) para SQL e JSON embutidos, com remoção automática do espaço incidental e <code>\</code> para continuar a linha; <em>records</em> (16) e <code>instanceof</code> com padrão (16); <code>sealed</code> (17); <code>switch</code> com padrões e desconstrução de <em>records</em> (21); colecções sequenciadas com <code>getFirst</code>, <code>getLast</code> e <code>reversed</code> (21). O Java 25, LTS de Setembro de 2025, continua o mesmo arco: corpos de construtor flexíveis, que permitem validar argumentos antes da chamada a <code>super()</code>, e importação de módulos inteiros numa declaração, que encurta o cabeçalho de ficheiros pequenos.</p>
+
+<p>Na plataforma, as mudanças que importam a um backend são maiores do que as da linguagem: <em>virtual threads</em> (21), que tornam viável o modelo bloqueante com dezenas de milhares de pedidos concorrentes; G1 por omissão desde o Java 9 e ZGC generacional para <em>heaps</em> grandes com pausas na ordem do milissegundo; <em>class data sharing</em> e melhorias de arranque que reduzem o tempo até ao primeiro pedido num contentor; e a encapsulação forte dos internos da JDK, que é a fonte real da dor da migração.</p>
+
+<figure class="listing java" id="lst-5-7"><div class="lhead"><span class="lnum">Listagem 5.7</span>
+<span class="lcap"><code>var</code>, <em>text blocks</em> e colecções sequenciadas em código de todos os dias.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>var sql = """
+        SELECT p.id, p.estado, SUM(l.valor) AS total
+          FROM pagamento p
+          JOIN linha l ON l.pagamento_id = p.id
+         WHERE p.criado_em &gt;= ?
+         GROUP BY p.id, p.estado
+        """;                        // sem "+", sem \n, indentação incidental removida
+
+// var: o tipo tem de continuar óbvio à direita do "="
+var porEstado = pagamentos.stream()                       // Map&lt;Estado, Long&gt;
+        .collect(Collectors.groupingBy(Pagamento::estado, Collectors.counting()));
+
+var ordenados = pagamentos.stream()                       // List&lt;Pagamento&gt; imutável
+        .sorted(Comparator.comparing(Pagamento::criadoEm))
+        .toList();
+
+var primeiro = ordenados.getFirst();                      // Java 21: SequencedCollection
+var ultimo   = ordenados.getLast();
+
+// var que prejudica: o leitor não sabe o que sai daqui
+// var r = servico.processar(pedido);</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 5.2</span> O que perguntar a si próprio antes de dizer «migrámos para o Java 21».</div>
+<div class="tscroll"><table><thead><tr><th>Frente</th><th>O que parte na migração 8 &rarr; 21</th><th>Mitigação</th></tr></thead><tbody>
+<tr><td>Módulos e reflexão</td><td>Acesso reflexivo a internos da JDK é negado por omissão desde o Java 16</td><td><code>--add-opens</code> como medida temporária; substituir a biblioteca é a solução</td></tr>
+<tr><td>Java EE removido</td><td><code>javax.xml.bind</code>, JAX-WS e CORBA saíram da JDK no Java 11</td><td>Adicionar as dependências Jakarta explicitamente</td></tr>
+<tr><td>Geração de <em>bytecode</em></td><td>ASM, cglib, Byte Buddy, Lombok, Mockito falham em versões novas</td><td>Actualizar antes de mudar de JDK, não depois</td></tr>
+<tr><td>Codificação por omissão</td><td>O <em>charset</em> por omissão passou a UTF-8 (Java 18); ficheiros lidos sem <em>charset</em> explícito mudam de comportamento</td><td>Fixar o <em>charset</em> em todas as chamadas de I/O; <code>-Dfile.encoding</code> só como diagnóstico</td></tr>
+<tr><td><em>Garbage collector</em></td><td>Parallel deixou de ser omissão no Java 9; parâmetros afinados para CMS deixaram de existir</td><td>Refazer a afinação do zero com medições, não traduzir <em>flags</em></td></tr>
+<tr><td>Concorrência</td><td>Piscinas de <em>threads</em> dimensionadas para I/O bloqueante deixam de fazer sentido com <em>virtual threads</em></td><td>Migrar por serviço, medindo; rever <code>synchronized</code> nos caminhos bloqueantes</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-5-11" data-box="qa" data-area="java" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa discute se deve usar <code>var</code> em todo o lado. Qual é a sua regra, e o que responde a quem diz que <code>var</code> torna Java uma linguagem de tipagem dinâmica?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Quem diz isso está enganado: <code>var</code> é inferência de tipo em compilação. O tipo é fixado no <em>bytecode</em>, é estático, e não se pode reatribuir a variável com um valor de outro tipo. A única coisa que <code>var</code> remove é a repetição do tipo no lado esquerdo quando ele já está escrito no lado direito.</p>
+      <p>A regra prática tem três partes. Primeira, usar <code>var</code> quando o tipo é evidente na mesma linha: <code>var pagamento = new Pagamento(...)</code>, <code>var it = lista.iterator()</code>, <code>var e : mapa.entrySet()</code> — aqui elimina-se uma repetição literal e a legibilidade sobe. Segunda, não usar quando o tipo vem de uma chamada cujo nome não o revela: <code>var r = servico.processar(pedido)</code> obriga o leitor a abrir outro ficheiro, e numa revisão de código no navegador não há sequer <em>hover</em> do IDE. Terceira, nunca usar com literais numéricos ambíguos nem com o operador diamante vazio: <code>var l = new ArrayList&lt;&gt;()</code> infere <code>ArrayList&lt;Object&gt;</code> e transforma um erro de compilação num bug.</p>
+      <p>Há restrições da linguagem que convém saber: <code>var</code> só se aplica a variáveis locais, ao índice de um <code>for</code>, ao recurso de um <em>try-with-resources</em> e — desde o Java 11 — aos parâmetros de uma lambda quando é preciso anotá-los. Não se aplica a campos, parâmetros de método, tipos de retorno nem a variáveis sem inicializador, precisamente porque nesses sítios o tipo é parte do contrato público e não deve ser inferido.</p>
+      <p>O <em>trade-off</em> é de audiência: <code>var</code> troca redundância por dependência da ferramenta. Numa equipa que revê código no IDE, o custo é quase nulo; numa equipa que revê em <em>diffs</em> no GitHub, com <em>reviewers</em> de outra equipa, o custo é real e a regra deve ser mais conservadora. O acordo deve ficar escrito no guia de estilo e verificado pelo <em>linter</em>, não decidido em cada <em>pull request</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Diz que <code>var</code> é tipagem dinâmica ou que «deixa o compilador decidir em <em>runtime</em>».</td></tr>
+        <tr><td>Mid</td><td>Sabe que é inferência estática e dá uma regra de gosto pessoal, sem casos concretos.</td></tr>
+        <tr><td>Sénior</td><td>Regra com três casos, conhece as restrições da linguagem e a armadilha do diamante vazio.</td></tr>
+        <tr><td>Staff</td><td>Transforma a discussão em política de equipa verificável pelo <em>linter</em>, com o contexto de revisão como critério.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que infere <code>var x = new ArrayList&lt;&gt;();</code>?»</li>
+      <li>«Pode usar <code>var</code> num campo? Porquê não?»</li>
+      <li>«E em <em>text blocks</em>: como preserva espaços no fim da linha?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir inferência de tipo com tipagem dinâmica.</li>
+      <li>Defender uso absoluto («sempre» ou «nunca») sem critério de legibilidade.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-5-12" data-box="qa" data-area="jvm" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Herdou um monólito em Java 8, Spring Boot 2.7, 700 mil linhas, 40 dependências. Como planeia a migração para Java 21 e o que espera ganhar em números?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A migração faz-se em quatro fases, e a primeira não muda de JDK. Fase zero: actualizar todas as dependências que geram ou lêem <em>bytecode</em> — Lombok, Mockito, ASM, cglib, Byte Buddy, o <em>plugin</em> de compilação — ainda em Java 8, porque são elas que falham primeiro e porque uma falha aqui é indistinguível de uma incompatibilidade da aplicação. Fase um: compilar para Java 8 mas <em>correr</em> em JDK 21, com <code>--add-opens</code> onde for preciso e a lista desses <em>flags</em> tratada como dívida registada. Fase dois: subir o alvo de compilação para 21 e resolver os erros. Fase três: adoptar funcionalidades — <em>records</em>, <code>sealed</code>, <em>virtual threads</em> — módulo a módulo, cada uma com uma decisão própria.</p>
+      <p>A actualização do Spring Boot é uma migração separada e não deve ser feita ao mesmo tempo: 2.7 para 3.x troca <code>javax.*</code> por <code>jakarta.*</code> em todo o código, o que toca centenas de ficheiros e produz um <em>diff</em> impossível de rever em conjunto com uma mudança de JDK. A ordem sensata é JDK primeiro (o Boot 2.7 corre em JDK 17 e 21), depois Boot 3.x, com libertação em produção entre as duas.</p>
+      <p>O que esperar em números, com honestidade sobre a incerteza: os ganhos de <em>throughput</em> só do <em>runtime</em> — melhorias do G1, do JIT e de <code>String</code> — situam-se tipicamente entre 5% e 15% sem qualquer alteração de código, e a única forma de os saber é medir com a carga real. O ganho grande é outro: substituir a piscina de 200 <em>threads</em> de plataforma por <em>virtual threads</em> num serviço dominado por I/O permite passar de centenas para dezenas de milhares de pedidos concorrentes com o mesmo código bloqueante, com o limite a deslocar-se para a piscina de ligações à base de dados — que passa a ser o verdadeiro semáforo e tem de ser dimensionada explicitamente.</p>
+      <p>As armadilhas a nomear: o <em>charset</em> por omissão passou a UTF-8, o que altera silenciosamente a leitura de ficheiros escritos com a codificação da plataforma; a afinação de GC herdada do CMS não se traduz, refaz-se com medições; e o modelo de <em>threads</em> obriga a rever blocos <code>synchronized</code> longos nos caminhos bloqueantes, porque no Java 21 uma <em>virtual thread</em> bloqueada dentro de <code>synchronized</code> fixa a <em>thread</em> transportadora — comportamento melhorado em versões posteriores, mas que na 21 obriga a preferir <code>ReentrantLock</code> nesses pontos.</p>
+      <p>A forma de decidir se vale a pena: o argumento não é «estar actualizado», é o custo de segurança e de contratação. O Java 8 público deixou de ter actualizações gratuitas para uso comercial, cada CVE por corrigir passa a exigir um fornecedor pago, e nenhum engenheiro sénior quer entrar numa equipa que corre uma versão de 2014. Isso quantifica-se em custo de licença e em tempo de recrutamento, que é a linguagem em que a direcção decide.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Mudava a versão no <code>pom.xml</code> e via o que rebentava.» Sem fases, sem ordem, sem medição.</td></tr>
+        <tr><td>Mid</td><td>Descreve a subida de versão e cita <code>--add-opens</code>, mas junta a migração do Spring Boot na mesma alteração.</td></tr>
+        <tr><td>Sénior</td><td>Fases explícitas com a ordem justificada, separação JDK/Boot, armadilhas concretas (charset, GC, <em>pinning</em>) e medição antes e depois.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o argumento de negócio (segurança, custo, contratação), trata os <code>--add-opens</code> como dívida registada e define o critério de sucesso por serviço.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que mede antes e depois, e durante quanto tempo?»</li>
+      <li>«Como reverte se o p99 piorar em produção?»</li>
+      <li>«Que serviço escolhe para o primeiro piloto e porquê?»</li>
+      <li>«Onde é que <em>virtual threads</em> não ajudam nada?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Prometer ganhos de performance sem medição («o Java 21 é 40% mais rápido»).</li>
+      <li>Fazer JDK e Spring Boot na mesma libertação.</li>
+      <li>Não referir nenhuma incompatibilidade concreta em 700 mil linhas e 40 dependências.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-5-8" class="h2"><span class="secnum">5.8</span> Resumo e checklist<a class="anchor" href="#sec-5-8" aria-label="ligação">#</a></h2>
+
+<p>O fio condutor deste capítulo é que cada funcionalidade moderna de Java existe para mover uma verificação de <em>runtime</em> para compilação, e que cada uma tem um limite onde deixa de servir. Quem sabe dizer o limite passa a ronda; quem só sabe a sintaxe não.</p>
+
+<ul class="lst">
+  <li>Os genéricos são apagados: <code>new T[]</code>, <code>o instanceof T</code>, <code>static T</code>, sobrecarga por argumento de tipo e subtipos genéricos de <code>Throwable</code> são impossíveis, e o custo real do apagamento é o <em>boxing</em> nos caminhos quentes.</li>
+  <li><code>@SafeVarargs</code> é uma promessa de que o <em>array</em> de <em>varargs</em> não é guardado nem devolvido; se essa promessa não se puder dar, a assinatura muda para <code>List&lt;T&gt;</code>.</li>
+  <li>PECS aplica-se a parâmetros de métodos públicos e não a tipos de retorno; a decisão tem de ser tomada na primeira versão da API, porque alargar depois obriga a rever todas as implementações.</li>
+  <li>Um <em>record</em> tem invariantes fortes se o construtor compacto validar e copiar; não é entidade JPA, mas é a melhor projecção de leitura e a melhor DTO de fronteira.</li>
+  <li>Interface <code>sealed</code> com <em>records</em> substitui <em>visitor</em> quando o conjunto de tipos muda menos do que o de operações — e a única razão para a usar é a exaustividade verificada, que um <code>default</code> destrói.</li>
+  <li>Guardas <code>when</code> fazem parte do rótulo e permitem retroceder para o rótulo seguinte; um <code>if</code> no corpo não. Num <code>switch</code> com padrões, <code>null</code> lança <code>NullPointerException</code> salvo <code>case null</code>.</li>
+  <li><code>Optional</code> é tipo de retorno, não campo nem parâmetro; <code>orElse</code> avalia sempre o argumento, <code>orElseGet</code> só quando é preciso, e <code>get()</code> não pertence a código de produção.</li>
+  <li>Numa migração 8 &rarr; 21, primeiro as dependências que geram <em>bytecode</em>, depois o <em>runtime</em>, depois o alvo de compilação, e só no fim as funcionalidades — com o Spring Boot 3.x como libertação separada.</li>
+</ul>
+
+<p>Checklist accionável antes de uma ronda de linguagem:</p>
+
+<ul class="lst">
+  <li>Escrever de memória, em papel, cinco operações que o apagamento torna ilegais e a razão de cada uma.</li>
+  <li>Implementar <code>copiar(List&lt;? super T&gt;, List&lt;? extends T&gt;)</code> sem consultar nada e explicar em voz alta porque é que cada lado tem o <em>wildcard</em> que tem.</li>
+  <li>Converter uma classe de 70 linhas do próprio projecto em <em>record</em> com construtor compacto que valide e copie os componentes mutáveis.</li>
+  <li>Modelar um domínio real do trabalho actual com interface <code>sealed</code> e três a cinco <em>records</em>, e escrever um <code>switch</code> exaustivo sem <code>default</code>.</li>
+  <li>Acrescentar um subtipo a essa hierarquia e confirmar que a compilação parte exactamente nos sítios previstos.</li>
+  <li>Rever o próprio código à procura de <code>Optional</code> como campo ou parâmetro e de chamadas a <code>get()</code>, e corrigir cada ocorrência.</li>
+  <li>Preparar três números do sistema actual para a pergunta de migração: versão do JDK, tempo de arranque e p99 antes e depois da última actualização de plataforma.</li>
+  <li>Ensaiar a resposta de dois minutos a «o que mudou desde o Java 8», estruturada em linguagem, plataforma e custo de migração.</li>
+</ul>

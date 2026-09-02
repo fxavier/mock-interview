@@ -1,0 +1,860 @@
+<p>Árvores são o tema que melhor separa quem decorou soluções de quem sabe raciocinar sobre estrutura: o espaço de problemas é pequeno — travessia, invariante de ordem, altura, prefixo, top-K — mas cada um tem uma versão recursiva de seis linhas e uma versão iterativa que exige perceber o que a pilha estava a guardar. Numa ronda de código de 45 minutos, o entrevistador tipicamente dá um problema de árvore porque consegue observar quatro sinais ao mesmo tempo: se o candidato fixa o contrato antes de escrever, se escolhe a travessia certa em vez de tentar todas, se sabe o custo em memória e não só em tempo, e se consegue converter a solução recursiva quando lhe dizem «a árvore tem 10 milhões de nós e é quase uma lista». Onde os candidatos caem é previsível: validar uma <em>BST</em> comparando cada nó só com os filhos directos, ordenar tudo quando bastava um <em>heap</em> de tamanho <var>k</var>, e não conseguir explicar porque é que a recursão rebentou em produção com <code>StackOverflowError</code> mas passava nos testes. Este capítulo trata as cinco famílias, com sete laboratórios em Java 21 e as respostas conceptuais que o entrevistador usa para calibrar o nível.</p>
+
+<h2 id="sec-25-1" class="h2"><span class="secnum">25.1</span> Árvores binárias e travessias<a class="anchor" href="#sec-25-1" aria-label="ligação">#</a></h2>
+
+<p>Uma árvore binária é um grafo acíclico ligado em que cada nó tem no máximo dois filhos, e quase tudo o que se pede numa entrevista reduz-se a escolher a ordem por que se visitam os nós. Há quatro ordens úteis e cada uma resolve uma classe distinta de problemas. Em <em>pre-order</em> (raiz, esquerda, direita) o nó é processado antes de se saber o que está por baixo — serve para copiar, serializar e propagar contexto de cima para baixo, como um caminho acumulado. Em <em>in-order</em> (esquerda, raiz, direita) o nó é processado depois da subárvore esquerda; numa árvore de pesquisa binária isto produz os valores por ordem crescente, o que transforma metade dos problemas de BST em «verificar que uma sequência é crescente». Em <em>post-order</em> (esquerda, direita, raiz) o nó só é processado quando os dois filhos já devolveram resultado — é a ordem de tudo o que agrega de baixo para cima: altura, diâmetro, soma de subárvore, libertação de recursos. Por níveis (<em>level order</em>, ou <em>BFS</em>) visita-se por profundidade crescente, com uma fila em vez de uma pilha — é a única que responde a perguntas com a palavra «nível», «mais raso» ou «vista lateral».</p>
+
+<p>A distinção prática entre as três primeiras e a quarta não é o resultado, é a memória. Uma travessia em profundidade consome memória proporcional à altura da árvore: 20 tramas numa árvore equilibrada de um milhão de nós, mas 10<sup>6</sup> tramas se a árvore tiver degenerado numa cadeia. Uma travessia por níveis consome memória proporcional à largura máxima, que numa árvore binária completa de <var>n</var> nós é cerca de <var>n</var>/2 — o último nível sozinho tem metade dos nós. Numa árvore equilibrada e larga, a recursão é barata e a BFS é cara; numa árvore degenerada é exactamente ao contrário. Dizer isto em voz alta, antes de escrever, vale mais numa rubrica do que escrever a solução dois minutos mais depressa.</p>
+
+<p>O terceiro eixo é o que se passa quando não há árvore: o nó nulo. Metade dos erros em entrevista são <code>NullPointerException</code> na raiz vazia ou num filho ausente, e o hábito que os evita é escrever o caso base antes do corpo recursivo, não depois. Em Java há ainda uma armadilha específica: <code>ArrayDeque</code>, que é a implementação certa para pilha e para fila (não <code>Stack</code>, sincronizada e obsoleta, nem <code>LinkedList</code>, com um objecto de nó por elemento), rejeita <code>null</code> com <code>NullPointerException</code>. Quem empilha filhos sem testar descobre-o na primeira execução.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 25.1</span> Que travessia escolher em função do que a pergunta pede.</div>
+<div class="tscroll"><table><thead><tr><th>Travessia</th><th>Estrutura auxiliar</th><th>Memória</th><th>Problemas típicos</th></tr></thead><tbody>
+<tr><td>Pre-order</td><td>Pilha (ou recursão)</td><td>O(altura)</td><td>Serializar, clonar, caminhos raiz→folha, propagar limites</td></tr>
+<tr><td>In-order</td><td>Pilha</td><td>O(altura)</td><td>Validar BST, k-ésimo menor, recuperar dois nós trocados</td></tr>
+<tr><td>Post-order</td><td>Pilha</td><td>O(altura)</td><td>Altura, diâmetro, soma/máximo de subárvore, podar</td></tr>
+<tr><td>Por níveis</td><td>Fila</td><td>O(largura) ≈ n/2</td><td>Vista lateral, nível mais raso, ligar irmãos, zigzag</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing java" id="lst-25-1"><div class="lhead"><span class="lnum">Listagem 25.1</span>
+<span class="lcap">Nó usado em todo o capítulo e travessia por níveis com fronteira congelada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>import java.util.*;
+
+/** Nó de árvore binária usado em todos os exercícios do capítulo. */
+final class TreeNode {
+    final int val;
+    TreeNode left, right;
+
+    TreeNode(int val) { this.val = val; }
+
+    TreeNode(int val, TreeNode left, TreeNode right) {
+        this.val = val; this.left = left; this.right = right;
+    }
+}
+
+final class Travessias {
+
+    /** Por níveis: uma lista por profundidade. O(n) tempo, O(largura máxima) memória. */
+    static List&lt;List&lt;Integer&gt;&gt; porNiveis(TreeNode raiz) {
+        List&lt;List&lt;Integer&gt;&gt; saida = new ArrayList&lt;&gt;();
+        if (raiz == null) return saida;                  // caso limite nº 1
+        Deque&lt;TreeNode&gt; fila = new ArrayDeque&lt;&gt;();       // atenção: não aceita null
+        fila.add(raiz);
+        while (!fila.isEmpty()) {
+            int n = fila.size();                         // congela a fronteira do nível
+            List&lt;Integer&gt; nivel = new ArrayList&lt;&gt;(n);
+            for (int i = 0; i &lt; n; i++) {
+                TreeNode no = fila.poll();
+                nivel.add(no.val);
+                if (no.left != null) fila.add(no.left);
+                if (no.right != null) fila.add(no.right);
+            }
+            saida.add(nivel);
+        }
+        return saida;
+    }
+}</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O truque de ler <code>fila.size()</code> para uma variável no início de cada iteração — em vez de iterar enquanto a fila não estiver vazia — é o que separa uma lista plana de uma lista por níveis. Sem ele, os filhos que se vão acrescentando misturam-se com o nível corrente. É a linha que o entrevistador procura primeiro em qualquer variante de BFS: vista lateral direita, zigzag, média por nível.</p></aside>
+
+<div class="qa" id="q-25-1" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Antes de escrever código: como decide, em trinta segundos, qual das travessias usar num problema de árvore que nunca viu?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A decisão sai de uma pergunta só: em que momento o nó tem toda a informação de que precisa. Se a informação vem de cima — um limite, um caminho acumulado, um prefixo — é pré-ordem, porque o nó tem de ser processado antes de descer. Se a informação vem de baixo — altura, soma, «esta subárvore é válida?» — é pós-ordem, porque o nó só decide depois de os dois filhos devolverem. Se o enunciado menciona ordem de valores numa BST, é in-order, porque a in-order de uma BST é a sequência ordenada. Se menciona nível, profundidade, «o mais próximo da raiz» ou distância em arestas num grafo não ponderado, é por níveis.</p>
+      <p>O segundo critério é o custo em memória, e é aqui que se ganha o nível sénior. Profundidade custa O(altura): 20 tramas para um milhão de nós equilibrados, 10<sup>6</sup> se a árvore for uma cadeia. Largura custa O(n/2) no último nível de uma árvore completa. Numa árvore de catálogo com 5 milhões de folhas, a BFS enche uma fila com milhões de referências — 8 bytes cada com <em>compressed oops</em>, mais o <code>ArrayDeque</code> a duplicar de capacidade — enquanto a DFS gasta a altura. A escolha certa depende da forma da árvore, e a forma da árvore é uma pergunta que se faz ao entrevistador, não uma suposição.</p>
+      <p>O terceiro critério é a existência de atalho. Para o k-ésimo menor de uma BST não é preciso materializar a in-order: pára-se ao k-ésimo elemento, O(altura + k). Para saber se existe um caminho raiz→folha com uma dada soma não é preciso visitar tudo: devolve-se no primeiro sucesso. A travessia é o esqueleto, mas a poda é o que muda a complexidade prática.</p>
+      <p>Quando é que a escolha contrária passa a ser a certa: se o objectivo é encontrar o nó válido mais raso — o antepassado comum mais próximo da raiz, a folha de menor profundidade — a BFS ganha mesmo com memória pior, porque termina no primeiro nível que contém a resposta, enquanto a DFS pode explorar um ramo de profundidade 10<sup>6</sup> antes de encontrar uma folha à profundidade 3.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escreve logo uma travessia recursiva sem dizer qual é nem porquê; confunde in-order com pré-ordem.</td></tr>
+        <tr><td>Mid</td><td>Sabe as quatro ordens e escolhe a certa, mas justifica pelo padrão memorizado («este problema é sempre DFS») e não fala de memória.</td></tr>
+        <tr><td>Sénior</td><td>Deriva a escolha de «onde nasce a informação», quantifica O(altura) contra O(largura) e pergunta pela forma esperada da árvore.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a poda que evita a travessia completa e o critério de quando a BFS ganha apesar da memória pior; nota que a in-order de uma BST é o que torna metade destes problemas triviais.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a árvore não couber em memória — como faria a mesma travessia com os nós em disco?»</li>
+      <li>«Consegue fazer a in-order com O(1) de memória extra?»</li>
+      <li>«A árvore tem 10 milhões de nós e altura 10 milhões. Qual das duas rebenta primeiro?»</li>
+      <li>«E se cada nó tiver k filhos em vez de dois — muda alguma coisa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não perguntar se a árvore pode ser nula nem se pode estar degenerada.</li>
+      <li>Assumir que «recursivo» e «iterativo» têm o mesmo custo de memória porque «a complexidade é a mesma».</li>
+      <li>Materializar a lista completa de valores para depois usar só os primeiros k.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-25-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.1 — As três travessias em profundidade, sem recursão</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: implementar <code>inOrder</code>, <code>preOrder</code> e <code>postOrder</code> sobre <code>TreeNode</code> devolvendo <code>List&lt;Integer&gt;</code>, sem qualquer chamada recursiva. Restrições: memória extra O(altura) — não é permitido converter primeiro para uma lista de todos os nós; a árvore pode ser nula, pode ter um só nó e pode estar degenerada numa cadeia de 300 000 nós à esquerda; nenhum valor é conhecido de antemão (podem existir repetidos e negativos). Exemplo: para a árvore <code>1</code> com filho direito <code>2</code>, que por sua vez tem filho esquerdo <code>3</code>, a pré-ordem é <code>[1, 2, 3]</code>, a in-order é <code>[1, 3, 2]</code> e a pós-ordem é <code>[3, 2, 1]</code>. Escrever também, em comentário, qual é o invariante que a pilha mantém em cada uma.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-2"><div class="lhead"><span class="lnum">Listagem 25.2</span>
+        <span class="lcap">Pilha explícita: in-order com descida à esquerda, pré-ordem directa, pós-ordem por inversão.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class TravessiasIterativas {
+
+    /** In-order: desce sempre à esquerda a empilhar, visita, salta para a direita.
+     *  Invariante: tudo o que está na pilha já teve a subárvore esquerda tratada
+     *  e ainda tem o próprio valor e a subárvore direita por visitar. */
+    static List&lt;Integer&gt; inOrder(TreeNode raiz) {
+        List&lt;Integer&gt; saida = new ArrayList&lt;&gt;();
+        Deque&lt;TreeNode&gt; pilha = new ArrayDeque&lt;&gt;();
+        TreeNode actual = raiz;
+        while (actual != null || !pilha.isEmpty()) {
+            while (actual != null) {
+                pilha.push(actual);
+                actual = actual.left;
+            }
+            actual = pilha.pop();
+            saida.add(actual.val);
+            actual = actual.right;       // a subárvore direita entra no mesmo ciclo
+        }
+        return saida;
+    }
+
+    /** Pré-ordem: empilha-se a direita primeiro para que a esquerda saia antes.
+     *  Invariante: a pilha contém subárvores por abrir, pela ordem em que devem sair. */
+    static List&lt;Integer&gt; preOrder(TreeNode raiz) {
+        List&lt;Integer&gt; saida = new ArrayList&lt;&gt;();
+        if (raiz == null) return saida;
+        Deque&lt;TreeNode&gt; pilha = new ArrayDeque&lt;&gt;();
+        pilha.push(raiz);
+        while (!pilha.isEmpty()) {
+            TreeNode no = pilha.pop();
+            saida.add(no.val);
+            if (no.right != null) pilha.push(no.right);
+            if (no.left != null) pilha.push(no.left);
+        }
+        return saida;
+    }
+
+    /** Pós-ordem sem marcadores: faz-se raiz-direita-esquerda e insere-se à cabeça,
+     *  o que equivale a inverter a sequência no fim. */
+    static List&lt;Integer&gt; postOrder(TreeNode raiz) {
+        LinkedList&lt;Integer&gt; saida = new LinkedList&lt;&gt;();
+        if (raiz == null) return saida;
+        Deque&lt;TreeNode&gt; pilha = new ArrayDeque&lt;&gt;();
+        pilha.push(raiz);
+        while (!pilha.isEmpty()) {
+            TreeNode no = pilha.pop();
+            saida.addFirst(no.val);      // O(1) na LinkedList; com ArrayList seria O(n)
+            if (no.left != null) pilha.push(no.left);
+            if (no.right != null) pilha.push(no.right);
+        }
+        return saida;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Tempo O(n) nas três: cada nó entra e sai da pilha exactamente uma vez. Memória O(altura) — 20 referências numa árvore equilibrada de 10<sup>6</sup> nós, 300 000 na cadeia do enunciado, o que continua a caber no <em>heap</em> mas rebentaria a pilha de uma versão recursiva.</li>
+        <li>Casos limite: raiz nula (as três devolvem lista vazia); nó único; cadeia só à esquerda (a in-order empilha tudo antes de emitir o primeiro valor); cadeia só à direita (a pilha nunca passa de um elemento).</li>
+        <li>A pós-ordem por inversão é a versão que se escreve sob pressão. A variante «canónica», com um ponteiro para o último nó visitado ou com um par (nó, jáExpandido), é mais difícil de acertar à primeira e não é mais rápida; vale a pena mencionar que existe e explicar porque não se escolheu.</li>
+        <li><code>ArrayDeque</code> e não <code>java.util.Stack</code>: <code>Stack</code> herda de <code>Vector</code>, é sincronizada e paga um <em>monitor</em> por operação sem benefício nenhum aqui. Dizer isto sem ser perguntado é um sinal positivo barato.</li>
+        <li>O sinal que o entrevistador procura: verbalizar o invariante da pilha. Quem só sabe o desenho memorizado falha assim que lhe pedirem uma variante — por exemplo, parar a in-order ao k-ésimo elemento.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-25-2" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.2 — Diâmetro da árvore numa só travessia</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">15 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dado <code>TreeNode raiz</code>, devolver o comprimento, em arestas, do caminho mais longo entre dois nós quaisquer da árvore. O caminho pode não passar pela raiz. Restrições: uma só travessia, O(n) tempo; não é permitido chamar uma função de altura dentro de cada nó (a solução ingénua O(n²) não conta como resposta). Exemplo: árvore <code>1</code> com filhos <code>2</code> e <code>3</code>, e o <code>2</code> com filhos <code>4</code> e <code>5</code> — o diâmetro é 3, correspondente ao caminho 4→2→1→3. Casos a tratar: raiz nula devolve 0; árvore com um só nó devolve 0.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-3"><div class="lhead"><span class="lnum">Listagem 25.3</span>
+        <span class="lcap">Pós-ordem que devolve a altura e actualiza o melhor diâmetro de passagem.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class Diametro {
+
+    private int melhor;    // em arestas; estado da travessia, não da árvore
+
+    /** O(n) tempo, O(altura) memória. Não é reentrante: um objecto por chamada
+     *  concorrente, ou passar um int[1] em vez do campo. */
+    int diametro(TreeNode raiz) {
+        melhor = 0;
+        altura(raiz);
+        return melhor;
+    }
+
+    /** Devolve a altura em nós e, de caminho, regista o caminho que passa por 'no'.
+     *  É o padrão «devolver uma coisa, actualizar outra» — a forma de resolver em
+     *  O(n) qualquer problema que precise de dois valores por nó. */
+    private int altura(TreeNode no) {
+        if (no == null) return 0;                    // altura de subárvore vazia
+        int esq = altura(no.left);
+        int dir = altura(no.right);
+        melhor = Math.max(melhor, esq + dir);        // arestas de um lado + do outro
+        return 1 + Math.max(esq, dir);
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>O(n) tempo e O(altura) memória. A solução ingénua — para cada nó, calcular a altura dos dois filhos com uma função separada — é O(n·altura), ou seja O(n²) numa árvore degenerada: com 100 000 nós em cadeia são 5×10<sup>9</sup> operações contra 10<sup>5</sup>.</li>
+        <li>Unidade: se o enunciado contar nós em vez de arestas, a resposta é <code>melhor + 1</code>. Perguntar isto antes de escrever evita a única fonte de erro deste exercício.</li>
+        <li>Casos limite: raiz nula (0); nó único (0); cadeia de 500 000 nós — a versão recursiva rebenta a pilha e a conversão para iterativa exige pós-ordem explícita, o que é um bom follow-up.</li>
+        <li>Variante frequente: diâmetro ponderado, em que cada aresta tem custo. Muda-se <code>1 +</code> para <code>peso +</code> e a altura passa a ser o custo máximo descendente; o resto é idêntico. Vale a pena dizer que a estrutura da solução não muda.</li>
+        <li>O sinal: reconhecer que o campo <code>melhor</code> é estado mutável partilhado e mencionar a alternativa sem estado (devolver um <em>record</em> com altura e melhor). Um sénior nota o problema de reentrância sem ser empurrado.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-25-2" class="h2"><span class="secnum">25.2</span> Árvores de pesquisa binária: propriedades e validação<a class="anchor" href="#sec-25-2" aria-label="ligação">#</a></h2>
+
+<p>Uma árvore de pesquisa binária impõe um invariante global, não local: para cada nó, <em>todos</em> os valores da subárvore esquerda são menores e <em>todos</em> os da direita são maiores. A palavra «todos» é a fonte do erro mais comum em entrevista — validar comparando cada nó apenas com os filhos directos aceita, por exemplo, a árvore com raiz 10, filho direito 15 e filho esquerdo de 15 igual a 6: localmente tudo bate certo, globalmente o 6 está do lado errado do 10. As duas correcções válidas são propagar limites (mínimo e máximo) para baixo em pré-ordem, ou percorrer em in-order e verificar que a sequência é estritamente crescente.</p>
+
+<p>O que a BST dá em troca do invariante é ordem. <code>get</code>, <code>put</code> e <code>remove</code> custam O(altura); numa árvore equilibrada, O(log n) — 20 comparações para um milhão de chaves. Mas dá também o que uma tabela de <em>hash</em> não dá a preço nenhum: o sucessor e o antecessor de uma chave, intervalos (<code>subMap</code>, <code>headMap</code>, <code>tailMap</code>), mínimo e máximo em O(log n), e iteração por ordem sem custo adicional. É exactamente esta a fronteira entre <code>HashMap</code> e <code>TreeMap</code> em Java, e é a pergunta que aparece disfarçada de problema de negócio: «tabela de preços por escalão», «último evento antes de um instante», «top de <em>leaderboard</em> por pontuação».</p>
+
+<p>O invariante, por si só, não garante desempenho. Inserir 1, 2, 3, … numa BST sem balanceamento produz uma cadeia de altura <var>n</var> e transforma o O(log n) em O(n) — é o modo de falha real de quem implementa a sua própria árvore e alimenta-a com chaves monotónicas, como <em>timestamps</em> ou identificadores sequenciais. As implementações de biblioteca resolvem isto com rotações: <code>TreeMap</code> e <code>ConcurrentSkipListMap</code> (com uma estrutura diferente, probabilística) mantêm a altura em O(log n) por construção. Escrever uma <em>red-black tree</em> no quadro não é pedido a um candidato de backend; explicar porque é que ela existe e qual é o custo do balanceamento nas escritas, é.</p>
+
+<div class="qa" id="q-25-2" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tem um serviço que guarda em memória algumas centenas de milhares de tarifas indexadas por escalão de consumo. Escolheria <code>HashMap</code> ou <code>TreeMap</code>, e porquê?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>TreeMap</code>, porque a consulta por escalão é uma consulta de intervalo e não de igualdade: dado um consumo de 437 kWh, o que se quer é a maior chave menor ou igual a 437, e isso é <code>floorEntry(437)</code> em O(log n). Com <code>HashMap</code> a mesma pergunta obriga a varrer as chaves todas, O(n) por consulta — a estrutura simplesmente não sabe responder. A decisão não é de desempenho de acesso pontual, é de operações suportadas.</p>
+      <p>O mecanismo: <code>HashMap</code> é uma tabela de dispersão com encadeamento por <em>bucket</em>; a partir de 8 elementos num <em>bucket</em> e capacidade ≥ 64 o encadeamento converte-se em árvore, o que limita o pior caso a O(log n) em vez de O(n). <code>TreeMap</code> é uma <em>red-black tree</em>: percurso da raiz até ao nó, O(log n) garantido, com custo por passo maior — um salto de referência e uma comparação via <code>Comparable</code> ou <code>Comparator</code>, contra o cálculo de um <em>hash</em> e um acesso a um array contíguo. Na prática, para acesso pontual puro, o <code>HashMap</code> anda tipicamente 2 a 5 vezes mais depressa e é bastante mais amigo da <em>cache</em>, porque o array de <em>buckets</em> é contíguo e os nós da árvore estão espalhados pelo <em>heap</em>.</p>
+      <p>Os números que sustentam a escolha: com 300 000 chaves, o <code>TreeMap</code> faz ~18 comparações por consulta e ocupa cerca de 40 bytes por nó (referências para pai, esquerda, direita, chave, valor, mais a cor e o cabeçalho do objecto), contra ~32 bytes por entrada no <code>HashMap</code> mais o array de <em>buckets</em>. A diferença de memória é da ordem de alguns megabytes — irrelevante face à capacidade de responder a <code>floorEntry</code>, <code>headMap</code> e iteração ordenada sem ordenar nada.</p>
+      <p>Quando é que a escolha contrária passa a ser a certa: se todas as consultas forem por chave exacta e o volume de leituras for muito alto, o <code>HashMap</code> ganha e a ordenação, se for precisa uma vez por dia, faz-se com um <code>sort</code> pontual. E se as chaves forem inteiros densos e limitados — escalões de 0 a 1000 — nem uma coisa nem outra: um array indexado directamente resolve em O(1) com uma fracção da memória. Em ambiente concorrente com leituras dominantes, o candidato natural é um <code>TreeMap</code> imutável substituído por referência em cada actualização, ou <code>ConcurrentSkipListMap</code> se houver escritas frequentes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>HashMap</code> é O(1), logo é sempre melhor.» Não repara que a consulta é por intervalo.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>TreeMap</code> por «precisar de ordem», mas não nomeia <code>floorEntry</code> nem quantifica o custo relativo das duas estruturas.</td></tr>
+        <tr><td>Sénior</td><td>Enquadra como «operações suportadas, não velocidade»; nomeia a operação exacta, dá O(log n) com o número de comparações e reconhece o custo de <em>cache</em> da árvore.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a alternativa de array indexado para chaves densas, a estratégia de imutabilidade sob concorrência e o critério de reversão da decisão em função do rácio leitura/escrita.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a tabela for actualizada cinco vezes por segundo por outra thread?»</li>
+      <li>«Quanto ocupa isso em memória e como o mediria?»</li>
+      <li>«O <code>HashMap</code> tem pior caso O(n)? Em que condições?»</li>
+      <li>«E se as chaves fossem intervalos sobrepostos em vez de escalões?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Responder pela complexidade assintótica sem olhar para a operação que o negócio precisa.</li>
+      <li>Propor ordenar a lista de chaves em cada consulta.</li>
+      <li>Não saber que <code>TreeMap</code> é uma árvore balanceada e afirmar que «pode degenerar».</li></ul></div>
+  </div>
+</div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Balanceamento é um imposto sobre a escrita para subsidiar a leitura. Uma <em>AVL</em> mantém a diferença de alturas ≤ 1 e fica com altura ≈ 1,44·log₂n, o que dá pesquisas mais curtas, mas obriga a mais rotações por inserção e remoção. Uma <em>red-black tree</em> tolera altura até ≈ 2·log₂n e faz, em amortizado, menos reequilíbrios estruturais por escrita. Por isso o <code>TreeMap</code> do JDK é <em>red-black</em>: numa biblioteca genérica, escritas e leituras são ambas frequentes. Se a carga fosse 99% leitura e a estrutura fosse construída uma vez, a resposta certa não seria nenhuma das duas — seria um array ordenado com pesquisa binária, sem ponteiros e com localidade perfeita.</p></aside>
+
+<div class="qa" id="q-25-3" data-box="qa" data-area="dsa" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Uma equipa implementou uma BST própria para indexar eventos por <em>timestamp</em> e as consultas ficaram lentas ao fim de duas semanas em produção. O que aconteceu e o que faria?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A árvore degenerou numa lista ligada. <em>Timestamps</em> chegam por ordem crescente, e inserir chaves monotonicamente crescentes numa BST sem balanceamento produz uma cadeia só à direita: a altura passa a ser <var>n</var> e a pesquisa passa de O(log n) para O(n). Com 2 milhões de eventos, cada consulta deixa de custar 21 comparações e passa a custar até 2 milhões — e como cada passo é um salto de ponteiro para um objecto arbitrário no <em>heap</em>, quase todos falham a <em>cache</em> de nível 1 e 2.</p>
+      <p>A assinatura do problema em produção é característica e distingue-o de outros: a latência cresce de forma linear com o tempo de vida do processo, não com a carga; um reinício «resolve» temporariamente se a árvore for reconstruída de outra maneira; e o perfil de CPU mostra tempo concentrado no método de descida da árvore, com <em>cache misses</em> elevados. Uma verificação rápida é medir a altura da árvore e compará-la com log₂n: se altura/log₂n for muito maior que 2, está degenerada.</p>
+      <p>A correcção imediata é substituir a implementação própria por <code>TreeMap</code>, que é uma <em>red-black tree</em> e garante altura ≤ 2·log₂(n+1) por construção. Não há justificação de negócio para manter uma BST escrita à mão para este caso: o balanceamento correcto tem casos de rotação que são notoriamente fáceis de errar, e o ganho seria nulo. Se o acesso for maioritariamente por intervalo temporal recente, a alternativa melhor ainda é não usar árvore nenhuma: uma estrutura em anel ou um array ordenado por <em>timestamp</em> com pesquisa binária dá O(log n) com localidade contígua e sem um objecto por nó.</p>
+      <p>Quando é que uma árvore própria se justifica: quando é preciso um invariante que nenhuma implementação de biblioteca oferece — por exemplo, uma árvore de intervalos aumentada com o máximo da subárvore para responder a «que janelas de manutenção se sobrepõem a este intervalo». Aí escreve-se, mas escreve-se sobre uma base balanceada e com testes de propriedade que verificam o invariante de altura depois de inserções aleatórias e ordenadas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Culpa o <em>garbage collector</em> ou a carga; não liga chaves ordenadas a degeneração.</td></tr>
+        <tr><td>Mid</td><td>Identifica a degeneração e propõe balancear, mas não sabe dizer que altura esperaria nem como o mediria.</td></tr>
+        <tr><td>Sénior</td><td>Explica a causa, quantifica O(n) contra O(log n) com números concretos, propõe <code>TreeMap</code> e descreve o diagnóstico (altura vs log₂n, perfil de CPU).</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais o questionamento da escolha de estrutura (array ordenado, anel), o critério para escrever árvore própria e os testes de propriedade que teriam apanhado isto antes do <em>deploy</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é a diferença prática entre AVL e red-black e porque é que o JDK escolheu a segunda?»</li>
+      <li>«Como escreveria um teste que apanhasse isto em CI?»</li>
+      <li>«E se as inserções fossem aleatórias — qual seria a altura esperada?»</li>
+      <li>«Como faria a migração sem tempo de indisponibilidade?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor manter a implementação própria e «acrescentar balanceamento» sem reconhecer o risco.</li>
+      <li>Confundir altura de árvore com número de nós, ou log₂ com log₁₀ ao dar números.</li>
+      <li>Não perguntar qual é o padrão de consulta antes de propor a estrutura de substituição.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-25-3" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.3 — Validar uma árvore de pesquisa binária</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">15 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: escrever <code>boolean valida(TreeNode raiz)</code> que devolve verdadeiro se e só se a árvore respeitar o invariante de BST estrita — toda a subárvore esquerda estritamente menor, toda a direita estritamente maior. Restrições: uma só travessia, O(n) tempo, O(altura) memória; os valores podem incluir <code>Integer.MIN_VALUE</code> e <code>Integer.MAX_VALUE</code>, pelo que sentinelas numéricas não são aceitáveis; não é permitido materializar a lista completa de valores. Exemplo positivo: raiz 10, esquerda 5, direita 15 — verdadeiro. Exemplo negativo: raiz 10, esquerda 5, direita 15 com filho esquerdo 6 — falso, porque 6 &lt; 10 e está na subárvore direita da raiz. Apresentar também a variante iterativa.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-4"><div class="lhead"><span class="lnum">Listagem 25.4</span>
+        <span class="lcap">Limites propagados em pré-ordem e a alternativa in-order iterativa sem sentinelas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class ValidaBst {
+
+    /** Limites como Integer (não int) precisamente para que Integer.MIN_VALUE e
+     *  Integer.MAX_VALUE sejam valores legítimos de nó e não sentinelas. */
+    static boolean valida(TreeNode raiz) {
+        return valida(raiz, null, null);
+    }
+
+    private static boolean valida(TreeNode no, Integer min, Integer max) {
+        if (no == null) return true;                       // subárvore vazia é válida
+        if (min != null &amp;&amp; no.val &lt;= min) return false;    // estrita: &lt;= é violação
+        if (max != null &amp;&amp; no.val &gt;= max) return false;
+        return valida(no.left, min, no.val)                // à esquerda, tecto = no.val
+            &amp;&amp; valida(no.right, no.val, max);              // à direita, chão = no.val
+    }
+
+    /** In-order iterativa: a sequência de uma BST é estritamente crescente.
+     *  Falha no primeiro par fora de ordem, sem materializar a lista. */
+    static boolean validaIterativo(TreeNode raiz) {
+        Deque&lt;TreeNode&gt; pilha = new ArrayDeque&lt;&gt;();
+        TreeNode actual = raiz;
+        Integer anterior = null;
+        while (actual != null || !pilha.isEmpty()) {
+            while (actual != null) { pilha.push(actual); actual = actual.left; }
+            actual = pilha.pop();
+            if (anterior != null &amp;&amp; actual.val &lt;= anterior) return false;
+            anterior = actual.val;
+            actual = actual.right;
+        }
+        return true;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>O(n) tempo em ambas; O(altura) memória. A versão iterativa devolve <code>false</code> mal encontra a primeira inversão, o que numa árvore inválida logo à esquerda custa O(altura) e não O(n).</li>
+        <li>O erro clássico, que este exercício existe para detectar: comparar cada nó só com <code>no.left</code> e <code>no.right</code>. O contra-exemplo do enunciado (o 6 debaixo do 15) passa nesse teste e não é BST.</li>
+        <li>O segundo erro clássico: usar <code>int min = Integer.MIN_VALUE</code> como sentinela. Uma árvore de um só nó com valor <code>Integer.MIN_VALUE</code> passa a ser considerada inválida. Daí os limites serem <code>Integer</code> e não <code>int</code>, ou em alternativa <code>long</code> com limites fora da gama de <code>int</code>.</li>
+        <li>Contrato a clarificar antes de escrever: duplicados são permitidos? Se a convenção for «iguais à esquerda», as comparações passam a <code>&lt;</code> e <code>&gt;=</code>. Perguntar isto conta mais do que a implementação.</li>
+        <li>Casos limite: raiz nula (verdadeiro); nó único; cadeia de 200 000 nós — a versão recursiva rebenta a pilha e a iterativa não, o que é o follow-up imediato.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-25-4" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.4 — Antepassado comum mais próximo (LCA)</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dada uma árvore binária e duas referências de nós <code>p</code> e <code>q</code>, devolver o antepassado comum mais próximo — o nó mais profundo que tem <code>p</code> e <code>q</code> na sua subárvore, contando que um nó é antepassado de si próprio. Restrições: sem ponteiros para o pai, sem estruturas auxiliares de tamanho O(n) se possível, O(n) tempo. Exemplo: na árvore <code>3</code> com filhos <code>5</code> e <code>1</code>, o LCA de 5 e 1 é 3; o LCA de 5 e de um descendente de 5 é o próprio 5. Depois responder a duas variantes: (a) e se <code>p</code> ou <code>q</code> puderem não existir na árvore? (b) e se a árvore for uma BST?</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-5"><div class="lhead"><span class="lnum">Listagem 25.5</span>
+        <span class="lcap">LCA genérico, variante segura com contagem e atalho O(h) para BST.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class Lca {
+
+    /** Contrato: p e q existem na árvore e são distintos.
+     *  Devolve o nó em que os dois lados «se encontram», ou o próprio p/q se um
+     *  for antepassado do outro. O(n) tempo, O(altura) memória. */
+    static TreeNode lca(TreeNode no, TreeNode p, TreeNode q) {
+        if (no == null || no == p || no == q) return no;   // identidade, não igualdade
+        TreeNode esq = lca(no.left, p, q);
+        TreeNode dir = lca(no.right, p, q);
+        if (esq != null &amp;&amp; dir != null) return no;         // um de cada lado: é aqui
+        return esq != null ? esq : dir;                    // ambos do mesmo lado
+    }
+
+    /** Variante (a): se p ou q podem não existir, o resultado acima é enganador —
+     *  devolveria p mesmo que q não estivesse na árvore. É preciso contar. */
+    static TreeNode lcaSeguro(TreeNode raiz, TreeNode p, TreeNode q) {
+        int[] vistos = new int[1];
+        TreeNode r = procura(raiz, p, q, vistos);
+        return vistos[0] == 2 ? r : null;
+    }
+
+    private static TreeNode procura(TreeNode no, TreeNode p, TreeNode q, int[] vistos) {
+        if (no == null) return null;
+        TreeNode esq = procura(no.left, p, q, vistos);      // sem saída antecipada:
+        TreeNode dir = procura(no.right, p, q, vistos);     // é preciso ver a árvore toda
+        if (no == p || no == q) { vistos[0]++; return no; }
+        if (esq != null &amp;&amp; dir != null) return no;
+        return esq != null ? esq : dir;
+    }
+
+    /** Variante (b): numa BST não é preciso explorar. Desce-se enquanto os dois
+     *  valores estiverem do mesmo lado; o primeiro nó «entre» os dois é o LCA.
+     *  O(altura) tempo, O(1) memória. */
+    static TreeNode lcaBst(TreeNode raiz, TreeNode p, TreeNode q) {
+        TreeNode no = raiz;
+        while (no != null) {
+            if (p.val &lt; no.val &amp;&amp; q.val &lt; no.val) no = no.left;
+            else if (p.val &gt; no.val &amp;&amp; q.val &gt; no.val) no = no.right;
+            else return no;
+        }
+        return null;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Genérico: O(n) tempo, O(altura) memória. BST: O(altura) tempo, O(1) memória — 20 passos numa árvore equilibrada de 10<sup>6</sup> nós, contra visitar o milhão inteiro. Reconhecer o atalho quando o enunciado diz «BST» é o sinal mais barato deste exercício.</li>
+        <li>Comparação por identidade (<code>no == p</code>) e não por valor: com valores repetidos, comparar por <code>val</code> devolve o nó errado. Se a API só der valores em vez de referências, o problema muda e é preciso garantir unicidade — vale a pena declarar essa suposição.</li>
+        <li>Casos limite: <code>p == q</code> (devolve o próprio nó); um é antepassado do outro (devolve o antepassado — muitos candidatos escrevem código que devolve o pai); árvore de um nó; <code>p</code> ou <code>q</code> ausentes, que é exactamente o que a variante segura resolve.</li>
+        <li>A variante com contagem custa sempre O(n) porque não pode parar cedo: parar no primeiro encontro impediria descobrir que o segundo nó não existe. Explicar este preço, em vez de o esconder, é o que distingue a resposta sénior.</li>
+        <li>Se a pergunta seguinte for «e para milhões de consultas na mesma árvore?», a resposta é pré-processar: Euler tour com <em>sparse table</em> (O(n log n) de preparação, O(1) por consulta) ou <em>binary lifting</em> (O(n log n) e O(log n)). Nomear a família chega; não é preciso escrever.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-25-3" class="h2"><span class="secnum">25.3</span> Heaps e top-K<a class="anchor" href="#sec-25-3" aria-label="ligação">#</a></h2>
+
+<p>Um <em>heap</em> binário é uma árvore quase completa guardada num array: o filho esquerdo de <code>i</code> está em <code>2i+1</code>, o direito em <code>2i+2</code>, o pai em <code>(i-1)/2</code>. Não há ponteiros e não há nós — é por isso que é a estrutura de árvore com melhor localidade de <em>cache</em> e a única que se usa sem hesitar em código de latência apertada. O invariante é fraco de propósito: o pai é menor (ou maior) que os filhos, e nada mais. Isso dá <code>peek</code> em O(1), <code>offer</code> e <code>poll</code> em O(log n), e não dá pesquisa: procurar um elemento arbitrário custa O(n), e é por isso que <code>PriorityQueue.remove(Object)</code> é O(n) e que uma fila de prioridade com cancelamentos frequentes é um problema de desenho, não de escolha de estrutura.</p>
+
+<p>A aplicação canónica é top-K. Para os <var>k</var> maiores de <var>n</var> elementos há três respostas e a diferença entre elas é o que se avalia. Ordenar tudo custa O(n log n) e O(n) de memória. Um <em>heap</em> mínimo de tamanho <var>k</var>, onde se insere cada elemento e se descarta a raiz sempre que o tamanho passa de <var>k</var>, custa O(n log k) e O(k) de memória: com <var>n</var> = 10<sup>7</sup> e <var>k</var> = 10, log₂k ≈ 3,3 contra log₂n ≈ 23, ou seja cerca de sete vezes menos comparações e um milhão de vezes menos memória. <em>Quickselect</em> custa O(n) esperado mas O(n²) no pior caso, precisa do array todo em memória e destrói a ordem original. A regra: se os dados chegam em fluxo ou não cabem em memória, é <em>heap</em>; se cabem, são mutáveis e <var>k</var> é da ordem de <var>n</var>, é <em>quickselect</em>; se <var>k</var> ≈ <var>n</var>, é ordenar.</p>
+
+<p>Em Java, <code>PriorityQueue</code> é um <em>heap</em> binário mínimo por defeito. Três detalhes falham em entrevista e em produção: iterar a fila <strong>não</strong> devolve os elementos por ordem — só <code>poll</code> repetido o faz; construir a fila a partir de uma colecção (<code>new PriorityQueue&lt;&gt;(lista)</code>) faz <em>heapify</em> em O(n), enquanto <var>n</var> chamadas a <code>offer</code> custam O(n log n); e a classe não é <em>thread-safe</em> — para produtor/consumidor usa-se <code>PriorityBlockingQueue</code>, e para tarefas agendadas <code>DelayQueue</code> ou <code>ScheduledThreadPoolExecutor</code>, que internamente é um <em>heap</em> por instante de execução.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Top-10 de 10 milhões de eventos: ordenar tudo faz ≈ 2,3×10<sup>8</sup> comparações e guarda 10<sup>7</sup> referências (≈ 80 MB só de ponteiros com <em>compressed oops</em>); um <em>heap</em> de tamanho 10 faz ≈ 3,3×10<sup>7</sup> comparações no pior caso e guarda 10 referências. Se os eventos vierem de Kafka a 50 000 mensagens por segundo, a versão com <em>heap</em> corre em fluxo e a versão com ordenação nem sequer é implementável sem acumular a janela inteira.</p></aside>
+
+<div class="qa" id="q-25-4" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando é que usa um <em>heap</em> em vez de simplesmente ordenar, e qual é o critério numérico que aplica?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Usa-se <em>heap</em> quando só interessa uma fracção pequena da ordem total, ou quando os dados chegam em fluxo e não há um momento em que se possa ordenar. O critério numérico é comparar O(n log k) com O(n log n): o <em>heap</em> de tamanho <var>k</var> ganha enquanto log k for substancialmente menor que log n, ou seja enquanto <var>k</var> for muito menor que <var>n</var>. Para <var>n</var> = 10<sup>6</sup> e <var>k</var> = 100, são ≈ 6,6 contra ≈ 20 comparações por elemento — três vezes menos trabalho e memória O(100) em vez de O(10<sup>6</sup>).</p>
+      <p>A segunda razão, e a mais importante em backend, é a memória e o modelo de execução. Um <em>heap</em> de tamanho <var>k</var> permite processar um fluxo ilimitado com uma quantidade fixa de memória, o que é a diferença entre um consumidor Kafka que corre para sempre e um que fica sem <em>heap</em> ao fim de algumas horas. A mesma propriedade dá o padrão de fusão de <var>m</var> fluxos ordenados com um <em>heap</em> de tamanho <var>m</var>, e o padrão de agenda — o próximo item a expirar está sempre na raiz, em O(1).</p>
+      <p>A terceira família de usos não tem nada a ver com top-K: escalonamento e algoritmos de grafos. Dijkstra com <code>PriorityQueue</code> é O((V+E) log V); um <em>rate limiter</em> com expirações usa um <em>heap</em> por instante; a mediana de um fluxo mantém-se com dois <em>heaps</em>, um máximo para a metade inferior e um mínimo para a superior, com inserção em O(log n) e leitura em O(1).</p>
+      <p>Quando é que a escolha contrária passa a ser a certa: se <var>k</var> se aproximar de <var>n</var>, o <em>heap</em> deixa de compensar e ordenar é mais simples e mais rápido na prática, porque o <code>Arrays.sort</code> do JDK explora sequências já ordenadas. Se o array couber em memória, for mutável e só interessar o k-ésimo elemento (não os k primeiros ordenados), <em>quickselect</em> é O(n) esperado e bate o <em>heap</em>. E se as frequências forem inteiros pequenos e limitados, há uma solução O(n) sem comparações nenhumas: distribuir por baldes indexados pela frequência e ler de trás para a frente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Uso <em>heap</em> quando preciso do máximo.» Não distingue de ordenar, não dá complexidade.</td></tr>
+        <tr><td>Mid</td><td>Diz O(n log k) contra O(n log n), mas não quantifica com números nem fala de memória constante em fluxo.</td></tr>
+        <tr><td>Sénior</td><td>Dá o critério k ≪ n com números, liga à memória fixa em processamento de fluxo, e nomeia os outros usos (fusão, agenda, mediana).</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais as condições de reversão (<em>quickselect</em>, baldes por frequência, k ≈ n) e a consciência de que <code>remove(Object)</code> em O(n) inviabiliza cancelamentos frequentes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se os dados estiverem espalhados por 50 nós — como faz o top-K global?»</li>
+      <li>«Como cancela uma tarefa já colocada na fila de prioridade?»</li>
+      <li>«Qual é o custo de construir o <em>heap</em> de uma vez em vez de inserir um a um?»</li>
+      <li>«E se não puder guardar todas as chaves distintas em memória?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Assumir que iterar uma <code>PriorityQueue</code> devolve os elementos por ordem.</li>
+      <li>Usar um <em>heap</em> de tamanho <var>n</var> para tirar os k primeiros e chamar-lhe optimização.</li>
+      <li>Partilhar uma <code>PriorityQueue</code> entre threads sem sincronização.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-25-6"><div class="lhead"><span class="lnum">Listagem 25.6</span>
+<span class="lcap">Quickselect com pivô aleatório: a alternativa O(n) esperado quando o array cabe em memória.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>final class Selecao {
+
+    /** k-ésimo maior (k = 1 devolve o máximo). O(n) esperado, O(n²) no pior caso.
+     *  Reordena o array recebido — só serve quando a mutação é aceitável. */
+    static int kEsimoMaior(int[] a, int k) {
+        if (a.length == 0 || k &lt; 1 || k &gt; a.length)
+            throw new IllegalArgumentException(&quot;k fora da gama: &quot; + k);
+        int alvo = a.length - k;                 // índice que teria no array ordenado
+        int lo = 0, hi = a.length - 1;
+        Random r = new Random();                 // pivô aleatório evita o pior caso
+        while (lo &lt; hi) {                        // em entradas já ordenadas
+            int p = particiona(a, lo, hi, lo + r.nextInt(hi - lo + 1));
+            if (p == alvo) return a[p];
+            if (p &lt; alvo) lo = p + 1; else hi = p - 1;
+        }
+        return a[lo];
+    }
+
+    private static int particiona(int[] a, int lo, int hi, int idxPivo) {
+        int pivo = a[idxPivo];
+        troca(a, idxPivo, hi);                   // pivô para o fim
+        int i = lo;
+        for (int j = lo; j &lt; hi; j++)
+            if (a[j] &lt; pivo) troca(a, i++, j);
+        troca(a, i, hi);                         // pivô para a posição definitiva
+        return i;
+    }
+
+    private static void troca(int[] a, int i, int j) { int t = a[i]; a[i] = a[j]; a[j] = t; }
+}</code></pre></figure>
+
+<div class="lab" id="lab-25-5" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.5 — Top-K elementos mais frequentes</span>
+    <div class="labpills"><span class="qpill">Alvo O(n + m log k)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: dado <code>int[] valores</code> com <var>n</var> elementos e um inteiro <var>k</var>, devolver os <var>k</var> valores mais frequentes, do mais frequente para o menos. Restrições: melhor do que O(n log n); <var>n</var> pode chegar a 10<sup>7</sup> e o número de valores distintos <var>m</var> a 10<sup>6</sup>, mas <var>k</var> ≤ 100; empates podem ser desempatados arbitrariamente. Exemplo: para <code>[1, 1, 1, 2, 2, 3]</code> e <var>k</var> = 2, a saída é <code>[1, 2]</code>. Depois responder: como muda a solução se os valores chegarem num fluxo infinito e não for possível guardar as <var>m</var> contagens?</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-7"><div class="lhead"><span class="lnum">Listagem 25.7</span>
+        <span class="lcap">Contagem com <code>merge</code> e min-heap de tamanho k que expulsa sempre o pior candidato.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class TopK {
+
+    /** n = total de elementos, m = valores distintos.
+     *  O(n) para contar + O(m log k) para seleccionar. Memória O(m + k). */
+    static int[] topKFrequentes(int[] valores, int k) {
+        if (k &lt;= 0 || valores.length == 0) return new int[0];
+
+        Map&lt;Integer, Integer&gt; contagem = new HashMap&lt;&gt;();
+        for (int v : valores) contagem.merge(v, 1, Integer::sum);   // O(1) amortizado
+
+        // Min-heap por frequência: a raiz é sempre o pior dos candidatos correntes,
+        // por isso é o que se descarta quando o heap passa de k elementos.
+        PriorityQueue&lt;Map.Entry&lt;Integer, Integer&gt;&gt; heap =
+                new PriorityQueue&lt;&gt;(Map.Entry.&lt;Integer, Integer&gt;comparingByValue());
+        for (Map.Entry&lt;Integer, Integer&gt; e : contagem.entrySet()) {
+            heap.offer(e);
+            if (heap.size() &gt; k) heap.poll();                       // O(log k)
+        }
+
+        // poll devolve do menos para o mais frequente: preenche-se de trás para a frente.
+        int[] saida = new int[heap.size()];
+        for (int i = saida.length - 1; i &gt;= 0; i--) saida[i] = heap.poll().getKey();
+        return saida;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>O(n + m log k) tempo, O(m) memória dominada pelo mapa de contagens. Com <var>n</var> = 10<sup>7</sup>, <var>m</var> = 10<sup>6</sup> e <var>k</var> = 100, são 10<sup>7</sup> incrementos e ≈ 6,6×10<sup>6</sup> comparações, contra ≈ 2×10<sup>7</sup> comparações se se ordenassem as <var>m</var> entradas.</li>
+        <li>O sentido do comparador é onde metade dos candidatos erra: para os <var>k</var> maiores usa-se um <strong>min</strong>-heap, para que a raiz seja o candidato mais fraco e o descarte seja O(log k). Um max-heap obrigaria a guardar tudo.</li>
+        <li>Alternativa O(n + m) sem comparações: <em>bucket sort</em> por frequência, com um array de listas indexado pela contagem (que nunca excede <var>n</var>), lido de trás para a frente. Vale mencionar — mostra que se percebeu que as frequências são inteiros limitados.</li>
+        <li>Casos limite: <var>k</var> ≥ <var>m</var> (devolve os <var>m</var> valores, e é por isso que o array de saída usa <code>heap.size()</code> e não <code>k</code>); array vazio; todos os valores iguais; <var>k</var> ≤ 0.</li>
+        <li>Fluxo infinito: deixa de ser possível contar exactamente. A resposta é <em>Count-Min Sketch</em> para frequências aproximadas com memória fixa, ou o algoritmo <em>Space-Saving</em> para <em>heavy hitters</em>, aceitando erro limitado. Nomear a família e o compromisso (memória fixa contra exactidão) é o que distingue o candidato sénior neste follow-up.</li>
+        <li>Nota de implementação: guardam-se no <em>heap</em> as <code>Map.Entry</code> do próprio <code>HashMap</code>. É seguro porque o mapa já não é modificado; se fosse, teria de se copiar cada entrada.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-25-4" class="h2"><span class="secnum">25.4</span> Tries e problemas de prefixos<a class="anchor" href="#sec-25-4" aria-label="ligação">#</a></h2>
+
+<p>Uma <em>trie</em> (ou árvore de prefixos) troca memória por uma propriedade que nenhuma tabela de <em>hash</em> tem: o custo de uma consulta depende apenas do comprimento da chave, não do número de chaves guardadas. Procurar «lisb» entre 10 palavras ou entre 10 milhões custa os mesmos 4 saltos. Isso torna-a a estrutura natural para autocompletar, para verificação de prefixos em encaminhamento (a tabela de rotas de um <em>router</em> é uma <em>trie</em> sobre bits de endereço), para filtros de palavras proibidas e para qualquer problema em que a pergunta seja «tudo o que começa por».</p>
+
+<p>O preço é a memória. Uma <em>trie</em> com um array de 26 filhos por nó gasta, em Java com <em>compressed oops</em>, cerca de 16 bytes de cabeçalho mais 16 do cabeçalho do array mais 26×4 bytes de referências — na ordem dos 130 bytes por nó, quase todos nulos nos níveis profundos. Um dicionário de 200 000 palavras com prefixos partilhados pode gerar meio milhão de nós, ou seja dezenas de megabytes para guardar poucos megabytes de texto. As três mitigações são conhecidas: substituir o array por um <code>HashMap&lt;Character, No&gt;</code> quando o alfabeto é grande e esparso (menos memória, mais indirecção); comprimir cadeias de nós com um só filho, obtendo uma <em>radix tree</em> ou <em>Patricia trie</em>; ou usar um autómato determinista mínimo (<em>FST</em>), que é o que o Lucene faz no dicionário de termos e que partilha também os sufixos.</p>
+
+<p>A alternativa que quase ninguém propõe em entrevista, e que muitas vezes é a certa em produção, é não usar <em>trie</em> nenhuma: um array ordenado de <em>strings</em> com pesquisa binária responde a «todos os que começam por P» em O(log n + k) — encontra-se o limite inferior, lê-se sequencialmente enquanto o prefixo bater — com memória compacta e localidade excelente. Em Redis, o mesmo se faz com um <em>sorted set</em> de pontuação uniforme e <code>ZRANGEBYLEX</code>. A <em>trie</em> ganha quando é preciso mais do que listar: contagens por prefixo, inserções e remoções frequentes, ou correspondência de padrões com carácter universal.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 25.2</span> Estruturas para consultas por prefixo sobre <var>n</var> chaves de comprimento médio <var>L</var>.</div>
+<div class="tscroll"><table><thead><tr><th>Estrutura</th><th>Prefixo</th><th>Inserção</th><th>Memória relativa</th><th>Quando é a certa</th></tr></thead><tbody>
+<tr><td><code>HashSet</code>/<code>HashMap</code></td><td>O(n·L) — varre tudo</td><td>O(L)</td><td>Baixa</td><td>Só há consultas por chave exacta</td></tr>
+<tr><td>Array ordenado + pesquisa binária</td><td>O(L·log n + k)</td><td>O(n) — reconstrução</td><td>Muito baixa</td><td>Conjunto estático, reconstruído em lote</td></tr>
+<tr><td>Trie R-way (26 filhos)</td><td>O(L + k)</td><td>O(L)</td><td>Alta (≈130 B/nó)</td><td>Escritas frequentes, contagens por prefixo</td></tr>
+<tr><td>Radix / Patricia</td><td>O(L + k)</td><td>O(L)</td><td>Média</td><td>Chaves longas com prefixos partilhados</td></tr>
+<tr><td>FST (Lucene)</td><td>O(L + k)</td><td>Construção em lote</td><td>Muito baixa</td><td>Dicionário grande e imutável</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-25-5" data-box="qa" data-area="dsa" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Precisamos de autocompletar sobre 2 milhões de nomes de produto, dez sugestões por prefixo, p99 abaixo de 20 ms. Usaria uma <em>trie</em>? Justifique com memória e alternativas.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A primeira pergunta não é qual a estrutura, é com que frequência o catálogo muda e onde é que a estrutura vive. Se o catálogo for reconstruído em lote uma ou algumas vezes por dia, a resposta certa é um índice imutável — array ordenado com pesquisa binária, ou um <em>FST</em> como o que o Elasticsearch usa no <em>completion suggester</em> — porque dá O(log n + k) ou O(L + k) com uma fracção da memória e sem qualquer sincronização entre threads. Se houver escritas contínuas e for preciso responder a contagens por prefixo, a <em>trie</em> justifica-se.</p>
+      <p>Os números: 2 milhões de nomes com comprimento médio 20 geram, com prefixos partilhados, tipicamente entre 4 e 8 milhões de nós numa <em>trie</em> R-way. A 130 bytes por nó, são 0,5 a 1 GB de <em>heap</em> — sozinho isto muda o dimensionamento dos <em>pods</em> e a pressão sobre o recolector. Trocar o array de 26 filhos por <code>HashMap&lt;Character, No&gt;</code> corta o desperdício dos nós esparsos mas acrescenta uma indirecção e um objecto de entrada por filho. Comprimir para <em>radix tree</em> reduz o número de nós numa ordem de grandeza porque cada cadeia sem ramificação passa a ser um único nó com uma fatia de <em>string</em>.</p>
+      <p>Sobre a latência: a descida da <em>trie</em> custa <var>L</var> saltos de ponteiro para objectos dispersos no <em>heap</em> — para um prefixo de 4 caracteres, 4 falhas prováveis de <em>cache</em>, na ordem de 100 ns cada; a recolha das 10 sugestões custa mais uma travessia limitada. O orçamento de 20 ms no p99 não é apertado para nenhuma das opções: o risco real está nas pausas do recolector provocadas pelos milhões de objectos vivos, não no algoritmo. Guardar as <var>k</var> melhores sugestões pré-calculadas em cada nó de prefixo transforma a consulta numa leitura O(L) sem travessia nenhuma, ao custo de memória adicional e de reconstrução na escrita.</p>
+      <p>Quando é que a escolha contrária passa a ser a certa: se o serviço já tiver Elasticsearch ou Redis, construir e manter uma <em>trie</em> em memória em cada instância é duplicar infra-estrutura — um <em>sorted set</em> com <code>ZRANGEBYLEX</code> ou um <em>completion suggester</em> resolve com um custo operacional que a equipa já paga. A <em>trie</em> em processo ganha quando a latência tem de excluir a ida à rede, ou quando as sugestões dependem de estado local que não está no índice partilhado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Trie, porque é a estrutura de autocompletar.» Sem memória, sem alternativas, sem perguntar pela taxa de escrita.</td></tr>
+        <tr><td>Mid</td><td>Explica bem a <em>trie</em> e dá O(L), mas não estima a memória nem considera índice imutável ou infra-estrutura existente.</td></tr>
+        <tr><td>Sénior</td><td>Começa pela taxa de mudança do catálogo, estima nós e bytes, compara com array ordenado e <em>radix</em>, e liga a latência às pausas do GC e não só ao algoritmo.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a pré-computação das k melhores por nó, o custo operacional de duplicar infra-estrutura e o critério explícito de quando a solução em processo bate a solução partilhada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como ordena as sugestões por popularidade e não por ordem alfabética?»</li>
+      <li>«E se os nomes tiverem acentos, cedilhas e maiúsculas?»</li>
+      <li>«Como actualiza a estrutura sem bloquear as leituras?»</li>
+      <li>«Quanto custaria isto se cada instância tiver 4 GB de <em>heap</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não estimar a memória de uma estrutura que vai viver no <em>heap</em> de um serviço.</li>
+      <li>Assumir alfabeto de 26 letras num catálogo europeu com acentuação e dígitos.</li>
+      <li>Ignorar que já existe um motor de pesquisa na plataforma e propor construir tudo de raiz.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-25-6" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.6 — Trie com autocompletar e contagem por prefixo</span>
+    <div class="labpills"><span class="qpill">Alvo O(L)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: implementar uma <code>Trie</code> com <code>inserir(String)</code>, <code>contem(String)</code>, <code>quantasComPrefixo(String)</code> e <code>autocompletar(String prefixo, int limite)</code>, que devolve até <code>limite</code> palavras com esse prefixo por ordem lexicográfica. Restrições: alfabeto <code>a</code>–<code>z</code> minúsculo; a consulta não pode ter custo dependente do número total de palavras guardadas; <code>quantasComPrefixo</code> tem de responder em O(L) sem varrer a subárvore. Exemplo: inserindo «casa», «casaco», «caso» e «carro», <code>autocompletar("cas", 2)</code> devolve <code>["casa", "casaco"]</code> e <code>quantasComPrefixo("ca")</code> devolve 4. Casos a tratar: prefixo vazio, prefixo inexistente, palavra vazia, limite ≤ 0.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-8"><div class="lhead"><span class="lnum">Listagem 25.8</span>
+        <span class="lcap">Trie R-way com contador de passagens e recolha lexicográfica com poda por limite.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class Trie {
+
+    private static final int R = 26;              // alfabeto 'a'..'z'
+
+    private static final class No {
+        final No[] filhos = new No[R];            // ≈ 130 bytes por nó no HotSpot 64 bits
+        boolean fimDePalavra;
+        int passagens;                            // palavras que atravessam este nó
+    }
+
+    private final No raiz = new No();
+
+    /** O(L) tempo, no máximo L nós novos. */
+    void inserir(String palavra) {
+        No no = raiz;
+        raiz.passagens++;                         // o prefixo vazio conta todas
+        for (int i = 0; i &lt; palavra.length(); i++) {
+            int c = indice(palavra.charAt(i));
+            if (no.filhos[c] == null) no.filhos[c] = new No();
+            no = no.filhos[c];
+            no.passagens++;
+        }
+        no.fimDePalavra = true;                   // palavra vazia marca a raiz
+    }
+
+    boolean contem(String palavra) {
+        No no = desce(palavra);
+        return no != null &amp;&amp; no.fimDePalavra;     // «cas» não conta se só existir «casa»
+    }
+
+    /** O(L): lê o contador acumulado em vez de varrer a subárvore. */
+    int quantasComPrefixo(String prefixo) {
+        No no = desce(prefixo);
+        return no == null ? 0 : no.passagens;
+    }
+
+    /** Até 'limite' palavras com o prefixo, por ordem lexicográfica.
+     *  O(L + limite × L): o custo não depende do total de palavras guardadas. */
+    List&lt;String&gt; autocompletar(String prefixo, int limite) {
+        List&lt;String&gt; saida = new ArrayList&lt;&gt;();
+        No no = desce(prefixo);
+        if (no == null || limite &lt;= 0) return saida;
+        recolher(no, new StringBuilder(prefixo), limite, saida);
+        return saida;
+    }
+
+    /** DFS por ordem de índice = ordem lexicográfica; pára assim que atinge o limite. */
+    private void recolher(No no, StringBuilder sb, int limite, List&lt;String&gt; saida) {
+        if (saida.size() &gt;= limite) return;
+        if (no.fimDePalavra) saida.add(sb.toString());
+        for (int c = 0; c &lt; R &amp;&amp; saida.size() &lt; limite; c++) {
+            if (no.filhos[c] == null) continue;
+            sb.append((char) ('a' + c));
+            recolher(no.filhos[c], sb, limite, saida);
+            sb.deleteCharAt(sb.length() - 1);     // desfaz antes de tentar o irmão
+        }
+    }
+
+    /** Devolve null (e não excepção) para caracteres fora do alfabeto: uma consulta
+     *  com lixo é «não encontrado», uma inserção com lixo é erro de programação. */
+    private No desce(String s) {
+        No no = raiz;
+        for (int i = 0; i &lt; s.length(); i++) {
+            int c = s.charAt(i) - 'a';
+            if (c &lt; 0 || c &gt;= R || no.filhos[c] == null) return null;
+            no = no.filhos[c];
+        }
+        return no;
+    }
+
+    private static int indice(char ch) {
+        int c = ch - 'a';
+        if (c &lt; 0 || c &gt;= R) throw new IllegalArgumentException(&quot;fora do alfabeto: &quot; + ch);
+        return c;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Inserção e pesquisa O(L); autocompletar O(L + limite×L) porque a recolha pára no limite; contagem por prefixo O(L) graças ao campo <code>passagens</code>, que é a diferença entre esta implementação e a versão de manual que varre a subárvore em O(tamanho da subárvore).</li>
+        <li>Memória: 26 referências por nó, quase todas nulas em profundidade. Para 200 000 palavras contar com centenas de milhares de nós; dizer o número e propor <code>HashMap&lt;Character, No&gt;</code> ou compressão <em>radix</em> como alternativa é o sinal de seniority.</li>
+        <li>Casos limite tratados: prefixo vazio (devolve a raiz e, portanto, todas as palavras até ao limite); prefixo inexistente (lista vazia); palavra vazia (marca <code>fimDePalavra</code> na raiz); limite ≤ 0; caracteres fora do alfabeto numa consulta.</li>
+        <li>A ordem lexicográfica sai de graça de iterar os filhos por índice crescente. Se o requisito for «as 10 mais populares», isso deixa de servir: acrescenta-se em cada nó um <em>heap</em> ou uma lista pré-calculada das melhores <var>k</var>, actualizada na inserção.</li>
+        <li>Remoção não está implementada e é deliberado — anunciar que se implementaria com o mesmo contador (<code>passagens--</code> e libertação do nó quando chega a zero) vale mais do que escrevê-la mal. O entrevistador quer ver o candidato a gerir o tempo e a declarar o que ficou de fora.</li>
+        <li>Recursão em <code>recolher</code>: a profundidade é o comprimento máximo de palavra, dezenas de tramas. É o caso em que a recursão é seguramente aceitável — e saber distinguir isto do caso da árvore degenerada é o tema da secção seguinte.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Alfabeto de 26 letras é uma suposição, não um dado. Um catálogo europeu tem «ã», «ç», «ü», hífenes, dígitos e espaços; um índice de <em>e-mails</em> tem «@» e «.». Com <code>c = ch - 'a'</code>, o carácter «ç» dá um índice fora do array e produz <code>ArrayIndexOutOfBoundsException</code> ou, pior, uma leitura silenciosamente errada se o índice cair dentro por acaso. A solução em produção é normalizar antes de indexar — <code>Normalizer.normalize(s, Form.NFD)</code> seguido da remoção de marcas diacríticas e passagem a minúsculas — e guardar a forma original em separado para a apresentação.</p></aside>
+
+<h2 id="sec-25-5" class="h2"><span class="secnum">25.5</span> Recursão, pilha e conversão para iterativo<a class="anchor" href="#sec-25-5" aria-label="ligação">#</a></h2>
+
+<p>Cada chamada recursiva ocupa uma trama na pilha da <em>thread</em>: parâmetros, variáveis locais, endereço de retorno. Numa <em>thread</em> de plataforma do HotSpot em Linux x86-64, a pilha tem por defeito cerca de 1 MB e cada trama de um método simples ocupa algumas dezenas de bytes — na prática, a profundidade máxima antes de <code>StackOverflowError</code> anda tipicamente entre alguns milhares e algumas dezenas de milhar de chamadas, e depende do método, do nível de <em>inlining</em> do JIT e da plataforma. É por isso que o mesmo código passa nos testes com árvores de 1000 nós e falha em produção com 200 000: o limite não é o tamanho da árvore, é a sua altura.</p>
+
+<p>Java não faz eliminação de chamada final (<em>tail call optimisation</em>): escrever o método de forma recursiva terminal não elimina a trama, ao contrário do que acontece em Scala com <code>@tailrec</code> ou em linguagens funcionais. Isto tem uma consequência directa: não há nenhuma forma de escrever recursão profunda segura em Java sem ou aumentar a pilha, ou mover a pilha para o <em>heap</em>. Aumentar a pilha faz-se globalmente com <code>-Xss</code> — o que multiplica pelo número de <em>threads</em> e pode ser caro — ou localmente, criando a <em>thread</em> com o construtor que aceita <code>stackSize</code>, que é a opção cirúrgica quando só uma operação é profunda. As <em>virtual threads</em> do Java 21 guardam a pilha no <em>heap</em> e crescem conforme necessário, mas não expõem um parâmetro de dimensão e não são a resposta a este problema.</p>
+
+<p>A conversão para iterativo é mecânica e vale a pena treiná-la: substitui-se a pilha implícita por um <code>Deque</code> explícito, e cada chamada recursiva passa a ser um <em>push</em>. Quando o método faz trabalho <em>depois</em> da chamada recursiva — como a pós-ordem, ou como a desserialização que precisa de ligar os filhos ao pai — é preciso guardar também o estado da chamada, tipicamente com um par (nó, fase) ou com o truque de inverter a ordem. Há ainda o caso especial da travessia de Morris, que faz a in-order em O(1) de memória extra ao criar ligações temporárias do predecessor para o nó actual e desfazê-las depois; é o que se responde quando o entrevistador pergunta «e sem pilha nenhuma?», mas raramente se usa em produção porque muta a árvore durante a travessia e é hostil à concorrência.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Uma árvore de 200 000 nós inserida por ordem crescente tem altura 200 000 e não sobrevive a uma travessia recursiva com a pilha por defeito. A mesma árvore, equilibrada, tem altura 18 — três ordens de grandeza abaixo e completamente segura. Entre uma coisa e outra não muda uma linha do algoritmo: muda a forma dos dados. Por isso a pergunta «a árvore pode estar degenerada?» é sempre a pergunta certa antes de escrever a versão recursiva.</p></aside>
+
+<div class="qa" id="q-25-6" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um <em>job</em> nocturno que percorre uma hierarquia de categorias falha intermitentemente com <code>StackOverflowError</code>. Como diagnostica e o que corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Há três causas possíveis e o diagnóstico separa-as em minutos: profundidade legítima maior do que a pilha, ciclo nos dados, ou recursão indirecta acidental. O primeiro passo é olhar para o <em>stack trace</em>: se ele mostrar o mesmo método repetido milhares de vezes com nós diferentes, é profundidade; se mostrar um ciclo curto de dois ou três métodos a repetir-se, é recursão mútua; se os dados forem uma hierarquia com um pai que é descendente de si próprio, é um ciclo — e um ciclo não se resolve com mais pilha, resolve-se com um conjunto de nós visitados e com uma restrição na base de dados que impeça a inserção.</p>
+      <p>«Intermitentemente» é a palavra que aponta para os dados: a profundidade da hierarquia depende do que foi importado nessa noite. Uma métrica de profundidade máxima observada, publicada a cada execução, transforma o incidente numa tendência visível antes da falha. O limite prático a ter em conta é que uma <em>thread</em> de plataforma com pilha por defeito de ≈ 1 MB aguenta na ordem de alguns milhares a algumas dezenas de milhar de tramas.</p>
+      <p>A correcção depende do diagnóstico. Se for ciclo, detecta-se com um <code>Set</code> de identificadores no caminho corrente e falha-se com uma mensagem que nomeia o ciclo, em vez de rebentar a pilha. Se for profundidade legítima, a correcção robusta é converter para iterativo com um <code>ArrayDeque</code> explícito: a pilha passa para o <em>heap</em>, que tem gigabytes em vez de megabytes, e o limite deixa de depender de uma flag da JVM. A correcção táctica, quando o código é grande e a janela é curta, é correr a operação numa <em>thread</em> criada com <code>new Thread(null, tarefa, "nome", 64L * 1024 * 1024)</code>, que isola o custo em vez de subir <code>-Xss</code> para todas as <em>threads</em> do processo.</p>
+      <p>O que não é correcção: apanhar <code>StackOverflowError</code> e continuar. É um <code>Error</code>, não uma <code>Exception</code>; depois de ele ocorrer, o estado da execução em curso é indeterminado — pode ter ficado a meio de uma actualização. Se houver mesmo de se apanhar, é na fronteira do <em>job</em>, para registar e abortar essa unidade de trabalho, nunca para prosseguir com o mesmo objecto.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentava a memória» — confunde pilha com <em>heap</em>, ou propõe apanhar o <code>Error</code> e continuar.</td></tr>
+        <tr><td>Mid</td><td>Identifica a recursão profunda e propõe <code>-Xss</code>, mas não distingue ciclo de profundidade nem menciona a conversão para iterativo.</td></tr>
+        <tr><td>Sénior</td><td>Separa as três causas pelo <em>stack trace</em>, explica que Java não elimina chamadas finais, converte para iterativo e propõe a métrica de profundidade máxima.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a defesa nos dados (restrição que impede ciclos), a distinção entre correcção táctica com <code>stackSize</code> e correcção estrutural, e o argumento de porque não se apanha um <code>Error</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como converteria uma pós-ordem recursiva para iterativa sem mudar o resultado?»</li>
+      <li>«Que profundidade máxima esperaria com a pilha por defeito, e como a mediria?»</li>
+      <li>«E se a hierarquia estiver em PostgreSQL — resolvia isto em SQL?»</li>
+      <li>«Virtual threads mudam alguma coisa aqui?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar <code>StackOverflowError</code> como uma excepção recuperável.</li>
+      <li>Afirmar que a JVM optimiza chamadas finais.</li>
+      <li>Subir <code>-Xss</code> para 512 MB sem reparar que o valor é por <em>thread</em>.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-25-9"><div class="lhead"><span class="lnum">Listagem 25.9</span>
+<span class="lcap">Duas saídas para recursão profunda: pilha maior só nesta thread, ou pilha explícita no heap.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>final class ProfundidadeSegura {
+
+    /** Correcção táctica: 64 MB de pilha só para esta operação, em vez de -Xss
+     *  global multiplicado por todas as threads do processo. O stackSize é uma
+     *  sugestão à VM e só existe para threads de plataforma. */
+    static long somaEmThreadComPilhaGrande(TreeNode raiz) throws InterruptedException {
+        long[] resultado = new long[1];
+        Thread t = new Thread(null, () -&gt; resultado[0] = soma(raiz),
+                              &quot;travessia-profunda&quot;, 64L * 1024 * 1024);
+        t.start();
+        t.join();
+        return resultado[0];
+    }
+
+    private static long soma(TreeNode no) {
+        return no == null ? 0 : no.val + soma(no.left) + soma(no.right);
+    }
+
+    /** Correcção estrutural: a pilha passa para o heap e o limite deixa de ser
+     *  1 MB de pilha para passar a ser o tamanho do heap. Não depende de flags. */
+    static long somaIterativa(TreeNode raiz) {
+        long total = 0;
+        Deque&lt;TreeNode&gt; pilha = new ArrayDeque&lt;&gt;();
+        if (raiz != null) pilha.push(raiz);
+        while (!pilha.isEmpty()) {
+            TreeNode no = pilha.pop();
+            total += no.val;
+            if (no.left != null) pilha.push(no.left);
+            if (no.right != null) pilha.push(no.right);
+        }
+        return total;
+    }
+}</code></pre></figure>
+
+<div class="lab" id="lab-25-7" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 25.7 — Serializar e desserializar uma árvore binária</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: escrever <code>String serializar(TreeNode)</code> e <code>TreeNode desserializar(String)</code> tais que desserializar o resultado de serializar produza uma árvore estruturalmente idêntica. Restrições: O(n) em ambas as direcções; a árvore pode ser nula, ter valores repetidos, negativos e não ser BST; o formato é livre mas tem de ser não ambíguo e legível. Exemplo: a árvore <code>1</code> com filho esquerdo <code>2</code> e filho direito <code>3</code>, tendo o <code>3</code> filhos <code>4</code> e <code>5</code>, serializa para <code>1,2,#,#,3,4,#,#,5,#,#</code>. Depois responder: porque é que a pré-ordem sem marcadores de nulo não chega, e o que muda se a árvore for uma BST?</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-25-10"><div class="lhead"><span class="lnum">Listagem 25.10</span>
+        <span class="lcap">Pré-ordem com marcador explícito de nulo: uma travessia serializa, um iterador reconstrói.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>final class Codec {
+
+    private static final String NULO = &quot;#&quot;;
+    private static final char SEP = ',';
+
+    /** Pré-ordem com nulos explícitos. A raiz vem primeiro, por isso a leitura
+     *  reconstrói na mesma ordem sem precisar de índices nem de procurar nada. */
+    String serializar(TreeNode raiz) {
+        StringBuilder sb = new StringBuilder();
+        escrever(raiz, sb);
+        return sb.toString();
+    }
+
+    private void escrever(TreeNode no, StringBuilder sb) {
+        if (sb.length() &gt; 0) sb.append(SEP);      // separador só entre tokens
+        if (no == null) { sb.append(NULO); return; }
+        sb.append(no.val);
+        escrever(no.left, sb);
+        escrever(no.right, sb);
+    }
+
+    /** O iterador consome os tokens exactamente pela ordem em que foram escritos:
+     *  é o que torna a reconstrução O(n) e sem estado global. */
+    TreeNode desserializar(String dados) {
+        Iterator&lt;String&gt; tokens = List.of(dados.split(&quot;,&quot;, -1)).iterator();
+        return ler(tokens);
+    }
+
+    private TreeNode ler(Iterator&lt;String&gt; tokens) {
+        String t = tokens.next();
+        if (NULO.equals(t)) return null;
+        TreeNode no = new TreeNode(Integer.parseInt(t));
+        no.left = ler(tokens);                    // a ordem destas duas linhas
+        no.right = ler(tokens);                   // é o contrato do formato
+        return no;
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>O(n) tempo nas duas direcções; a saída tem 2n+1 tokens (n valores e n+1 marcadores de nulo), o que é o dobro do estritamente necessário mas mantém o formato trivialmente correcto. Memória O(altura) na recursão, mais O(n) na cadeia produzida.</li>
+        <li>Porque é que a pré-ordem sem nulos não chega: as árvores «1 com filho esquerdo 2» e «1 com filho direito 2» produzem ambas <code>1,2</code>. Sem marcadores é preciso uma segunda travessia (a in-order) e valores todos distintos para reconstruir — duas restrições que o marcador de nulo dispensa.</li>
+        <li>Se a árvore for uma BST, os marcadores tornam-se dispensáveis: a pré-ordem sozinha determina a árvore, porque os limites de cada subárvore saem do invariante de ordem. A saída encolhe para n tokens.</li>
+        <li>Casos limite: raiz nula (produz <code>#</code> e volta a dar <code>null</code>); nó único; valores negativos, que funcionam porque o separador é vírgula e o marcador é <code>#</code>; valores repetidos, que funcionam porque a estrutura vem do formato e não dos valores.</li>
+        <li>Cadeia degenerada de 200 000 nós: esta implementação recursiva rebenta a pilha nas duas direcções. A conversão para iterativo é o follow-up esperado — na serialização com uma pilha explícita, na desserialização com uma pilha de nós à espera de filho esquerdo e depois de filho direito.</li>
+        <li>O que o entrevistador procura: fixar o formato em voz alta antes de escrever, e reconhecer que serializar e desserializar são um contrato — a ordem de <code>no.left</code> e <code>no.right</code> na leitura tem de espelhar exactamente a ordem da escrita. Quem escreve as duas metades sem enunciar o contrato costuma trocar uma delas.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-25-6" class="h2"><span class="secnum">25.6</span> Resumo e checklist<a class="anchor" href="#sec-25-6" aria-label="ligação">#</a></h2>
+
+<p>Os problemas de árvores repetem-se com poucas variações, e a diferença entre uma resposta mid e uma resposta sénior está quase sempre fora do algoritmo: na pergunta feita antes de escrever, no custo em memória declarado, e na condição em que a solução escolhida deixa de servir.</p>
+
+<ul class="lst">
+  <li>A travessia sai de uma pergunta única — onde nasce a informação de que o nó precisa. De cima, pré-ordem; de baixo, pós-ordem; da ordem de valores numa BST, in-order; do nível, BFS.</li>
+  <li>Profundidade custa O(altura) de memória e largura custa O(n/2) no último nível. A escolha depende da forma da árvore, e a forma da árvore é uma pergunta ao entrevistador.</li>
+  <li>O invariante de BST é global: validar comparando só com os filhos directos é o erro que este tipo de exercício existe para apanhar. Sentinelas <code>Integer.MIN_VALUE</code> são a segunda armadilha; usar <code>Integer</code> nulo ou <code>long</code> resolve-a.</li>
+  <li><code>TreeMap</code> não se escolhe por ser mais rápido — não é — mas por responder a <code>floorEntry</code>, intervalos e iteração ordenada, que o <code>HashMap</code> não responde a preço nenhum.</li>
+  <li>Chaves monotónicas numa BST sem balanceamento produzem uma cadeia e transformam O(log n) em O(n). O sintoma em produção é latência que cresce com o tempo de vida do processo, não com a carga.</li>
+  <li>Top-K com <em>heap</em> mínimo de tamanho <var>k</var> é O(n log k) e O(k) de memória; ordenar é O(n log n) e O(n). O <em>heap</em> ganha enquanto <var>k</var> ≪ <var>n</var>, e ganha sempre em fluxo, porque a memória é fixa.</li>
+  <li>A <em>trie</em> dá custo O(L) independente do número de chaves e cobra-o em memória — cerca de 130 bytes por nó numa <em>trie</em> R-way. Para dicionários estáticos, um array ordenado com pesquisa binária ou um FST costuma ser a escolha certa.</li>
+  <li>Java não elimina chamadas finais. Recursão profunda resolve-se movendo a pilha para o <em>heap</em> com um <code>ArrayDeque</code>, ou isolando a operação numa <em>thread</em> com <code>stackSize</code> próprio — nunca apanhando o <code>StackOverflowError</code>.</li>
+  <li>Formato de serialização não ambíguo exige marcadores de nulo, ou duas travessias e valores distintos. A ordem de leitura tem de espelhar a ordem de escrita.</li>
+</ul>
+
+<p>Checklist para usar nos primeiros dois minutos de qualquer exercício de árvores:</p>
+
+<ul class="lst">
+  <li>Perguntar: a raiz pode ser nula? A árvore pode estar degenerada? Qual é a altura máxima esperada?</li>
+  <li>Perguntar: há valores repetidos? São permitidos numa BST e de que lado?</li>
+  <li>Perguntar: a resposta é em nós ou em arestas? (Diâmetro, altura, profundidade — a unidade muda a resposta.)</li>
+  <li>Declarar a travessia escolhida e porquê, antes de escrever a primeira linha.</li>
+  <li>Escrever o caso base antes do corpo recursivo, e testar mentalmente com raiz nula e nó único.</li>
+  <li>Anunciar tempo <em>e</em> memória, distinguindo O(altura) de O(n).</li>
+  <li>Usar <code>ArrayDeque</code> para pilha e fila; nunca <code>Stack</code>; nunca empilhar <code>null</code>.</li>
+  <li>Se a altura puder exceder alguns milhares, propor a versão iterativa sem esperar que a peçam.</li>
+  <li>Antes de dar por terminado, correr à mão o exemplo do enunciado e um caso degenerado.</li>
+  <li>Fechar com a condição de reversão: em que cenário esta solução deixa de ser a certa e qual a passaria a ser.</li>
+</ul>

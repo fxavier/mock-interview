@@ -1,0 +1,571 @@
+<p>Uma ronda sobre lambdas e streams parece inofensiva e é das que mais separa mid de sénior, porque quase toda a gente escreve streams e quase ninguém sabe explicar o que a máquina faz com eles. O entrevistador não quer saber se o candidato conhece <code>Collectors.groupingBy</code>: quer saber se percebe que um <em>pipeline</em> é uma descrição preguiçosa que só corre no operador terminal, que <code>Stream&lt;Integer&gt;</code> paga <em>boxing</em> em cada elemento, que <code>parallelStream()</code> partilha o <code>ForkJoinPool.commonPool()</code> com o resto do processo, e que há casos em que um <code>for</code> de cinco linhas é a resposta certa. Onde os candidatos caem é em três sítios: descrevem <code>map</code>/<code>filter</code>/<code>collect</code> como açúcar sintáctico sem mecanismo, usam <code>peek</code> e efeitos secundários como se fossem gratuitos, e recomendam paralelismo por reflexo em código de servidor onde já existem 200 pedidos concorrentes. Este capítulo cobre o modelo de execução, os colectores que valem a pena, o custo real do paralelismo e o critério para não usar streams.</p>
+
+<h2 id="sec-6-1" class="h2"><span class="secnum">6.1</span> Interfaces funcionais e referências de método<a class="anchor" href="#sec-6-1" aria-label="ligação">#</a></h2>
+
+<p>Uma interface funcional é uma interface com um único método abstracto; a anotação <code>@FunctionalInterface</code> não cria a propriedade, apenas faz o compilador falhar se ela se perder. O pacote <code>java.util.function</code> traz cerca de quarenta interfaces, mas o núcleo são seis: <code>Function&lt;T,R&gt;</code>, <code>BiFunction&lt;T,U,R&gt;</code>, <code>Predicate&lt;T&gt;</code>, <code>Consumer&lt;T&gt;</code>, <code>Supplier&lt;T&gt;</code> e <code>UnaryOperator&lt;T&gt;</code>. Tudo o resto são especializações primitivas — <code>IntPredicate</code>, <code>ToLongFunction&lt;T&gt;</code>, <code>ObjIntConsumer&lt;T&gt;</code> — que existem por uma razão única e mensurável: evitar <em>boxing</em>.</p>
+
+<p>Um lambda não é uma classe anónima. O compilador emite uma instrução <code>invokedynamic</code> cujo <em>bootstrap</em> é o <code>LambdaMetafactory</code>, que na primeira execução do <em>call site</em> gera em memória a classe que implementa a interface funcional. Consequências práticas: não há um ficheiro <code>Outer$1.class</code> por lambda (o que reduz o número de classes carregadas e o tempo de arranque em aplicações com milhares de lambdas), e um lambda que não captura nada é instanciado uma vez e reutilizado — a JVM guarda a instância no <em>call site</em>. Um lambda que captura variáveis aloca um objecto por avaliação, embora a análise de fuga o elimine com frequência quando o lambda não escapa do método.</p>
+
+<p>A captura obedece a uma regra que se explica em cinco segundos e se percebe mal em entrevista: capturam-se valores, não variáveis. A variável local tem de ser <em>final</em> ou efectivamente final porque o lambda pode sobreviver ao <em>frame</em> da pilha que a criou; copiar o valor é a única forma barata de o garantir sem <em>heap allocation</em> de uma célula partilhada, como faz o Groovy ou o C#. Campos de instância não sofrem esta restrição — <code>this.contador++</code> compila dentro de um lambda — e é precisamente por isso que capturar <code>this</code> implicitamente é uma fuga de memória frequente em <em>listeners</em> registados num barramento estático.</p>
+
+<figure class="listing java" id="lst-6-1"><div class="lhead"><span class="lnum">Listagem 6.1</span>
+<span class="lcap">Boxing invisível: o mesmo cálculo com e sem especialização primitiva.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// 1) Stream&lt;Integer&gt;: cada elemento é um objecto no heap
+long somaBoxed = pedidos.stream()                 // Stream&lt;Pedido&gt;
+        .map(Pedido::centimos)                    // Stream&lt;Long&gt;  -&gt; boxing
+        .reduce(0L, Long::sum);                   // unboxing + boxing por passo
+
+// 2) LongStream: o valor viaja em long, sem alocação
+long soma = pedidos.stream()
+        .mapToLong(Pedido::centimos)              // LongStream
+        .sum();
+
+// 3) A armadilha do Integer cache: só -128..127 são interned
+Integer a = 127, b = 127;   // a == b  -&gt; true  (mesma instância em cache)
+Integer c = 128, d = 128;   // c == d  -&gt; false (duas instâncias distintas)
+// num Stream&lt;Integer&gt; com .distinct() ou .contains(), equals() salva;
+// num filtro escrito com == o bug só aparece acima de 127.</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa soma sobre 10 milhões de elementos, <code>Stream&lt;Integer&gt;.reduce(0, Integer::sum)</code> costuma ficar entre 3x e 8x mais lento do que <code>IntStream.sum()</code> sobre um <code>int[]</code>, e aloca na ordem de 10<sup>7</sup> objectos de 16 bytes — cerca de 160 MB de lixo que a colecção jovem tem de varrer. A diferença não está na abstracção do stream: está no <em>boxing</em>. O mesmo <code>for</code> sobre <code>Integer[]</code> sofre exactamente o mesmo custo.</p></aside>
+
+<div class="qa" id="q-6-1" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um lambda é açúcar sintáctico para uma classe anónima? Explique o que o compilador e a JVM fazem realmente, e em que é que isso se nota.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não é. Uma classe anónima produz um ficheiro <code>.class</code> em tempo de compilação e um <code>new</code> em tempo de execução. Um lambda produz um método privado sintético na própria classe e um <em>call site</em> <code>invokedynamic</code>; a ligação a uma implementação da interface funcional é feita na primeira execução pelo <code>LambdaMetafactory</code>, que gera a classe dinamicamente.</p>
+      <p>Isso nota-se em quatro sítios. Primeiro, no número de classes: uma aplicação Spring com 3 000 lambdas não carrega 3 000 classes extra do <em>jar</em>, o que reduz o tamanho do artefacto e o trabalho do <em>class loader</em>. Segundo, no arranque: a estratégia inverte-se, porque a geração acontece em <em>runtime</em>, e é por isso que compilação nativa com GraalVM tem de resolver os lambdas em tempo de construção. Terceiro, na alocação: um lambda sem captura é criado uma vez e o <em>call site</em> devolve sempre a mesma instância; um lambda com captura aloca por avaliação, embora a análise de fuga frequentemente elimine essa alocação. Quarto, na semântica de <code>this</code>: dentro de um lambda, <code>this</code> é o objecto envolvente, ao passo que numa classe anónima é a instância anónima — diferença que muda o significado de <code>this.equals(x)</code> e que explica fugas de memória em <em>callbacks</em>.</p>
+      <p>O trade-off relevante é entre lambdas e classes anónimas: quando é preciso estado mutável próprio, vários métodos, ou um nome no <em>stack trace</em> que diga alguma coisa ao operador de plantão, uma classe nomeada ganha. Um <em>stack trace</em> com <code>lambda$processar$3</code> a meio de um <em>pipeline</em> paralelo é significativamente mais difícil de ler do que um com <code>ValidadorDeIban.validar</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É o mesmo que uma classe anónima, só mais curto.» Nenhuma noção de <code>invokedynamic</code> nem de diferenças observáveis.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há <code>invokedynamic</code> mas não consegue nomear uma consequência prática; confunde a semântica de <code>this</code>.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o mecanismo, dá pelo menos duas consequências medíveis (classes carregadas, alocação com/sem captura, <code>this</code>) e sabe quando prefere uma classe nomeada.</td></tr>
+        <tr><td>Staff</td><td>Liga ao arranque e à imagem nativa, à qualidade dos <em>stack traces</em> em produção, e ao efeito de <em>call sites</em> megamórficos na <em>inlining</em> do JIT.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a variável capturada tem de ser efectivamente final?»</li>
+      <li>«<code>lista::add</code> e <code>x -&gt; lista.add(x)</code> são equivalentes? E <code>obterLista()::add</code>?»</li>
+      <li>«Um lambda sem captura aloca? Como o confirmaria?»</li>
+      <li>«O que muda para o GraalVM em imagem nativa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que lambdas são sempre mais rápidos do que classes anónimas, sem qualificar.</li>
+      <li>Julgar que <code>@FunctionalInterface</code> é obrigatória para o lambda compilar.</li>
+      <li>Não distinguir captura de variável local de captura de campo de instância.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-6-2" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos <code>repositorio.obterCache()::get</code> guardado num campo <code>Function</code> criado no arranque. Um colega diz que é equivalente a <code>k -&gt; repositorio.obterCache().get(k)</code>. Concorda?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não são equivalentes, e a diferença é uma fonte real de incidentes. Numa referência de método sobre uma expressão — <code>expr::metodo</code> — a expressão <code>expr</code> é avaliada <strong>uma vez</strong>, no momento em que a referência é criada, e o receptor fica capturado. No lambda, <code>repositorio.obterCache()</code> é avaliado em <strong>cada</strong> invocação.</p>
+      <p>Se <code>obterCache()</code> devolver sempre a mesma instância imutável, os dois comportam-se igual. Se devolver uma instância que é substituída — invalidação periódica, recarga de configuração, <em>failover</em> para um segundo Redis — a referência de método fica presa à instância antiga para sempre, e o sintoma em produção é um serviço que serve dados obsoletos indefinidamente sem um único erro nos <em>logs</em>. É o mesmo mecanismo por que <code>System.out::println</code> capturado ao arranque continua a escrever no <code>PrintStream</code> antigo depois de um <code>System.setOut</code>.</p>
+      <p>Há ainda um caso limite: se <code>expr</code> for <code>null</code>, <code>expr::metodo</code> lança <code>NullPointerException</code> na criação da referência, ao passo que o lambda só falha na primeira invocação. Isto é ocasionalmente desejável — falhar cedo no arranque em vez de falhar no primeiro pedido do cliente.</p>
+      <p>A regra prática: usar <code>Tipo::metodo</code> e <code>this::metodo</code> à vontade, porque o receptor é estável; suspeitar sempre de <code>chamada()::metodo</code> e de referências guardadas em campos de vida longa. Quando é preciso indirecção estável, guarda-se o <code>Supplier</code> da instância, não a referência ao método.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São a mesma coisa, o IDE até sugere a conversão.»</td></tr>
+        <tr><td>Mid</td><td>Suspeita que há diferença mas não consegue dizer qual, ou inverte o momento da avaliação.</td></tr>
+        <tr><td>Sénior</td><td>Identifica a avaliação única do receptor, dá um cenário de falha concreto e a correcção com <code>Supplier</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o <code>NullPointerException</code> antecipado, discute a diferença como escolha deliberada de «falhar no arranque vs. falhar no pedido» e sugere um teste que fixa o comportamento.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o campo for <code>volatile</code> — resolve?»</li>
+      <li>«Como é que escreveria um teste que apanhasse isto?»</li>
+      <li>«Quando é que a avaliação antecipada é a que se quer?»</li>
+      <li>«O que muda se a referência for a um método estático?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Aplicar «referência de método é sempre mais limpo» como regra sem excepção.</li>
+      <li>Não reconhecer que o problema é de tempo de vida do receptor, não de sintaxe.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-6-2" class="h2"><span class="secnum">6.2</span> Streams: pipeline, lazy evaluation e short-circuit<a class="anchor" href="#sec-6-2" aria-label="ligação">#</a></h2>
+
+<p>Um <em>pipeline</em> tem três partes: uma fonte (colecção, array, gerador, <code>Files.lines</code>), zero ou mais operações intermédias e exactamente uma operação terminal. As intermédias — <code>map</code>, <code>filter</code>, <code>sorted</code>, <code>limit</code>, <code>flatMap</code>, <code>distinct</code>, <code>peek</code> — devolvem um novo <code>Stream</code> e não executam nada: apenas acrescentam um estágio a uma lista ligada de estágios. A terminal — <code>collect</code>, <code>forEach</code>, <code>reduce</code>, <code>count</code>, <code>findFirst</code>, <code>anyMatch</code>, <code>toList</code> — é que percorre a fonte através do <code>Spliterator</code> e empurra cada elemento por toda a cadeia de <code>Sink</code>. Sem operação terminal, o <em>pipeline</em> nunca corre: é o erro mais comum em revisões de código, um <code>stream().map(this::guardar)</code> que não guarda nada.</p>
+
+<p>Isto tem uma consequência que muitos candidatos não conseguem prever no quadro: a execução é por elemento, não por estágio. Numa lista de um milhão de registos com <code>filter(...).map(...).findFirst()</code>, o primeiro elemento atravessa o filtro e o <code>map</code> antes de o segundo ser tocado, e se passar no filtro o <em>pipeline</em> pára ali. Não há um milhão de <code>filter</code> seguidos de um milhão de <code>map</code>. É esta fusão de estágios (<em>loop fusion</em>) que torna os streams competitivos com um ciclo escrito à mão.</p>
+
+<p>As operações que cortam cedo são <code>limit</code>, <code>takeWhile</code>, <code>findFirst</code>, <code>findAny</code>, <code>anyMatch</code>, <code>allMatch</code> e <code>noneMatch</code>. As que são <em>barreiras com estado</em> — <code>sorted</code> e <code>distinct</code> — obrigam a materializar todos os elementos antes de emitir o primeiro, e por isso anulam o benefício de um <code>limit</code> colocado a seguir a elas em fontes infinitas ou muito grandes. Ordenar um milhão de registos para levar os dez maiores custa O(n log n) e vários megabytes de <em>array</em> intermédio; a alternativa correcta é um <em>heap</em> limitado de tamanho 10 ou uma cláusula <code>ORDER BY … LIMIT 10</code> na base de dados, que faz o mesmo trabalho com um índice.</p>
+
+<figure class="listing java" id="lst-6-2"><div class="lhead"><span class="lnum">Listagem 6.2</span>
+<span class="lcap">Lazy evaluation e short-circuit: a ordem em que as mensagens aparecem.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>List&lt;String&gt; nomes = List.of("ana", "bruno", "carla", "duarte");
+
+Optional&lt;String&gt; r = nomes.stream()
+        .filter(n -&gt; { System.out.println("filtro: " + n); return n.length() &gt; 4; })
+        .map(n -&gt;   { System.out.println("  map: " + n); return n.toUpperCase(); })
+        .findFirst();
+
+// Saída:
+// filtro: ana
+// filtro: bruno
+//   map: bruno
+// -&gt; 3 chamadas no total, não 4 + 2. "carla" e "duarte" nunca são tocados.
+
+// Sem terminal, nada corre:
+nomes.stream().map(n -&gt; { System.out.println("nunca"); return n; });   // silêncio
+
+// Barreira com estado: sorted() consome tudo antes de emitir o primeiro
+long n = Stream.iterate(1L, x -&gt; x + 1)
+        .limit(1_000_000)
+        .sorted()          // materializa 1e6 elementos em memória
+        .limit(10)         // o limit chega tarde de mais
+        .count();</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>Files.lines(caminho)</code> e <code>Files.walk</code> devolvem streams que seguram um descritor de ficheiro. Sem <code>try (var s = Files.lines(p))</code>, o descritor só é libertado pelo colector de lixo — num serviço que lê 500 ficheiros por minuto, o limite de <code>ulimit -n</code> (tipicamente 1024 num contentor por omissão) esgota-se em poucos minutos com <code>Too many open files</code>. Streams de colecções não precisam de fecho; streams de I/O precisam sempre.</p></aside>
+
+<div class="qa" id="q-6-3" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Distinga operações intermédias de terminais e diga-me, para <code>lista.stream().filter(f).map(m).findFirst()</code> sobre um milhão de elementos, quantas vezes <code>f</code> e <code>m</code> são chamados e porquê.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>As intermédias devolvem um <code>Stream</code> e são preguiçosas: apenas registam um estágio. A terminal desencadeia o percurso e produz um valor, uma colecção ou um efeito. Em <code>filter(f).map(m).findFirst()</code>, <code>f</code> é chamado até ao primeiro elemento que passe — se for o k-ésimo, são k chamadas — e <code>m</code> é chamado exactamente uma vez. Se nenhum elemento passar, são um milhão de chamadas a <code>f</code>, zero a <code>m</code>, e o resultado é <code>Optional.empty()</code>.</p>
+      <p>O mecanismo é a fusão de estágios: a terminal pede elementos ao <code>Spliterator</code> da fonte e empurra cada um pela cadeia de <code>Sink</code>; cada elemento atravessa o <em>pipeline</em> inteiro antes de o seguinte ser lido. As operações que cortam cedo sinalizam isso ao percurso, e o <code>forEachRemaining</code> é interrompido. Por isso a ordem das operações importa em termos de custo real: pôr o <code>filter</code> mais selectivo primeiro reduz o número de invocações de tudo o que vem depois, e um <code>map</code> caro colocado antes de um <code>filter</code> é dinheiro deitado fora — o compilador não reordena estágios por nós.</p>
+      <p>A excepção são as barreiras com estado. <code>sorted()</code> e <code>distinct()</code> têm de ver todos os elementos antes de emitir o primeiro, portanto anulam o corte antecipado para tudo o que esteja a montante e obrigam a materializar a fonte. Um <code>limit(10)</code> depois de um <code>sorted()</code> não evita ordenar um milhão de registos.</p>
+      <p>O trade-off que interessa referir: esta preguiça é o que permite trabalhar com fontes infinitas (<code>Stream.iterate</code>, <code>Stream.generate</code>) e é também o que torna os efeitos secundários dentro do <em>pipeline</em> imprevisíveis — o número de vezes que um <code>peek</code> corre depende de optimizações que não fazem parte do contrato.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Filtra um milhão e depois mapeia um milhão.» Não conhece a preguiça.</td></tr>
+        <tr><td>Mid</td><td>Diz «é lazy» e acerta no resultado, mas não explica a fusão nem sabe o caso em que nada passa no filtro.</td></tr>
+        <tr><td>Sénior</td><td>Dá k chamadas a <code>f</code> e uma a <code>m</code>, explica <code>Spliterator</code>/<code>Sink</code>, e usa isso para justificar a ordem das operações.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta as barreiras com estado, o efeito no consumo de memória, e liga ao desenho de APIs que devolvem <code>Stream</code> em vez de <code>List</code> para não materializar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se puser um <code>sorted()</code> antes do <code>findFirst()</code>?»</li>
+      <li>«Quando é que faz sentido uma API devolver <code>Stream&lt;T&gt;</code> em vez de <code>List&lt;T&gt;</code>?»</li>
+      <li>«<code>anyMatch(p)</code> e <code>filter(p).findFirst().isPresent()</code> custam o mesmo?»</li>
+      <li>«Como é que isto muda em paralelo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Acreditar que a JVM reordena <code>filter</code> e <code>map</code> por si.</li>
+      <li>Descrever streams como «for elegante» sem nenhuma noção de execução.</li>
+      <li>Ignorar que <code>sorted()</code> materializa e mata o corte antecipado.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-6-4" data-box="qa" data-area="java" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tenho <code>List&lt;Encomenda&gt;</code> e cada encomenda tem <code>List&lt;Linha&gt;</code>. Quero o total facturado por SKU. Escreva a diferença entre <code>map</code> e <code>flatMap</code> aqui e diga quando usaria <code>mapMulti</code>.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>map</code> é uma transformação 1 para 1: <code>encomendas.stream().map(Encomenda::linhas)</code> dá <code>Stream&lt;List&lt;Linha&gt;&gt;</code>, um elemento por encomenda. <code>flatMap</code> é 1 para N com achatamento: recebe uma função que devolve um <code>Stream</code> por elemento e concatena os resultados, dando <code>Stream&lt;Linha&gt;</code>. Para agrupar por SKU precisa-se do segundo.</p>
+      <p>A implementação escreve-se numa linha: <code>encomendas.stream().flatMap(e -&gt; e.linhas().stream()).collect(groupingBy(Linha::sku, summingLong(Linha::centimos)))</code>. Se cada encomenda tem em média 8 linhas e há 50 000 encomendas, o <em>pipeline</em> vê 400 000 elementos e produz um mapa com tantas entradas quantos os SKU distintos.</p>
+      <p>O detalhe de nível sénior é o custo: <code>flatMap</code> consome cada sub-stream até ao fim antes de passar ao seguinte, e por isso o corte antecipado a jusante é imperfeito — um <code>findFirst()</code> depois de um <code>flatMap</code> pode processar a sub-colecção inteira do primeiro elemento. Além disso, cada chamada aloca um <code>Stream</code> temporário; sobre 400 000 encomendas com listas pequenas, essa alocação domina o custo.</p>
+      <p>É aí que entra <code>mapMulti</code>: em vez de devolver um <code>Stream</code>, recebe um <code>Consumer</code> e o código empurra zero, um ou vários resultados directamente para o estágio seguinte. Elimina o stream intermédio. A regra é simples: usa-se <code>flatMap</code> por omissão, porque é mais legível; passa-se a <code>mapMulti</code> quando o factor de expansão é pequeno (0 a 2 elementos), o <em>pipeline</em> é quente e a medição mostra que a alocação dos streams intermédios é significativa. Trocar legibilidade por <code>mapMulti</code> sem medir é optimização prematura.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe achatar; propõe ciclos aninhados com uma lista temporária e um <code>addAll</code>.</td></tr>
+        <tr><td>Mid</td><td>Usa <code>flatMap</code> correctamente e escreve o <code>groupingBy</code>, sem falar de custo.</td></tr>
+        <tr><td>Sénior</td><td>Explica o achatamento, o <code>summingLong</code> como <em>downstream</em>, e conhece o custo do stream intermédio e o corte antecipado imperfeito.</td></tr>
+        <tr><td>Staff</td><td>Traz <code>mapMulti</code> com o critério de quando compensa, e questiona se a agregação não deveria ser feita em SQL com <code>GROUP BY</code> para não trazer 400 000 linhas para a JVM.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se uma encomenda tiver <code>linhas()</code> a <code>null</code>?»</li>
+      <li>«Como devolve também a contagem de linhas por SKU no mesmo percurso?»</li>
+      <li>«Faria isto em Java ou em SQL? Com que critério?»</li>
+      <li>«O que muda se as encomendas vierem de um cursor de base de dados?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Fazer <code>collect(toList())</code> a meio só para voltar a abrir outro stream.</li>
+      <li>Somar valores monetários em <code>double</code> em vez de <code>long</code> de cêntimos ou <code>BigDecimal</code>.</li>
+      <li>Não notar que o achatamento multiplica o número de elementos processados.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-6-5" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Este código lança <code>IllegalStateException: stream has already been operated upon or closed</code> em produção uma vez por dia. Guardamos o stream num campo e usamo-lo em dois métodos. Como explica e como corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <code>Stream</code> é de utilização única. Internamente há um estado <code>linkedOrConsumed</code>; assim que uma operação intermédia é encadeada ou uma terminal é executada, o <em>pipeline</em> fica marcado e qualquer nova utilização lança <code>IllegalStateException</code>. Não é um <em>bug</em> da biblioteca: é o preço de o stream ser uma vista preguiçosa sobre uma fonte, possivelmente infinita ou de I/O, que não pode ser rebobinada.</p>
+      <p>Guardar um <code>Stream</code> num campo é quase sempre um erro de desenho, e o facto de falhar «uma vez por dia» sugere que o segundo consumo é raro — um caminho de erro, um <em>retry</em>, um <em>endpoint</em> secundário. Há três correcções, por ordem de preferência. Primeira: guardar a fonte, não o stream — um <code>List&lt;T&gt;</code> imutável, e abrir <code>list.stream()</code> em cada uso; custa memória proporcional ao tamanho, mas é trivialmente correcto. Segunda: guardar um <code>Supplier&lt;Stream&lt;T&gt;&gt;</code> e invocá-lo em cada consumo, que é o padrão certo quando a fonte é cara de materializar mas barata de reabrir. Terceira: se a fonte for I/O e só puder ser lida uma vez (um <code>InputStream</code>, um cursor de base de dados), então o consumo único é a semântica correcta e o que tem de mudar é o desenho — quem consome recebe o stream como parâmetro e fecha-o num <code>try-with-resources</code>.</p>
+      <p>Vale a pena distinguir do erro parecido: <code>Optional</code>, <code>Iterator</code> e <code>Spliterator</code> também são de consumo único; <code>Iterable</code> e <code>Collection</code> não. Uma API interna que devolve <code>Stream&lt;T&gt;</code> transfere para o chamador a obrigação de o consumir uma só vez e de o fechar, o que é uma boa escolha para resultados grandes e uma má escolha para um DTO que vai ser lido em três sítios.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe apanhar a excepção e repetir, ou culpa a concorrência sem evidência.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o stream é de uso único e materializa numa lista, sem discutir o custo nem o caso de I/O.</td></tr>
+        <tr><td>Sénior</td><td>Explica <code>linkedOrConsumed</code> e o porquê semântico, oferece <code>Supplier&lt;Stream&lt;T&gt;&gt;</code> e distingue fonte reabrível de fonte de I/O.</td></tr>
+        <tr><td>Staff</td><td>Reenquadra como decisão de API: quem é dono do ciclo de vida, o que se promete no contrato do método, e como um teste que consome duas vezes fixa a regressão.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se dois <em>threads</em> consumirem o mesmo stream ao mesmo tempo?»</li>
+      <li>«Quando devolveria <code>Stream&lt;T&gt;</code> numa API pública?»</li>
+      <li>«Como garante que um stream de <code>Files.lines</code> é fechado?»</li>
+      <li>«Que teste teria apanhado isto antes do <em>deploy</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Sugerir <code>stream.onClose</code> ou <code>parallel()</code> como solução.</li>
+      <li>Não perceber que o problema é de posse e ciclo de vida, não de sintaxe.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-6-3" class="h2"><span class="secnum">6.3</span> Colectores, agrupamentos e reduções<a class="anchor" href="#sec-6-3" aria-label="ligação">#</a></h2>
+
+<p>Um <code>Collector&lt;T,A,R&gt;</code> são cinco peças: <code>supplier</code> cria o contentor mutável, <code>accumulator</code> junta um elemento, <code>combiner</code> funde dois contentores (só usado em paralelo), <code>finisher</code> converte o contentor no resultado e <code>characteristics</code> declara propriedades como <code>UNORDERED</code>, <code>CONCURRENT</code> e <code>IDENTITY_FINISH</code>. Perceber estas cinco peças é o que permite responder a metade das perguntas desta secção sem decorar a API.</p>
+
+<p>A distinção entre <code>reduce</code> e <code>collect</code> deriva daí. <code>reduce</code> é redução imutável: cada passo produz um valor novo. <code>collect</code> é redução mutável: cada passo altera um contentor existente. Para <code>long</code> e <code>int</code>, <code>reduce</code> é ideal, porque criar um novo <code>long</code> não custa nada. Para <code>String</code> ou <code>List</code>, <code>reduce</code> é uma armadilha de complexidade: concatenar n cadeias com <code>reduce(&quot;&quot;, String::concat)</code> aloca uma cadeia nova por passo e é O(n²) em cópias de bytes — com 100 000 elementos de 20 caracteres, são cerca de 10<sup>11</sup> bytes copiados, o que na prática significa que o serviço deixa de responder. <code>Collectors.joining()</code> usa um único <code>StringBuilder</code> e é O(n).</p>
+
+<p>Os colectores que aparecem em entrevista são poucos e vale a pena dominá-los a fundo: <code>toList</code> (e o <code>Stream.toList()</code> desde o Java 16, que devolve uma lista imutável e aceita <code>null</code>), <code>toMap</code> com e sem função de fusão, <code>groupingBy</code> com <em>downstream</em>, <code>partitioningBy</code>, <code>counting</code>, <code>summingLong</code>, <code>averagingDouble</code>, <code>summarizingLong</code>, <code>mapping</code>, <code>filtering</code>, <code>flatMapping</code>, <code>collectingAndThen</code> e <code>teeing</code>. As três armadilhas clássicas: <code>toMap</code> lança <code>IllegalStateException</code> em chave duplicada (<code>groupingBy</code> não), <code>toMap</code> lança <code>NullPointerException</code> se o valor for <code>null</code> (porque usa <code>merge</code>), e <code>groupingBy</code> devolve um <code>HashMap</code> sem ordem — se a ordem importa, passa-se <code>TreeMap::new</code> ou <code>LinkedHashMap::new</code> como fábrica.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 6.1</span> Colectores por objectivo, com o que falha se for o escolhido errado.</div>
+<div class="tscroll"><table><thead><tr><th>Objectivo</th><th>Colector</th><th>Falha típica da alternativa</th></tr></thead><tbody>
+<tr><td>Somar um campo</td><td><code>summingLong</code> / <code>mapToLong().sum()</code></td><td><code>reduce</code> sobre <code>Stream&lt;Long&gt;</code>: boxing por elemento</td></tr>
+<tr><td>Concatenar texto</td><td><code>joining(", ")</code></td><td><code>reduce("", String::concat)</code>: O(n²)</td></tr>
+<tr><td>Índice por chave única</td><td><code>toMap(k, v)</code></td><td><code>groupingBy</code>: dá <code>Map&lt;K,List&lt;V&gt;&gt;</code> com listas de um elemento</td></tr>
+<tr><td>Índice com chaves repetidas</td><td><code>toMap(k, v, (a,b) -&gt; b)</code></td><td><code>toMap</code> sem fusão: <code>IllegalStateException</code> em produção</td></tr>
+<tr><td>Contar por categoria</td><td><code>groupingBy(f, counting())</code></td><td><code>groupingBy(f)</code> + <code>size()</code>: materializa listas inteiras</td></tr>
+<tr><td>Duas agregações num percurso</td><td><code>teeing(c1, c2, fusão)</code></td><td>Dois <code>stream()</code> sobre a mesma fonte: 2x o percurso</td></tr>
+<tr><td>Mapa imutável no fim</td><td><code>collectingAndThen(toMap(...), Map::copyOf)</code></td><td>Devolver o <code>HashMap</code> interno: mutável por quem o receber</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><code>groupingBy(f, counting())</code> guarda um <code>Long</code> por grupo; <code>groupingBy(f)</code> guarda a lista completa de elementos de cada grupo. Para 2 milhões de eventos em 50 categorias, o primeiro ocupa uns poucos kilobytes e o segundo mantém referências aos 2 milhões de objectos vivos até o mapa ser descartado — diferença entre um <em>heap</em> plano e uma pausa de GC. Guardar as listas só se justifica se as listas forem realmente usadas a seguir; caso contrário, escolhe-se sempre o <em>downstream</em> agregador.</p></aside>
+
+<div class="qa" id="q-6-6" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando é que usa <code>reduce</code> e quando é que usa <code>collect</code>? Dê-me um caso em que <code>reduce</code> é claramente a escolha errada e explique o custo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>reduce</code> faz redução imutável — cada passo devolve um valor novo — e exige que o acumulador seja associativo e sem estado, e que a identidade seja neutra. <code>collect</code> faz redução mutável: acumula num contentor que é alterado no lugar. A regra é o custo de criar o valor intermédio: barato para primitivos, caro para estruturas.</p>
+      <p>O caso errado clássico é a concatenação. <code>strings.stream().reduce(&quot;&quot;, String::concat)</code> aloca uma <code>String</code> nova em cada passo e copia tudo o que já lá estava: com n elementos de comprimento médio m, são O(n²·m) bytes copiados. Com 100 000 elementos de 20 caracteres, isso são dezenas de milhares de milhões de bytes copiados e uma pressão de alocação que enche a geração jovem repetidamente. <code>Collectors.joining()</code> resolve o mesmo problema com um <code>StringBuilder</code> em O(n·m). O mesmo padrão aplica-se a <code>reduce</code> com <code>List</code>: <code>(a, b) -&gt; { var l = new ArrayList&lt;&gt;(a); l.add(b); return l; }</code> é O(n²) e aparece em código real.</p>
+      <p>Há um segundo erro, mais subtil, que é usar <code>reduce</code> com um acumulador que muta o argumento — <code>(lista, x) -&gt; { lista.add(x); return lista; }</code>. Funciona em série e produz resultados errados em paralelo, porque a identidade é partilhada entre ramos e o contrato de associatividade é violado. É exactamente esse caso de uso que <code>collect</code> existe para servir, com <code>supplier</code>, <code>accumulator</code> e <code>combiner</code> separados.</p>
+      <p>Quando é que <code>reduce</code> ganha, então? Em agregações escalares: soma, máximo, mínimo, <em>hash</em> combinado, produto de matrizes pequenas — e sobretudo em <code>IntStream</code>/<code>LongStream</code>, onde não há alocação nenhuma e a versão com <code>collect</code> seria mais verbosa sem qualquer ganho. Para tudo o que seja construir uma estrutura, <code>collect</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São a mesma coisa, <code>collect</code> é para listas.» Sem noção de custo.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>joining</code> é melhor do que <code>reduce</code> para texto, mas não sabe dizer porquê nem quantifica.</td></tr>
+        <tr><td>Sénior</td><td>Imutável vs. mutável, O(n²) contra O(n), associatividade, e o exemplo do acumulador que muta o argumento.</td></tr>
+        <tr><td>Staff</td><td>Descreve as cinco peças do <code>Collector</code>, explica porque é que o <code>combiner</code> só é chamado em paralelo e como testaria a associatividade de um colector próprio.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva a assinatura do <code>reduce</code> de três argumentos e diga para que serve o terceiro.»</li>
+      <li>«O <code>combiner</code> é chamado num stream sequencial?»</li>
+      <li>«Como escreveria um <code>Collector</code> para um histograma de latências?»</li>
+      <li>«O que acontece se o acumulador não for associativo em paralelo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>reduce</code> com acumulador que muta o argumento e chamar-lhe correcto.</li>
+      <li>Não conseguir explicar o que a identidade tem de garantir.</li>
+      <li>Afirmar que <code>collect</code> é sempre mais lento por «criar objectos».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-6-7" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Preciso, por comerciante, do número de transacções e da soma só das aprovadas, num único percurso e sem materializar listas. Como escreve o <code>groupingBy</code> e que armadilhas tem o <em>downstream</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <code>groupingBy</code> com <em>downstream</em> composto resolve-o. O <em>downstream</em> por omissão é <code>toList()</code>; substituí-lo por um agregador evita guardar os elementos. Para duas agregações no mesmo percurso usa-se <code>teeing</code>, que corre dois colectores em paralelo sobre o mesmo fluxo e funde os resultados no fim: <code>groupingBy(Tx::comerciante, teeing(counting(), filtering(t -&gt; t.aprovada(), summingLong(Tx::centimos)), Resumo::new))</code>.</p>
+      <p>A armadilha número um é <code>filter</code> antes do <code>groupingBy</code> em vez de <code>filtering</code> dentro dele. <code>stream().filter(Tx::aprovada).collect(groupingBy(...))</code> faz desaparecer do mapa os comerciantes que só tiveram transacções recusadas — e num relatório de risco são precisamente esses que interessam. <code>Collectors.filtering</code> aplica o filtro depois do agrupamento, mantendo o grupo com contagem zero.</p>
+      <p>A número dois é a ordem e o tipo do mapa: <code>groupingBy</code> devolve um <code>HashMap</code> e a ordem de iteração não é a de inserção. Se o relatório é lido por um humano ou comparado em testes, passa-se a fábrica: <code>groupingBy(f, TreeMap::new, downstream)</code>. A número três é <code>summarizingLong</code> sobre grupos possivelmente vazios: <code>getMax()</code> devolve <code>Long.MIN_VALUE</code> e <code>getAverage()</code> devolve 0,0 quando a contagem é zero — publicar isso num painel dá números absurdos, portanto o <code>finisher</code> tem de tratar o caso.</p>
+      <p>Sobre custo: um percurso com <code>teeing</code> sobre 2 milhões de transacções e 5 000 comerciantes faz uma passagem, aloca 5 000 entradas e dois acumuladores por entrada. A alternativa ingénua — dois <code>stream()</code> sobre a mesma lista — duplica o percurso e, se a fonte for um cursor de base de dados, é impossível. O trade-off do <code>teeing</code> é a legibilidade: aninhar mais do que dois níveis torna-se ilegível, e nesse ponto compensa escrever um <code>Collector</code> próprio ou um acumulador mutável com <code>collect(supplier, accumulator, combiner)</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Faz dois percursos, ou agrupa em listas e depois itera o mapa para somar.</td></tr>
+        <tr><td>Mid</td><td>Usa <code>groupingBy</code> com <code>counting()</code>, mas filtra antes de agrupar e perde grupos.</td></tr>
+        <tr><td>Sénior</td><td>Usa <code>teeing</code> + <code>filtering</code>, justifica o percurso único e conhece o tipo de mapa devolvido.</td></tr>
+        <tr><td>Staff</td><td>Discute o caso do grupo vazio em <code>summarizing*</code>, quando passar a <code>Collector</code> próprio, e se a agregação não devia estar em SQL.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se quisesse também o percentil 95 do valor por comerciante?»</li>
+      <li>«Como é que garante que o mapa devolvido é imutável?»</li>
+      <li>«Este <em>pipeline</em> é seguro em <code>parallelStream()</code>? Porquê?»</li>
+      <li>«Quando é que passa a <code>groupingByConcurrent</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Filtrar antes de agrupar sem reparar nos grupos que desaparecem.</li>
+      <li>Acumular num <code>HashMap</code> partilhado dentro de um <code>forEach</code>.</li>
+      <li>Devolver o <code>HashMap</code> interno como se fosse imutável.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-6-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 6.1 — Relatório por comerciante num só percurso</span>
+    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Dada <code>List&lt;Transacao&gt;</code> com <code>record Transacao(String comerciante, long centimos, Estado estado)</code> e <code>enum Estado { APROVADA, RECUSADA }</code>, produza <code>Map&lt;String, Resumo&gt;</code> em que <code>record Resumo(long total, long aprovadas, long recusadas, long maiorAprovada, double mediaAprovada)</code>. Restrições: um único percurso da lista (a fonte pode ser um cursor), sem ordenar, sem materializar as listas de cada grupo, e comerciantes com zero aprovadas têm de aparecer no mapa com <code>maiorAprovada = 0</code> e <code>mediaAprovada = 0.0</code>. Exemplo: com <code>[("A",1000,APROVADA), ("A",500,RECUSADA), ("B",300,RECUSADA)]</code> o resultado é <code>{A=Resumo[2,1,1,1000,1000.0], B=Resumo[1,0,1,0,0.0]}</code>. Escreva a versão funcional e depois a imperativa equivalente, e diga qual defenderia numa revisão de código.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-6-3"><div class="lhead"><span class="lnum">Listagem 6.3</span>
+        <span class="lcap">Versão funcional: groupingBy + teeing + filtering, um percurso.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>import java.util.*;
+import java.util.stream.*;
+import static java.util.stream.Collectors.*;
+
+enum Estado { APROVADA, RECUSADA }
+record Transacao(String comerciante, long centimos, Estado estado) {}
+record Resumo(long total, long aprovadas, long recusadas,
+              long maiorAprovada, double mediaAprovada) {}
+
+static Map&lt;String, Resumo&gt; relatorio(List&lt;Transacao&gt; txs) {
+    return txs.stream().collect(groupingBy(
+            Transacao::comerciante,
+            TreeMap::new,                       // ordem estável para relatório e testes
+            teeing(
+                counting(),                     // ramo 1: total do grupo
+                filtering(t -&gt; t.estado() == Estado.APROVADA,
+                          summarizingLong(Transacao::centimos)),   // ramo 2: só aprovadas
+                (total, ap) -&gt; new Resumo(
+                        total,
+                        ap.getCount(),
+                        total - ap.getCount(),
+                        ap.getCount() == 0 ? 0L : ap.getMax(),      // MIN_VALUE se vazio
+                        ap.getCount() == 0 ? 0.0 : ap.getAverage()))));
+}
+
+// Variante imutável, se o mapa sair da fronteira do serviço:
+static Map&lt;String, Resumo&gt; relatorioImutavel(List&lt;Transacao&gt; txs) {
+    return Collections.unmodifiableMap(relatorio(txs));
+}</code></pre></figure>
+      <figure class="listing java" id="lst-6-4"><div class="lhead"><span class="lnum">Listagem 6.4</span>
+        <span class="lcap">Versão imperativa equivalente: acumulador mutável e um único ciclo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>static Map&lt;String, Resumo&gt; relatorioImperativo(List&lt;Transacao&gt; txs) {
+    final class Acc { long total, aprovadas, soma, maior; }
+    Map&lt;String, Acc&gt; acc = new TreeMap&lt;&gt;();
+
+    for (Transacao t : txs) {                       // um percurso, sem alocação por elemento
+        Acc a = acc.computeIfAbsent(t.comerciante(), k -&gt; new Acc());
+        a.total++;
+        if (t.estado() == Estado.APROVADA) {
+            a.aprovadas++;
+            a.soma += t.centimos();
+            if (t.centimos() &gt; a.maior) a.maior = t.centimos();
+        }
+    }
+
+    Map&lt;String, Resumo&gt; out = new TreeMap&lt;&gt;();
+    acc.forEach((nome, a) -&gt; out.put(nome, new Resumo(
+            a.total, a.aprovadas, a.total - a.aprovadas, a.maior,
+            a.aprovadas == 0 ? 0.0 : (double) a.soma / a.aprovadas)));
+    return out;
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Ambas são O(n) em tempo e O(g) em memória, com g = número de comerciantes distintos. A funcional aloca dois acumuladores por grupo (o <code>LongSummaryStatistics</code> e o contador do <code>teeing</code>); a imperativa aloca um objecto <code>Acc</code> por grupo. Para g = 5 000 a diferença é irrelevante; para g na ordem de 10<sup>6</sup> a imperativa poupa memória mensurável.</li>
+        <li>Caso limite decisivo: comerciante sem transacções aprovadas. <code>summarizingLong</code> devolve <code>getMax() == Long.MIN_VALUE</code> e <code>getAverage() == 0.0</code> num grupo vazio — quem não trata isto publica <code>-9223372036854775808</code> no relatório. Foi por isso que o enunciado o exigiu.</li>
+        <li>Segundo caso limite: <code>filter</code> antes do <code>groupingBy</code> faria desaparecer o comerciante «B» do resultado. <code>Collectors.filtering</code> mantém o grupo.</li>
+        <li><code>TreeMap::new</code> dá ordem determinística; sem ele, os testes que comparam o mapa serializado tornam-se instáveis entre execuções com <code>String</code> de <em>hash</em> diferente.</li>
+        <li>Em paralelo, a versão funcional continua correcta porque cada colector tem <code>combiner</code>; a imperativa não é segura sem sincronização. Isto é argumento a favor da funcional apenas se o paralelismo for real — ver a secção seguinte.</li>
+        <li>O que se procura na defesa: reconhecer que a imperativa é mais fácil de depurar (<em>breakpoint</em> no ciclo, <em>stack trace</em> legível) e a funcional mais fácil de compor e paralelizar; escolher com base em quem mantém o código, e não por gosto.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-6-4" class="h2"><span class="secnum">6.4</span> Streams paralelos: quando ajudam e quando destroem<a class="anchor" href="#sec-6-4" aria-label="ligação">#</a></h2>
+
+<p><code>parallelStream()</code> e <code>stream().parallel()</code> submetem o trabalho ao <code>ForkJoinPool.commonPool()</code>, um <em>pool</em> estático partilhado por todo o processo cuja dimensão por omissão é <code>Runtime.getRuntime().availableProcessors() - 1</code> — o <em>thread</em> chamador também participa. Num contentor Kubernetes com <code>limits.cpu: 2</code>, uma JVM moderna respeita a quota do <em>cgroup</em> e reporta 2 processadores, portanto o <em>pool</em> comum tem 1 <em>thread</em> além do chamador. Todo o ganho teórico do paralelismo desaparece, e fica só o custo de dividir e fundir.</p>
+
+<p>A heurística de decisão é o modelo N·Q: N é o número de elementos e Q o custo por elemento em unidades arbitrárias. Abaixo de N·Q na ordem de 10<sup>4</sup>, o custo fixo do <em>fork/join</em> — dividir o <code>Spliterator</code>, submeter tarefas, roubar trabalho, fundir com o <code>combiner</code> — domina e o paralelo perde. Há ainda a qualidade da divisão: <code>ArrayList</code>, arrays e <code>IntStream.range</code> dividem-se em O(1) e por metades exactas; <code>LinkedList</code>, <code>Stream.iterate</code>, <code>BufferedReader.lines</code> e <code>HashMap</code> com muitas colisões dividem-se mal ou não dividem, e nesses casos o paralelo é quase sempre mais lento.</p>
+
+<p>O problema grave, porém, não é a performance: é o acoplamento. O <em>pool</em> comum é partilhado com tudo o que na aplicação use <code>CompletableFuture</code> sem executor explícito e com qualquer outra biblioteca que dele dependa. Um único <code>parallelStream()</code> que faça uma chamada HTTP bloqueante por elemento sobre 500 elementos ocupa os poucos <em>threads</em> do <em>pool</em> durante segundos e paralisa componentes que não têm nada a ver com aquele pedido. Num servidor que já processa 200 pedidos concorrentes, cada um com o seu <em>thread</em>, não há paralelismo por explorar: o CPU já está saturado e o paralelismo por pedido só acrescenta contenção e piora a cauda de latência.</p>
+
+<figure class="listing java" id="lst-6-5"><div class="lhead"><span class="lnum">Listagem 6.5</span>
+<span class="lcap">Isolar o paralelismo do pool comum, e a alternativa correcta para I/O.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// MAU: bloqueia o pool comum de todo o processo com I/O
+List&lt;Resposta&gt; r = ids.parallelStream().map(cliente::obterBloqueante).toList();
+
+// Menos mau para trabalho CPU-bound que se quer isolar: pool dedicado.
+// Funciona porque uma ForkJoinTask submetida a um pool executa nesse pool.
+try (var pool = new java.util.concurrent.ForkJoinPool(4)) {
+    List&lt;Long&gt; hashes = pool.submit(() -&gt;
+            blocos.parallelStream().map(Hashing::sha256).toList()).join();
+}
+
+// CERTO para I/O em Java 21+: um thread virtual por chamada, sem tocar no pool comum
+try (var exec = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+    List&lt;java.util.concurrent.Future&lt;Resposta&gt;&gt; fs =
+            exec.invokeAll(ids.stream()
+                    .&lt;java.util.concurrent.Callable&lt;Resposta&gt;&gt;map(
+                            id -&gt; () -&gt; cliente.obterBloqueante(id))
+                    .toList());
+}</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Somar 100 elementos de um <code>ArrayList</code> em paralelo custa tipicamente mais 5 a 20 microssegundos do que em série, só em <em>overhead</em> de <em>fork/join</em>. Somar 10 milhões de <code>int</code> de um array com 8 núcleos disponíveis chega a ganhar 4x a 6x. Entre estes extremos, N·Q ≈ 10<sup>4</sup> é a fronteira empírica citada pelos autores da API, e a única forma de a confirmar no caso concreto é um <em>benchmark</em> JMH com a fonte real.</p></aside>
+
+<div class="qa" id="q-6-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um colega substituiu <code>stream()</code> por <code>parallelStream()</code> num serviço REST e diz que ficou mais rápido no portátil dele. O que pergunta antes de aprovar o <em>pull request</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não aprovo sem quatro respostas. Primeira: onde é que este <em>pipeline</em> corre? Se for dentro de um <em>handler</em> de pedido de um serviço que já processa dezenas ou centenas de pedidos concorrentes, o CPU já está saturado por paralelismo entre pedidos; acrescentar paralelismo dentro do pedido não cria capacidade, só acrescenta contenção e alarga o p99. O portátil dele tem 10 núcleos ociosos e um pedido de cada vez — não é o ambiente de produção.</p>
+      <p>Segunda: qual é N e qual é Q? Se forem 50 elementos com uma comparação de <code>String</code> cada, N·Q está três ordens de grandeza abaixo do limiar útil e o paralelo é mais lento por causa do custo de dividir e fundir. Terceira: a fonte divide-se bem? <code>ArrayList</code> e arrays dividem em O(1); <code>LinkedList</code>, <code>Stream.iterate</code> ou linhas de ficheiro não, e o trabalho acaba desequilibrado num ramo só.</p>
+      <p>Quarta, e a mais importante: há I/O ou bloqueio no <em>pipeline</em>? <code>parallelStream()</code> usa o <code>ForkJoinPool.commonPool()</code>, que é global ao processo e dimensionado a <code>availableProcessors() - 1</code>. Num contentor com <code>limits.cpu: 2</code> isso é um <em>thread</em>. Uma chamada HTTP de 200 ms por elemento sobre 100 elementos ocupa esse <em>pool</em> durante dezenas de segundos e bloqueia todos os <code>CompletableFuture</code> sem executor explícito da aplicação inteira. Para I/O, a resposta em Java 21 é um executor de <em>threads</em> virtuais ou concorrência estruturada, não um stream paralelo.</p>
+      <p>Também verifico se o <em>pipeline</em> é seguro: nada de acumular em colecções partilhadas não sincronizadas, e o <code>combiner</code> dos colectores tem de ser associativo. E peço a medição certa — JMH ou um teste de carga com a distribuição real de N, não um <code>System.nanoTime</code> em torno de uma execução única com o JIT ainda frio.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Se ficou mais rápido, aprova-se.» Ou rejeita paralelismo por princípio, sem argumento.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é preciso medir e que N tem de ser grande; desconhece o <em>pool</em> comum e o efeito em contentor.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia o <code>commonPool</code>, a paralelismo <code>availableProcessors()-1</code>, o problema do I/O bloqueante e a saturação já existente no servidor.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito no p99 e no orçamento de latência, propõe <em>threads</em> virtuais para I/O, e define o critério de aceitação da medição antes de mudar código.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como isolaria o paralelismo do <em>pool</em> comum?»</li>
+      <li>«O que reporta <code>availableProcessors()</code> num contentor com <code>cpu: 500m</code>?»</li>
+      <li>«Que fontes se dividem mal e porquê?»</li>
+      <li>«E se o <em>pipeline</em> tiver <code>forEach</code> com escrita numa <code>ArrayList</code> partilhada?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <code>parallelStream()</code> cria <em>threads</em> novos por invocação.</li>
+      <li>Recomendar paralelismo para chamadas de rede.</li>
+      <li>Medir com uma execução única sem aquecimento do JIT.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-6-5" class="h2"><span class="secnum">6.5</span> Efeitos secundários, estado partilhado e ordem<a class="anchor" href="#sec-6-5" aria-label="ligação">#</a></h2>
+
+<p>O contrato dos streams pede que as funções passadas às operações sejam não-interferentes (não modificam a fonte durante o percurso) e sem estado (o resultado não depende de nada que mude entre invocações). Violar a primeira dá <code>ConcurrentModificationException</code> — ou, pior, resultados silenciosamente errados em fontes que não detectam modificação. Violar a segunda dá código que funciona em série e produz resultados diferentes em paralelo ou depois de uma optimização do JIT.</p>
+
+<p>O erro mais comum é acumular num contentor externo: <code>lista.stream().forEach(x -&gt; resultado.add(x))</code>. Em série funciona; em paralelo, com um <code>ArrayList</code> não sincronizado, produz elementos perdidos, <code>null</code> no meio ou <code>ArrayIndexOutOfBoundsException</code>, porque o crescimento do array interno não é atómico. A correcção não é sincronizar — é usar <code>collect</code>, que foi desenhado exactamente para isto e cujo <code>combiner</code> funde contentores privados de cada ramo sem contenção.</p>
+
+<p>Sobre ordem: um stream tem ou não a característica <code>ORDERED</code>, herdada da fonte (<code>List</code> tem, <code>HashSet</code> não). Num stream ordenado e paralelo, <code>forEachOrdered</code> garante a ordem de encontro e <code>forEach</code> não; o primeiro custa sincronização e frequentemente anula o ganho do paralelismo. Ao contrário, chamar <code>unordered()</code> explicitamente pode acelerar <code>distinct()</code>, <code>limit()</code> e <code>skip()</code> em paralelo, por dispensar o rastreio de posições. E <code>findAny()</code> existe precisamente para dizer ao <em>runtime</em> que qualquer resultado serve.</p>
+
+<div class="qa" id="q-6-9" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Pusemos um <code>peek</code> com <code>log.debug</code> a meio de um <em>pipeline</em> para diagnosticar um problema e as linhas não aparecem todas. Explique porquê e diga como usaria <code>peek</code> correctamente.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o número de vezes que <code>peek</code> é invocado não faz parte do contrato: depende de quantos elementos o operador terminal precisa de ver. Com <code>findFirst()</code> ou <code>anyMatch()</code> a jusante, o <em>pipeline</em> pára cedo e o <code>peek</code> só corre para os elementos consumidos. Pior: com <code>count()</code>, desde o Java 9 o <em>runtime</em> pode saltar completamente o percurso quando consegue determinar o tamanho a partir da fonte e nenhuma operação altera a contagem — nesse caso o <code>peek</code> não corre nenhuma vez, e o <em>Javadoc</em> documenta isto explicitamente. Se houver um <code>filter</code> no meio, a contagem deixa de ser conhecida e o <code>peek</code> volta a correr.</p>
+      <p>A segunda causa possível é o paralelismo: em <code>parallelStream()</code>, o <code>peek</code> corre em vários <em>threads</em>, sem ordem garantida, e as linhas surgem intercaladas — o que parece «faltarem linhas» é muitas vezes ordem baralhada mais um <em>appender</em> assíncrono a descartar sob carga.</p>
+      <p>O uso correcto de <code>peek</code> é o que o <em>Javadoc</em> declara: observação temporária em desenvolvimento, tipicamente com o <em>pipeline</em> terminado num <code>toList()</code> que consome tudo. O que não se deve fazer é usar <code>peek</code> para efeitos com significado de negócio — enviar eventos, incrementar métricas, mutar entidades — porque a semântica passa a depender do operador terminal. Para métricas, coloca-se o efeito num <code>map</code> explícito, ou melhor, fora do <em>pipeline</em>, num ciclo sobre o resultado já materializado.</p>
+      <p>O trade-off honesto: <code>peek</code> é conveniente para depurar um <em>pipeline</em> longo sem o partir em variáveis intermédias. Em código que vai para produção, partir o <em>pipeline</em> em dois passos nomeados dá mais informação no <em>stack trace</em> e permite testar cada metade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Culpa o <em>logger</em> ou o nível de <em>log</em>, sem ligar à preguiça do <em>pipeline</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que os streams são preguiçosos e que <code>findFirst</code> corta, mas desconhece a elisão com <code>count()</code>.</td></tr>
+        <tr><td>Sénior</td><td>Explica a dependência do terminal, o caso do <code>count()</code>, o efeito do paralelismo e diz para que serve <code>peek</code> de facto.</td></tr>
+        <tr><td>Staff</td><td>Generaliza para a regra de não pôr efeitos com significado dentro de operações intermédias e propõe onde colocar métricas e eventos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se em vez de <code>count()</code> tiver <code>filter(...).count()</code>?»</li>
+      <li>«Como registaria uma métrica por elemento processado sem <code>peek</code>?»</li>
+      <li>«Que diferença há entre <code>forEach</code> e <code>forEachOrdered</code> em paralelo?»</li>
+      <li>«O que é interferência com a fonte e que excepção dá?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>peek</code> para publicar eventos ou gravar em base de dados.</li>
+      <li>Acumular numa <code>ArrayList</code> externa dentro de <code>map</code> ou <code>peek</code>.</li>
+      <li>Assumir que <code>forEach</code> preserva a ordem em paralelo.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>Collectors.toMap</code> lança <code>NullPointerException</code> quando o valor calculado é <code>null</code>, porque internamente usa <code>Map::merge</code>. <code>groupingBy</code> aceita elementos cujo <em>downstream</em> produza <code>null</code>, mas lança <code>NullPointerException</code> se a própria chave de classificação for <code>null</code>. Num relatório sobre dados vindos de uma tabela com colunas anuláveis, isto rebenta em produção com dados reais e nunca nos testes com dados sintéticos: a defesa é <code>Objects.requireNonNullElse</code> na função de classificação, ou filtrar explicitamente e contar os descartados.</p></aside>
+
+<h2 id="sec-6-6" class="h2"><span class="secnum">6.6</span> Streams vs ciclos: legibilidade e performance<a class="anchor" href="#sec-6-6" aria-label="ligação">#</a></h2>
+
+<p>A comparação honesta não é «streams são lentos» contra «streams são elegantes». Para a esmagadora maioria do código de serviço — dezenas ou centenas de elementos por pedido — a diferença de desempenho é de microssegundos e irrelevante face aos 2 a 20 ms de uma consulta a PostgreSQL. O critério é legibilidade e composição, e os streams ganham quando o <em>pipeline</em> é uma sequência de transformações declarativas com um resultado agregado.</p>
+
+<p>Os ciclos ganham em cinco situações concretas. Primeira, quando é preciso <code>break</code> com estado, <code>continue</code> condicional ou <code>return</code> a meio: <code>takeWhile</code> e <code>findFirst</code> cobrem parte dos casos, mas um ciclo com duas condições de paragem escreve-se melhor imperativamente. Segunda, quando o corpo lança excepções verificadas: os tipos funcionais de <code>java.util.function</code> não as declaram, e embrulhar em <code>RuntimeException</code> para desembrulhar depois é pior do que o ciclo. Terceira, em ciclos quentes sobre primitivos onde cada nanossegundo conta e o <em>boxing</em> ou a profundidade de <em>inlining</em> pesam. Quarta, quando o <em>pipeline</em> passa a ter mais de quatro ou cinco estágios com lambdas de várias linhas — nesse ponto a versão imperativa é mais fácil de depurar com <em>breakpoints</em> e produz <em>stack traces</em> legíveis. Quinta, quando é preciso iterar dois índices em paralelo ou olhar para o elemento anterior: os streams não têm um conceito nativo de janela, e emular isso com <code>IntStream.range</code> e acessos por índice é pior do que um <code>for</code>.</p>
+
+<p>Há uma armadilha de <em>performance</em> específica que merece ser conhecida: um <em>call site</em> de lambda que veja três ou mais implementações diferentes torna-se megamórfico e o JIT deixa de o poder inserir em linha. Numa biblioteca genérica onde o mesmo <code>map</code> é chamado com dezenas de lambdas distintas, o custo por elemento pode subir várias vezes em relação ao caso monomórfico. Isto não afecta o código de aplicação típico, onde cada <em>call site</em> vê um só lambda, mas explica resultados de <em>benchmark</em> contraditórios entre um microteste e uma biblioteca real.</p>
+
+<figure class="listing java" id="lst-6-6"><div class="lhead"><span class="lnum">Listagem 6.6</span>
+<span class="lcap">Três casos em que o ciclo é a resposta certa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// 1) Excepções verificadas: o stream obriga a embrulhar; o ciclo não.
+List&lt;Config&gt; cfgs = new ArrayList&lt;&gt;(caminhos.size());
+for (Path p : caminhos) {
+    cfgs.add(Config.ler(p));          // throws IOException — propaga naturalmente
+}
+
+// 2) Duas condições de paragem com estado acumulado
+long total = 0;
+int lidos = 0;
+for (Registo r : registos) {
+    if (total &gt; ORCAMENTO_BYTES || lidos &gt;= MAX_REGISTOS) break;
+    total += r.tamanho();
+    lidos++;
+}
+
+// 3) Janela sobre o elemento anterior: sem equivalente natural em stream
+List&lt;Long&gt; deltas = new ArrayList&lt;&gt;(amostras.size() - 1);
+for (int i = 1; i &lt; amostras.size(); i++) {
+    deltas.add(amostras.get(i).valor() - amostras.get(i - 1).valor());
+}</code></pre></figure>
+
+<div class="qa" id="q-6-10" data-box="qa" data-area="java" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Numa revisão de código, quando é que exige que um stream seja reescrito como ciclo, e quando é que exige o contrário? Dê-me o critério que aplicaria à equipa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O critério que defendo é de manutenção, com uma excepção medida de performance. Exijo stream quando o código é uma agregação ou transformação declarativa — filtrar, mapear, agrupar, somar — e a versão imperativa seria um ciclo com um <code>Map</code> temporário e três <code>if</code>. Aí o stream elimina estado intermédio nomeado, que é onde nascem os <em>bugs</em>.</p>
+      <p>Exijo ciclo em cinco casos: quando há excepções verificadas no corpo; quando há duas ou mais condições de paragem com estado; quando é preciso olhar para o elemento vizinho ou iterar dois índices; quando o <em>pipeline</em> passa de quatro estágios ou tem lambdas de mais de três linhas; e quando o código está no caminho quente medido e o <em>benchmark</em> mostra ganho. Fora destes casos, reescrever por gosto é ruído na revisão.</p>
+      <p>Sobre os números, sou explícito com a equipa para desarmar a discussão. Para um pedido HTTP que faz duas consultas a PostgreSQL de 3 ms cada e transforma 200 objectos, a escolha entre stream e ciclo vale menos de 50 microssegundos, ou seja, menos de 1% da latência do <em>endpoint</em>. Optimizar aí é desperdício. Já num ciclo de 10<sup>8</sup> iterações sobre <code>int[]</code>, o <em>boxing</em> de um <code>Stream&lt;Integer&gt;</code> pode custar um factor de 3 a 8, e isso é uma discussão legítima — que se resolve mudando para <code>IntStream</code>, não necessariamente para um ciclo.</p>
+      <p>Acrescento duas regras que valem mais do que a escolha: nunca esconder efeitos secundários dentro de operações intermédias, e nunca introduzir <code>parallelStream()</code> sem medição no ambiente de produção. Estas duas causam incidentes; a escolha entre <code>for</code> e <code>stream</code> causa, no máximo, debates.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Preferência dogmática num sentido ou noutro («streams são sempre melhores», «streams são lentos»).</td></tr>
+        <tr><td>Mid</td><td>Diz «depende da legibilidade» sem conseguir enunciar um critério que outra pessoa possa aplicar.</td></tr>
+        <tr><td>Sénior</td><td>Dá casos concretos em ambos os sentidos, quantifica a irrelevância da diferença no código de serviço e distingue <em>boxing</em> de abstracção.</td></tr>
+        <tr><td>Staff</td><td>Formula o critério como regra de equipa aplicável em revisão, separa o que causa incidentes do que causa debates e diz como o mediria antes de decidir.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como mede a diferença de forma credível?»</li>
+      <li>«O que é um <em>call site</em> megamórfico e porque é que interessa aqui?»</li>
+      <li>«Como trata excepções verificadas dentro de um stream, se tiver mesmo de o fazer?»</li>
+      <li>«Escreveria esta regra num guia de estilo? Com que redacção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Reescrever código alheio por preferência estética sem argumento de manutenção.</li>
+      <li>Citar ganhos de performance sem nunca ter medido.</li>
+      <li>Embrulhar <code>IOException</code> em <code>RuntimeException</code> dentro de um lambda e chamar-lhe solução.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Desde as versões posteriores ao Java 21, a API de <em>gatherers</em> (<code>Stream::gather</code>) preenche a lacuna das operações intermédias personalizadas: janelas deslizantes, agrupamento por blocos, <em>scan</em> com estado — tudo o que antes obrigava a sair do <em>pipeline</em>. Em entrevista, mencioná-la mostra actualização; o que não convence é propô-la como solução sem saber se a versão de Java do candidato à vaga a inclui.</p></aside>
+
+<h2 id="sec-6-7" class="h2"><span class="secnum">6.7</span> Resumo e checklist<a class="anchor" href="#sec-6-7" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo:</p>
+
+<ul class="lst">
+  <li>Um lambda não é uma classe anónima: é <code>invokedynamic</code> com <code>LambdaMetafactory</code>; sem captura é instanciado uma vez, com captura aloca por avaliação, e <code>this</code> refere o objecto envolvente.</li>
+  <li><code>expr::metodo</code> avalia o receptor uma única vez, no momento da criação; o lambda equivalente avalia-o em cada invocação. Guardar referências de método em campos de vida longa serve dados obsoletos sem erro visível.</li>
+  <li>As operações intermédias não fazem nada até haver uma terminal, e a execução é elemento a elemento com fusão de estágios; <code>sorted()</code> e <code>distinct()</code> são barreiras que anulam o corte antecipado a montante.</li>
+  <li>Um <code>Stream</code> é de utilização única: guardar a fonte ou um <code>Supplier&lt;Stream&lt;T&gt;&gt;</code>, nunca o stream. Streams de I/O fecham-se em <code>try-with-resources</code>.</li>
+  <li><code>reduce</code> é redução imutável e serve escalares; <code>collect</code> é redução mutável e serve estruturas. <code>reduce(&quot;&quot;, String::concat)</code> é O(n²) e <code>joining()</code> é O(n).</li>
+  <li><code>groupingBy</code> sem <em>downstream</em> materializa listas inteiras; <code>counting()</code>, <code>summingLong</code>, <code>filtering</code> e <code>teeing</code> resolvem em memória constante por grupo e num só percurso. <code>filtering</code> mantém os grupos que um <code>filter</code> a montante faria desaparecer.</li>
+  <li><code>parallelStream()</code> usa o <code>ForkJoinPool.commonPool()</code> global, com paralelismo <code>availableProcessors() - 1</code>, que num contentor de 2 CPU é 1. Nunca com I/O bloqueante; para isso existem <em>threads</em> virtuais.</li>
+  <li>Efeitos secundários dentro de operações intermédias não têm contagem garantida (<code>peek</code> com <code>count()</code> pode não correr) nem ordem garantida em paralelo.</li>
+  <li>Entre stream e ciclo, o critério é manutenção; a diferença de latência num <em>endpoint</em> típico está abaixo de 1% e não justifica reescritas.</li>
+</ul>
+
+<p>Checklist antes da ronda:</p>
+
+<ul class="lst">
+  <li>Saber desenhar no quadro o percurso de <code>filter().map().findFirst()</code> e dizer o número exacto de invocações de cada função.</li>
+  <li>Escrever de memória um <code>groupingBy</code> com <code>teeing</code> e <code>filtering</code>, incluindo o tratamento do grupo vazio em <code>summarizingLong</code>.</li>
+  <li>Ter na ponta da língua as três armadilhas de <code>toMap</code>: chave duplicada, valor <code>null</code>, mapa mutável devolvido.</li>
+  <li>Conseguir enunciar a heurística N·Q ≈ 10<sup>4</sup> e o valor de <code>availableProcessors()</code> num contentor com <code>limits.cpu: 2</code>.</li>
+  <li>Ter um exemplo próprio, com números antes e depois, de um <em>pipeline</em> que foi optimizado ou de um <code>parallelStream()</code> que foi removido.</li>
+  <li>Preparar a resposta a «streams ou ciclos?» como critério de equipa, não como preferência pessoal.</li>
+  <li>Saber quando escolheria <code>IntStream</code> em vez de <code>Stream&lt;Integer&gt;</code> e quantificar o custo do <em>boxing</em>.</li>
+  <li>Praticar a reescrita de um <em>pipeline</em> de cinco estágios em ciclo e vice-versa, em papel, em menos de cinco minutos.</li>
+</ul>
