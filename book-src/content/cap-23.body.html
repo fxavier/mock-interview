@@ -1,722 +1,933 @@
-<p>A ronda de algoritmos de um loop sénior não procura quem decorou cinquenta problemas: procura quem impõe um limite de complexidade antes de escrever a primeira linha e depois o cumpre. Arrays e strings são o terreno escolhido porque não escondem nada — não há biblioteca a fazer o trabalho, o índice fora dos limites é visível e a diferença entre O(n²) e O(n) mede-se com um exemplo de dez elementos executado à mão. Onde os candidatos seniores caem não é no algoritmo: é em anunciar «isto é O(n)» sobre um ciclo que faz <code>substring</code> lá dentro, em esquecer o array vazio, em não distinguir custo amortizado de custo do pior caso, e em programar em silêncio durante doze minutos. Este capítulo cobre a análise assintótica que o entrevistador espera ouvir em voz alta, os quatro padrões que resolvem a maioria dos exercícios de array e string, e sete laboratórios com solução de referência em Java 21.</p>
+<p>Esta é a área onde a diferença entre um mid e um sénior é mais fácil de medir e mais difícil de disfarçar: quase toda a gente sabe recitar o acrónimo ACID, e quase ninguém sabe dizer o que acontece exactamente quando duas sessões concorrentes tocam na mesma linha em <code>READ COMMITTED</code>. O entrevistador procura três coisas: se o candidato distingue as anomalias pelo mecanismo (e não pela definição decorada), se sabe qual é o nível de isolamento por omissão da base que diz usar, e se já pagou o preço de uma decisão de replicação ou de <em>sharding</em> em produção. O erro mais comum não é técnico, é de ordem: candidatos que saltam para «usávamos Cassandra» sem conseguir explicar que anomalia estavam a evitar. Este capítulo cobre isolamento, MVCC, <em>locks</em>, replicação, particionamento, a escolha entre SQL e NoSQL e a consistência entre serviços — sempre com o exemplo de duas sessões concorrentes à frente, porque é assim que a pergunta chega.</p>
 
-<h2 id="sec-23-1" class="h2"><span class="secnum">23.1</span> Análise assintótica e análise amortizada<a class="anchor" href="#sec-23-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-23-1" class="h2"><span class="secnum">23.1</span> ACID e os níveis de isolamento na prática<a class="anchor" href="#sec-23-1" aria-label="ligação">#</a></h2>
 
-<p>O Big-O descreve o crescimento do custo em função da dimensão da entrada quando essa dimensão tende para infinito, ignorando constantes e termos de ordem inferior. É uma ferramenta de comparação, não de previsão: dizer que um algoritmo é O(n log n) não diz quanto tempo demora, diz que duplicar n multiplica o trabalho por pouco mais de dois. Numa entrevista, a afirmação só vale acompanhada da unidade — «O(n) comparações de caracteres», «O(n) inserções amortizadas no <code>HashMap</code>» — porque é aí que o entrevistador verifica se o candidato contou a operação certa ou apenas os ciclos visíveis.</p>
+<p>ACID não são quatro propriedades do mesmo tipo. Atomicidade e durabilidade são garantias do motor de armazenamento — ou o <em>write-ahead log</em> foi para disco antes do <code>COMMIT</code> devolver, ou não foi. Consistência, no sentido de ACID, é apenas «as restrições declaradas continuam válidas»: chaves estrangeiras, <code>CHECK</code>, <code>UNIQUE</code>. Isolamento é a única propriedade que vem com um botão, e é sobre esse botão que a entrevista incide, porque é a única onde o candidato escolhe quanta correcção quer comprar e a que preço.</p>
 
-<p>As três armadilhas de contagem são sempre as mesmas. A primeira é o custo escondido em chamadas de biblioteca: <code>String.substring</code> em Java copia desde a JDK 7u6, portanto é O(k) no comprimento do resultado e não O(1); um ciclo com n iterações que faz <code>substring</code> de tamanho médio n/2 é O(n²). A segunda é confundir o custo de uma operação com o custo total: <code>ArrayList.add</code> no fim é O(1) amortizado mas O(n) no pior caso individual, e a diferença importa quando existe um orçamento de latência p99. A terceira é ignorar o espaço: uma solução recursiva com profundidade n consome n <em>frames</em> de pilha, e a pilha por omissão de uma <em>thread</em> de plataforma na HotSpot é de 1 MB — algumas dezenas de milhar de <em>frames</em> antes de <code>StackOverflowError</code>.</p>
+<p>O padrão SQL define quatro níveis por aquilo que <em>proíbem</em>, não por como o fazem: <code>READ UNCOMMITTED</code>, <code>READ COMMITTED</code>, <code>REPEATABLE READ</code> e <code>SERIALIZABLE</code>. Os motores reais não seguem a definição à letra. O PostgreSQL 17 não tem <code>READ UNCOMMITTED</code> real — pede-se e obtém-se <code>READ COMMITTED</code> — e o seu <code>REPEATABLE READ</code> é um <em>snapshot</em> consistente que já elimina leituras fantasma, coisa que o padrão não exige. O MySQL 8 com InnoDB tem por omissão <code>REPEATABLE READ</code>, também com <em>snapshot</em>, mas com <em>next-key locks</em> que mudam o comportamento das escritas. O Oracle chama <code>SERIALIZABLE</code> a algo que é <em>snapshot isolation</em> e admite <em>write skew</em>. A primeira frase útil numa entrevista é, portanto: «o nível por omissão do PostgreSQL é <code>READ COMMITTED</code>, o do MySQL é <code>REPEATABLE READ</code>, e nenhum dos dois implementa o padrão à letra».</p>
 
-<p>A análise amortizada responde à pergunta «qual é o custo médio por operação numa sequência de operações, no pior caso dessa sequência?». Não é o caso médio probabilístico: é uma garantia determinística sobre o total. O <code>ArrayList</code> é o exemplo canónico. Quando o array interno enche, a JDK aloca um novo com aproximadamente 1,5 vezes a capacidade anterior e copia o conteúdo. Para chegar a n elementos, as cópias totalizam uma série geométrica de razão 1/1,5, cuja soma é limitada por 3n — logo, menos de três cópias de elemento por inserção, ou seja O(1) amortizado. Se o factor de crescimento fosse aditivo (capacidade + 10), o total seria O(n²) e o custo amortizado O(n).</p>
+<p>O detalhe operacional que separa o sénior: em <code>READ COMMITTED</code> o <em>snapshot</em> é tomado no início de <strong>cada instrução</strong>, não da transacção. Duas instruções seguidas dentro do mesmo <code>BEGIN</code> podem ver estados diferentes do mundo. Em <code>REPEATABLE READ</code> o <em>snapshot</em> é tomado na primeira leitura da transacção e mantém-se; o preço é que uma escrita sobre uma linha alterada por outra transacção já commitada falha com <code>ERROR: could not serialize access due to concurrent update</code> (SQLSTATE 40001) e a aplicação tem de repetir.</p>
 
-<figure class="listing java" id="lst-23-1"><div class="lhead"><span class="lnum">Listagem 23.1</span>
-<span class="lcap">O crescimento geométrico que torna a inserção O(1) amortizada — e o que o anula.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// Regra de crescimento efectiva do ArrayList na OpenJDK: 1,5x a capacidade anterior.
-static int novaCapacidade(int antiga) {
-    return antiga + (antiga &gt;&gt; 1);            // 10 -&gt; 15 -&gt; 22 -&gt; 33 -&gt; 49 -&gt; ...
-}
-
-// Total de elementos copiados para chegar a n: 10 + 15 + 22 + ... &lt; 3n  =&gt;  O(1) amortizado.
-List&lt;Integer&gt; fim = new ArrayList&lt;&gt;(1_000_000);   // dimensionar evita mesmo as ~35 cópias
-for (int i = 0; i &lt; 1_000_000; i++) fim.add(i);   // O(n) no total
-
-// A mesma estrutura, com inserção à cabeça, é O(n) por operação — sem amortização que a salve.
-List&lt;Integer&gt; cabeca = new ArrayList&lt;&gt;();
-for (int i = 0; i &lt; 1_000_000; i++) cabeca.add(0, i);  // ~5 x 10^11 movimentos: O(n^2)
-
-// ArrayDeque: O(1) amortizado nas duas pontas, capacidade sempre potência de 2.
-Deque&lt;Integer&gt; fila = new ArrayDeque&lt;&gt;();
-fila.addFirst(1); fila.addLast(2);</code></pre></figure>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 23.1</span> Custos que o entrevistador espera ouvir de cor, com a distinção entre amortizado e pior caso.</div>
-<div class="tscroll"><table><thead><tr><th>Operação</th><th>Amortizado</th><th>Pior caso individual</th><th>Nota</th></tr></thead><tbody>
-<tr><td><code>ArrayList.add(e)</code></td><td>O(1)</td><td>O(n)</td><td>Realocação de 1,5x e cópia</td></tr>
-<tr><td><code>ArrayList.add(0, e)</code></td><td>O(n)</td><td>O(n)</td><td><code>System.arraycopy</code> de tudo</td></tr>
-<tr><td><code>ArrayList.get(i)</code></td><td>O(1)</td><td>O(1)</td><td>Acesso directo, boa localidade</td></tr>
-<tr><td><code>HashMap.get/put</code></td><td>O(1)</td><td>O(log n)</td><td><em>Bucket</em> vira árvore acima de 8 colisões</td></tr>
-<tr><td><code>ArrayDeque.addFirst</code></td><td>O(1)</td><td>O(n)</td><td>Duplicação da capacidade</td></tr>
-<tr><td><code>LinkedList.get(i)</code></td><td>O(n)</td><td>O(n)</td><td>Percorre nós; falhas de cache</td></tr>
-<tr><td><code>String.substring</code></td><td>O(k)</td><td>O(k)</td><td>Cópia desde a JDK 7u6</td></tr>
-<tr><td><code>StringBuilder.append</code></td><td>O(1)</td><td>O(n)</td><td>Mesma amortização do <code>ArrayList</code></td></tr>
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 23.1</span> O que cada nível impede no PostgreSQL 17 (o padrão SQL é mais permissivo).</div>
+<div class="tscroll"><table><thead><tr><th>Nível</th><th>Dirty read</th><th>Non-repeatable</th><th>Phantom</th><th>Write skew</th><th>Custo típico</th></tr></thead><tbody>
+<tr><td>READ COMMITTED (omissão)</td><td>Impossível</td><td>Possível</td><td>Possível</td><td>Possível</td><td>Base de referência</td></tr>
+<tr><td>REPEATABLE READ</td><td>Impossível</td><td>Impossível</td><td>Impossível</td><td>Possível</td><td>Erros 40001 a repetir</td></tr>
+<tr><td>SERIALIZABLE (SSI)</td><td>Impossível</td><td>Impossível</td><td>Impossível</td><td>Impossível</td><td>2-15% de <em>throughput</em> + retentativas</td></tr>
+<tr><td>MySQL 8 REPEATABLE READ</td><td>Impossível</td><td>Impossível</td><td>Impossível na leitura</td><td>Possível</td><td><em>Next-key locks</em> em escrita</td></tr>
 </tbody></table></div></div>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza para calibrar o limite antes de escrever código, assumindo cerca de 10<sup>8</sup> a 10<sup>9</sup> operações simples por segundo numa JVM aquecida: n até 10 aceita O(n!), n até 25 aceita O(2<sup>n</sup>), n até 5 000 aceita O(n²), n até 10<sup>6</sup> exige O(n log n), n acima de 10<sup>7</sup> exige O(n) com uma passagem e boa localidade de memória. Quando o enunciado diz «n até 10<sup>5</sup> e até 10<sup>5</sup> consultas», o produto é 10<sup>10</sup>: a resposta esperada é pré-processamento, não força bruta.</p></aside>
+<figure class="listing sql" id="lst-23-1"><div class="lhead"><span class="lnum">Listagem 23.1</span>
+<span class="lcap">SERIALIZABLE no PostgreSQL: o conflito não bloqueia, aborta.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN ISOLATION LEVEL SERIALIZABLE;
+B t2 | BEGIN ISOLATION LEVEL SERIALIZABLE;
+A t3 | SELECT sum(valor) FROM lancamento WHERE conta_id = 7;   -- 1000
+B t4 | SELECT sum(valor) FROM lancamento WHERE conta_id = 7;   -- 1000
+A t5 | INSERT INTO lancamento (conta_id, valor) VALUES (7, -900);
+B t6 | INSERT INTO lancamento (conta_id, valor) VALUES (7, -900);
+A t7 | COMMIT;                                                 -- OK
+B t8 | COMMIT;
+     | ERROR:  could not serialize access due to read/write dependencies
+     | DETAIL: Reason code: Canceled on identification as a pivot.
+     | HINT:   The transaction might succeed if retried.   -- SQLSTATE 40001</code></pre></figure>
 
-<div class="qa" id="q-23-1" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Em bancos de ensaio típicos, subir de <code>READ COMMITTED</code> para <code>SERIALIZABLE</code> no PostgreSQL custa entre 2% e 15% de <em>throughput</em> em cargas com pouca contenção, e muito mais quando as transacções tocam nos mesmos intervalos de chaves — aí o custo aparece como taxa de aborto, não como latência. Uma taxa de 40001 acima de 1-2% das transacções indica que o desenho está errado, não que o nível está errado: a solução é reduzir o âmbito da transacção ou materializar o conflito numa linha, não baixar o isolamento.</p></aside>
+
+<div class="qa" id="q-23-1" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Diz-se que <code>ArrayList.add</code> é O(1) amortizado. O que significa «amortizado» aqui e em que situação essa garantia deixa de ser suficiente para o sistema?</div>
+  <div class="qprompt">Explique a diferença prática entre <code>READ COMMITTED</code>, <code>REPEATABLE READ</code> e <code>SERIALIZABLE</code>, e dê-me um caso concreto em que <code>REPEATABLE READ</code> ainda produz um resultado errado.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Amortizado significa que o custo total de qualquer sequência de n inserções é O(n), logo o custo médio por inserção é constante — mas é uma garantia sobre o total, não sobre cada operação. Uma inserção individual pode custar O(n) quando obriga à realocação do array interno e à cópia de tudo o que lá está.</p>
-      <p>O mecanismo é o crescimento geométrico. A OpenJDK aumenta a capacidade em 50% (<code>antiga + (antiga &gt;&gt; 1)</code>). Para chegar a n elementos partindo de 10, o número total de elementos copiados é 10 + 15 + 22 + … , uma série geométrica de razão 2/3 que soma menos de 3n. Três cópias por elemento no total, independentemente de n: daí o O(1) amortizado. Com crescimento aditivo — mais 10 de cada vez — o total seria n²/20, ou seja O(n) amortizado por inserção.</p>
-      <p>A garantia deixa de chegar quando existe um orçamento de latência por pedido. Numa lista com 4 milhões de elementos, a realocação copia 32 MB, aloca no espaço de <em>humongous objects</em> do G1 se o array passar de metade do tamanho da região, e paga uma pausa de dezenas de milissegundos — que aparece no p99,9 e em mais nenhum percentil. Um serviço com orçamento p99 de 50 ms não pode ter esse pico dentro do caminho crítico.</p>
-      <p>As saídas são três. Dimensionar à cabeça com <code>new ArrayList&lt;&gt;(capacidadeEsperada)</code> elimina as realocações quando a dimensão é conhecida a menos de um factor de dois. Trocar por <code>ArrayDeque</code> quando o acesso é por pontas. Ou aceitar a amortização, que é o caso normal: em processamento em lote, o total é o que conta e a variância por operação é irrelevante.</p></div>
+      <p>A diferença prática está no âmbito do <em>snapshot</em> e no tratamento das dependências entre leituras e escritas. Em <code>READ COMMITTED</code> cada instrução vê um <em>snapshot</em> novo do que estava commitado no instante em que ela arrancou; dentro da mesma transacção, dois <code>SELECT</code> iguais podem devolver valores diferentes. Em <code>REPEATABLE READ</code> o <em>snapshot</em> é fixado na primeira leitura e vale até ao fim, pelo que a transacção vê um mundo congelado e coerente. Em <code>SERIALIZABLE</code>, o PostgreSQL acrescenta <em>Serializable Snapshot Isolation</em>: continua a haver <em>snapshot</em>, mas o motor segue as dependências de leitura/escrita e aborta uma das transacções sempre que o entrelaçamento não seria equivalente a nenhuma execução em série.</p>
+      <p>O caso concreto em que <code>REPEATABLE READ</code> falha é o <em>write skew</em>. Duas transacções lêem o mesmo conjunto de linhas, cada uma verifica um invariante sobre esse conjunto, e cada uma escreve numa linha <strong>diferente</strong>. Como não há conflito de escrita na mesma linha, o motor não vê nada de errado e ambas fazem <code>COMMIT</code>. Exemplo clássico: a regra é «tem de haver pelo menos um médico de plantão». Alice e Bob estão de plantão; ambos abrem a aplicação, ambos lêem <code>count = 2</code>, ambos concluem que podem sair, e cada um actualiza a sua própria linha. No fim, zero médicos de plantão e nenhuma das transacções violou uma restrição declarada.</p>
+      <p>O mesmo padrão aparece com dinheiro: dois levantamentos concorrentes que verificam «saldo agregado dos lançamentos ≥ montante» e depois inserem linhas novas — os <code>INSERT</code> não colidem entre si, e a conta acaba negativa. É a <em>Listagem 23.1</em>: em <code>SERIALIZABLE</code> a segunda transacção morre com 40001; em <code>REPEATABLE READ</code> passam as duas.</p>
+      <p>As três formas de resolver, por ordem de preferência: (1) tornar o invariante uma restrição da base — <code>CHECK (saldo &gt;= 0)</code> sobre uma coluna materializada, ou um índice <code>UNIQUE</code> parcial; (2) materializar o conflito, isto é, bloquear explicitamente a linha-agregado com <code>SELECT ... FOR UPDATE</code> sobre a conta antes de inserir os lançamentos, transformando o <em>write skew</em> num conflito de escrita normal; (3) subir para <code>SERIALIZABLE</code> e implementar retentativa com <em>backoff</em> em 40001. A opção 3 é a mais correcta e a menos controlável em produção, porque o custo cresce com a contenção; a opção 1 é gratuita em tempo de execução mas nem sempre exprimível.</p>
+      <p>O <em>trade-off</em>: <code>SERIALIZABLE</code> só é razoável se toda a aplicação souber repetir transacções, o que implica transacções curtas, idempotentes e sem efeitos externos lá dentro (nada de chamadas HTTP nem de envios para Kafka antes do <code>COMMIT</code>). Se o código tiver efeitos externos dentro da transacção, subir o nível troca um <em>bug</em> raro de dados por um <em>bug</em> frequente de duplicação.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Amortizado é o caso médio.» Confunde média probabilística com garantia sobre a sequência.</td></tr>
-        <tr><td>Mid</td><td>Sabe que há realocação e cópia, mas não sabe o factor de crescimento nem porque é que ele torna o total linear.</td></tr>
-        <tr><td>Sénior</td><td>Explica a série geométrica, dá o factor 1,5x, e distingue custo total de custo por operação.</td></tr>
-        <tr><td>Staff</td><td>Liga ao efeito em produção — p99,9, alocação de arrays grandes, pressão no GC — e diz quando dimensionar à cabeça compensa e quando é micro-optimização.</td></tr>
+        <tr><td>Insuficiente</td><td>Recita a tabela do padrão SQL de cor; não sabe o nível por omissão da base que diz usar; confunde isolamento com <em>locking</em>.</td></tr>
+        <tr><td>Mid</td><td>Explica correctamente as três anomalias clássicas, mas acha que <code>REPEATABLE READ</code> resolve tudo e nunca ouviu falar de <em>write skew</em>.</td></tr>
+        <tr><td>Sénior</td><td>Distingue o âmbito do <em>snapshot</em> (instrução vs transacção), dá um exemplo real de <em>write skew</em> e nomeia as três estratégias de correcção com o respectivo custo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta que SSI aborta em vez de bloquear, discute a taxa de 40001 como métrica de produção, e liga a escolha ao facto de a aplicação saber ou não repetir transacções com segurança.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o factor de crescimento fosse 1,01? E 4x?»</li>
-      <li>«<code>HashMap</code> também é O(1) amortizado. Qual é o pior caso e porquê?»</li>
-      <li>«Como mediria essa pausa de realocação num serviço em produção?»</li>
-      <li>«<code>ArrayList</code> ou <code>LinkedList</code> para uma fila de 10 000 elementos com remoção pela cabeça?»</li></ul></div>
+      <li>«Qual é o nível por omissão do PostgreSQL? E do MySQL? Porque é que são diferentes?»</li>
+      <li>«Como implementaria a retentativa de 40001 numa aplicação Spring Boot?»</li>
+      <li>«E se o invariante envolver duas tabelas em serviços diferentes?»</li>
+      <li>«Quanto custa <code>SERIALIZABLE</code> em <em>throughput</em>? Como mediria isso?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Dizer que <code>ArrayList.add</code> é O(1) sem qualificação e defender isso quando confrontado.</li>
-      <li>Propor <code>LinkedList</code> «porque a inserção é O(1)» sem mencionar o custo de chegar à posição nem as falhas de cache.</li>
-      <li>Não saber que a capacidade cresce por multiplicação e não por soma.</li></ul></div>
+      <li>«Uso sempre <code>SERIALIZABLE</code>, é o mais seguro» sem mencionar retentativas nem custo.</li>
+      <li>Acreditar que <code>REPEATABLE READ</code> do MySQL e do PostgreSQL se comportam de forma idêntica nas escritas.</li>
+      <li>Propor <code>synchronized</code> em Java como solução de concorrência de base de dados numa aplicação com várias instâncias.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-23-2" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
+<div class="qa" id="q-23-2" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Tem uma solução O(n log n) com espaço O(1) e outra O(n) com espaço O(n). Como decide qual apresenta ao entrevistador?</div>
+  <div class="qprompt">Um método anotado com <code>@Transactional</code> escreve na base, chama um serviço externo por HTTP e depois publica em Kafka. Que problemas vê e como reorganizaria o método?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A decisão faz-se com três perguntas ao enunciado, ditas em voz alta antes de escolher: qual é a dimensão máxima de n, o array de entrada pode ser modificado, e a estrutura vai ser consultada uma vez ou muitas.</p>
-      <p>Para n até 10<sup>5</sup> e uma única consulta, a diferença entre n log n e n é um factor de 17 — irrelevante face à constante da tabela de dispersão, que paga <em>hashing</em>, colisões e uma indirecção por acesso. Nesse regime, ordenar é frequentemente mais rápido em relógio de parede do que construir um <code>HashMap</code>, e o espaço O(1) é uma vantagem real. Para n acima de 10<sup>7</sup>, ou quando o array chega já ordenado por outra razão, a análise inverte-se e o O(n) ganha.</p>
-      <p>O critério decisivo raramente é o tempo: é se o espaço extra é aceitável e se a entrada pode ser destruída. Ordenar altera a ordem original — se os índices originais fazem parte da resposta, como no <em>two sum</em>, ordenar obriga a transportar pares (valor, índice) e o espaço O(1) evapora-se. Numa API que recebe a lista do chamador, ordenar no lugar é um efeito colateral que quebra o contrato.</p>
-      <p>A forma de o comunicar é apresentar as duas, nomear o critério e escolher: «tenho uma versão que ordena, O(n log n) e sem memória extra, e uma com tabela de dispersão, O(n) tempo e O(n) espaço. Como o enunciado diz que os índices originais são pedidos e n pode ir a 10<sup>6</sup>, escrevo a da tabela. Se a memória fosse a restrição apertada — por exemplo num serviço com 512 MB de heap a processar lotes em paralelo — trocava.» Isso demonstra a competência que a ronda mede: escolher sob restrições declaradas, não recitar a solução óptima.</p></div>
+      <p>Há três problemas independentes. O primeiro é de duração: a chamada HTTP mantém a transacção aberta durante o tempo de resposta do terceiro. Com um <em>timeout</em> de 3 segundos e uma <em>pool</em> HikariCP de 20 ligações, 20 pedidos lentos em simultâneo esgotam a <em>pool</em> e derrubam o serviço inteiro por esgotamento de ligações — o sintoma é <code>Connection is not available, request timed out after 30000ms</code>, e a causa está a 40 linhas de distância. Em PostgreSQL, uma transacção aberta também segura o horizonte do <code>VACUUM</code>: enquanto durar, as versões antigas de linhas de <em>toda</em> a base não podem ser recuperadas.</p>
+      <p>O segundo é de atomicidade falsa: a chamada HTTP e o envio para Kafka não participam na transacção. Se o <code>COMMIT</code> falhar depois de a chamada HTTP ter tido sucesso, o efeito externo aconteceu e o estado local não. Se o processo morrer depois do <code>COMMIT</code> e antes do envio para Kafka, o evento perde-se para sempre. Não existe forma de tornar isto atómico sem <em>two-phase commit</em>, e o <em>2PC</em> com um <em>broker</em> e uma API de terceiros não é opção realista.</p>
+      <p>O terceiro é de visibilidade: se o evento for publicado <em>antes</em> do <code>COMMIT</code>, um consumidor rápido pode ler a base antes de a escrita estar visível e concluir que a entidade não existe. É uma corrida que se manifesta em 1 em cada 10 000 mensagens e que aparece sempre no consumidor errado.</p>
+      <p>A reorganização tem três movimentos. A chamada HTTP sai da transacção: ou acontece antes, com o resultado passado como argumento, ou depois, disparada por um <em>listener</em> de <code>AFTER_COMMIT</code>. A escrita local e o registo do evento ficam numa única transacção curta, com o evento gravado numa tabela <em>outbox</em> — a mesma transacção, a mesma garantia de atomicidade. Um processo separado lê a <em>outbox</em> e publica em Kafka com semântica «pelo menos uma vez», o que obriga o consumidor a ser idempotente por chave. O <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> do Spring resolve o problema da visibilidade mas não o da durabilidade: se a JVM morrer entre o <code>COMMIT</code> e o envio, o evento evapora-se — por isso é <em>outbox</em>, e não <em>listener</em>, quando a perda é inaceitável.</p>
+      <p>Detalhe de Spring que aparece no <em>follow-up</em>: <code>@Transactional</code> é implementado por <em>proxy</em>, logo uma chamada interna (<code>this.metodo()</code>) não abre transacção nenhuma, e a anotação num método <code>private</code> ou <code>final</code> é silenciosamente ignorada com <em>proxies</em> JDK ou CGLIB.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Escolhe «a mais rápida em Big-O» sem olhar para n nem para o espaço.</td></tr>
-        <tr><td>Mid</td><td>Compara as duas complexidades correctamente mas não considera constantes, cache nem mutabilidade da entrada.</td></tr>
-        <tr><td>Sénior</td><td>Faz as perguntas ao enunciado, nomeia o critério de decisão e justifica a escolha com um regime de n concreto.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o custo de manutenção e o contrato da API; refere que ordenar in-place é um efeito colateral observável pelo chamador.</td></tr>
+        <tr><td>Insuficiente</td><td>Não vê problema nenhum; ou diz apenas «é má prática» sem explicar o mecanismo.</td></tr>
+        <tr><td>Mid</td><td>Identifica que a transacção fica aberta demasiado tempo, mas não liga isso à <em>pool</em> de ligações nem ao <code>VACUUM</code>, e propõe apenas mover o código.</td></tr>
+        <tr><td>Sénior</td><td>Separa os três problemas, quantifica o esgotamento da <em>pool</em>, e propõe <em>outbox</em> com consumidor idempotente em vez de eventos em memória.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito no horizonte do <code>VACUUM</code>, distingue <code>AFTER_COMMIT</code> de <em>outbox</em> pela garantia de durabilidade, e menciona o limite dos <em>proxies</em> de auto-invocação.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«A partir de que n é que a versão O(n) ganha em relógio de parede? Como mediria?»</li>
-      <li>«E se o array já estivesse ordenado à entrada?»</li>
-      <li>«Qual das duas escolhe se o método for chamado 10<sup>4</sup> vezes sobre o mesmo array?»</li></ul></div>
+      <li>«Qual é a diferença entre <code>REQUIRES_NEW</code> e <code>REQUIRED</code> aqui?»</li>
+      <li>«Como é que o consumidor de Kafka se torna idempotente?»</li>
+      <li>«Que métrica poria a alarmar para apanhar transacções longas?»</li>
+      <li>«E se o serviço externo for idempotente por chave — muda alguma coisa?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar Big-O como se as constantes não existissem em nenhum regime.</li>
-      <li>Ordenar o array recebido por parâmetro sem avisar que a entrada é modificada.</li>
-      <li>Não conseguir dizer quanta memória é «O(n)» em bytes para n = 10<sup>6</sup>.</li></ul></div>
+      <li>Propor <em>2PC</em> entre PostgreSQL e Kafka como se fosse configuração trivial.</li>
+      <li>Não distinguir «o evento é publicado» de «o evento é publicado depois do <code>COMMIT</code>».</li>
+      <li>Aumentar o tamanho da <em>pool</em> HikariCP como resposta ao esgotamento de ligações.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-23-2" class="h2"><span class="secnum">23.2</span> Two pointers e o padrão de janela deslizante<a class="anchor" href="#sec-23-2" aria-label="ligação">#</a></h2>
+<h2 id="sec-23-2" class="h2"><span class="secnum">23.2</span> MVCC, locks e deadlocks na base de dados<a class="anchor" href="#sec-23-2" aria-label="ligação">#</a></h2>
 
-<p>Os dois padrões partilham a mesma ideia — dois índices que percorrem o array sem nunca recuar, dando O(n) total — mas resolvem problemas diferentes. Em <em>two pointers</em> convergentes, os índices começam nas pontas e aproximam-se; funciona quando existe uma propriedade monótona que garante que um dos lados nunca pode melhorar a resposta, como no array ordenado ou no problema do reservatório. Na janela deslizante, ambos avançam da esquerda para a direita: o índice direito estende a janela e o esquerdo contrai-a quando um invariante é violado.</p>
+<p>O PostgreSQL implementa isolamento por <em>Multi-Version Concurrency Control</em>: um <code>UPDATE</code> não altera a linha, escreve uma versão nova e marca a antiga como morta a partir de um dado identificador de transacção. Cada <em>snapshot</em> é essencialmente uma lista de transacções visíveis, e cada leitura percorre as versões até encontrar a que o seu <em>snapshot</em> pode ver. A consequência prática, e o motivo pelo qual esta pergunta aparece tanto: <strong>leitores nunca bloqueiam escritores e escritores nunca bloqueiam leitores</strong>. Só escritores bloqueiam escritores, e apenas na mesma linha.</p>
 
-<p>O invariante é o que distingue uma janela deslizante correcta de um duplo ciclo disfarçado. Deve poder escrever-se numa frase: «entre <code>inicio</code> e <code>fim</code> não há caracteres repetidos», «a soma da janela é menor ou igual a K». Cada iteração do ciclo exterior avança <code>fim</code> em um; o ciclo interior avança <code>inicio</code> apenas o necessário para restaurar o invariante. Como <code>inicio</code> nunca recua e está limitado por n, o total de avanços dos dois índices é no máximo 2n, portanto O(n) — argumento que se diz em voz alta, porque um ciclo dentro de outro parece O(n²) a quem só olha para a indentação.</p>
+<p>O preço do MVCC é o lixo. Uma tabela com 10 milhões de linhas actualizadas duas vezes por dia acumula 20 milhões de versões mortas por dia; o <code>autovacuum</code> recupera esse espaço para reutilização, mas não devolve ficheiro ao sistema de ficheiros excepto no fim físico da tabela. Uma transacção aberta há 40 minutos impede o <code>VACUUM</code> de limpar tudo o que ficou morto depois de ela começar — em toda a base, não só na tabela que ela tocou. É por isso que uma sessão esquecida em <code>idle in transaction</code> aparece dias depois como «as consultas ficaram três vezes mais lentas»: a tabela inchou de 4 GB para 30 GB e os planos deixaram de caber em memória.</p>
 
-<p>A condição de aplicabilidade que os candidatos esquecem é a monotonia. A janela deslizante só funciona se estender a janela nunca puder tornar verdadeira uma condição que era falsa, e contrair nunca puder torná-la falsa. Com valores não negativos, «soma ≤ K» é monótona e a técnica aplica-se; com valores negativos deixa de ser, e a resposta correcta passa a ser somas de prefixo com uma tabela de dispersão. Anunciar essa fronteira é sinal de sénior.</p>
+<p>Do lado dos <em>locks</em>, os que interessam em entrevista são poucos. <code>FOR UPDATE</code> adquire o <em>lock</em> exclusivo de linha e bloqueia qualquer outra escrita ou <code>FOR UPDATE</code> sobre ela. <code>FOR NO KEY UPDATE</code> é mais fraco e é o que o próprio motor usa em <code>UPDATE</code> que não toca em colunas de chave — permite que chaves estrangeiras sejam verificadas em paralelo. <code>FOR SHARE</code> permite outros leitores com <em>lock</em> mas impede escritas. <code>SKIP LOCKED</code> ignora linhas já bloqueadas em vez de esperar, e é a instrução que transforma uma tabela numa fila de trabalho competitiva sem <em>broker</em>. Ao nível da tabela, o <em>lock</em> que causa incidentes é o <code>ACCESS EXCLUSIVE</code> de um <code>ALTER TABLE</code>: fica atrás da transacção mais lenta em curso e, a partir daí, <strong>toda</strong> a fila de pedidos a essa tabela fica atrás dele, incluindo <code>SELECT</code>.</p>
+
+<figure class="listing sql" id="lst-23-2"><div class="lhead"><span class="lnum">Listagem 23.2</span>
+<span class="lcap">Duas sessões em <code>FOR UPDATE</code>: a segunda espera e relê a versão nova.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN;                                    -- READ COMMITTED (omissão)
+A t2 | SELECT stock FROM produto WHERE id = 42 FOR UPDATE;   -- 5, linha bloqueada
+B t3 | BEGIN;
+B t4 | SELECT stock FROM produto WHERE id = 42 FOR UPDATE;   -- fica em espera
+A t5 | UPDATE produto SET stock = stock - 5 WHERE id = 42;
+A t6 | COMMIT;
+B t7 | -- desbloqueia e devolve 0, nao 5: em READ COMMITTED o FOR UPDATE
+     | -- re-le a versao mais recente commitada da linha bloqueada
+B t8 | ROLLBACK;
+
+-- Em REPEATABLE READ, o passo t7 nao devolve 0: aborta com
+--   ERROR: could not serialize access due to concurrent update (40001)
+
+-- Fila de trabalho sem broker: cada worker leva lotes disjuntos
+SELECT id, payload FROM tarefa
+ WHERE estado = 'PENDENTE'
+ ORDER BY criado_em
+ FOR UPDATE SKIP LOCKED
+ LIMIT 100;</code></pre></figure>
+
+<figure class="listing sql" id="lst-23-3"><div class="lhead"><span class="lnum">Listagem 23.3</span>
+<span class="lcap">Deadlock por ordem de aquisição invertida (SQLSTATE 40P01).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN;
+A t2 | UPDATE conta SET saldo = saldo - 50 WHERE id = 1;   -- lock em 1
+B t3 | BEGIN;
+B t4 | UPDATE conta SET saldo = saldo - 50 WHERE id = 2;   -- lock em 2
+A t5 | UPDATE conta SET saldo = saldo + 50 WHERE id = 2;   -- espera por B
+B t6 | UPDATE conta SET saldo = saldo + 50 WHERE id = 1;   -- espera por A: ciclo
+     |
+     | -- passado deadlock_timeout (1s por omissao) o detector escolhe
+     | -- a vitima mais barata e aborta-a:
+     | ERROR:  deadlock detected                              -- SQLSTATE 40P01
+     | DETAIL: Process 8123 waits for ShareLock on transaction 5512;
+     |         blocked by process 8140.
+
+-- Correccao: ordem total de aquisicao (por id crescente) nas duas sessoes
+UPDATE conta SET saldo = saldo + CASE id WHEN 1 THEN -50 ELSE 50 END
+ WHERE id IN (1, 2);   -- uma instrucao, ordem determinada pelo plano</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Uma migração <code>ALTER TABLE encomenda ADD COLUMN ... NOT NULL DEFAULT ...</code> parece instantânea no PostgreSQL 17 (não reescreve a tabela desde a versão 11), mas continua a precisar de <code>ACCESS EXCLUSIVE</code>. Se houver uma consulta de relatório a correr há 90 segundos, o <code>ALTER</code> espera por ela — e todos os <code>SELECT</code> que chegam entretanto esperam pelo <code>ALTER</code>. Uma alteração de metadados de 5 ms transforma-se em 90 segundos de indisponibilidade total da tabela. A defesa é <code>SET lock_timeout = '2s'</code> antes de qualquer DDL, com retentativa.</p></aside>
+
+<div class="qa" id="q-23-3" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tem um endpoint que decrementa stock. Quando usaria <code>SELECT ... FOR UPDATE</code>, quando usaria um <code>UPDATE</code> condicional, e o que muda com <code>SKIP LOCKED</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A regra é simples: se a decisão depender apenas do valor da própria linha, não é preciso <code>FOR UPDATE</code> — um <code>UPDATE ... WHERE id = ? AND stock &gt;= ?</code> é atómico por construção e devolve zero linhas afectadas quando não há stock. Uma ida à base em vez de duas, sem <em>lock</em> mantido entre elas, e o resultado é o mesmo. <code>FOR UPDATE</code> só se justifica quando é preciso <strong>ler, decidir em código e escrever</strong> — por exemplo quando o cálculo do desconto depende de outras tabelas, ou quando é preciso escrever em várias linhas de forma consistente com o que se leu.</p>
+      <p>O que <code>FOR UPDATE</code> faz mecanicamente: adquire o <em>lock</em> exclusivo da linha, mantido até ao fim da transacção. Em <code>READ COMMITTED</code> tem um comportamento que apanha muita gente — quando a espera termina, o motor <em>relê</em> a versão mais recente commitada da linha e reavalia a cláusula <code>WHERE</code> sobre ela. É por isso que a segunda sessão da <em>Listagem 23.2</em> vê 0 e não 5. Em <code>REPEATABLE READ</code> não relê: aborta com 40001, porque a linha mudou depois do <em>snapshot</em>.</p>
+      <p>Os riscos são dois. O primeiro é a serialização: se todos os pedidos tocarem no mesmo produto — um artigo em campanha — <code>FOR UPDATE</code> transforma o <em>endpoint</em> numa fila de uma via. Com uma transacção de 5 ms de trabalho, o tecto é ~200 reservas por segundo nesse produto, independentemente do número de instâncias. O segundo é o <em>deadlock</em>: bloquear várias linhas por ordem não determinada (por exemplo, iterar sobre um <code>Set</code>) gera ciclos. A defesa é <code>ORDER BY id</code> no <code>SELECT ... FOR UPDATE</code>.</p>
+      <p><code>SKIP LOCKED</code> muda a semântica de «espera pela tua vez» para «leva o que estiver livre». Não serve para stock — saltar a linha do produto daria a resposta errada — mas é a instrução certa para filas de trabalho: N <em>workers</em> a fazerem <code>SELECT ... FOR UPDATE SKIP LOCKED LIMIT 100</code> obtêm lotes disjuntos sem coordenação e sem <em>broker</em>. Escala bem até algumas centenas de mensagens por segundo e alguns milhões de linhas na tabela; acima disso o custo de <em>vacuum</em> e o crescimento do índice passam a doer e vale a pena um Kafka ou um SQS.</p>
+      <p>O complemento habitual é <code>NOWAIT</code>: falha imediatamente com 55P03 em vez de esperar, útil quando é preferível devolver 409 ao cliente do que segurar um <em>thread</em> durante 30 segundos.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Usa <code>FOR UPDATE</code> em tudo, ou não sabe que existe e propõe <code>synchronized</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>FOR UPDATE</code> bloqueia a linha, mas não vê que o <code>UPDATE</code> condicional dispensa o <em>lock</em> explícito neste caso.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe pelo critério «a decisão depende de mais do que a linha?», conhece a releitura em <code>READ COMMITTED</code>, e quantifica o tecto de <em>throughput</em> por linha quente.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>SKIP LOCKED</code> para filas com o limite a partir do qual deixa de compensar, <code>NOWAIT</code> para degradação controlada, e a ordem total de aquisição como prevenção de <em>deadlock</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas reservas por segundo aguenta esse produto? Como calculou?»</li>
+      <li>«E se precisar de bloquear 50 linhas de uma vez?»</li>
+      <li>«Como faria isto com JPA — <code>LockModeType</code> qual?»</li>
+      <li>«Em que ponto trocaria a tabela-fila por Kafka?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Ler o stock numa transacção, fechá-la, e escrever noutra («entre as duas ninguém mexe»).</li>
+      <li>Usar <code>SKIP LOCKED</code> em contexto de reserva de stock.</li>
+      <li>Manter a transacção aberta enquanto se chama o serviço de pagamentos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-4" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Em produção começam a aparecer 200 <em>deadlocks</em> por hora numa tabela de contas. Como investiga e o que muda no código?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <em>deadlock</em> é sempre um ciclo de espera por <em>locks</em>, e no PostgreSQL o detector corre passado <code>deadlock_timeout</code> (1 segundo por omissão), escolhe a transacção mais barata de abortar e devolve 40P01 a essa. Não é um <em>bug</em> da base: é o único desfecho possível quando duas transacções pedem os mesmos recursos por ordens diferentes. Portanto a investigação é sobre a <strong>ordem de aquisição</strong>, não sobre a base.</p>
+      <p>A investigação em três passos. Primeiro, <code>log_lock_waits = on</code> e <code>deadlock_timeout = '200ms'</code> temporariamente, para o log passar a conter o par de instruções envolvidas em cada ciclo — o log de <em>deadlock</em> do PostgreSQL diz exactamente que processo esperava por que <em>lock</em> e qual era a instrução de cada um. Segundo, agregar por par de instruções: em 90% dos casos são duas ou três combinações a gerar tudo. Terceiro, mapear o par para o código — normalmente é um método que actualiza duas contas (transferência) e outro que actualiza um lote de contas iterando sobre um <code>HashSet</code>, cuja ordem de iteração varia com o <em>hash</em>.</p>
+      <p>As correcções, por ordem de eficácia. (1) Ordem total de aquisição: todas as transacções bloqueiam por <code>id</code> crescente — numa transferência, <code>ORDER BY id</code> antes do <code>FOR UPDATE</code>, ou ordenar a lista em Java antes de iterar. Elimina o ciclo por construção. (2) Colapsar em uma instrução: um único <code>UPDATE ... WHERE id IN (...)</code> deixa a ordem a cargo do plano, que é consistente entre sessões. (3) Encurtar a transacção: menos tempo com <em>locks</em> significa menos janela de sobreposição — reduz a frequência, não elimina a causa. (4) Retentativa com <em>backoff</em> em 40P01 e 40001, com limite de 3 tentativas e <em>jitter</em>; é rede de segurança, não solução.</p>
+      <p>O número importa para decidir a urgência: 200 por hora sobre, digamos, 400 000 transacções por hora é 0,05% — irritante, tratável na próxima <em>sprint</em>. Os mesmos 200 sobre 5 000 transacções por hora é 4%, é incidente, e provavelmente já está a produzir erros visíveis ao cliente porque a retentativa não existe ou esgotou.</p>
+      <p>O <em>trade-off</em> da retentativa: só é segura se a transacção não tiver efeitos externos e for idempotente. Repetir automaticamente uma transacção que já enviou um e-mail ou já debitou um cartão troca um erro por uma duplicação, que é pior e mais difícil de detectar.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentava o <em>timeout</em>» ou «reiniciava a base»; não sabe o que é um ciclo de espera.</td></tr>
+        <tr><td>Mid</td><td>Explica o que é um <em>deadlock</em> e propõe retentativa, sem procurar a ordem de aquisição nem os logs.</td></tr>
+        <tr><td>Sénior</td><td>Vai ao log, agrega por par de instruções, identifica a ordem inconsistente e corrige com ordem total; usa a retentativa apenas como rede.</td></tr>
+        <tr><td>Staff</td><td>Normaliza o número contra o volume total para decidir a urgência, e nota que a retentativa automática só é aceitável em transacções sem efeitos externos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como distingue 40P01 de 40001 no tratamento de erros?»</li>
+      <li>«E se o ciclo envolver um índice único em vez de linhas?»</li>
+      <li>«Que valor de <code>deadlock_timeout</code> deixaria em produção?»</li>
+      <li>«Como testaria a correcção antes de a enviar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Culpar a base de dados em vez da ordem de aquisição da aplicação.</li>
+      <li>Retentativa infinita sem <em>backoff</em> nem limite — transforma <em>deadlocks</em> em tempestade.</li>
+      <li>Baixar o nível de isolamento na esperança de que os <em>deadlocks</em> desapareçam.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-23-3" class="h2"><span class="secnum">23.3</span> Anomalias: dirty read, non-repeatable, phantom, write skew<a class="anchor" href="#sec-23-3" aria-label="ligação">#</a></h2>
+
+<p>As quatro anomalias distinguem-se por duas perguntas: <em>o que muda entre as duas leituras</em> e <em>quem escreve</em>. Na leitura suja, lê-se algo que nunca foi commitado. Na leitura não repetível, a <strong>mesma linha</strong> muda de valor entre duas leituras da mesma transacção. Na leitura fantasma, o <strong>conjunto de linhas</strong> que satisfaz um predicado muda — aparecem ou desaparecem linhas. No <em>write skew</em>, nenhuma leitura é inconsistente: duas transacções lêem o mesmo estado, decidem correctamente sobre ele, e escrevem em linhas diferentes, violando em conjunto um invariante que nenhuma violou sozinha.</p>
+
+<p>Vale sublinhar o que os motores reais fazem, porque o padrão está desactualizado. O PostgreSQL nunca permite leituras sujas, em nível nenhum: o MVCC não tem sequer forma de mostrar uma versão não commitada. O MySQL/InnoDB permite-as em <code>READ UNCOMMITTED</code>. Ambos eliminam leituras fantasma já em <code>REPEATABLE READ</code>, porque ambos usam <em>snapshot</em> — o que o padrão SQL não exige. E nenhum dos dois impede <em>write skew</em> em <code>REPEATABLE READ</code>; só o <code>SERIALIZABLE</code> do PostgreSQL o faz, e fá-lo abortando.</p>
+
+<figure class="listing sql" id="lst-23-4"><div class="lhead"><span class="lnum">Listagem 23.4</span>
+<span class="lcap">Dirty read: só possível em MySQL <code>READ UNCOMMITTED</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN;
+A t2 | UPDATE conta SET saldo = saldo - 100 WHERE id = 7;
+     | -- saldo passa de 500 para 400 na versao ainda NAO commitada
+B t3 | SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+B t4 | BEGIN;
+B t5 | SELECT saldo FROM conta WHERE id = 7;       -- 400  (leitura suja)
+B t6 | -- autoriza um levantamento com base em 400
+A t7 | ROLLBACK;                                   -- saldo real: 500
+B t8 | COMMIT;   -- decidiu sobre um estado que nunca existiu
+
+-- PostgreSQL: pedir READ UNCOMMITTED e legal mas silenciosamente
+-- equivalente a READ COMMITTED; t5 devolveria 500.</code></pre></figure>
+
+<figure class="listing sql" id="lst-23-5"><div class="lhead"><span class="lnum">Listagem 23.5</span>
+<span class="lcap">Non-repeatable read: a mesma linha muda dentro da transacção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN ISOLATION LEVEL READ COMMITTED;
+A t2 | SELECT preco FROM artigo WHERE id = 42;   -- 19.90 (usado no calculo do IVA)
+B t3 | BEGIN;
+B t4 | UPDATE artigo SET preco = 24.90 WHERE id = 42;
+B t5 | COMMIT;
+A t6 | SELECT preco FROM artigo WHERE id = 42;   -- 24.90 (usado na linha da factura)
+A t7 | COMMIT;   -- factura com IVA calculado sobre 19.90 e total sobre 24.90
+
+-- Em REPEATABLE READ, t6 devolve 19.90: o snapshot foi fixado em t2.</code></pre></figure>
+
+<figure class="listing sql" id="lst-23-6"><div class="lhead"><span class="lnum">Listagem 23.6</span>
+<span class="lcap">Phantom read: o conjunto que satisfaz o predicado cresce.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>A t1 | BEGIN ISOLATION LEVEL READ COMMITTED;
+A t2 | SELECT count(*), sum(valor) FROM lancamento WHERE conta_id = 7;
+     | -- 3 linhas, total 1000
+B t3 | BEGIN;
+B t4 | INSERT INTO lancamento (conta_id, valor) VALUES (7, 250);
+B t5 | COMMIT;
+A t6 | SELECT count(*), sum(valor) FROM lancamento WHERE conta_id = 7;
+     | -- 4 linhas, total 1250: apareceu uma linha "fantasma"
+A t7 | COMMIT;   -- o extracto tem o total do rodape diferente do das linhas
+
+-- Em REPEATABLE READ (PostgreSQL e MySQL), t6 devolve 3 linhas / 1000:
+-- o snapshot ignora linhas commitadas depois de t2. O padrao SQL
+-- permitiria o fantasma neste nivel; estes motores nao o produzem.</code></pre></figure>
+
+<figure class="listing sql" id="lst-23-7"><div class="lhead"><span class="lnum">Listagem 23.7</span>
+<span class="lcap">Write skew: nenhuma transacção erra sozinha, o invariante cai.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- Invariante: pelo menos um medico de plantao no turno da noite.
+A t1 | BEGIN ISOLATION LEVEL REPEATABLE READ;
+B t2 | BEGIN ISOLATION LEVEL REPEATABLE READ;
+A t3 | SELECT count(*) FROM plantao WHERE turno = 'noite' AND activo;   -- 2
+B t4 | SELECT count(*) FROM plantao WHERE turno = 'noite' AND activo;   -- 2
+A t5 | -- 2 &gt;= 2, logo a Alice pode sair
+A t6 | UPDATE plantao SET activo = false WHERE medico = 'alice' AND turno = 'noite';
+B t7 | -- 2 &gt;= 2, logo o Bob pode sair
+B t8 | UPDATE plantao SET activo = false WHERE medico = 'bob' AND turno = 'noite';
+A t9 | COMMIT;   -- OK: linhas diferentes, nenhum conflito de escrita
+B t10| COMMIT;   -- OK tambem  ==  zero medicos de plantao
+
+-- Com ISOLATION LEVEL SERIALIZABLE, t10 falha:
+--   ERROR: could not serialize access due to read/write dependencies (40001)
+-- Alternativa sem SERIALIZABLE: materializar o conflito numa linha unica
+A t5'| SELECT * FROM turno_noite WHERE data = CURRENT_DATE FOR UPDATE;</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Contra <em>write skew</em> há três caminhos com custos diferentes. Uma restrição declarativa (<code>EXCLUDE</code>, <code>UNIQUE</code> parcial, <code>CHECK</code> sobre coluna materializada) custa zero em tempo de execução mas só exprime invariantes locais a uma linha ou a um índice. Materializar o conflito com <code>FOR UPDATE</code> numa linha-agregado é sempre exprimível e serializa apenas o grupo afectado, mas exige disciplina em <em>todos</em> os caminhos de escrita — basta um que esqueça o <em>lock</em> para a garantia desaparecer. <code>SERIALIZABLE</code> é a única opção que não depende de disciplina do programador, e é a única que obriga toda a aplicação a saber repetir transacções.</p></aside>
+
+<div class="qa" id="q-23-5" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Distinga leitura não repetível de leitura fantasma com um exemplo de duas sessões cada, e diga-me em que nível de isolamento cada uma deixa de acontecer no PostgreSQL.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A distinção é entre <strong>linha</strong> e <strong>conjunto</strong>. Na leitura não repetível, a transacção A lê a linha 42 e obtém 19,90; a transacção B faz <code>UPDATE</code> dessa linha para 24,90 e <code>COMMIT</code>; A relê a mesma linha e obtém 24,90. O identificador da linha é o mesmo, o valor mudou. Na leitura fantasma, A executa <code>SELECT count(*) ... WHERE conta_id = 7</code> e obtém 3; B insere uma linha nova que satisfaz o mesmo predicado e faz <code>COMMIT</code>; A repete e obtém 4. Nenhuma linha que A tinha lido mudou — mudou o conjunto de linhas que satisfazem o predicado.</p>
+      <p>A diferença importa porque as defesas são diferentes. Bloquear as linhas lidas com <code>FOR UPDATE</code> resolve a leitura não repetível e <strong>não</strong> resolve o fantasma: não se pode bloquear uma linha que ainda não existe. Contra fantasmas é preciso bloquear o intervalo do predicado (os <em>next-key locks</em> do InnoDB, ou os <em>predicate locks</em> do SSI do PostgreSQL) ou ter um <em>snapshot</em> estável.</p>
+      <p>No PostgreSQL, ambas desaparecem ao subir de <code>READ COMMITTED</code> para <code>REPEATABLE READ</code>, e desaparecem pelo mesmo mecanismo: o <em>snapshot</em> é fixado na primeira leitura da transacção, por isso nem alterações nem inserções commitadas depois desse instante ficam visíveis. É por isso que o <code>REPEATABLE READ</code> do PostgreSQL é mais forte do que o padrão SQL exige — o padrão admite fantasmas nesse nível. O que <code>REPEATABLE READ</code> continua a não impedir é o <em>write skew</em>, porque aí não há leitura inconsistente nenhuma: cada transacção leu um estado coerente e escreveu numa linha que mais ninguém tocou.</p>
+      <p>O caso prático onde isto morde: um relatório financeiro que faz vários <code>SELECT</code> agregados em <code>READ COMMITTED</code> e produz um documento em que o total do rodapé não bate com a soma das linhas, porque foram lidos em instantes diferentes. A correcção não é «somar em Java»: é abrir o relatório em <code>REPEATABLE READ</code>, custo zero em escrita porque a transacção só lê. Em Spring, <code>@Transactional(isolation = Isolation.REPEATABLE_READ, readOnly = true)</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Troca as duas anomalias, ou define-as com as palavras do manual sem conseguir dar um exemplo com duas sessões.</td></tr>
+        <tr><td>Mid</td><td>Dá os exemplos correctos mas não sabe em que nível cada uma desaparece, ou repete a tabela do padrão SQL como se fosse o PostgreSQL.</td></tr>
+        <tr><td>Sénior</td><td>Distingue linha vs conjunto, explica porque <code>FOR UPDATE</code> não chega para fantasmas, e sabe que no PostgreSQL ambas caem em <code>REPEATABLE READ</code>.</td></tr>
+        <tr><td>Staff</td><td>Nota que o <code>REPEATABLE READ</code> do PostgreSQL excede o padrão, e aplica o nível a um relatório só de leitura como decisão de desenho com custo quantificado.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que <code>FOR UPDATE</code> não impede um fantasma?»</li>
+      <li>«O que são <em>next-key locks</em> e onde é que aparecem?»</li>
+      <li>«Um relatório em <code>REPEATABLE READ</code> de 20 minutos tem algum custo? Qual?»</li>
+      <li>«E em MySQL, a resposta muda?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que <code>READ COMMITTED</code> impede leituras não repetíveis.</li>
+      <li>Não conseguir escrever a sequência de duas sessões quando pedida no quadro.</li>
+      <li>Confundir «anomalia de isolamento» com «erro de concorrência em memória Java».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-6" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A regra de negócio é «uma sala não pode ter duas reservas sobrepostas». Duas reservas concorrentes passaram na validação e ficaram ambas gravadas. O que aconteceu e como o corrige em definitivo?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É <em>write skew</em> na sua forma mais comum. Cada transacção fez <code>SELECT ... WHERE sala = 3 AND intervalo sobrepõe ...</code>, não encontrou nada, concluiu que podia inserir, e inseriu uma linha nova. As duas linhas são diferentes, não há conflito de escrita, e nenhuma restrição declarada foi violada. Nem <code>READ COMMITTED</code> nem <code>REPEATABLE READ</code> detectam isto: a anomalia está na dependência entre a leitura de A e a escrita de B, e vice-versa.</p>
+      <p>A correcção definitiva, e a que se espera de um sénior no PostgreSQL, é uma restrição de exclusão — o motor passa a impedir a sobreposição por construção, em qualquer nível de isolamento e a partir de qualquer caminho de escrita, incluindo consolas e <em>scripts</em> de migração:</p>
+      <ul class="lst">
+        <li><code>CREATE EXTENSION btree_gist;</code> para poder misturar igualdade de <code>sala_id</code> com sobreposição de intervalos.</li>
+        <li><code>ALTER TABLE reserva ADD CONSTRAINT sem_sobreposicao EXCLUDE USING gist (sala_id WITH =, periodo WITH &amp;&amp;);</code> com <code>periodo</code> do tipo <code>tstzrange</code>.</li>
+        <li>A segunda inserção concorrente falha com <code>23P01 exclusion_violation</code>; a aplicação traduz para 409 e devolve o conflito ao cliente.</li>
+      </ul>
+      <p>As alternativas, com o respectivo custo. Subir a transacção para <code>SERIALIZABLE</code> funciona — o SSI detecta a dependência e aborta uma — mas só protege os caminhos que passam por essa transacção e obriga a retentativa em toda a aplicação. Materializar o conflito com <code>SELECT ... FROM sala WHERE id = 3 FOR UPDATE</code> antes de validar também funciona e serializa apenas as reservas daquela sala, mas a garantia depende de todos os caminhos de escrita se lembrarem do <em>lock</em>. A validação em Java com um <code>synchronized</code> ou um <code>ReentrantLock</code> não funciona de todo assim que houver mais de uma instância do serviço.</p>
+      <p>O critério de escolha: se o invariante for exprimível como restrição da base, é aí que ele deve viver, porque é o único sítio onde não pode ser contornado. Quando não for — invariantes que envolvem várias tabelas ou agregações complexas — materializa-se o conflito numa linha e documenta-se o <em>lock</em> obrigatório; <code>SERIALIZABLE</code> fica como opção quando a disciplina não é realista, aceitando 1-3% de retentativas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Faltou um <em>lock</em>» sem saber qual, ou propõe verificar outra vez depois de inserir.</td></tr>
+        <tr><td>Mid</td><td>Identifica a corrida e propõe <code>synchronized</code> ou uma verificação dupla; não distingue instância única de <em>cluster</em>.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia <em>write skew</em>, propõe <code>SERIALIZABLE</code> ou <em>lock</em> na linha da sala, e discute o custo de retentativa.</td></tr>
+        <tr><td>Staff</td><td>Move o invariante para a base com <code>EXCLUDE USING gist</code>, argumenta que é o único sítio incontornável, e mapeia <code>23P01</code> para a resposta HTTP correcta.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se as reservas estiverem repartidas por vários <em>shards</em>?»</li>
+      <li>«Como testaria esta corrida de forma determinística?»</li>
+      <li>«Qual é o custo de escrita do índice GiST face a um B-tree?»</li>
+      <li>«E se a base fosse MySQL, que não tem <code>EXCLUDE</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Resolver com bloqueio em memória da JVM num serviço com réplicas.</li>
+      <li>Achar que <code>REPEATABLE READ</code> impede este caso.</li>
+      <li>Aceitar «acontece raramente, corrigimos manualmente» como desenho.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-23-4" class="h2"><span class="secnum">23.4</span> Replicação, failover e leituras replicadas<a class="anchor" href="#sec-23-4" aria-label="ligação">#</a></h2>
+
+<p>A replicação em PostgreSQL é <em>streaming</em> do WAL: o primário envia os registos do <em>write-ahead log</em> às réplicas, que os aplicam. O parâmetro que decide tudo é <code>synchronous_commit</code>. Em <code>off</code> ou <code>local</code> (o valor por omissão, assíncrono), o <code>COMMIT</code> devolve assim que o WAL está em disco no primário — latência mínima, mas uma falha do primário pode perder as transacções que ainda não chegaram à réplica. Em <code>remote_write</code> ou <code>on</code> com <code>synchronous_standby_names</code> configurado, o <code>COMMIT</code> só devolve depois de a réplica confirmar — perda zero de transacções commitadas, ao preço de somar um <em>round-trip</em> de rede a cada escrita: 1-2 ms na mesma zona de disponibilidade, 10-40 ms entre regiões europeias.</p>
+
+<p>Este é o ponto onde muitos candidatos falham a tradução para o negócio. RPO (<em>Recovery Point Objective</em>) é quantos dados a empresa aceita perder; RTO (<em>Recovery Time Objective</em>) é quanto tempo aceita estar em baixo. Replicação assíncrona típica dá RPO de algumas centenas de milissegundos a alguns segundos, e um <em>failover</em> gerido (Patroni, RDS Multi-AZ) dá RTO de 30 a 120 segundos. Replicação síncrona dá RPO zero com o mesmo RTO, mas transforma a réplica num ponto de falha do caminho de escrita: se ela ficar lenta, todas as escritas ficam lentas. O compromisso habitual em pagamentos é síncrona para uma réplica na mesma região e assíncrona para a de <em>disaster recovery</em> noutra região.</p>
+
+<p>As leituras nas réplicas são a poupança óbvia — e a fonte de <em>bugs</em> mais desagradável do capítulo. O utilizador actualiza o perfil, o <code>POST</code> vai ao primário, o <code>GET</code> imediatamente a seguir vai a uma réplica com 200 ms de atraso e devolve os dados antigos. Do lado do utilizador, «a aplicação perdeu o que eu gravei». Chama-se falha de <em>read-your-writes</em>, e não se resolve com <em>caches</em> — agrava-se com elas.</p>
+
+<figure class="listing sql" id="lst-23-8"><div class="lhead"><span class="lnum">Listagem 23.8</span>
+<span class="lcap">Medir o atraso de replicação: em bytes no primário, em tempo na réplica.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- No primario: quanto WAL cada replica ainda nao aplicou
+SELECT application_name,
+       state,                                   -- streaming / catchup
+       sync_state,                              -- sync / async / potential
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_em_atraso,
+       write_lag, flush_lag, replay_lag
+  FROM pg_stat_replication;
+
+-- Na replica: atraso em tempo (0 quando nao ha trafego de escrita)
+SELECT CASE WHEN pg_is_in_recovery()
+            THEN now() - pg_last_xact_replay_timestamp()
+       END AS atraso;
+
+-- Ler a posicao do WAL apos escrever, para depois esperar por ela na replica
+SELECT pg_current_wal_lsn();          -- no primario, no fim da transacao
+SELECT pg_last_wal_replay_lsn();      -- na replica, para comparar</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa réplica na mesma região AWS, o atraso típico é de 5 a 50 ms em regime normal e sobe para segundos ou minutos durante uma reindexação, uma migração de esquema ou uma carga em lote. O valor que interessa alarmar não é a média: é o p99 diário e o máximo. Uma regra defensável é alarmar em <code>replay_lag &gt; 5 s</code> durante 2 minutos, e retirar automaticamente a réplica do encaminhamento de leituras acima desse limite — o custo de servir dados de há 30 segundos é quase sempre maior do que o de sobrecarregar o primário durante 5 minutos.</p></aside>
+
+<div class="qa" id="q-23-7" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Encaminharam as leituras para réplicas e começaram a chegar queixas de utilizadores que gravam e não vêem a alteração. Como resolve sem desistir das réplicas?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É uma falha de <em>read-your-writes</em>: a escrita foi para o primário, a leitura seguinte foi para uma réplica que ainda não aplicou aquele registo do WAL. O problema não é a replicação estar lenta — 30 ms de atraso chegam, porque o <code>GET</code> do <em>browser</em> parte 10 ms depois do <code>POST</code>. Portanto a solução tem de garantir consistência de sessão, não reduzir o atraso.</p>
+      <p>Há quatro estratégias, por ordem crescente de custo e de garantia. A primeira, e a que resolve 90% dos casos com o menor esforço: <strong>janela pegajosa por utilizador</strong>. Depois de uma escrita, marca-se a sessão (num cabeçalho, num <em>cookie</em> assinado ou no Redis) durante N segundos — tipicamente 5 — e todas as leituras dessa sessão nessa janela vão ao primário. Custa uma fracção do tráfego de leitura: se 3% dos pedidos forem escritas e cada uma arrastar 5 segundos de leituras dessa sessão, o primário recebe talvez 10-15% das leituras em vez de 100%.</p>
+      <p>A segunda é <strong>esperar pelo LSN</strong>: no fim da transacção de escrita regista-se <code>pg_current_wal_lsn()</code>, propaga-se esse valor com a sessão, e a leitura só usa uma réplica cujo <code>pg_last_wal_replay_lsn()</code> já seja igual ou superior. É a garantia mais forte sem ir ao primário, custa uma consulta extra de verificação por leitura (ou uma consulta periódica com estado em memória) e obriga a ter um <em>fallback</em> para o primário quando nenhuma réplica está actualizada.</p>
+      <p>A terceira é <strong>devolver o estado na resposta da escrita</strong>: o <code>POST</code>/<code>PUT</code> responde com a representação completa do recurso e o cliente usa-a em vez de fazer o <code>GET</code>. Elimina a corrida em vez de a gerir, custa zero em infra-estrutura e é a que menos gente propõe.</p>
+      <p>A quarta é <strong>replicação síncrona</strong> para a réplica de leitura: garantia total, mas paga-se em cada escrita, e a réplica passa a poder derrubar o caminho de escrita. Reserva-se para domínios onde a leitura desactualizada é inaceitável, como saldos.</p>
+      <p>Independentemente da escolha, há duas regras: nunca encaminhar para uma réplica com <code>replay_lag</code> acima do limiar (5 s é um ponto de partida razoável), e classificar explicitamente cada <em>endpoint</em> como tolerante ou não a leitura desactualizada. Em Spring, <code>@Transactional(readOnly = true)</code> combinado com um <code>AbstractRoutingDataSource</code> faz o encaminhamento, mas a decisão de tolerância é de domínio e tem de ser escrita algures — um catálogo de produtos tolera 30 segundos, o saldo de uma conta não tolera 30 milissegundos.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Punha um <em>sleep</em> de 500 ms» ou «desligava as réplicas».</td></tr>
+        <tr><td>Mid</td><td>Explica o atraso de replicação e propõe mandar tudo para o primário, sem quantificar o que isso desperdiça.</td></tr>
+        <tr><td>Sénior</td><td>Propõe janela pegajosa por sessão com número concreto, remove réplicas atrasadas do encaminhamento e classifica <em>endpoints</em> por tolerância.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a espera por LSN como garantia forte, propõe devolver o recurso na resposta da escrita, e trata a tolerância a dados desactualizados como decisão de produto documentada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que percentagem de leituras volta ao primário com uma janela de 5 segundos?»</li>
+      <li>«E se o utilizador tiver dois separadores abertos em dispositivos diferentes?»</li>
+      <li>«Como implementaria o encaminhamento em Spring Boot?»</li>
+      <li>«Qual é o efeito de um <em>failover</em> a meio de uma janela pegajosa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que o problema se resolve com <em>cache</em> à frente da réplica.</li>
+      <li>Assumir que a replicação assíncrona é «praticamente instantânea» e ignorar o p99.</li>
+      <li>Não distinguir <em>endpoints</em> tolerantes de intolerantes a dados desactualizados.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-8" data-box="qa" data-area="sd" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O primário da base de dados falhou às 3 da manhã e houve promoção automática de uma réplica. Que dados se podem ter perdido e o que é que a aplicação tem de saber fazer?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com replicação assíncrona, perdem-se as transacções que foram commitadas no primário e cujo WAL ainda não tinha chegado à réplica promovida. A dimensão da perda é exactamente o atraso de replicação no instante da falha: com um <code>replay_lag</code> de 300 ms e 800 escritas por segundo, são cerca de 240 transacções — que o cliente viu confirmadas e que deixaram de existir. Com replicação síncrona para pelo menos uma réplica, o RPO é zero, mas cada escrita pagou o <em>round-trip</em> enquanto tudo estava bem.</p>
+      <p>O segundo perigo é o <em>split-brain</em>: se o primário antigo não estiver realmente morto — só isolado da rede — e continuar a aceitar escritas, ficam duas linhas de história divergentes. É por isso que qualquer solução séria (Patroni com etcd, RDS Multi-AZ) usa <em>fencing</em>: o antigo primário é isolado ou reiniciado como réplica antes de a promoção ser considerada válida, e a decisão é tomada por quórum, não pelo nó.</p>
+      <p>Do lado da aplicação, três capacidades. Primeira, reconectar sem reiniciar: a <em>pool</em> tem de detectar ligações mortas — HikariCP com <code>validationTimeout</code> curto e uma consulta de validação — e o cliente PostgreSQL deve apontar para o <em>endpoint</em> de escrita gerido pelo <em>failover</em>, não para um IP. Segunda, falhar depressa em vez de acumular: durante os 30-120 segundos da promoção, o serviço deve devolver 503 com <code>Retry-After</code> e abrir o disjuntor, porque encher a <em>pool</em> de pedidos à espera transforma uma falha de base numa falha total do serviço. Terceira, ser idempotente na retentativa: um <code>COMMIT</code> cuja resposta se perdeu pode ter tido sucesso — com chaves de idempotência, repetir é seguro; sem elas, repetir duplica.</p>
+      <p>O detalhe que separa: depois de um <em>failover</em>, o novo primário está frio. As <em>caches</em> de páginas e os planos foram-se, e a latência p99 pode multiplicar por 5 nos primeiros minutos. Vale a pena manter as réplicas a receber uma fracção do tráfego de leitura precisamente para que não estejam frias no dia em que forem promovidas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Não se perde nada, há replicação»; não sabe distinguir síncrono de assíncrono.</td></tr>
+        <tr><td>Mid</td><td>Sabe que a replicação assíncrona pode perder dados, mas não quantifica nem fala do comportamento da aplicação durante a promoção.</td></tr>
+        <tr><td>Sénior</td><td>Calcula a perda a partir do atraso e do débito de escrita, exige <em>fencing</em> contra <em>split-brain</em>, e descreve reconexão, disjuntor e idempotência.</td></tr>
+        <tr><td>Staff</td><td>Liga a escolha a RPO/RTO acordados com o negócio, propõe síncrono local e assíncrono entre regiões, e antecipa o efeito da <em>cache</em> fria no p99 pós-promoção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é o RPO que negociaria para um sistema de pagamentos? E para um catálogo?»</li>
+      <li>«Como testaria o <em>failover</em> sem esperar por um incidente?»</li>
+      <li>«O que faz o cliente que estava a meio de uma transacção?»</li>
+      <li>«Como evita <em>split-brain</em> se a rede se partir em duas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir replicação com cópia de segurança — não protege de <code>DROP TABLE</code>.</li>
+      <li>Promoção automática sem quórum nem <em>fencing</em>.</li>
+      <li>Retentativa cega de escritas sem chave de idempotência.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-23-5" class="h2"><span class="secnum">23.5</span> Sharding e particionamento<a class="anchor" href="#sec-23-5" aria-label="ligação">#</a></h2>
+
+<p>Convém separar dois termos que a conversa mistura. <em>Particionamento</em> é repartir uma tabela por vários ficheiros dentro do <strong>mesmo</strong> servidor: o PostgreSQL 17 fá-lo de forma declarativa por <code>RANGE</code>, <code>LIST</code> ou <code>HASH</code>, e o ganho é de manutenção e de <em>pruning</em> de partições, não de capacidade de escrita. <em>Sharding</em> é repartir por vários servidores independentes, cada um com o seu primário: ganha-se capacidade de escrita e perdem-se as transacções, as junções e as chaves estrangeiras entre <em>shards</em>.</p>
+
+<p>Particionar por data é a aplicação com melhor relação custo/benefício e é quase sempre a resposta certa antes de falar em <em>sharding</em>. Uma tabela de eventos com 2 mil milhões de linhas particionada por mês permite três coisas que não se conseguem de outra forma: apagar um mês com <code>DROP TABLE</code> em milissegundos em vez de um <code>DELETE</code> de horas que gera lixo para o <code>VACUUM</code>; correr <code>VACUUM</code> e <code>REINDEX</code> por partição, com bloqueios curtos; e deixar o planeador ignorar 23 das 24 partições quando a consulta filtra por data. Particionar por <code>HASH</code> serve outro propósito — distribuir escritas quentes por vários ficheiros para reduzir contenção — e não permite <em>pruning</em> excepto em igualdade sobre a chave.</p>
+
+<p>A regra de ouro do particionamento: a chave de partição tem de estar em quase todas as consultas. Se metade das consultas não filtrar por data, o planeador varre todas as partições e o desempenho fica pior do que antes, porque agora são 24 varrimentos de índice em vez de um. E, no PostgreSQL, a chave de partição tem de fazer parte de qualquer <code>PRIMARY KEY</code> ou <code>UNIQUE</code> — o que significa que a unicidade global de uma coluna deixa de ser exprimível se essa coluna não incluir a chave.</p>
+
+<figure class="listing sql" id="lst-23-9"><div class="lhead"><span class="lnum">Listagem 23.9</span>
+<span class="lcap">Particionamento declarativo por intervalo e por <em>hash</em> em PostgreSQL 17.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE evento (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  conta_id    bigint      NOT NULL,
+  criado_em   timestamptz NOT NULL,
+  payload     jsonb       NOT NULL,
+  PRIMARY KEY (id, criado_em)     -- a chave de particao TEM de entrar na PK
+) PARTITION BY RANGE (criado_em);
+
+CREATE TABLE evento_2026_09 PARTITION OF evento
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE evento_2026_10 PARTITION OF evento
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+-- Retencao de 12 meses: milissegundos em vez de um DELETE de horas
+DROP TABLE evento_2025_09;
+
+-- Pruning: le uma particao, ignora as outras 23
+EXPLAIN SELECT count(*) FROM evento
+ WHERE criado_em &gt;= '2026-09-01' AND criado_em &lt; '2026-09-08';
+
+-- Variante HASH: espalha escritas quentes por 8 ficheiros.
+-- Nao ha pruning por intervalo, so por igualdade em conta_id.
+CREATE TABLE sessao (conta_id bigint NOT NULL, dados jsonb)
+  PARTITION BY HASH (conta_id);
+CREATE TABLE sessao_0 PARTITION OF sessao
+  FOR VALUES WITH (MODULUS 8, REMAINDER 0);</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><em>Sharding</em> por <code>hash(id) % N</code> parece elegante até ao dia em que <code>N</code> tem de mudar: passar de 8 para 16 <em>shards</em> obriga a mover cerca de metade das linhas, com escritas a decorrer. O <em>hashing</em> consistente com <em>vnodes</em>, ou uma tabela de mapeamento explícita de <em>slot</em> para <em>shard</em> (o modelo dos 16 384 <em>slots</em> do Redis Cluster), permite mover uma fracção proporcional e mover <em>slots</em> um a um. Escolher o esquema de mapeamento antes do primeiro <em>shard</em> custa uma tarde; mudá-lo depois custa um trimestre.</p></aside>
+
+<div class="qa" id="q-23-9" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Uma tabela de eventos tem 2 mil milhões de linhas e o <code>DELETE</code> nocturno de retenção já demora 6 horas. Particionava por data ou por <em>hash</em>? Justifique e diga o que se parte.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Por data, e a razão é directa: o problema declarado é retenção. Com partições mensais, apagar um mês passa de um <code>DELETE</code> de 6 horas — que escreve 2 mil milhões de versões mortas, faz o WAL explodir e deixa a tabela inchada até o <code>VACUUM</code> a recuperar — para um <code>DROP TABLE</code> de milissegundos que devolve o ficheiro ao sistema operativo. É a única forma de apagar dados em massa em PostgreSQL sem pagar o custo do MVCC.</p>
+      <p>Os ganhos secundários são igualmente reais. O <em>pruning</em> de partições faz uma consulta sobre a última semana ler uma partição em vez de 24. As operações de manutenção — <code>VACUUM</code>, <code>REINDEX CONCURRENTLY</code>, <code>ANALYZE</code> — passam a correr por partição, com bloqueios de segundos em vez de horas. E os índices ficam mais pequenos: um B-tree de 24 partições tem 24 árvores de menor profundidade em vez de uma árvore gigante, o que reduz as leituras aleatórias por consulta.</p>
+      <p><em>Hash</em> serviria outro problema — contenção de escrita numa tabela quente, ou distribuição uniforme quando não há dimensão temporal. Não ajuda em nada na retenção, porque as linhas antigas ficam espalhadas por todas as partições.</p>
+      <p>O que se parte, e é isto que o entrevistador espera ouvir sem ter de perguntar: (1) a chave de partição tem de entrar em toda a <code>PRIMARY KEY</code> e em todo o <code>UNIQUE</code>, portanto a unicidade global de, digamos, um <code>id_externo</code> deixa de ser exprimível directamente; (2) as consultas que não filtram por <code>criado_em</code> passam a varrer todas as partições e ficam mais lentas do que antes; (3) as chaves estrangeiras <strong>para</strong> uma tabela particionada só são suportadas desde o PostgreSQL 12 e continuam a ter limitações; (4) é preciso um processo que crie partições futuras — se faltar a partição de Outubro, os <code>INSERT</code> de 1 de Outubro falham à meia-noite, e é assim que se estraga uma passagem de mês.</p>
+      <p>O plano de migração: criar a tabela particionada nova, escrever nas duas em paralelo ou usar <code>ATTACH PARTITION</code> sobre a tabela antiga como partição histórica, migrar em lotes por intervalo de datas, e trocar o nome numa transacção. Automatizar a criação de partições com três meses de antecedência e alarmar quando restarem menos de dois meses criados.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde particionamento com <em>sharding</em>; ou propõe apenas «criar um índice».</td></tr>
+        <tr><td>Mid</td><td>Escolhe data pela razão certa mas não sabe o que se perde nas chaves nem que as partições futuras têm de ser criadas.</td></tr>
+        <tr><td>Sénior</td><td>Justifica com <code>DROP</code> vs <code>DELETE</code> e MVCC, enumera <em>pruning</em> e manutenção, e nomeia a restrição da chave primária.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o plano de migração sem indisponibilidade, a automatização e o alarme das partições futuras, e sabe quando <em>hash</em> seria a escolha certa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é o tamanho ideal de uma partição? Como decide entre mensal e semanal?»</li>
+      <li>«E as consultas que filtram só por <code>conta_id</code>?»</li>
+      <li>«Como migra 2 mil milhões de linhas sem parar o serviço?»</li>
+      <li>«O que acontece se ninguém criar a partição do mês seguinte?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Prometer que o particionamento aumenta a capacidade de escrita do servidor.</li>
+      <li>Não saber que o <code>DELETE</code> em massa gera lixo MVCC proporcional.</li>
+      <li>Particionar por uma coluna que raramente aparece no <code>WHERE</code>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-10" data-box="qa" data-area="sd" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vai fazer <em>sharding</em> de uma base de encomendas de uma plataforma de comércio. Que chave escolhe, e o que faz quando um comerciante grande gerar 40% das escritas?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A chave de <em>sharding</em> escolhe-se por três critérios, nesta ordem: distribuir a carga de forma uniforme, manter juntas as entidades que participam na mesma transacção, e aparecer em quase todas as consultas. Numa plataforma de comércio, <code>comerciante_id</code> satisfaz os dois últimos de forma exemplar — as encomendas, os itens e o catálogo de um comerciante ficam no mesmo <em>shard</em>, e todas as consultas de <em>backoffice</em> filtram por comerciante — e falha o primeiro, porque a distribuição de comerciantes por volume segue uma lei de potência.</p>
+      <p>É por isso que a resposta certa não é uma chave, é uma chave composta com <em>fallback</em>. A prática habitual: <em>shard</em> por <code>hash(comerciante_id)</code> para o comum, e uma tabela de mapeamento explícita que permite fixar comerciantes específicos em <em>shards</em> dedicados. Os 20 maiores comerciantes têm entrada própria; os restantes 200 000 caem no <em>hash</em>. Quando um deles cresce, muda-se a entrada e migra-se aquele comerciante — sem tocar em mais ninguém.</p>
+      <p>Se um único comerciante gerar 40% das escritas e não couber num <em>shard</em>, é preciso partir dentro dele. A chave passa a <code>hash(comerciante_id, encomenda_id)</code> para esse comerciante, o que resolve a escrita e parte as consultas agregadas — que passam a ter de ser <em>scatter-gather</em> sobre N <em>shards</em>, ou servidas por uma vista materializada alimentada por eventos. Este é o momento em que se aceita que o <em>backoffice</em> desse comerciante lê de um índice secundário com 2 segundos de atraso em vez de ler a base transaccional.</p>
+      <p>O que se perde com <em>sharding</em>, e tem de ser dito antes de o entrevistador perguntar: transacções ACID entre <em>shards</em> (passa a saga ou a <em>2PC</em>), junções entre <em>shards</em>, chaves estrangeiras entre <em>shards</em>, unicidade global (que passa a exigir uma tabela central ou identificadores tipo ULID/Snowflake), e as consultas sem chave de <em>sharding</em>, que passam a ser <em>scatter-gather</em> com latência do <em>shard</em> mais lento — com 16 <em>shards</em> a p99 de 20 ms cada, o p99 do agregado anda pelos 60-80 ms.</p>
+      <p>O <em>trade-off</em> mais importante é temporal: antes de fazer <em>sharding</em> esgotam-se as alternativas, porque cada uma delas custa semanas e o <em>sharding</em> custa trimestres. Uma instância de PostgreSQL 17 com 64 vCPU e discos NVMe faz confortavelmente 20 000 a 50 000 transacções simples por segundo; réplicas de leitura absorvem o tráfego de leitura; particionamento resolve o tamanho; arquivo frio para S3 resolve a retenção. <em>Sharding</em> só quando o gargalo é escrita no primário e já não há nada para tirar de lá.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe uma chave sem critério; ou propõe <em>sharding</em> como primeira medida de escala.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>comerciante_id</code> com boa justificação de localidade, mas não antecipa o desequilíbrio nem o que se perde.</td></tr>
+        <tr><td>Sénior</td><td>Aplica os três critérios, prevê o <em>hotspot</em> e resolve com mapeamento explícito, e enumera o que deixa de existir (junções, FK, unicidade global).</td></tr>
+        <tr><td>Staff</td><td>Propõe partir dentro do comerciante quente com consultas servidas por vista materializada, quantifica o p99 do <em>scatter-gather</em>, e defende adiar o <em>sharding</em> com alternativas mais baratas primeiro.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como gera identificadores únicos sem uma sequência central?»</li>
+      <li>«Como faz uma consulta que precisa de todos os <em>shards</em>?»</li>
+      <li>«Como migra um comerciante de <em>shard</em> sem parar as escritas?»</li>
+      <li>«Que sinais lhe diriam que ainda não é altura de fazer <em>sharding</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>hash(id) % N</code> sem plano para o dia em que <code>N</code> muda.</li>
+      <li>Assumir que se mantêm transacções ACID entre <em>shards</em>.</li>
+      <li>Não perguntar quais são as consultas antes de escolher a chave.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-23-6" class="h2"><span class="secnum">23.6</span> SQL vs NoSQL: escolher com critério<a class="anchor" href="#sec-23-6" aria-label="ligação">#</a></h2>
+
+<p>A pergunta «SQL ou NoSQL?» está mal posta e o entrevistador sabe disso — está a testar se o candidato a reformula. A reformulação correcta tem quatro perguntas: quais são os padrões de acesso conhecidos e quais são desconhecidos; que invariantes precisam de ser garantidos numa única transacção; qual é a dimensão dos dados e a taxa de escrita; e que consistência o negócio aceita nas leituras. As respostas a estas quatro determinam a escolha; a discussão de «esquema flexível» quase nunca determina nada.</p>
+
+<p>O erro típico dos candidatos mid é subestimar o PostgreSQL. Com <code>jsonb</code> e índices GIN, cobre grande parte dos casos de «documento»; com <code>LISTEN/NOTIFY</code> e <code>SKIP LOCKED</code>, faz de fila para dezenas de milhares de mensagens por hora; com <code>pgvector</code>, faz pesquisa vectorial. Uma instância bem dimensionada chega para a maioria das empresas europeias de dimensão média durante toda a sua vida. A pergunta a fazer antes de introduzir um segundo sistema é sempre a mesma: que restrição concreta é que o PostgreSQL não satisfaz, e com que número.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 23.2</span> Quando cada família ganha, e o que se paga por ela.</div>
+<div class="tscroll"><table><thead><tr><th>Sistema</th><th>Ganha quando</th><th>Preço</th><th>Sinal de má escolha</th></tr></thead><tbody>
+<tr><td>PostgreSQL</td><td>Invariantes transaccionais, consultas <em>ad hoc</em>, até dezenas de TB</td><td>Escrita limitada a um primário</td><td>Usado como <em>cache</em> de sessões</td></tr>
+<tr><td>MongoDB</td><td>Agregado que se lê e escreve inteiro, esquema a evoluir depressa</td><td>Junções e transacções entre documentos são caras</td><td>Precisa de junções em três colecções</td></tr>
+<tr><td>Cassandra / ScyllaDB</td><td>Escrita muito alta, multi-região activo-activo, séries temporais</td><td>Sem junções, sem agregações <em>ad hoc</em>; modelo por consulta</td><td>Padrões de acesso ainda desconhecidos</td></tr>
+<tr><td>DynamoDB</td><td>Chave-valor previsível, escala elástica, sem equipa de operação</td><td>Modelação rígida; custo cresce com o tráfego</td><td>Consultas analíticas sobre a tabela</td></tr>
+<tr><td>Redis</td><td>Latência sub-milissegundo, <em>cache</em>, contadores, <em>rate limiting</em></td><td>Durabilidade fraca; tudo em memória</td><td>Usado como fonte de verdade</td></tr>
+<tr><td>Elasticsearch</td><td>Pesquisa de texto, facetas, agregações sobre logs</td><td>Não é transaccional; índice a reconstruir</td><td>Usado como base primária</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing sql" id="lst-23-10"><div class="lhead"><span class="lnum">Listagem 23.10</span>
+<span class="lcap">Cassandra: uma tabela por consulta, com a duplicação assumida.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- Consulta 1: ultimas mensagens de uma conversa, por ordem decrescente.
+-- Chave de particao = conversa_id  (define o no que guarda os dados)
+-- Chave de agrupamento = enviada_em (define a ordem DENTRO da particao)
+CREATE TABLE mensagem_por_conversa (
+  conversa_id  uuid,
+  enviada_em   timeuuid,
+  mensagem_id  uuid,
+  autor_id     uuid,
+  corpo        text,
+  PRIMARY KEY ((conversa_id), enviada_em)
+) WITH CLUSTERING ORDER BY (enviada_em DESC);
+
+SELECT * FROM mensagem_por_conversa
+ WHERE conversa_id = ? LIMIT 50;      -- uma particao, uma leitura sequencial
+
+-- Consulta 2: mensagens de um autor. NAO se resolve com um indice
+-- secundario (obrigaria a consultar todos os nos); cria-se outra tabela
+-- e escreve-se nas duas no mesmo BATCH logado.
+CREATE TABLE mensagem_por_autor (
+  autor_id     uuid,
+  enviada_em   timeuuid,
+  conversa_id  uuid,
+  corpo        text,
+  PRIMARY KEY ((autor_id), enviada_em)
+) WITH CLUSTERING ORDER BY (enviada_em DESC);
+
+-- Armadilha: particao sem limite de crescimento. Uma conversa com
+-- 50 milhoes de mensagens da uma particao inutilizavel (alvo: abaixo
+-- de ~100 MB e ~100 000 linhas). Corrige-se com bucket temporal:
+--   PRIMARY KEY ((conversa_id, ano_mes), enviada_em)</code></pre></figure>
+
+<div class="qa" id="q-23-11" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A equipa quer introduzir MongoDB para o novo serviço de catálogo porque «o esquema muda muito». Como conduz essa decisão?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O argumento «o esquema muda muito» não decide nada, porque o PostgreSQL 17 tem <code>jsonb</code> com índices GIN e permite exactamente a mesma flexibilidade nos atributos variáveis, mantendo colunas tipadas e restrições nas partes estáveis — que num catálogo são o identificador, o preço, o estado e a referência ao comerciante. O custo de manter dois motores em produção é permanente: cópias de segurança, monitorização, plantão, actualizações de versão, conhecimento na equipa. Portanto o ónus da prova é de quem quer o segundo motor.</p>
+      <p>A condução é por padrões de acesso, não por preferência. Faço quatro perguntas com resposta em números: quantos produtos e quantas escritas por segundo no pico; que consultas existem além de «dá-me o produto por id» — filtros por facetas, pesquisa de texto, ordenação por preço; que invariantes têm de ser atómicos (preço e stock actualizados em conjunto?); e se as leituras toleram atraso e de quanto.</p>
+      <p>MongoDB ganha quando o agregado é lido e escrito inteiro e não há consultas que atravessem colecções: um documento de produto com variantes, atributos e imagens, obtido numa leitura, é um caso legítimo — evita a junção de cinco tabelas por pedido. Perde assim que aparecem junções entre colecções, ou quando um invariante abrange dois documentos: as transacções multi-documento existem desde a versão 4.0, mas custam significativamente mais e a maioria das equipas descobre-o tarde.</p>
+      <p>A proposta concreta que faria: começar em PostgreSQL com colunas tipadas para o estável e <code>jsonb</code> com índice GIN para os atributos variáveis; se a pesquisa por facetas e texto se tornar o padrão dominante, acrescentar Elasticsearch como índice derivado alimentado por eventos, mantendo o PostgreSQL como fonte de verdade. Isto dá a flexibilidade pedida e mantém uma única fonte de verdade transaccional.</p>
+      <p>A condição que me faria mudar de ideias, dita explicitamente: se o serviço tiver de servir 50 000 leituras por segundo de documentos grandes em várias regiões com escrita local, o modelo de um primário do PostgreSQL torna-se o obstáculo e um motor distribuído passa a ser a escolha certa. O que não aceito é decidir isso sem o número.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe por gosto («NoSQL escala melhor») ou rejeita liminarmente sem argumento técnico.</td></tr>
+        <tr><td>Mid</td><td>Compara funcionalidades de forma genérica, sem perguntar padrões de acesso nem contabilizar o custo operacional do segundo motor.</td></tr>
+        <tr><td>Sénior</td><td>Reformula por padrões de acesso e invariantes, propõe <code>jsonb</code> como alternativa concreta, e nomeia o custo permanente de operar dois motores.</td></tr>
+        <tr><td>Staff</td><td>Define à partida a condição quantificada que inverteria a decisão, e desenha o caminho de evolução (índice derivado, fonte de verdade única) em vez de uma escolha binária.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que índice usaria sobre <code>jsonb</code> e com que operadores?»</li>
+      <li>«Como mantém o Elasticsearch sincronizado com o PostgreSQL?»</li>
+      <li>«Quanto custa realmente uma transacção multi-documento em MongoDB?»</li>
+      <li>«E se metade da equipa já souber MongoDB e ninguém souber PostgreSQL?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>«NoSQL não tem esquema» — tem, só não é aplicado pelo motor.</li>
+      <li>Ignorar o custo operacional de um segundo sistema de armazenamento.</li>
+      <li>Decidir sem uma única pergunta sobre volumes ou consultas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-12" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Modele em Cassandra o histórico de mensagens de uma aplicação de conversação: ler as últimas 50 de uma conversa e, também, as mensagens enviadas por um autor.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Em Cassandra modela-se por consulta, não por entidade. A regra é: uma tabela por padrão de leitura, com a chave de partição igual ao filtro obrigatório dessa leitura, e a duplicação de dados assumida como custo normal. Duas consultas, duas tabelas.</p>
+      <p>Para as últimas mensagens de uma conversa: chave de partição <code>conversa_id</code>, chave de agrupamento <code>enviada_em</code> do tipo <code>timeuuid</code> com <code>CLUSTERING ORDER BY (enviada_em DESC)</code>. A leitura das últimas 50 toca num único nó e lê linhas fisicamente contíguas e já ordenadas, sem ordenação em tempo de consulta. Para as mensagens de um autor: uma segunda tabela com <code>autor_id</code> como chave de partição. Um índice secundário sobre <code>autor_id</code> na primeira tabela seria a escolha errada — obrigaria a consultar todos os nós do anel para cada leitura, e o custo cresce linearmente com o tamanho do <em>cluster</em>.</p>
+      <p>A escrita vai às duas tabelas. Se for necessário que apareçam juntas, usa-se um <code>BATCH</code> logado com a mesma chave lógica — que garante atomicidade mas não isolamento, e custa cerca de 30% de latência adicional face a escritas independentes. Em muitos domínios de mensagens, escrever independentemente e tolerar uma janela de inconsistência de milissegundos é a escolha certa.</p>
+      <p>A armadilha que separa quem já operou Cassandra: <strong>partições sem limite de crescimento</strong>. Uma conversa de grupo com 50 milhões de mensagens põe tudo numa partição, que passa a ser lenta a ler, cara a compactar e impossível de reparar. O alvo prático é manter as partições abaixo de ~100 MB e ~100 000 linhas, e para isso acrescenta-se um <em>bucket</em> temporal à chave de partição: <code>PRIMARY KEY ((conversa_id, ano_mes), enviada_em)</code>. O preço é que ler as últimas 50 pode agora precisar de consultar dois <em>buckets</em> na fronteira do mês — lógica extra na aplicação, em troca de um sistema que não se degrada com o tempo.</p>
+      <p>Duas decisões finais que o entrevistador procura: o factor de replicação (tipicamente 3) e o nível de consistência. <code>QUORUM</code> na escrita e na leitura dá consistência forte porque 2+2 &gt; 3; <code>ONE</code> na leitura reduz a latência a metade e admite ler uma versão antiga. E o <em>tombstone</em>: apagar em Cassandra escreve um marcador que só desaparece após <code>gc_grace_seconds</code> (10 dias por omissão); uma partição com muitos apagamentos torna as leituras progressivamente mais lentas, e usar TTL é preferível a <code>DELETE</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Desenha um modelo relacional normalizado e propõe junções; ou usa índice secundário para a segunda consulta.</td></tr>
+        <tr><td>Mid</td><td>Percebe que é preciso desnormalizar, mas não distingue chave de partição de chave de agrupamento.</td></tr>
+        <tr><td>Sénior</td><td>Uma tabela por consulta, chaves correctas com ordem de agrupamento, e assume a duplicação com escrita nas duas tabelas.</td></tr>
+        <tr><td>Staff</td><td>Antecipa o crescimento ilimitado da partição e resolve com <em>bucket</em> temporal, escolhe factor de replicação e nível de consistência com o cálculo do quórum, e nota o custo dos <em>tombstones</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como faz a paginação na fronteira de dois <em>buckets</em>?»</li>
+      <li>«Que nível de consistência usa e porquê?»</li>
+      <li>«Como apaga o histórico de um utilizador que pede o direito ao esquecimento?»</li>
+      <li>«E se agora precisar de pesquisar por texto no corpo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Índices secundários como resposta a padrões de acesso alternativos.</li>
+      <li>Não referir o limite de tamanho da partição.</li>
+      <li>Achar que <code>ALLOW FILTERING</code> é uma solução aceitável em produção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-23-7" class="h2"><span class="secnum">23.7</span> Consistência entre serviços: outbox e transacções distribuídas<a class="anchor" href="#sec-23-7" aria-label="ligação">#</a></h2>
+
+<p>Assim que o estado se reparte por dois sistemas — duas bases, ou uma base e um <em>broker</em> — deixa de haver <code>COMMIT</code> que os cubra aos dois. O <em>two-phase commit</em> existe e funciona: um coordenador pede <code>PREPARE</code> a todos os participantes, e só se todos responderem «sim» é que envia <code>COMMIT</code>. O problema é o que acontece quando o coordenador morre entre as duas fases: os participantes ficam com transacções preparadas, a segurar <em>locks</em>, sem saber o desfecho, e não podem decidir sozinhos. Em PostgreSQL, isso vê-se em <code>pg_prepared_xacts</code> e bloqueia o <code>VACUUM</code> indefinidamente. O <em>2PC</em> é aceitável dentro de um <em>datacenter</em>, entre duas bases relacionais, com transacções curtas; é má ideia entre serviços de equipas diferentes ou com um <em>broker</em> pelo meio.</p>
+
+<p>A alternativa dominante é a saga: a transacção distribuída é decomposta numa sequência de transacções locais, cada uma com a sua compensação. Reservar stock, cobrar o cartão, criar a expedição — se a cobrança falhar, executa-se a compensação da reserva. As duas variantes são coreografia (cada serviço reage a eventos dos outros; menos acoplamento, e ninguém consegue desenhar o fluxo completo ao fim de seis meses) e orquestração (um coordenador explícito conduz os passos; mais acoplamento ao orquestrador, mas o fluxo é legível, testável e observável). Acima de três ou quatro passos, orquestração.</p>
+
+<p>O que a saga não dá é isolamento. Entre o passo 1 e o passo 3, o mundo vê um estado intermédio que nunca existiria numa transacção ACID — e a compensação não é um <code>ROLLBACK</code>: é uma acção de negócio nova, visível, que às vezes nem é possível (o e-mail já saiu). O desenho tem de tornar o estado intermédio explícito no modelo: <code>RESERVADO</code>, <code>A_AGUARDAR_PAGAMENTO</code>, <code>CANCELADO_POR_FALHA_DE_PAGAMENTO</code>.</p>
+
+<figure class="listing sql" id="lst-23-11"><div class="lhead"><span class="lnum">Listagem 23.11</span>
+<span class="lcap"><em>Transactional outbox</em>: o evento entra na mesma transacção do estado.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE outbox (
+  id            uuid PRIMARY KEY,
+  agregado_tipo text        NOT NULL,
+  agregado_id   text        NOT NULL,
+  tipo          text        NOT NULL,
+  payload       jsonb       NOT NULL,
+  criado_em     timestamptz NOT NULL DEFAULT now(),
+  publicado_em  timestamptz
+);
+CREATE INDEX ON outbox (criado_em) WHERE publicado_em IS NULL;
+
+-- Uma transacao: ou ha estado novo E evento, ou nao ha nada.
+BEGIN;
+  UPDATE encomenda SET estado = 'PAGA' WHERE id = 918;
+  INSERT INTO outbox (id, agregado_tipo, agregado_id, tipo, payload)
+  VALUES (gen_random_uuid(), 'encomenda', '918', 'EncomendaPaga',
+          '{"encomendaId":918,"valor":4990,"moeda":"EUR"}'::jsonb);
+COMMIT;
+
+-- Relay: N instancias sem coordenacao, lotes disjuntos, sem duplicar trabalho
+BEGIN;
+  SELECT id, tipo, payload FROM outbox
+   WHERE publicado_em IS NULL
+   ORDER BY criado_em
+   FOR UPDATE SKIP LOCKED
+   LIMIT 200;
+  -- publica em Kafka com a chave = agregado_id (mantem a ordem por agregado)
+  UPDATE outbox SET publicado_em = now() WHERE id = ANY(?);
+COMMIT;   -- garantia: pelo menos uma vez. O consumidor TEM de ser idempotente.</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p><em>Polling</em> da tabela <em>outbox</em> e CDC com Debezium resolvem o mesmo problema com custos diferentes. O <em>polling</em> a cada 200 ms custa uma consulta indexada barata e acrescenta até 200 ms de latência ao evento; não precisa de infra-estrutura nova e é trivial de depurar. O Debezium lê o WAL através de uma <em>replication slot</em> lógica, não toca na tabela, dá latência de dezenas de milissegundos e preserva a ordem — mas exige Kafka Connect em produção e traz um perigo operacional: se o conector parar, a <em>slot</em> retém o WAL e o disco do primário enche até parar a base. Alarmar em <code>pg_replication_slots.confirmed_flush_lsn</code> não é opcional.</p></aside>
+
+<div class="qa" id="q-23-13" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Uma encomenda tem de reservar stock, cobrar o cartão e agendar a expedição, em três serviços com bases separadas. Usa <em>2PC</em> ou saga? Justifique e descreva o que corre mal.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Saga com orquestração. O <em>2PC</em> está fora por três razões concretas: o serviço de pagamentos é externo e não expõe <code>PREPARE</code>; o coordenador torna-se um ponto de falha que, ao morrer entre fases, deixa transacções preparadas a segurar <em>locks</em> e a bloquear o <code>VACUUM</code> no PostgreSQL; e a disponibilidade do conjunto passa a ser o produto das disponibilidades — três serviços a 99,9% dão 99,7%, ou seja mais do dobro do tempo em baixa.</p>
+      <p>A saga decompõe em três transacções locais com compensações: reservar stock (compensação: libertar reserva), cobrar (compensação: reembolsar), agendar expedição (compensação: cancelar guia). Um orquestrador — uma máquina de estados persistida, não um <code>if</code> em memória — conduz os passos, guarda o estado de cada instância e retoma depois de um reinício. Com três ou mais passos, orquestração ganha à coreografia porque o fluxo fica legível num sítio só e observável com uma consulta.</p>
+      <p>O que corre mal, por ordem de probabilidade. Primeiro, <strong>mensagens duplicadas</strong>: a entrega é «pelo menos uma vez», logo todos os passos têm de ser idempotentes por chave — a cobrança leva uma chave de idempotência derivada do identificador da encomenda, e repetir não cobra duas vezes. Segundo, <strong>respostas perdidas</strong>: a cobrança teve sucesso e a confirmação perdeu-se; o orquestrador tem de conseguir consultar o estado no serviço de pagamentos em vez de assumir falha, sob pena de compensar uma cobrança que foi feita. Terceiro, <strong>compensações que falham</strong>: o reembolso não passa; é preciso retentativa com <em>backoff</em>, e ao fim de N tentativas uma fila de intervenção humana com alarme — não um <em>log</em> de erro. Quarto, <strong>estado intermédio visível</strong>: entre reservar e cobrar, o stock está reservado mas não vendido, e isso tem de aparecer no modelo e nas interfaces.</p>
+      <p>Os números que uso para desenhar: a reserva de stock expira ao fim de 15 minutos por TTL, para que uma saga interrompida não bloqueie inventário indefinidamente; a cobrança tem 3 tentativas com <em>backoff</em> exponencial e <em>jitter</em> até 30 segundos; e o alarme dispara quando há instâncias de saga em estado não terminal há mais de 30 minutos. Este último é a métrica que apanha praticamente todos os <em>bugs</em> de saga em produção.</p>
+      <p>O <em>2PC</em> volta a ser a escolha certa num caso restrito: duas bases relacionais no mesmo <em>datacenter</em>, sob controlo da mesma equipa, com transacções de milissegundos e onde a compensação seria inaceitável do ponto de vista legal ou contabilístico.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe uma transacção distribuída como se fosse um <code>@Transactional</code> maior; ou não sabe o que é uma compensação.</td></tr>
+        <tr><td>Mid</td><td>Escolhe saga com boa justificação teórica, mas não trata duplicados, respostas perdidas nem compensações falhadas.</td></tr>
+        <tr><td>Sénior</td><td>Justifica com disponibilidade composta e <em>locks</em> presos, desenha compensações concretas, exige idempotência por chave e orquestração com estado persistido.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta TTL nas reservas, fila de intervenção humana, alarme sobre sagas não terminais, e delimita o caso restrito em que <em>2PC</em> continua a ser correcto.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que faz se a compensação também falhar?»</li>
+      <li>«Como garante que a cobrança não é feita duas vezes?»</li>
+      <li>«Coreografia ou orquestração — quando muda de opinião?»</li>
+      <li>«Como testa uma saga com falhas em cada passo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Assumir entrega «exactamente uma vez» do <em>broker</em> como garantia de ponta a ponta.</li>
+      <li>Compensações que só existem no diagrama e não no código.</li>
+      <li>Orquestrador com estado em memória, que perde as sagas em curso ao reiniciar.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-23-14" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique o padrão <em>transactional outbox</em> e diga-me quando usaria CDC com Debezium em vez de um processo que faz <em>polling</em> à tabela.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O <em>outbox</em> resolve o problema da dupla escrita: gravar na base e publicar no <em>broker</em> são duas operações que não podem ser atómicas. O padrão elimina a segunda escrita do caminho crítico — o evento é gravado numa tabela da <strong>mesma</strong> base, dentro da <strong>mesma</strong> transacção que muda o estado. Ou ambos existem, ou nenhum existe; a atomicidade é a do <code>COMMIT</code> local. Um processo separado lê a tabela e publica, com garantia de «pelo menos uma vez», o que transfere a responsabilidade da correcção para a idempotência do consumidor.</p>
+      <p>Três detalhes que separam quem já o operou. A chave da mensagem em Kafka deve ser o identificador do agregado, para que todos os eventos da mesma encomenda caiam na mesma partição e mantenham a ordem — a ordem global não existe nem é necessária. O relay usa <code>FOR UPDATE SKIP LOCKED</code> para que N instâncias possam correr sem coordenação e sem processar as mesmas linhas. E a tabela precisa de limpeza: as linhas publicadas são apagadas ou movidas ao fim de alguns dias, senão o índice cresce sem limite e o <code>VACUUM</code> começa a doer.</p>
+      <p>O <em>polling</em> a cada 200-500 ms é o que recomendaria por omissão: não acrescenta nenhuma peça de infra-estrutura, a consulta é um <em>index scan</em> sobre um índice parcial (<code>WHERE publicado_em IS NULL</code>) que devolve poucas linhas, e depurar consiste em fazer <code>SELECT</code> à tabela. A latência adicional é a do intervalo de <em>polling</em>, o que é irrelevante para eventos de negócio.</p>
+      <p>O CDC com Debezium lê o WAL através de uma <em>slot</em> de replicação lógica em vez de consultar a tabela. Passa a valer a pena em três situações: quando a latência tem de ser de dezenas de milissegundos e não de centenas; quando o volume é alto ao ponto de o <em>polling</em> e as suas actualizações gerarem carga e lixo MVCC relevantes (acima de alguns milhares de eventos por segundo); e quando é preciso capturar alterações de tabelas que <strong>não</strong> foram instrumentadas com <em>outbox</em> — sistemas legados que não se pode alterar.</p>
+      <p>O preço do Debezium é operacional e tem de ser dito: exige Kafka Connect em produção, e a <em>replication slot</em> retém WAL enquanto o conector não confirmar. Se o conector estiver parado durante a noite, o disco do primário pode encher e a base pára de aceitar escritas — a falha mais brutal desta família. É obrigatório alarmar sobre o atraso da <em>slot</em> e definir <code>max_slot_wal_keep_size</code> para que a base sacrifique a <em>slot</em> em vez de si própria.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não identifica o problema da dupla escrita; acha que publicar depois do <code>COMMIT</code> é suficiente.</td></tr>
+        <tr><td>Mid</td><td>Descreve a tabela <em>outbox</em> correctamente, mas não fala de idempotência do consumidor, chave de partição nem limpeza da tabela.</td></tr>
+        <tr><td>Sénior</td><td>Explica a atomicidade local, o relay com <code>SKIP LOCKED</code>, a chave por agregado, e escolhe <em>polling</em> por omissão com justificação de custo.</td></tr>
+        <tr><td>Staff</td><td>Define os limiares quantificados que justificam CDC, e antecipa o risco da <em>replication slot</em> a encher o disco com a mitigação concreta.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que o consumidor deduplica na prática?»</li>
+      <li>«O <em>outbox</em> garante ordem entre agregados diferentes?»</li>
+      <li>«Que acontece se o relay publicar e falhar antes de marcar como publicado?»</li>
+      <li>«Como faz a limpeza da tabela sem gerar lixo MVCC?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Publicar em Kafka dentro do bloco <code>@Transactional</code> e chamar-lhe atómico.</li>
+      <li>Não mencionar que a garantia é «pelo menos uma vez».</li>
+      <li>Propor Debezium sem referir o custo operacional nem o risco da <em>slot</em>.</li></ul></div>
+  </div>
+</div>
 
 <div class="lab" id="lab-23-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.1 — Two Sum com índices originais</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">15 min</span></div></div>
+  <div class="labhead"><span class="labttl">Exercício 23.1 — Reserva de stock sem <em>overselling</em></span>
+    <div class="labpills"><span class="qpill">3 abordagens</span><span class="qpill">35 min</span></div></div>
   <div class="labbody">
-    <p>Dado um array de inteiros <code>nums</code> e um inteiro <code>alvo</code>, devolva os índices dos dois elementos cuja soma é exactamente <code>alvo</code>. Restrições: 2 ≤ n ≤ 10<sup>6</sup>; os valores cabem em <code>int</code> e podem ser negativos; existe pelo menos uma solução e o mesmo índice não pode ser usado duas vezes; o array não pode ser reordenado, porque os índices devolvidos são os da entrada original. Exemplo: <code>nums = [3, 2, 4, -3]</code>, <code>alvo = 6</code> devolve <code>[1, 2]</code> (2 + 4). Se houver várias soluções, devolva qualquer uma.</p>
+    <p>Tabela <code>produto(id bigint, stock int, versao bigint)</code>. O <em>endpoint</em> <code>POST /reservas</code> recebe <code>{produtoId, quantidade, chaveIdempotencia}</code> e tem de garantir que a soma das reservas confirmadas nunca excede o stock — com 8 instâncias do serviço a correr em Kubernetes e picos de 500 pedidos por segundo no mesmo produto durante campanhas. Implemente <strong>três</strong> soluções — bloqueio optimista, bloqueio pessimista e serialização por mensagem — e diga, para cada uma, qual é o tecto de <em>throughput</em> no produto quente, o que acontece sob contenção e em que cenário a escolheria. Exemplo: stock 5, chegam 8 pedidos de 1 unidade em simultâneo, resultado esperado 5 × 201 e 3 × 409, stock final 0, nunca negativo.</p>
     <h4>A sua solução</h4>
     <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
     <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-2"><div class="lhead"><span class="lnum">Listagem 23.2</span>
-        <span class="lcap">Uma passagem, tabela de dispersão dimensionada e complemento calculado em <code>long</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public final class TwoSum {
+      <figure class="listing java" id="lst-23-12"><div class="lhead"><span class="lnum">Listagem 23.12</span>
+        <span class="lcap">Optimista: <code>@Version</code> com retentativa, e a variante CAS de uma instrução.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@Entity
+class Produto {
+    @Id Long id;
+    int stock;
+    @Version long versao;          // JPA acrescenta versao = ? ao WHERE do UPDATE
 
-    private TwoSum() { }
-
-    /** Índices de dois elementos distintos cuja soma é {@code alvo}. O(n) tempo, O(n) espaço. */
-    public static int[] indices(int[] nums, int alvo) {
-        if (nums == null || nums.length &lt; 2) throw new IllegalArgumentException("n &lt; 2");
-
-        // valor -&gt; índice da primeira ocorrência. newHashMap dimensiona para n sem rehash (Java 19+).
-        Map&lt;Integer, Integer&gt; vistos = HashMap.newHashMap(nums.length);
-
-        for (int i = 0; i &lt; nums.length; i++) {
-            // alvo - nums[i] transborda em int (ex.: alvo = -2^31, nums[i] = 1). Calcular em long.
-            long complemento = (long) alvo - nums[i];
-            if (complemento &gt;= Integer.MIN_VALUE &amp;&amp; complemento &lt;= Integer.MAX_VALUE) {
-                Integer j = vistos.get((int) complemento);
-                if (j != null) return new int[] { j, i };   // j &lt; i: pares distintos, ordem crescente
-            }
-            // putIfAbsent guarda o índice mais à esquerda; irrelevante para a correcção,
-            // determinista para os testes.
-            vistos.putIfAbsent(nums[i], i);
-        }
-        throw new NoSuchElementException("nenhum par soma " + alvo);
+    void reservar(int q) {
+        if (stock &lt; q) throw new StockInsuficienteException(id, stock, q);
+        stock -= q;
     }
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(n): uma passagem, cada <code>get</code>/<code>putIfAbsent</code> O(1) amortizado. <strong>Espaço</strong> O(n) para a tabela — cerca de 48 bytes por entrada com <em>boxing</em>, ou seja ~48 MB para n = 10<sup>6</sup>.</li>
-        <li>A verificação do complemento <em>antes</em> de inserir o elemento actual é o que impede usar o mesmo índice duas vezes. Inserir primeiro e procurar depois falha em <code>nums = [3]</code>, <code>alvo = 6</code>.</li>
-        <li>Casos limite: n = 2; duplicados (<code>[3, 3]</code>, alvo 6); valores negativos; transbordo do complemento; ausência de solução — a assinatura tem de dizer se lança ou devolve <code>int[0]</code>/<code>Optional</code>.</li>
-        <li>Alternativa O(n log n) e O(1) de espaço extra: ordenar e usar dois ponteiros convergentes — mas só se os índices originais não forem pedidos, porque a ordenação destrói-os.</li>
-        <li>O entrevistador avalia se o candidato troca o duplo ciclo O(n²) por uma passagem sem lhe ser pedido, se detecta o transbordo, e se pergunta pelo comportamento quando não há solução em vez de assumir.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<div class="lab" id="lab-23-2" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.2 — Reservatório de maior área</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
-  <div class="labbody">
-    <p>Um array <code>altura</code> descreve n paredes verticais colocadas em posições 0, 1, …, n−1. Escolhendo duas paredes, a água contida entre elas tem altura igual à menor das duas e largura igual à distância entre índices. Devolva a maior área possível. Restrições: 2 ≤ n ≤ 10<sup>5</sup>; 0 ≤ altura[i] ≤ 10<sup>4</sup>; o array não é modificável; espaço extra O(1). Exemplo: <code>[1, 8, 6, 2, 5, 4, 8, 3, 7]</code> devolve 49 (paredes nos índices 1 e 8: min(8, 7) × 7). O entrevistador vai pedir a justificação de correcção, não apenas o código.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-3"><div class="lhead"><span class="lnum">Listagem 23.3</span>
-        <span class="lcap">Ponteiros convergentes: mover sempre o lado mais baixo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public static long maiorArea(int[] altura) {
-    if (altura == null || altura.length &lt; 2) return 0L;
-
-    int esq = 0, dir = altura.length - 1;
-    long melhor = 0L;
-
-    while (esq &lt; dir) {
-        int h = Math.min(altura[esq], altura[dir]);
-        melhor = Math.max(melhor, (long) h * (dir - esq));   // long: 10^4 * 10^5 cabe em int,
-                                                             // mas o hábito evita transbordos
-        // Invariante de correcção: a área é limitada pela parede mais baixa. Manter essa parede
-        // e aproximar a outra só reduz a largura sem poder aumentar a altura -> nenhum par
-        // descartado ao mover o lado baixo pode ser melhor do que o já contabilizado.
-        if (altura[esq] &lt; altura[dir]) esq++;
-        else dir--;                                          // empate: qualquer lado serve
-    }
-    return melhor;
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(n): cada iteração move um dos ponteiros e eles nunca recuam, logo há no máximo n−1 iterações. <strong>Espaço</strong> O(1).</li>
-        <li>A justificação de correcção é o núcleo do exercício: ao mover o lado mais baixo descartam-se todos os pares que o incluíam, e nenhum deles pode superar a área já registada, porque teria altura ≤ h e largura &lt; (dir − esq).</li>
-        <li>Casos limite: n = 2; todas as alturas iguais (a resposta é h × (n−1)); zeros no array; array estritamente crescente (a resposta envolve sempre a última parede).</li>
-        <li>Empates entre <code>altura[esq]</code> e <code>altura[dir]</code>: mover qualquer um é seguro, porque com alturas iguais o par que fica só perde largura.</li>
-        <li>O entrevistador avalia se o candidato prova que a solução gulosa não perde o óptimo. Chegar ao código certo por intuição e não conseguir justificá-lo lê-se como problema memorizado.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Anunciar «O(n)» num ciclo com <code>while</code> interior sem justificar porque é que o total de avanços é limitado. O entrevistador vai perguntar exactamente isso, e a resposta é sempre a mesma frase: o ponteiro interior nunca recua e está limitado por n, logo os dois ponteiros somam no máximo 2n movimentos. Quem não a diz é frequentemente classificado como tendo o padrão decorado.</p></aside>
-
-<div class="lab" id="lab-23-3" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.3 — Maior substring sem caracteres repetidos</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
-  <div class="labbody">
-    <p>Dada uma string <code>s</code>, devolva o comprimento da maior substring contígua sem caracteres repetidos. Restrições: 0 ≤ n ≤ 10<sup>6</sup>; caracteres ASCII imprimíveis (códigos 32 a 126); espaço extra independente de n. Exemplo: <code>"abcabcbb"</code> devolve 3 (<code>"abc"</code>); <code>"bbbbb"</code> devolve 1; <code>"pwwkew"</code> devolve 3 (<code>"wke"</code>, não <code>"pwke"</code>, que não é contígua). Sublinhe qual é o invariante da janela antes de escrever código.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-4"><div class="lhead"><span class="lnum">Listagem 23.4</span>
-        <span class="lcap">Janela deslizante com salto directo do início, sem ciclo interior.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public static int maiorSemRepetir(String s) {
-    if (s == null || s.isEmpty()) return 0;
-
-    // ultimo[c] = índice da última ocorrência de c, ou -1. Tabela de 128 int = 512 bytes: O(1).
-    int[] ultimo = new int[128];
-    Arrays.fill(ultimo, -1);
-
-    int melhor = 0;
-    int inicio = 0;                       // invariante: s[inicio..fim] não tem repetidos
-
-    for (int fim = 0; fim &lt; s.length(); fim++) {
-        char c = s.charAt(fim);
-        // Se c já apareceu dentro da janela actual, o início salta para logo a seguir.
-        // O teste &gt;= inicio é essencial: ocorrências anteriores à janela não contam.
-        if (ultimo[c] &gt;= inicio) inicio = ultimo[c] + 1;
-
-        ultimo[c] = fim;
-        melhor = Math.max(melhor, fim - inicio + 1);
-    }
-    return melhor;
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(n) com exactamente uma leitura por carácter — o salto directo elimina o ciclo interior da versão clássica. <strong>Espaço</strong> O(1): 512 bytes fixos, independentes de n.</li>
-        <li>O teste <code>ultimo[c] &gt;= inicio</code> é o erro clássico. Sem ele, <code>"abba"</code> devolve 3: ao chegar ao segundo <code>a</code>, o início recuaria para 1 quando já estava em 2.</li>
-        <li>Casos limite: string vazia (0); string de um carácter (1); todos os caracteres iguais (1); todos distintos (n); espaços e pontuação, que são caracteres como os outros.</li>
-        <li>Generalização para Unicode: com o BMP inteiro, <code>int[65536]</code> custa 256 KB e continua O(1); para pontos de código fora do BMP é preciso iterar com <code>s.codePoints()</code> e usar <code>HashMap&lt;Integer, Integer&gt;</code>, porque um par substituto ocupa dois <code>char</code>.</li>
-        <li>O entrevistador avalia se o invariante é enunciado antes do código, se o salto de <code>inicio</code> nunca recua, e se o candidato pergunta pelo alfabeto em vez de assumir ASCII em silêncio.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<div class="qa" id="q-23-3" data-box="qa" data-area="dsa" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Quando é que a janela deslizante é aplicável e quando é que ela dá a resposta errada em silêncio?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A janela deslizante é aplicável quando a condição sobre a janela é monótona: estender a janela nunca pode passá-la de inválida a válida, e contrair nunca pode passá-la de válida a inválida. Com essa monotonia, para cada <code>fim</code> existe um único <code>inicio</code> mínimo válido, e como esse mínimo é não decrescente em <code>fim</code>, os dois índices percorrem o array uma vez cada — O(n).</p>
-      <p>O caso onde falha em silêncio é o clássico: «maior subarray com soma ≤ K» com valores negativos permitidos. Aí, estender a janela pode <em>baixar</em> a soma e tornar válido o que era inválido, e contrair pode subi-la. O algoritmo devolve um resultado plausível, mais curto do que o óptimo, e passa nos testes com dados positivos. A correcção só se detecta com um caso de teste como <code>[2, -1, 2]</code> e K = 3.</p>
-      <p>A alternativa correcta com negativos é somas de prefixo. Para «existe subarray com soma exactamente K», guarda-se cada prefixo numa tabela de dispersão e procura-se <code>prefixo − K</code>: O(n) tempo, O(n) espaço. Para «soma ≤ K» com negativos, o problema deixa de ter solução linear simples e recorre-se a prefixos ordenados com um <em>deque</em> monótono ou a uma árvore de pesquisa balanceada, O(n log n).</p>
-      <p>A verificação prática em entrevista é escrever a condição numa frase e perguntar «se eu acrescentar um elemento à direita, isto pode passar de falso a verdadeiro?». Se a resposta for sim, a janela deslizante está fora e o candidato deve dizê-lo em vez de a forçar.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Aplica a janela a qualquer problema com «subarray contíguo» no enunciado.</td></tr>
-        <tr><td>Mid</td><td>Implementa a janela correctamente mas não sabe enunciar a condição de aplicabilidade.</td></tr>
-        <tr><td>Sénior</td><td>Nomeia a monotonia, dá o contra-exemplo com negativos e propõe somas de prefixo como alternativa.</td></tr>
-        <tr><td>Staff</td><td>Formaliza o argumento O(n) pelo início não decrescente e enquadra as variantes com <em>deque</em> monótono ou árvore balanceada.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o problema for “janela de tamanho exactamente K”? Ainda precisa do ciclo interior?»</li>
-      <li>«Como adapta para “no máximo K caracteres distintos”?»</li>
-      <li>«Que caso de teste escreveria primeiro para apanhar este erro?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Insistir na janela depois de o entrevistador dar um exemplo com valores negativos.</li>
-      <li>Não conseguir escrever o invariante da janela numa frase.</li>
-      <li>Aceitar que o ciclo interior torna o algoritmo O(n²) sem examinar o total de movimentos.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-23-3" class="h2"><span class="secnum">23.3</span> Prefix sums e diferenças<a class="anchor" href="#sec-23-3" aria-label="ligação">#</a></h2>
-
-<p>As somas de prefixo trocam O(n) de espaço por consultas de intervalo em O(1). Constrói-se <code>p[0] = 0</code> e <code>p[i+1] = p[i] + a[i]</code>; a soma de <code>a[i..j]</code> inclusive é <code>p[j+1] − p[i]</code>. O ganho aparece quando há q consultas: força bruta custa O(n·q), prefixos custam O(n + q). Com n = q = 10<sup>5</sup>, é a diferença entre 10<sup>10</sup> e 2 × 10<sup>5</sup> operações — de dezenas de segundos para menos de um milissegundo.</p>
-
-<p>O array de diferenças é o dual: aplica m actualizações de intervalo em O(m) e materializa o resultado em O(n), em vez de O(n·m). Regista-se <code>dif[inicio] += delta</code> e <code>dif[fim+1] −= delta</code>, e no fim uma soma de prefixo reconstrói o array. É o padrão certo para «somar X a todos os elementos entre i e j, muitas vezes, e ler no fim» — reserva de capacidade por intervalo horário, contagem de sobreposições, agregação de limites de utilização.</p>
-
-<p>A combinação de prefixos com tabela de dispersão resolve a família «subarray com soma exactamente K» mesmo com valores negativos, que é onde a janela deslizante falha. Percorre-se o array acumulando o prefixo corrente e consulta-se quantas vezes <code>corrente − K</code> já foi visto; cada ocorrência é um subarray válido a terminar na posição actual. O detalhe que separa quem percebe de quem copiou é inicializar o mapa com <code>{0 → 1}</code>, para contar os subarrays que começam no índice 0.</p>
-
-<figure class="listing java" id="lst-23-5"><div class="lhead"><span class="lnum">Listagem 23.5</span>
-<span class="lcap">Array de diferenças: m actualizações de intervalo em O(m + n).</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>/** intervalos[k] = {inicio, fim, delta}, com fim inclusivo. O(m + n) em vez de O(m * n). */
-public static int[] aplicarIntervalos(int n, int[][] intervalos) {
-    int[] dif = new int[n + 1];                 // n+1 para absorver fim = n-1 sem teste extra
-
-    for (int[] it : intervalos) {
-        dif[it[0]] += it[2];
-        dif[it[1] + 1] -= it[2];                // cancela o delta a partir de fim+1
-    }
-
-    int[] resultado = new int[n];
-    int corrente = 0;
-    for (int i = 0; i &lt; n; i++) {
-        corrente += dif[i];                     // soma de prefixo reconstrói o array final
-        resultado[i] = corrente;
-    }
-    return resultado;
-}</code></pre></figure>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Somas de prefixo dão consultas O(1) mas exigem que o array seja imutável entre consultas: uma actualização pontual obriga a recalcular O(n) do prefixo. Quando há actualizações e consultas intercaladas, a estrutura certa é a árvore de Fenwick, com O(log n) nas duas operações e O(n) de espaço. A fronteira prática: com menos de 5% de actualizações no total de operações, os prefixos ganham; acima disso, Fenwick.</p></aside>
-
-<div class="lab" id="lab-23-4" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.4 — Subarray de soma máxima com os limites</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
-  <div class="labbody">
-    <p>Dado um array de inteiros, devolva a soma máxima de um subarray contíguo <strong>não vazio</strong>, juntamente com os índices inicial e final desse subarray. Restrições: 1 ≤ n ≤ 10<sup>6</sup>; −10<sup>9</sup> ≤ a[i] ≤ 10<sup>9</sup>, portanto a soma pode exceder <code>int</code>; espaço extra O(1); uma só passagem. Exemplo: <code>[-2, 1, -3, 4, -1, 2, 1, -5, 4]</code> devolve soma 6 nos índices 3 a 6. Atenção ao array só com negativos — o enunciado exige subarray não vazio.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-6"><div class="lhead"><span class="lnum">Listagem 23.6</span>
-        <span class="lcap">Kadane com acumulador <code>long</code> e registo dos limites.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public record Janela(long soma, int inicio, int fim) { }
-
-/** Kadane: O(n) tempo, O(1) espaço. Subarray não vazio, logo funciona com todos negativos. */
-public static Janela maiorSoma(int[] a) {
-    if (a == null || a.length == 0) throw new IllegalArgumentException("array vazio");
-
-    long melhor = a[0], corrente = a[0];        // long: n * 10^9 transborda int
-    int melhorInicio = 0, melhorFim = 0, correnteInicio = 0;
-
-    for (int i = 1; i &lt; a.length; i++) {
-        // Decisão de Kadane: se o prefixo acumulado é negativo, arrastá-lo só piora.
-        // Recomeça-se em i. Com &lt; 0 (e não &lt;= 0) preferem-se subarrays mais curtos nos empates.
-        if (corrente &lt; 0) {
-            corrente = a[i];
-            correnteInicio = i;
-        } else {
-            corrente += a[i];
-        }
-
-        if (corrente &gt; melhor) {                // &gt; e não &gt;=: mantém o primeiro óptimo encontrado
-            melhor = corrente;
-            melhorInicio = correnteInicio;
-            melhorFim = i;
-        }
-    }
-    return new Janela(melhor, melhorInicio, melhorFim);
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(n) numa passagem; <strong>espaço</strong> O(1) com cinco variáveis escalares. A alternativa por somas de prefixo (máximo de <code>p[j] − min p[i&lt;j]</code>) é igualmente O(n) mas gasta O(n) de espaço se o prefixo for materializado.</li>
-        <li>Inicializar <code>melhor</code> a <code>0</code> em vez de <code>a[0]</code> é o erro que quase toda a gente comete: com <code>[-3, -1, -2]</code> devolve 0, que corresponde a um subarray vazio e viola o enunciado. A resposta correcta é −1.</li>
-        <li>O acumulador tem de ser <code>long</code>: 10<sup>6</sup> elementos de 10<sup>9</sup> somam 10<sup>15</sup>, muito acima de 2,1 × 10<sup>9</sup>. Um <code>int</code> transborda em silêncio e devolve números negativos plausíveis.</li>
-        <li>Casos limite: n = 1; todos negativos; todos positivos (a resposta é o array inteiro); zeros intercalados; empates entre subarrays de soma igual — decidir e documentar se se devolve o primeiro ou o mais curto.</li>
-        <li>O entrevistador avalia se o candidato justifica a decisão gulosa («um prefixo negativo nunca ajuda o sufixo»), se trata o caso todo-negativo sem ser avisado, e se percebe que devolver os índices custa três variáveis e não muda a complexidade.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<div class="lab" id="lab-23-5" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.5 — Produto do array excepto o próprio elemento</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">20 min</span></div></div>
-  <div class="labbody">
-    <p>Dado um array <code>nums</code> de n inteiros, devolva um array <code>res</code> em que <code>res[i]</code> é o produto de todos os elementos excepto <code>nums[i]</code>. Restrições: 2 ≤ n ≤ 10<sup>5</sup>; <strong>a divisão é proibida</strong>; o array de saída não conta para o espaço extra, que tem de ser O(1); tempo O(n). Exemplo: <code>[1, 2, 3, 4]</code> devolve <code>[24, 12, 8, 6]</code>; <code>[-1, 1, 0, -3, 3]</code> devolve <code>[0, 0, 9, 0, 0]</code>. O entrevistador vai perguntar porque é que a divisão está proibida.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-7"><div class="lhead"><span class="lnum">Listagem 23.7</span>
-        <span class="lcap">Duas passagens: prefixo à ida, sufixo à volta, sem buffers auxiliares.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>/** O(n) tempo, O(1) espaço extra (o array devolvido não conta). Sem divisão. */
-public static long[] produtoExcepto(int[] nums) {
-    int n = nums.length;
-    if (n &lt; 2) throw new IllegalArgumentException("n &lt; 2");
-
-    long[] res = new long[n];
-
-    // 1.ª passagem: res[i] = produto de tudo à ESQUERDA de i.
-    long prefixo = 1L;
-    for (int i = 0; i &lt; n; i++) {
-        res[i] = prefixo;
-        prefixo *= nums[i];
-    }
-
-    // 2.ª passagem: multiplicar pelo produto de tudo à DIREITA, acumulado ao contrário.
-    // O sufixo vive num único escalar: é isso que mantém o espaço extra em O(1).
-    long sufixo = 1L;
-    for (int i = n - 1; i &gt;= 0; i--) {
-        res[i] *= sufixo;
-        sufixo *= nums[i];
-    }
-    return res;
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(n) em duas passagens (2n multiplicações). <strong>Espaço</strong> extra O(1): dois escalares, porque o array de prefixos é reutilizado como saída.</li>
-        <li>A divisão é proibida porque quebra com zeros: com um zero, o produto total é 0 e a divisão é indefinida; com dois ou mais zeros, todas as posições são 0 e a fórmula «total / nums[i]» não recupera nada. A solução por prefixo/sufixo trata zeros sem qualquer caso especial.</li>
-        <li>Transbordo: 10<sup>5</sup> valores mesmo pequenos multiplicam-se para lá de <code>long</code>. Se o enunciado não garantir que o resultado cabe, é preciso perguntar — as opções são <code>BigInteger</code>, aritmética modular ou uma garantia explícita nas restrições.</li>
-        <li>Casos limite: n = 2 (<code>[a, b]</code> → <code>[b, a]</code>); um zero; dois ou mais zeros; valores negativos, cujo sinal do resultado depende da paridade da contagem de negativos.</li>
-        <li>O entrevistador avalia se o candidato chega às duas passagens sem sugestão, se elimina o array de sufixos para cumprir o O(1), e se antecipa a pergunta sobre zeros em vez de esperar pelo contra-exemplo.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<div class="qa" id="q-23-4" data-box="qa" data-area="dsa" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Um endpoint recebe 10<sup>5</sup> consultas por minuto do tipo «soma das métricas entre os minutos i e j» sobre uma janela fixa de 10<sup>5</sup> pontos. Como serve isto?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Com o array imutável durante a janela, a resposta é uma soma de prefixo calculada uma vez: <code>p[i+1] = p[i] + a[i]</code>, e cada consulta é <code>p[j+1] − p[i]</code> em O(1). O pré-processamento custa O(n) — 10<sup>5</sup> somas, abaixo de um milissegundo — e serve as 10<sup>5</sup> consultas por minuto com custo agregado desprezável. A alternativa por força bruta custaria 10<sup>10</sup> operações por minuto, ou seja mais de 1,6 × 10<sup>8</sup> por segundo só neste endpoint.</p>
-      <p>O espaço é O(n) num <code>long[]</code>: 800 KB para 10<sup>5</sup> pontos, que cabe folgadamente em cache L3 e torna cada consulta duas leituras de memória. Usar <code>long</code> e não <code>int</code> é obrigatório se as métricas forem contadores acumulados.</p>
-      <p>O trade-off aparece quando o array deixa de ser imutável. Uma actualização pontual invalida O(n) do prefixo; se houver escritas intercaladas com leituras, a estrutura certa é a árvore de Fenwick — O(log n) em ambas, cerca de 17 passos para n = 10<sup>5</sup> — ou, para consultas de mínimo/máximo em vez de soma, uma árvore de segmentos. Se as escritas forem apenas acrescentos no fim, o prefixo mantém-se e basta estendê-lo em O(1) por ponto novo.</p>
-      <p>Em produção, a decisão seguinte é onde vive esta estrutura: reconstruir o prefixo por pedido anula o ganho, portanto fica num <em>cache</em> em memória com invalidação por janela temporal, ou é pré-agregada no armazenamento — o mesmo raciocínio que leva de uma consulta SQL agregada em tempo real a uma tabela de agregados por minuto.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe percorrer o intervalo a cada consulta e não estima o custo agregado.</td></tr>
-        <tr><td>Mid</td><td>Chega às somas de prefixo mas não fala de mutabilidade nem do tipo do acumulador.</td></tr>
-        <tr><td>Sénior</td><td>Prefixos com números, <code>long</code> justificado, e a fronteira em que Fenwick passa a ser a escolha.</td></tr>
-        <tr><td>Staff</td><td>Trata o problema como decisão de sistema: onde a estrutura vive, como é invalidada, e quando se empurra a agregação para o armazenamento.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se 20% das operações forem actualizações pontuais?»</li>
-      <li>«E se a consulta fosse o máximo do intervalo em vez da soma?»</li>
-      <li>«E em duas dimensões, para consultas rectangulares?»</li>
-      <li>«Como invalida o prefixo quando chega um ponto atrasado?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Recalcular o prefixo dentro do tratamento de cada pedido.</li>
-      <li>Usar <code>int</code> para acumular contadores sem verificar o intervalo de valores.</li>
-      <li>Saltar directamente para árvore de segmentos num problema sem escritas.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-23-4" class="h2"><span class="secnum">23.4</span> Strings: manipulação, anagramas e palíndromos<a class="anchor" href="#sec-23-4" aria-label="ligação">#</a></h2>
-
-<p>Em Java, uma <code>String</code> é imutável e, desde a JDK 9, guarda os caracteres num <code>byte[]</code> com um indicador de codificação: LATIN1 com um byte por carácter quando todos cabem em 0–255, UTF-16 com dois bytes caso contrário. Essa optimização — <em>compact strings</em> — reduz a ocupação de heap de strings ASCII para metade, e é a razão pela qual introduzir um único carácter acentuado numa string longa pode duplicar a memória que ela ocupa.</p>
-
-<p>A imutabilidade tem consequência directa na complexidade. Concatenar dentro de um ciclo cria uma string nova por iteração e copia tudo o que já lá está: n concatenações de comprimento médio n/2 dão O(n²). O compilador optimiza <code>a + b</code> numa única expressão (via <code>invokedynamic</code> com <code>StringConcatFactory</code> desde a JDK 9), mas não consegue fundir concatenações através das iterações de um ciclo. A regra é operacional: dentro de ciclo, <code>StringBuilder</code>, dimensionado quando o comprimento final é estimável; fora de ciclo, o operador <code>+</code> é tão bom ou melhor.</p>
-
-<p>Os problemas de anagramas reduzem-se todos à mesma pergunta: qual é a assinatura canónica desta string? Ordenar os caracteres dá uma assinatura em O(k log k) por palavra; contar ocorrências num array de dimensão do alfabeto dá O(k) e é a resposta esperada quando o alfabeto é pequeno e conhecido. Os palíndromos reduzem-se a dois ponteiros convergentes com filtragem, O(n) e espaço O(1) — desde que não se construa uma string limpa primeiro, o que passaria o espaço para O(n) sem necessidade.</p>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Comparar strings ignorando maiúsculas com <code>toLowerCase()</code> é dependente da localização: em turco, <code>"I".toLowerCase()</code> devolve um <em>i</em> sem ponto se a localização por omissão for <code>tr</code>. Em código de comparação usa-se <code>toLowerCase(Locale.ROOT)</code> ou <code>equalsIgnoreCase</code>. Numa entrevista, mencionar isto de passagem em três segundos distingue de imediato quem já foi mordido em produção.</p></aside>
-
-<div class="lab" id="lab-23-6" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.6 — Agrupar anagramas</span>
-    <div class="labpills"><span class="qpill">Alvo O(N·k)</span><span class="qpill">20 min</span></div></div>
-  <div class="labbody">
-    <p>Dado um array de N palavras, agrupe as que são anagramas umas das outras. Restrições: 1 ≤ N ≤ 10<sup>4</sup>; cada palavra tem entre 0 e 100 letras minúsculas de <code>a</code> a <code>z</code>; a ordem dos grupos e a ordem dentro de cada grupo são livres. Exemplo: <code>["eat", "tea", "tan", "ate", "nat", "bat"]</code> devolve <code>[["eat","tea","ate"], ["tan","nat"], ["bat"]]</code>. Diga qual é a assinatura escolhida e porque é que ela não colide.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-8"><div class="lhead"><span class="lnum">Listagem 23.8</span>
-        <span class="lcap">Assinatura por contagem em O(k), sem ordenar cada palavra.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public static List&lt;List&lt;String&gt;&gt; agrupar(String[] palavras) {
-    Map&lt;String, List&lt;String&gt;&gt; grupos = HashMap.newHashMap(palavras.length);
-
-    for (String p : palavras) {
-        grupos.computeIfAbsent(assinatura(p), chave -&gt; new ArrayList&lt;&gt;()).add(p);
-    }
-    return new ArrayList&lt;&gt;(grupos.values());
 }
 
-/**
- * Assinatura canónica: pares (letra, contagem) por ordem alfabética -- "aab" -&gt; "a2b1".
- * Não colide porque cada contagem é sempre precedida da sua letra: a leitura é única.
- * O(k) em vez do O(k log k) de ordenar os caracteres da palavra.
- */
-private static String assinatura(String p) {
-    int[] contagem = new int[26];
-    for (int i = 0; i &lt; p.length(); i++) {
-        contagem[p.charAt(i) - 'a']++;
+@Service
+class ReservaOptimista {
+    private final ProdutoRepository produtos;
+    private final ReservaRepository reservas;
+
+    @Retryable(retryFor = ObjectOptimisticLockingFailureException.class,
+               maxAttempts = 5,
+               backoff = @Backoff(delay = 20, multiplier = 2.0, random = true))
+    @Transactional
+    public Reserva reservar(long produtoId, int q, String chave) {
+        return reservas.findByChave(chave).orElseGet(() -&gt; {   // idempotencia
+            Produto p = produtos.findById(produtoId).orElseThrow();
+            p.reservar(q);                                     // valida o invariante
+            return reservas.save(new Reserva(chave, produtoId, q));
+        });
+        // no COMMIT: UPDATE produto SET stock=?, versao=versao+1
+        //            WHERE id=? AND versao=?   -- 0 linhas =&gt; excepcao =&gt; retentativa
     }
+}
 
-    StringBuilder sb = new StringBuilder(52);          // dimensionado: evita realocações
-    for (int i = 0; i &lt; 26; i++) {
-        if (contagem[i] &gt; 0) sb.append((char) ('a' + i)).append(contagem[i]);
+// Variante sem entidade e sem retentativa: compare-and-set numa instrucao.
+// E a implementacao com melhor throughput das tres em SQL puro.
+@Modifying
+@Query("""
+       UPDATE Produto p SET p.stock = p.stock - :q, p.versao = p.versao + 1
+        WHERE p.id = :id AND p.stock &gt;= :q
+       """)
+int decrementarSeHouver(@Param("id") long id, @Param("q") int q);
+// devolve 1 = reservado; 0 = sem stock (409). Sem lock explicito, sem releitura.</code></pre></figure>
+      <figure class="listing java" id="lst-23-13"><div class="lhead"><span class="lnum">Listagem 23.13</span>
+        <span class="lcap">Pessimista: <code>SELECT ... FOR UPDATE</code> com <em>timeout</em> de <em>lock</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public interface ProdutoRepository extends JpaRepository&lt;Produto, Long&gt; {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)                 // gera FOR UPDATE
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))
+    @Query("SELECT p FROM Produto p WHERE p.id = :id")
+    Optional&lt;Produto&gt; findByIdParaActualizar(@Param("id") long id);
+}
+
+@Service
+class ReservaPessimista {
+    private final ProdutoRepository produtos;
+    private final ReservaRepository reservas;
+
+    @Transactional                                        // manter CURTA: so base
+    public Reserva reservar(long produtoId, int q, String chave) {
+        Optional&lt;Reserva&gt; ja = reservas.findByChave(chave);
+        if (ja.isPresent()) return ja.get();
+
+        Produto p = produtos.findByIdParaActualizar(produtoId)   // serializa aqui
+                            .orElseThrow(ProdutoInexistenteException::new);
+        if (p.getStock() &lt; q) throw new StockInsuficienteException(produtoId, p.getStock(), q);
+        p.setStock(p.getStock() - q);
+        return reservas.save(new Reserva(chave, produtoId, q));
     }
-    return sb.toString();
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Tempo</strong> O(N·k) com k = comprimento máximo da palavra: cada palavra é lida uma vez e a assinatura tem no máximo 26 entradas. A versão que ordena cada palavra é O(N·k log k) — para k = 100, cerca de 6,6 vezes mais comparações.</li>
-        <li><strong>Espaço</strong> O(N·k) para os grupos, mais O(1) por chamada a <code>assinatura</code> (o array de 26 e o <code>StringBuilder</code> de 52).</li>
-        <li>A assinatura <code>"a2b1"</code> é injectiva porque cada bloco de dígitos é sempre delimitado pela letra seguinte; usar apenas as contagens separadas por vírgulas também serve, mas produz chaves mais longas e mais lentas de comparar.</li>
-        <li>Casos limite: string vazia (assinatura vazia, e todas as vazias caem no mesmo grupo); N = 1; todas as palavras anagramas entre si (um único grupo); palavras com letras repetidas, que é onde uma assinatura por conjunto de letras — em vez de multiconjunto — falharia.</li>
-        <li>O entrevistador avalia se o candidato reconhece o padrão «agrupar por chave canónica», se justifica a escolha da assinatura, e se resiste a usar o <em>hash</em> numérico da contagem, que colide e não é aceitável como chave sem verificação.</li>
-      </ul>
-    </div>
-  </div>
-</div>
+}
 
-<div class="lab" id="lab-23-7" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 23.7 — Palíndromo válido com filtragem</span>
-    <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">15 min</span></div></div>
-  <div class="labbody">
-    <p>Determine se uma string é um palíndromo, considerando apenas caracteres alfanuméricos e ignorando maiúsculas e minúsculas. Restrições: 0 ≤ n ≤ 2 × 10<sup>5</sup>; espaço extra O(1), ou seja sem construir uma cópia limpa da string; uma só passagem. Exemplo: <code>"A man, a plan, a canal: Panama"</code> é palíndromo; <code>"race a car"</code> não é; <code>""</code> e <code>", ."</code> são palíndromos por vacuidade. Diga o que faz com acentos e com dígitos.</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-23-9"><div class="lhead"><span class="lnum">Listagem 23.9</span>
-        <span class="lcap">Ponteiros convergentes com filtragem in-place, sem alocar nada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public static boolean ehPalindromo(String s) {
-    if (s == null) return false;
+/* SQL equivalente, para ver o que corre mesmo:
+     BEGIN;
+       SELECT stock FROM produto WHERE id = 42 FOR UPDATE;   -- as outras esperam
+       UPDATE produto SET stock = stock - 1 WHERE id = 42;
+       INSERT INTO reserva (chave, produto_id, quantidade) VALUES (?, 42, 1);
+     COMMIT;
+   Nunca chamar o gateway de pagamentos entre o SELECT e o COMMIT:
+   3 s de HTTP = 3 s de lock = 1 reserva a cada 3 s naquele produto. */</code></pre></figure>
+      <figure class="listing java" id="lst-23-14"><div class="lhead"><span class="lnum">Listagem 23.14</span>
+        <span class="lcap">Por mensagem: partição por produto, um consumidor por partição, <em>outbox</em> na resposta.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// O endpoint aceita e devolve 202; a decisao e assincrona.
+@PostMapping("/reservas")
+ResponseEntity&lt;Void&gt; pedir(@RequestBody PedidoReserva pedido) {
+    kafka.send(new ProducerRecord&lt;&gt;("reservas.pedidos",
+            String.valueOf(pedido.produtoId()),      // CHAVE = produto: mesma particao
+            pedido));                                // =&gt; ordem total por produto
+    return ResponseEntity.accepted()
+            .location(URI.create("/reservas/" + pedido.chaveIdempotencia()))
+            .build();
+}
 
-    int esq = 0, dir = s.length() - 1;
+@Component
+class ConsumidorReservas {
+    // Uma particao = um consumidor = zero concorrencia naquele produto.
+    // Sem locks, sem retentativas por conflito: as escritas ja vem em serie.
+    @KafkaListener(topics = "reservas.pedidos", concurrency = "12")
+    @Transactional
+    public void consumir(PedidoReserva pedido) {
+        if (reservas.existsByChave(pedido.chaveIdempotencia())) return;  // duplicado
 
-    while (esq &lt; dir) {
-        // Saltar o que não é alfanumérico, sem construir string nova: mantém o espaço em O(1).
-        while (esq &lt; dir &amp;&amp; !Character.isLetterOrDigit(s.charAt(esq))) esq++;
-        while (esq &lt; dir &amp;&amp; !Character.isLetterOrDigit(s.charAt(dir))) dir--;
-
-        // Character.toLowerCase é independente da localização, ao contrário de String.toLowerCase().
-        if (Character.toLowerCase(s.charAt(esq)) != Character.toLowerCase(s.charAt(dir))) {
-            return false;
+        int linhas = produtos.decrementarSeHouver(pedido.produtoId(), pedido.quantidade());
+        Resultado r = linhas == 1 ? Resultado.CONFIRMADA : Resultado.SEM_STOCK;
+        if (r == Resultado.CONFIRMADA) {
+            reservas.save(new Reserva(pedido.chaveIdempotencia(),
+                                      pedido.produtoId(), pedido.quantidade()));
         }
-        esq++;
-        dir--;
+        // mesma transaccao: estado + evento de resposta (outbox)
+        outbox.save(new EventoOutbox("reserva", pedido.chaveIdempotencia(),
+                                     "ReservaDecidida", payloadDe(pedido, r)));
     }
-    return true;   // esq &gt;= dir: sobrou zero ou um carácter ao centro
-}</code></pre></figure>
+}
+// O cliente sonda GET /reservas/{chave} ou recebe o resultado por WebSocket.
+// O decrementarSeHouver mantem-se como rede de seguranca: se alguem
+// reequilibrar as particoes, duas instancias podem sobrepor-se por instantes.</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li><strong>Tempo</strong> O(n): cada índice avança no máximo n posições no total, mesmo com os ciclos interiores. <strong>Espaço</strong> O(1) — construir uma string filtrada primeiro seria mais legível mas custaria O(n) e viola a restrição.</li>
-        <li>Os testes <code>esq &lt; dir</code> dentro dos ciclos interiores são obrigatórios: sem eles, uma string só com pontuação (<code>", ."</code>) faz os índices cruzarem-se e sair dos limites.</li>
-        <li><code>Character.isLetterOrDigit</code> aceita letras acentuadas e dígitos não-ASCII; se o requisito for estritamente <code>[a-zA-Z0-9]</code>, é preciso um teste explícito — e é uma pergunta a fazer ao entrevistador, não a decidir em silêncio.</li>
-        <li>Casos limite: string vazia e string de um carácter (ambas verdadeiras); só pontuação; comprimento par e ímpar; <code>null</code>, cujo contrato tem de ser declarado — devolver <code>false</code> ou lançar <code>NullPointerException</code>.</li>
-        <li>Fora do ASCII, dois pontos de código podem representar o mesmo carácter (<code>é</code> pré-composto ou <code>e</code> + acento combinante); a comparação correcta exige normalização com <code>java.text.Normalizer</code> em NFC antes de percorrer.</li>
-        <li>O entrevistador avalia se o candidato evita a cópia intermédia, se protege os ciclos interiores contra o cruzamento, e se levanta a questão da localização e da normalização em vez de assumir ASCII.</li>
+        <li><strong>Optimista (CAS de uma instrução)</strong>: uma ida à base, sem <em>lock</em> mantido, sem retentativa. Tecto no produto quente ≈ 1/(latência da instrução) por ligação, na ordem de 2 000-5 000 reservas por segundo com contenção só ao nível da linha no motor. É a melhor escolha por omissão e a que menos gente propõe.</li>
+        <li><strong>Optimista com <code>@Version</code></strong>: útil quando a decisão precisa de ler várias tabelas. Sob contenção alta degrada-se — com 500 pedidos por segundo no mesmo produto, quase todos falham a versão e a retentativa gera uma tempestade; sem <em>jitter</em> no <em>backoff</em>, sincroniza as tentativas e piora. Aceitável até taxas de conflito na casa dos 5-10%.</li>
+        <li><strong>Pessimista</strong>: correcto e previsível, com tecto igual a 1/(duração da transacção) — com 5 ms de trabalho são ~200 reservas por segundo <em>naquele produto</em>, independentemente do número de instâncias. Falha catastroficamente se houver E/S externa dentro da transacção. Exige <code>lock_timeout</code> ou <code>jakarta.persistence.lock.timeout</code> para não segurar <em>threads</em> do <em>servlet</em>.</li>
+        <li><strong>Por mensagem</strong>: elimina a concorrência em vez de a gerir, absorve picos por <em>buffer</em> e sobrevive à indisponibilidade da base. Paga-se com a mudança de contrato para 202 e sondagem, com o reequilíbrio de partições (que pode sobrepor consumidores por instantes — daí manter o CAS), e com a ordenação garantida apenas por produto.</li>
+        <li><strong>Idempotência em todas</strong>: a chave é obrigatória em qualquer das três, e deve ter um índice <code>UNIQUE</code> na tabela <code>reserva</code> — a verificação em código é uma optimização, a restrição é a garantia.</li>
+        <li><strong>Casos limite a mencionar sem ser perguntado</strong>: quantidade zero ou negativa (rejeitar no <em>controller</em>); produto inexistente (404, não 500); expiração da reserva por TTL para não bloquear inventário; e o teste determinístico da corrida com <code>CountDownLatch</code> e 8 <em>threads</em> sobre um PostgreSQL real em Testcontainers — <code>H2</code> não reproduz o comportamento de <em>locking</em>.</li>
       </ul>
     </div>
   </div>
 </div>
 
-<div class="qa" id="q-23-5" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Este ciclo concatena 50 000 linhas com <code>relatorio += linha;</code>. Qual é a complexidade real e o que muda com <code>StringBuilder</code>?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>É O(n²) no comprimento total. Cada <code>+=</code> sobre uma <code>String</code> imutável aloca um <code>byte[]</code> novo e copia o conteúdo acumulado; com 50 000 linhas de 60 caracteres, o comprimento final é 3 milhões e os bytes copiados no total rondam 7,5 × 10<sup>10</sup> — dezenas de segundos e uma pressão de alocação que enche a <em>eden</em> repetidamente e dispara colecções jovens em cadeia.</p>
-      <p>Com <code>StringBuilder</code> passa a O(n): o <em>buffer</em> interno cresce geometricamente, com a mesma amortização do <code>ArrayList</code>, e há uma única cópia final em <code>toString()</code>. Dimensionar o construtor com uma estimativa do comprimento final (<code>new StringBuilder(3_200_000)</code>) elimina até as realocações intermédias.</p>
-      <p>O que o compilador faz e não faz é a parte que separa níveis. Desde a JDK 9, <code>a + b + c</code> numa única expressão é compilado para um <code>invokedynamic</code> resolvido por <code>StringConcatFactory</code>, que gera uma cadeia de <em>method handles</em> capaz de dimensionar o resultado exactamente e evitar cópias intermédias — frequentemente mais rápida do que <code>StringBuilder</code> escrito à mão. Mas essa optimização é por expressão: não atravessa a fronteira do ciclo, porque cada iteração é uma expressão independente que tem de produzir uma <code>String</code> observável.</p>
-      <p>O <em>trade-off</em>: <code>StringBuilder</code> não é seguro em acesso concorrente (<code>StringBuffer</code> é, ao custo de sincronização que a JIT raramente consegue eliminar) e, para volumes grandes, a alternativa correcta nem é construir a string — é escrever directamente para um <code>Writer</code> com <em>buffer</em>, mantendo a memória constante em vez de proporcional ao relatório.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«<code>StringBuilder</code> é mais rápido» sem saber porquê nem qual é a complexidade do ciclo.</td></tr>
-        <tr><td>Mid</td><td>Identifica o O(n²) e a imutabilidade, mas acha que o compilador optimiza a concatenação dentro do ciclo.</td></tr>
-        <tr><td>Sénior</td><td>Dá os números, explica a amortização do <em>buffer</em> e a fronteira da optimização por expressão.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o efeito no GC, dimensiona o construtor e propõe escrever em <em>streaming</em> quando o resultado não cabe confortavelmente em memória.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se as linhas vierem de um <code>Stream</code>? <code>Collectors.joining</code> resolve?»</li>
-      <li>«Qual é a diferença de memória entre uma string ASCII e uma com um carácter acentuado?»</li>
-      <li>«Quando é que <code>StringBuffer</code> ainda faz sentido?»</li>
-      <li>«Como demonstraria a diferença com um <em>benchmark</em> honesto?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Afirmar que a JIT transforma automaticamente o ciclo num <code>StringBuilder</code>.</li>
-      <li>Não conseguir explicar porque é que <code>String</code> ser imutável implica cópia na concatenação.</li>
-      <li>Propor <code>StringBuffer</code> por omissão «para ser seguro» num contexto de uma só <em>thread</em>.</li></ul></div>
-  </div>
-</div>
+<h2 id="sec-23-8" class="h2"><span class="secnum">23.8</span> Resumo e checklist<a class="anchor" href="#sec-23-8" aria-label="ligação">#</a></h2>
 
-<div class="qa" id="q-23-6" data-box="qa" data-area="dsa" data-level="mid" data-freq="media">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Duas strings de 10<sup>6</sup> caracteres: como verifica se são anagramas e qual é o custo de cada abordagem?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Há três abordagens com custos distintos. Ordenar ambas e comparar é O(n log n) em tempo e O(n) em espaço, porque <code>toCharArray</code> copia. Contar ocorrências num <code>int[]</code> do tamanho do alfabeto é O(n) em tempo e O(1) em espaço quando o alfabeto é fixo — para minúsculas latinas, 26 inteiros, ou seja 104 bytes. Contar num <code>HashMap&lt;Character, Integer&gt;</code> é O(n) mas com uma constante 5 a 10 vezes maior por causa do <em>boxing</em> e das indirecções.</p>
-      <p>A escolha certa é a contagem em array, com uma optimização que quase ninguém faz: uma única passagem que incrementa pela primeira string e decrementa pela segunda, verificando no fim que todas as posições estão a zero. Antes disso, o teste de comprimentos diferentes rejeita em O(1) a maioria dos casos negativos reais.</p>
-      <p>A qualificação que o entrevistador procura é sobre o alfabeto. «O(1) de espaço» só é verdade com alfabeto limitado; para Unicode completo, um array de 1,1 milhões de posições é irrealista e volta-se ao mapa — mas com <code>HashMap&lt;Integer, Integer&gt;</code> sobre pontos de código, não sobre <code>char</code>, senão pares substitutos são contados como duas metades independentes e <code>"𝄞x"</code> compara mal.</p>
-      <p>Para 10<sup>6</sup> caracteres, a contagem em array faz duas passagens sequenciais com excelente localidade: da ordem de poucos milissegundos. Ordenar as duas strings faz 2 × 10<sup>6</sup> × 20 comparações e aloca 4 MB — uma ordem de grandeza pior, sem qualquer vantagem.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Só conhece «ordenar e comparar» e não consegue dar a complexidade.</td></tr>
-        <tr><td>Mid</td><td>Propõe a contagem em array e dá O(n); esquece o teste de comprimento e o alfabeto.</td></tr>
-        <tr><td>Sénior</td><td>Uma passagem com incremento/decremento, teste de comprimento primeiro, e a qualificação sobre o alfabeto no O(1) de espaço.</td></tr>
-        <tr><td>Staff</td><td>Trata pontos de código e normalização Unicode, e discute quando o custo de leitura da entrada domina tudo o resto.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se as strings estiverem em ficheiros de 10 GB?»</li>
-      <li>«Como estende para “anagrama ignorando espaços e acentos”?»</li>
-      <li>«Porque é que o <code>HashMap</code> é mais lento se ambos são O(n)?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Dizer «O(1) de espaço» sem mencionar que depende do alfabeto ser limitado.</li>
-      <li>Comparar <code>char</code> a <code>char</code> assumindo que um carácter é sempre um <code>char</code>.</li>
-      <li>Não fazer o teste de comprimentos antes de contar.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-23-5" class="h2"><span class="secnum">23.5</span> Reconhecer o padrão em 60 segundos<a class="anchor" href="#sec-23-5" aria-label="ligação">#</a></h2>
-
-<p>A maioria dos exercícios de array e string numa entrevista de 45 minutos cai num de seis padrões, e o sinal está na formulação do enunciado. «Contíguo» aponta para janela deslizante ou Kadane. «Ordenado» aponta para dois ponteiros ou pesquisa binária. «Par que soma» aponta para tabela de dispersão ou dois ponteiros. «Muitas consultas de intervalo» aponta para somas de prefixo. «Agrupar por equivalência» aponta para chave canónica. «K maiores» aponta para <em>heap</em> de tamanho K. Reconhecer o padrão não resolve o problema, mas fixa o limite de complexidade a anunciar nos primeiros sessenta segundos.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 23.2</span> Da pista do enunciado ao padrão e ao limite de complexidade a anunciar.</div>
-<div class="tscroll"><table><thead><tr><th>Pista no enunciado</th><th>Padrão</th><th>Alvo</th><th>Armadilha</th></tr></thead><tbody>
-<tr><td>«subarray contíguo», valores ≥ 0</td><td>Janela deslizante</td><td>O(n) / O(1)</td><td>Falha com negativos</td></tr>
-<tr><td>«subarray contíguo», soma máxima</td><td>Kadane</td><td>O(n) / O(1)</td><td>Todos negativos</td></tr>
-<tr><td>«array ordenado», par ou triplo</td><td>Dois ponteiros convergentes</td><td>O(n) / O(1)</td><td>Duplicados</td></tr>
-<tr><td>«soma exactamente K», com negativos</td><td>Prefixo + tabela de dispersão</td><td>O(n) / O(n)</td><td>Falta o par 0 → 1</td></tr>
-<tr><td>«q consultas de intervalo»</td><td>Somas de prefixo</td><td>O(n+q) / O(n)</td><td>Array mutável</td></tr>
-<tr><td>«agrupar equivalentes»</td><td>Chave canónica</td><td>O(N·k) / O(N·k)</td><td>Chave que colide</td></tr>
-<tr><td>«K maiores de um fluxo»</td><td><em>Heap</em> de tamanho K</td><td>O(n log K) / O(K)</td><td>Ordenar tudo</td></tr>
-</tbody></table></div></div>
-
-<p>O guião dos primeiros minutos tem cinco passos e é o mesmo em todas as empresas. Repetir o enunciado por palavras próprias e confirmar. Perguntar os limites: dimensão máxima, intervalo de valores, se há duplicados, se a entrada pode ser modificada, o que fazer com entrada vazia ou <code>null</code>. Fixar dois exemplos, um normal e um degenerado, e escrever a saída esperada de ambos. Anunciar a solução ingénua com a sua complexidade e a solução alvo com a sua. Só depois escrever código, narrando a decisão em cada bloco.</p>
-
-<p>Os dois minutos finais são tão avaliados quanto o meio da sessão: executar o código à mão sobre o exemplo degenerado, enunciar os casos limite que ficaram por tratar, e dizer que testes se escreveriam. Terminar com «acho que está» é medido como ausência de rigor; terminar com «executei o exemplo vazio e o de um elemento, e falta decidir o contrato para <code>null</code>» é medido como maturidade.</p>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Programar em silêncio. Numa ronda de 45 minutos, o entrevistador tem de preencher uma grelha com evidência de raciocínio, comunicação e correcção; quinze minutos sem uma palavra produzem código possivelmente certo e a grelha vazia. O hábito treinável é narrar a decisão — não o código — em cada bloco: «vou percorrer da direita para a esquerda para reutilizar o array de saída como acumulador do sufixo».</p></aside>
-
-<div class="qa" id="q-23-7" data-box="qa" data-area="processo" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Processo de entrevista</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Tem 45 minutos e um problema que não reconhece. Descreva exactamente o que faz nos primeiros cinco.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Os primeiros cinco minutos não são para pensar na solução: são para converter um enunciado ambíguo numa especificação. Um minuto a repetir o problema por palavras próprias e a obter confirmação — é onde metade dos mal-entendidos morre. Dois minutos de perguntas de fronteira: n máximo, intervalo dos valores, duplicados, entrada modificável, comportamento com vazio e com <code>null</code>, e o que devolver quando não há resposta.</p>
-      <p>Depois, dois exemplos escritos no editor: um representativo e um degenerado (vazio, um elemento, tudo igual). Escrever a saída esperada de ambos <em>antes</em> de escrever código dá um oráculo para o teste manual final e apanha ambiguidades que as perguntas não apanharam.</p>
-      <p>Só então se anuncia a estratégia, e sempre em dois tempos: «a força bruta é o duplo ciclo, O(n²) tempo e O(1) espaço; acho que consigo O(n) trocando espaço por tempo com uma tabela de dispersão — sigo por aí?». Isto dá ao entrevistador um ponto de intervenção barato e garante que não se investem trinta minutos numa direcção que ele sabe estar errada. Se a ideia da solução linear não aparecer em dois minutos, escreve-se a força bruta e optimiza-se depois: uma solução O(n²) completa e testada pontua acima de uma solução O(n) incompleta.</p>
-      <p>O erro simétrico é gastar dez minutos nesta fase. O sinal para avançar é ter dois exemplos com saída escrita e um limite de complexidade anunciado; a partir daí, cada minuto extra de clarificação é tempo retirado ao código.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Começa a escrever código no primeiro minuto e descobre o requisito real aos vinte.</td></tr>
-        <tr><td>Mid</td><td>Faz uma ou duas perguntas genéricas («os números são positivos?») e avança sem exemplos escritos.</td></tr>
-        <tr><td>Sénior</td><td>Reformula, pergunta fronteiras concretas, escreve dois exemplos com saída e anuncia complexidade antes de codificar.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais a negociação explícita da direcção com o entrevistador e um plano de recuo para a força bruta com prazo.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se eu lhe disser que n pode ser 10<sup>9</sup> e não cabe em memória?»</li>
-      <li>«Ao fim de vinte minutos percebe que a abordagem está errada. O que faz?»</li>
-      <li>«Como decide entre pedir uma pista e continuar sozinho?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não fazer uma única pergunta sobre restrições.</li>
-      <li>Ficar bloqueado em silêncio mais de dois minutos sem verbalizar onde está preso.</li>
-      <li>Recusar a pista do entrevistador por orgulho e ficar sem solução no fim.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-23-8" data-box="qa" data-area="dsa" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Estruturas de dados e algoritmos</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Duas soluções ambas O(n): uma percorre um <code>int[]</code>, a outra um <code>LinkedList&lt;Integer&gt;</code>. Porque é que a primeira é 10 vezes mais rápida?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque o Big-O conta operações e o processador paga por acessos à memória. Um <code>int[]</code> é um bloco contíguo de 4 bytes por elemento; uma linha de cache de 64 bytes traz 16 elementos de uma vez, e o pré-carregador do processador reconhece o padrão sequencial e traz as linhas seguintes antes de serem pedidas. O custo efectivo aproxima-se de uma leitura de L1 (cerca de 1 ns) por elemento.</p>
-      <p>Um <code>LinkedList&lt;Integer&gt;</code> paga três indirecções por elemento: o nó, a referência ao <code>Integer</code>, e o <code>Integer</code> em si. Os nós são alocados em momentos diferentes e podem estar espalhados pelo heap; cada salto é potencialmente uma falha de cache, e uma leitura da memória principal custa 60 a 100 ns — duas ordens de grandeza acima da L1. Em ocupação, cada elemento custa cerca de 48 bytes (24 do nó, 16 do <code>Integer</code>, alinhamento) contra 4 bytes no <code>int[]</code>: 12 vezes mais memória a atravessar o barramento.</p>
-      <p>A consequência prática é que a constante escondida no Big-O varia por um factor de 10 a 50 conforme o esquema de memória, e por isso o Big-O só serve para comparar <em>classes</em> de algoritmos, não implementações da mesma classe. Entre duas soluções O(n), decide-se por medição.</p>
-      <p>Quando é que a lista ligada ganha, mesmo assim: quando há remoções frequentes no meio com o iterador já posicionado, ou quando é preciso concatenar listas em O(1). Na prática, em Java, isso é raro — o <code>ArrayDeque</code> cobre a maior parte dos casos de fila e pilha com melhor localidade, e o <code>ArrayList</code> vence quase sempre para percorrer e indexar. A regra operacional é usar <code>int[]</code> ou <code>ArrayList</code> por omissão e justificar qualquer outra escolha com uma medição.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«São ambas O(n), logo têm o mesmo desempenho.»</td></tr>
-        <tr><td>Mid</td><td>Menciona <em>boxing</em> e alocação, mas não fala de cache nem dá números.</td></tr>
-        <tr><td>Sénior</td><td>Localidade de referência, linha de cache de 64 bytes, custo do <em>boxing</em> em bytes, e a conclusão de medir.</td></tr>
-        <tr><td>Staff</td><td>Quantifica L1 contra memória principal, explica o pré-carregador, e nomeia os casos em que a lista ligada continua a ser a escolha certa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E <code>ArrayList&lt;Integer&gt;</code> contra <code>int[]</code>? Ainda há diferença?»</li>
-      <li>«O que muda com <em>value types</em> e achatamento de objectos?»</li>
-      <li>«Como mediria isto sem enganar-se com o aquecimento da JIT?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar o Big-O como previsão de tempo de execução.</li>
-      <li>Não saber que <code>Integer</code> é um objecto com cabeçalho e referência.</li>
-      <li>Propor <code>LinkedList</code> como estrutura por omissão para percursos.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-23-6" class="h2"><span class="secnum">23.6</span> Resumo e checklist<a class="anchor" href="#sec-23-6" aria-label="ligação">#</a></h2>
-
-<p>O que reter deste capítulo, na forma em que é útil dentro de uma ronda de 45 minutos.</p>
+<p>O que reter deste capítulo, em forma directamente utilizável numa resposta:</p>
 
 <ul class="lst">
-  <li><strong>Amortizado não é caso médio.</strong> É uma garantia sobre o total de uma sequência. <code>ArrayList.add</code> é O(1) amortizado por causa do crescimento de 1,5x, cujas cópias somam menos de 3n; individualmente pode custar O(n) e aparecer no p99,9.</li>
-  <li><strong>Contar a operação certa.</strong> <code>String.substring</code> é O(k), não O(1). Um ciclo com <code>substring</code> lá dentro é O(n²) mesmo parecendo linear.</li>
-  <li><strong>Dois ponteiros e janela deslizante são O(n) porque os índices nunca recuam.</strong> O argumento — no máximo 2n movimentos — diz-se em voz alta; sem ele, o ciclo interior parece quadrático.</li>
-  <li><strong>A janela deslizante exige monotonia.</strong> Com valores negativos, «soma ≤ K» deixa de ser monótona e a técnica dá resultados errados sem falhar; a alternativa é somas de prefixo com tabela de dispersão.</li>
-  <li><strong>Prefixos trocam O(n) de espaço por consultas O(1)</strong>, e o array de diferenças faz o dual para actualizações de intervalo. Se houver escritas intercaladas, a estrutura passa a ser a árvore de Fenwick, O(log n) nas duas operações.</li>
-  <li><strong>Strings são imutáveis e compactas.</strong> Concatenar em ciclo é O(n²); <code>StringBuilder</code> dimensionado é O(n); a optimização do compilador vale por expressão e não atravessa o ciclo.</li>
-  <li><strong>Anagramas são chaves canónicas</strong> e palíndromos são dois ponteiros com filtragem in-place. Ambos O(n) com espaço O(1) para alfabeto limitado — e essa qualificação tem de ser dita.</li>
-  <li><strong>O Big-O compara classes, não implementações.</strong> Entre dois O(n), decide a localidade de memória: <code>int[]</code> contra <code>LinkedList&lt;Integer&gt;</code> difere por um factor de 10 ou mais.</li>
-  <li><strong>Anunciar o limite antes de codificar</strong> e narrar cada decisão vale tanto na grelha quanto a correcção do código.</li>
+  <li>Isolamento é a única propriedade de ACID com um botão. <code>READ COMMITTED</code> toma um <em>snapshot</em> por instrução, <code>REPEATABLE READ</code> um por transacção, <code>SERIALIZABLE</code> acrescenta detecção de dependências e aborta com 40001 em vez de bloquear.</li>
+  <li>O <code>REPEATABLE READ</code> do PostgreSQL já elimina leituras fantasma, o que o padrão SQL não exige; o que continua a não impedir é o <em>write skew</em> — duas transacções que lêem o mesmo estado e escrevem em linhas diferentes.</li>
+  <li>Se o invariante for exprimível como restrição da base (<code>UNIQUE</code> parcial, <code>EXCLUDE USING gist</code>), é aí que deve viver: é o único sítio que nenhum caminho de escrita consegue contornar.</li>
+  <li>Um <code>UPDATE ... WHERE id = ? AND stock &gt;= ?</code> dispensa <code>FOR UPDATE</code>. O <em>lock</em> explícito só se justifica quando é preciso ler, decidir em código e escrever — e o seu tecto é 1/(duração da transacção) na linha quente.</li>
+  <li><em>Deadlocks</em> são sempre ordem de aquisição inconsistente. Corrigem-se com ordem total por identificador; a retentativa é rede de segurança e só é segura em transacções sem efeitos externos.</li>
+  <li>Replicação assíncrona dá RPO igual ao atraso no instante da falha; leituras em réplicas partem <em>read-your-writes</em> e resolvem-se com janela pegajosa por sessão, espera por LSN, ou devolvendo o recurso na resposta da escrita.</li>
+  <li>Particionar por data resolve retenção e manutenção no mesmo servidor; <em>sharding</em> resolve capacidade de escrita e custa junções, chaves estrangeiras, unicidade global e transacções entre <em>shards</em>.</li>
+  <li>Não há <code>COMMIT</code> que cubra dois sistemas. <em>Outbox</em> torna o evento atómico com o estado; a entrega é «pelo menos uma vez» e a correcção vem da idempotência do consumidor.</li>
+  <li>A saga substitui isolamento por estados intermédios explícitos e compensações que são acções de negócio, não <code>ROLLBACK</code>.</li>
 </ul>
 
-<p>Checklist accionável, a correr mentalmente em cada exercício de código:</p>
+<p>Checklist para a véspera da entrevista:</p>
 
 <ul class="lst">
-  <li>Reformular o enunciado e obter confirmação antes de qualquer código.</li>
-  <li>Perguntar n máximo, intervalo dos valores, duplicados, entrada modificável, e contrato para vazio e <code>null</code>.</li>
-  <li>Escrever dois exemplos com saída esperada: um representativo e um degenerado.</li>
-  <li>Anunciar a solução ingénua com complexidade e a solução alvo com complexidade, e pedir concordância na direcção.</li>
-  <li>Escolher o tipo do acumulador antes de somar: <code>long</code> sempre que o produto de n pelo valor máximo passe 2,1 × 10<sup>9</sup>.</li>
-  <li>Enunciar o invariante do ciclo numa frase e verificar que se mantém na primeira e na última iteração.</li>
-  <li>Verificar as fronteiras dos índices: <code>esq &lt; dir</code> nos ciclos interiores, <code>n+1</code> nos arrays de diferenças, <code>&gt;= inicio</code> nos saltos de janela.</li>
-  <li>Executar o código à mão sobre o exemplo degenerado antes de dizer que está pronto.</li>
-  <li>Enumerar em voz alta os casos limite tratados e os que ficaram por tratar, e que testes se escreveriam.</li>
-  <li>Fechar com a complexidade final de tempo e de espaço, e com a alternativa que se escolheria se a restrição fosse a memória.</li>
+  <li>Saber de cor o nível de isolamento por omissão do PostgreSQL e do MySQL, e uma diferença de comportamento entre os dois.</li>
+  <li>Conseguir escrever no quadro, em 60 segundos, as duas sessões que produzem <em>write skew</em> e a correcção escolhida.</li>
+  <li>Ter um número próprio para a duração das transacções do sistema actual e para o atraso p99 de replicação.</li>
+  <li>Ter um incidente de <em>deadlock</em> ou de <em>lock</em> preso preparado, com o par de instruções envolvido e a correcção enviada.</li>
+  <li>Saber justificar a chave de <em>sharding</em> do sistema actual pelos três critérios, e nomear o <em>hotspot</em> que ela cria.</li>
+  <li>Ter pronta a condição quantificada que faria trocar PostgreSQL por outro motor — e admitir que hoje ela não se verifica, se for o caso.</li>
+  <li>Conseguir desenhar a tabela <em>outbox</em> e o relay com <code>SKIP LOCKED</code> sem hesitar nas colunas.</li>
+  <li>Ter as três soluções do laboratório 23.1 na ponta da língua, cada uma com o seu tecto de <em>throughput</em>.</li>
+  <li>Preparar a frase que fecha qualquer resposta deste capítulo: qual é o invariante, onde é que ele é garantido, e o que acontece quando falha.</li>
 </ul>

@@ -1,714 +1,677 @@
-<p>Numa entrevista de Java sénior, os padrões de desenho não são avaliados pela capacidade de recitar o catálogo GoF de 1994: são avaliados pela capacidade de nomear o eixo de variação que um padrão isola e de dizer quanto custa isolá-lo. O entrevistador quer ouvir «isto varia por país e vai continuar a variar, por isso vale uma estratégia» e também «isto nunca variou em quatro anos, uma fábrica aqui é indirecção paga sem retorno». Onde os candidatos caem é em três sítios: descrevem o padrão pela estrutura de classes e não pela intenção; ignoram que metade do catálogo foi absorvido pela linguagem (lambdas, <code>record</code>, <code>sealed</code>, <code>enum</code>) e pelo contentor de <em>beans</em>; e aplicam padrões defensivamente, produzindo camadas de interfaces com uma implementação cada. Este capítulo percorre os padrões que aparecem mesmo em código Java 21 e Spring Boot 3.5, com os exemplos do JDK que o entrevistador espera ouvir citados, e trata a crítica — quando o padrão é ruído — como parte obrigatória da resposta.</p>
+<p>Uma ronda de design orientada a SOLID não mede se o candidato sabe recitar cinco siglas — mede se sabe dizer, sobre código concreto, qual é o eixo de mudança que justifica uma separação e quanto custa essa separação a quem lê o código a seguir. O entrevistador procura três coisas: um exemplo real do próprio código do candidato, um critério de detecção que funcione em <em>code review</em> sem ser estético, e a fronteira — o ponto a partir do qual aplicar o princípio piora o sistema. Onde os candidatos caem é na primeira frase: definem SRP como «uma classe faz uma coisa só», o que é uma tautologia que não decide nada, e depois defendem uma <em>codebase</em> com quarenta interfaces de implementação única como se isso fosse arquitectura. Este capítulo trata cada princípio como uma ferramenta com preço: o mecanismo, o sinal que o dispara, o refactor mínimo, e o caso em que a decisão correcta é violá-lo conscientemente.</p>
 
-<h2 id="sec-16-1" class="h2"><span class="secnum">16.1</span> Criacionais: factory, builder, singleton e alternativas modernas<a class="anchor" href="#sec-16-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-16-1" class="h2"><span class="secnum">16.1</span> SRP: a razão para mudar<a class="anchor" href="#sec-16-1" aria-label="ligação">#</a></h2>
 
-<p>Os padrões criacionais existem para separar <em>quem decide qual a implementação</em> de <em>quem a usa</em>, e para tornar a construção de objectos com muitos parâmetros legível e válida. Em código de aplicação moderno, a maior parte dessa responsabilidade já não é escrita à mão: o contentor de injecção de dependências é uma <em>abstract factory</em> configurável, e a interface <code>BeanFactory</code> chama-se assim precisamente por isso. Restam três casos em que o candidato ainda escreve estes padrões: quando a escolha da implementação depende de dados de <em>runtime</em> (um código de país, um tipo de evento), quando a construção tem de validar invariantes sobre 8 ou mais campos, e quando existe estado global genuíno — um relógio, um registo de métricas, uma <em>cache</em> de processo.</p>
+<p>A formulação útil do <em>Single Responsibility Principle</em> não é «uma classe faz uma coisa»: é «um módulo deve ter uma, e apenas uma, razão para mudar», onde razão para mudar significa <strong>um interlocutor</strong> — o departamento fiscal, a equipa de contabilidade, o fornecedor de <em>e-mail</em>, o esquema da base de dados. Duas responsabilidades no mesmo ficheiro significam duas equipas a alterar as mesmas linhas por motivos que nada têm em comum, e por isso a merge de uma quebra a outra. É um princípio sobre pessoas e cadência de mudança, não sobre contagem de métodos.</p>
 
-<p>A <em>static factory method</em> do <em>Effective Java</em> é a variante mais usada e a que menos candidatos nomeiam. Tem nome (<code>Money.ofMinor(1250, EUR)</code> lê-se melhor do que um construtor com dois inteiros), não obriga a criar uma instância nova em cada chamada, e pode devolver um subtipo escondido. O JDK está cheio de exemplos com consequências mensuráveis: <code>Integer.valueOf</code> devolve instâncias em <em>cache</em> para o intervalo −128 a 127, <code>List.of</code> devolve implementações especializadas para 0, 1 e 2 elementos antes de cair numa baseada em <em>array</em>, e <code>EnumSet.noneOf</code> escolhe entre uma implementação com um <code>long</code> de máscara de bits e outra com vários conforme o <em>enum</em> tenha até 64 constantes ou mais. Nenhuma dessas escolhas poderia ser feita por um construtor público.</p>
+<p>Daí decorre o critério operacional: se, para responder «porque é que este ficheiro mudou no último ano», forem necessárias duas frases ligadas por «e também», há duas responsabilidades. O histórico de <em>git</em> é a evidência mais barata que existe — um ficheiro tocado em 60% dos <em>pull requests</em> de duas áreas de produto distintas é um candidato objectivo, sem discussão de gosto.</p>
 
-<p>O <em>builder</em> é o padrão criacional com pior relação custo/benefício em Java 21, porque grande parte do que resolvia — legibilidade de listas longas de argumentos, imutabilidade, <code>equals</code> e <code>hashCode</code> — passou para os <code>record</code>. O que o <code>record</code> não resolve é a ausência de argumentos nomeados e opcionais: com 11 componentes, um construtor canónico é ilegível e dois componentes do mesmo tipo trocados compilam sem erro. É aí, e só aí, que o <em>builder</em> continua a pagar-se.</p>
+<p>A armadilha simétrica é dividir por camada técnica em vez de por eixo de mudança. Partir uma classe em <code>Validator</code>, <code>Mapper</code>, <code>Calculator</code> e <code>Persister</code> quando as quatro mudam sempre ao mesmo tempo, pela mesma razão de negócio, não aplica SRP: multiplica por quatro o número de ficheiros que um <em>pull request</em> tem de tocar e reduz a coesão. SRP e coesão funcional são a mesma métrica vista de dois lados; a separação só compensa quando as partes têm ritmos de mudança diferentes.</p>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um <em>builder</em> escrito à mão para um agregado de 12 campos custa 60 a 80 linhas de código que ninguém testa, mais um objecto intermédio por construção. Um <code>record</code> equivalente custa 1 linha de declaração mais a validação no construtor compacto. A regra prática usada em revisão de código: menos de 5 componentes, construtor canónico; 5 a 8 com todos obrigatórios, construtor canónico mais fábricas estáticas com nome; mais de 8, ou 3 ou mais opcionais, <em>builder</em>.</p></aside>
+<figure class="listing java" id="lst-16-1"><div class="lhead"><span class="lnum">Listagem 16.1</span>
+<span class="lcap">Antes: quatro interlocutores no mesmo método — regra fiscal, esquema SQL, apresentação e notificação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class InvoiceService {
+
+    private final JdbcTemplate jdbc;
+    private final JavaMailSender mail;
+    private final PdfEngine pdf;
+
+    public void issue(Order order) {
+        BigDecimal net = order.lines().stream()
+                .map(l -&gt; l.unitPrice().multiply(BigDecimal.valueOf(l.qty())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal vat = net.multiply(new BigDecimal(&quot;0.23&quot;));      // muda com a lei fiscal
+        Invoice inv = new Invoice(order.id(), net, net.add(vat));
+
+        jdbc.update(&quot;insert into invoice(id, net, gross) values (?,?,?)&quot;,
+                inv.id().value(), inv.net(), inv.gross());          // muda com o esquema
+
+        byte[] doc = pdf.render(&quot;invoice-a4.ftl&quot;, inv);             // muda com o marketing
+
+        mail.send(mime -&gt; {                                         // muda com o fornecedor
+            var h = new MimeMessageHelper(mime, true);
+            h.setTo(order.customerEmail());
+            h.setSubject(&quot;Factura &quot; + inv.id().value());
+            h.addAttachment(&quot;factura.pdf&quot;, new ByteArrayResource(doc));
+        });
+    }
+}</code></pre></figure>
+
+<p>O sintoma mensurável desta classe é o custo do teste: para exercitar a regra dos 23% é preciso levantar uma base de dados, um duplo de <em>e-mail</em> e um motor de PDF. Depois da separação, a regra fiscal testa-se com um <em>unit test</em> puro na ordem dos microssegundos, e os adaptadores testam-se uma vez cada, contra o contrato.</p>
+
+<figure class="listing java" id="lst-16-2"><div class="lhead"><span class="lnum">Listagem 16.2</span>
+<span class="lcap">Depois: a política fiscal isolada, os detalhes atrás de portas, e um caso de uso que orquestra sem decidir.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// 1. Política: muda quando muda a lei. Sem Spring, sem I/O, testável em microssegundos.
+public final class InvoiceCalculator {
+    private final VatTable vat;
+
+    public InvoiceCalculator(VatTable vat) { this.vat = vat; }
+
+    public Invoice issue(Order order, LocalDate on) {
+        BigDecimal net = order.lines().stream()
+                .map(l -&gt; l.unitPrice().multiply(BigDecimal.valueOf(l.qty())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .setScale(2, RoundingMode.HALF_UP);
+        return new Invoice(order.id(), net, net.add(vat.rateFor(order.country(), on)
+                .multiply(net).setScale(2, RoundingMode.HALF_UP)));
+    }
+}
+
+// 2. Portas: declaradas no pacote do domínio, uma por interlocutor externo.
+public interface Invoices          { void save(Invoice invoice); }
+public interface InvoiceDocuments  { Document render(Invoice invoice); }
+public interface CustomerNotifier  { void invoiceIssued(Invoice invoice, Document doc); }
+
+// 3. Caso de uso: a única razão para mudar é a sequência do processo de negócio.
+@Service
+public class IssueInvoice {
+    private final InvoiceCalculator calculator;
+    private final Invoices invoices;
+    private final InvoiceDocuments documents;
+    private final CustomerNotifier notifier;
+
+    @Transactional
+    public InvoiceId handle(Order order) {
+        Invoice invoice = calculator.issue(order, LocalDate.now());
+        invoices.save(invoice);
+        notifier.invoiceIssued(invoice, documents.render(invoice));
+        return invoice.id();
+    }
+}</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O custo real da violação aparece na suite de testes. Um teste da regra fiscal sobre a Listagem 16.1 precisa de contexto Spring e de PostgreSQL em Testcontainers: 6 a 12 segundos de arranque e 30 a 80 ms por caso. O mesmo teste sobre <code>InvoiceCalculator</code> corre em menos de 1 ms, sem contexto. Numa suite com 400 casos de regra de negócio, é a diferença entre ~4 minutos e ~2 segundos — e é essa diferença que determina se a equipa corre os testes antes de cada <em>commit</em> ou só no CI.</p></aside>
 
 <div class="qa" id="q-16-1" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">SOLID e design patterns</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Implemente um singleton seguro em ambiente concorrente em Java. Depois diga-me se o usaria no código que escreve hoje.</div>
+  <div class="qprompt">Dê-me um exemplo concreto do seu próprio código em que aplicou o SRP: o que estava junto, porque decidiu separar, e o que melhorou de forma mensurável.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Há duas formas correctas e uma que só se escreve para mostrar que se conhece o modelo de memória. A correcta e mais curta é o <code>enum</code> de constante única: a especificação da linguagem garante que a inicialização da classe acontece uma só vez, sob o bloqueio de inicialização da JVM, e resolve de graça a serialização e o ataque por reflexão que quebram o singleton clássico. A segunda é o <em>initialization-on-demand holder</em>: uma classe estática aninhada só é carregada e inicializada no primeiro acesso ao seu campo, o que dá inicialização preguiçosa sem uma única instrução de sincronização no caminho de leitura.</p>
-      <p>A terceira é o <em>double-checked locking</em>, e o ponto que o entrevistador procura é o <code>volatile</code>. Sem ele, o construtor e a atribuição da referência podem ser reordenados, e outra <em>thread</em> vê uma referência não nula a um objecto parcialmente construído. Com <code>volatile</code> é correcto desde o modelo de memória de Java 5, mas continua a ser mais código e mais fácil de errar do que o <em>holder</em>, para o mesmo resultado.</p>
-      <p>Quanto à segunda parte: em código de aplicação, não. O singleton no sentido GoF — a classe controla o seu próprio número de instâncias e expõe-se por um método estático global — é um anti-padrão em serviços porque cria estado global mutável, esconde a dependência (o construtor de quem o usa não a declara), impede substituir o <em>colaborador</em> num teste sem <em>bytecode</em> mágico e mantém-se vivo enquanto o <em>class loader</em> viver, o que em contentores de aplicação com recarregamento produz fugas de memória. O que se quer é instância única <em>gerida</em>: um <code>@Bean</code> de âmbito <em>singleton</em>, injectado pelo construtor. A unicidade passa a ser uma decisão de configuração, e não uma propriedade cravada na classe.</p>
-      <p>A distinção que separa um sénior: o âmbito <em>singleton</em> do Spring é único por contentor, não por JVM. Com dois <code>ApplicationContext</code> no mesmo processo — habitual em testes com contextos diferentes — existem duas instâncias. Se o requisito for mesmo unicidade por processo (um contador, um <em>lock</em> de ficheiro), isso tem de ser garantido explicitamente e não pela palavra «singleton» na configuração.</p>
-      <figure class="listing java" id="lst-16-1"><div class="lhead"><span class="lnum">Listagem 16.1</span>
-        <span class="lcap">As duas formas defensáveis e a forma que a aplicação deve mesmo usar.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>// 1) enum: uma instância garantida pela inicialização de classe; imune a serialização e reflexão
-public enum MetricsRegistry {
-    INSTANCE;
-    private final ConcurrentHashMap&lt;String, LongAdder&gt; counters = new ConcurrentHashMap&lt;&gt;();
-    public void inc(String name) { counters.computeIfAbsent(name, k -&gt; new LongAdder()).increment(); }
-}
+      <p>A resposta começa pelo eixo de mudança, não pela estrutura. «Tínhamos um <code>InvoiceService</code> que calculava IVA, escrevia em PostgreSQL, gerava o PDF e enviava o <em>e-mail</em>. Em nove meses, esse ficheiro apareceu em 31 <em>pull requests</em>: 12 por alterações de regra fiscal, 9 por mudanças de <em>template</em> do documento, 6 por migrações de esquema e 4 pela troca de fornecedor de <em>e-mail</em>. Quatro interlocutores, quatro cadências, um ficheiro — e três conflitos de <em>merge</em> por mês entre duas equipas.»</p>
+      <p>Depois, o critério que decidiu o corte. Não se separa por camada técnica; separa-se pelo interlocutor que pede a alteração. A regra fiscal ficou numa classe pura sem dependências de <em>framework</em>; a persistência, o documento e a notificação passaram a portas declaradas no domínio com adaptadores em infraestrutura; e ficou um caso de uso que apenas ordena os passos e desenha a fronteira transaccional.</p>
+      <p>Por fim, o número. «O teste da regra fiscal deixou de precisar de contexto Spring: passou de ~40 ms com Testcontainers para menos de 1 ms; a suite de regras de negócio caiu de 4 minutos para segundos. Os conflitos de <em>merge</em> nessa área desapareceram porque as duas equipas passaram a tocar em ficheiros distintos. E, quando a lei do IVA mudou em Janeiro, o <em>pull request</em> tinha 14 linhas em vez de tocar num ficheiro de 400.»</p>
+      <p>Um sénior fecha com o que não fez. «Não parti a classe em <code>Validator</code>, <code>Mapper</code> e <code>Persister</code>: essas três mudam sempre juntas e pela mesma razão. Separá-las só teria multiplicado ficheiros e reduzido a coesão. O corte foi por interlocutor, e parou aí.»</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Recita a definição («uma classe, uma responsabilidade») e não tem exemplo próprio; ou o exemplo é um <em>tutorial</em> de blogue.</td></tr>
+        <tr><td>Mid</td><td>Exemplo real, mas o critério é estético: «a classe tinha 500 linhas, era demasiado grande». Nenhuma referência a eixos de mudança nem a impacto medido.</td></tr>
+        <tr><td>Sénior</td><td>Identifica os interlocutores, mostra o sinal (histórico de alterações, número de mocks, tempo de teste) e quantifica o ganho. Diz onde parou de separar e porquê.</td></tr>
+        <tr><td>Staff</td><td>Liga SRP a fronteiras de equipa e de <em>deploy</em>: quem é dono de cada parte, o que isso fez ao <em>lead time</em>, e que regra automática (ArchUnit, <em>CODEOWNERS</em>) impede a erosão.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como decidiu que eram quatro responsabilidades e não duas ou sete?»</li>
+      <li>«O caso de uso que orquestra não é ele próprio uma segunda responsabilidade?»</li>
+      <li>«Se a regra fiscal e o esquema mudassem sempre juntos, ainda separava?»</li>
+      <li>«Quanto custou o refactor em dias e o que ficou por fazer?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Definir SRP como «uma classe faz uma coisa só» e não conseguir operacionalizar «uma coisa».</li>
+      <li>Apresentar a divisão por camadas técnicas como aplicação de SRP.</li>
+      <li>Zero números: nem tempo de teste, nem contagem de alterações, nem conflitos.</li>
+      <li>Não reconhecer nenhum custo na separação.</li></ul></div>
+  </div>
+</div>
 
-// 2) initialization-on-demand holder: preguiçoso, sem sincronização no caminho de leitura
-public final class RuleCache {
-    private RuleCache() {}
-    private static final class Holder { static final RuleCache INSTANCE = new RuleCache(); }
-    public static RuleCache get() { return Holder.INSTANCE; }   // Holder só carrega aqui
-}
+<div class="qa" id="q-16-2" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Está a rever um <em>pull request</em> de um colega. Que sinais objectivos o fazem escrever «isto viola o SRP» em vez de deixar passar, e como formula o comentário?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Há quatro sinais que se verificam sem debate de gosto, todos observáveis no próprio <em>diff</em>.</p>
+      <ul class="lst">
+        <li><strong>Mistura de vocabulários nos <em>imports</em>.</strong> A mesma classe importa <code>javax.sql</code> ou <code>JdbcTemplate</code>, <code>MimeMessageHelper</code> e tipos de domínio. Três dialectos no mesmo ficheiro são três interlocutores.</li>
+        <li><strong>Número de colaboradores no construtor.</strong> Acima de quatro ou cinco dependências injectadas, a probabilidade de haver mais do que um eixo de mudança é alta; o teste correspondente precisa do mesmo número de duplos, e isso aparece no <em>diff</em> dos testes.</li>
+        <li><strong>O nome.</strong> <code>OrderManager</code>, <code>UserHelper</code>, <code>PaymentUtils</code> ou qualquer nome que só descreve o processo com «e» — o nome que não se consegue escrever sem conjunção denuncia a classe que não se consegue descrever sem conjunção.</li>
+        <li><strong>Histórico.</strong> <code>git log --format=%s -- ficheiro.java</code> com mensagens de duas áreas de produto sem relação. É o sinal mais forte porque é histórico, não previsão.</li>
+      </ul>
+      <p>A formulação do comentário é o que separa um sénior de um purista. Um comentário útil não diz «viola o SRP»; diz qual é o cenário de mudança que dói: «se o fornecedor de <em>e-mail</em> mudar, o teste da regra de IVA passa a ter de ser reescrito — proponho extrair a notificação para uma porta». O princípio é o argumento de segunda ordem; o custo concreto é o de primeira.</p>
+      <p>E há o critério de não comentar. Se a classe é uma folha estável, com um único dono, sem histórico de alterações cruzadas e coberta por testes rápidos, a violação teórica não paga o custo do refactor nem o do debate no <em>review</em>. A pergunta é sempre «que alteração futura, plausível a seis meses, fica mais cara por isto estar junto?» — se não houver resposta com nome, o comentário fica por escrever.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Vejo se a classe é muito grande.» Linhas de código como único critério.</td></tr>
+        <tr><td>Mid</td><td>Cita dois sinais válidos (nome, número de dependências) mas trata o princípio como regra absoluta; comentaria sempre.</td></tr>
+        <tr><td>Sénior</td><td>Sinais objectivos incluindo histórico e custo de teste; formula o comentário em termos de cenário de mudança; sabe quando não comentar.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta automação — regras ArchUnit para direcção de dependências, limites de fan-in no <em>build</em> — para que o <em>review</em> deixe de depender de vigilância humana.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o autor responder que separar agora é <em>over-engineering</em>?»</li>
+      <li>«Que limite de dependências injectadas usa e porquê esse?»</li>
+      <li>«Como impede que a fronteira volte a erodir daqui a seis meses?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Bloquear um <em>merge</em> por violação teórica sem cenário de custo.</li>
+      <li>Contar linhas ou métodos como prova de responsabilidade dupla.</li>
+      <li>Não distinguir código de fronteira (adaptadores, <em>controllers</em>) de código de política.</li></ul></div>
+  </div>
+</div>
 
-// 3) double-checked locking: correcto SÓ com volatile (modelo de memória de Java 5+)
-public final class Legacy {
-    private static volatile Legacy instance;                    // sem volatile: publicação insegura
-    public static Legacy get() {
-        Legacy local = instance;                                // uma leitura volatile, não duas
-        if (local == null) {
-            synchronized (Legacy.class) {
-                local = instance;
-                if (local == null) { instance = local = new Legacy(); }
+<h2 id="sec-16-2" class="h2"><span class="secnum">16.2</span> OCP: extensão sem modificação em Java moderno<a class="anchor" href="#sec-16-2" aria-label="ligação">#</a></h2>
+
+<p>O <em>Open-Closed Principle</em> pede que se acrescente comportamento sem editar código já testado e em produção. Em 1988 isso significava herança; em Java 25 significa quase sempre uma abstracção com várias implementações registadas — e o Spring dá o registo de graça, porque injectar <code>List&lt;PaymentHandler&gt;</code> ou <code>Map&lt;String, PaymentHandler&gt;</code> entrega todos os <em>beans</em> do tipo sem que o ponto de decisão os conheça.</p>
+
+<p>O sinal da violação é o <code>if</code>/<code>switch</code> sobre um tipo ou um enum que reaparece em três sítios diferentes do <em>codebase</em>. Um único <code>switch</code> não é um problema; três <code>switch</code> sobre o mesmo enum são: acrescentar um valor obriga a lembrar de três locais, e o compilador não ajuda se houver <code>default</code>. A regra prática é a regra do terceiro caso — ao primeiro <code>if</code> escreve-se o <code>if</code>, ao segundo hesita-se, ao terceiro extrai-se a abstracção, porque só ao terceiro se conhece o verdadeiro eixo de variação.</p>
+
+<figure class="listing java" id="lst-16-3"><div class="lhead"><span class="lnum">Listagem 16.3</span>
+<span class="lcap">Antes: o ponto de decisão conhece todos os meios de pagamento; cada novo meio edita código em produção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class PaymentService {
+
+    public PaymentResult pay(PaymentRequest req) {
+        switch (req.method()) {
+            case CARD -&gt; {
+                var auth = stripe.authorize(req.amount(), req.cardToken());
+                return PaymentResult.of(auth.id(), auth.status());
             }
+            case SEPA -&gt; {
+                if (req.amount().compareTo(new BigDecimal(&quot;15000&quot;)) &gt; 0) {
+                    throw new LimitExceeded(&quot;SEPA instantâneo até 15 000 EUR&quot;);
+                }
+                return PaymentResult.pending(sepa.submit(req.iban(), req.amount()));
+            }
+            case MBWAY -&gt; return PaymentResult.pending(mbway.push(req.msisdn(), req.amount()));
+            default -&gt; throw new IllegalArgumentException(&quot;método &quot; + req.method());
         }
-        return local;
     }
+}</code></pre></figure>
+
+<figure class="listing java" id="lst-16-4"><div class="lhead"><span class="lnum">Listagem 16.4</span>
+<span class="lcap">Depois: registo por injecção de colecção — um meio novo é uma classe nova, zero edições no ponto de decisão.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public interface PaymentHandler {
+    PaymentMethod method();
+    PaymentResult pay(PaymentRequest req);
 }
 
-// 4) o que se escreve numa aplicação Spring Boot: unicidade é configuração, não é a classe
-@Service
-public class PricingService {
-    private final Clock clock;                                  // substituível no teste
-    private final RateSource rates;
-    PricingService(Clock clock, RateSource rates) { this.clock = clock; this.rates = rates; }
-}</code></pre></figure></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Campo estático com <em>getter</em> e <code>synchronized</code> no método, sem perceber o custo; ou <em>double-checked locking</em> sem <code>volatile</code> apresentado como correcto.</td></tr>
-        <tr><td>Mid</td><td>Sabe o <em>enum</em> e o <em>holder</em>, explica <code>volatile</code>, mas defende o singleton como boa prática geral.</td></tr>
-        <tr><td>Sénior</td><td>As três formas com o mecanismo (inicialização de classe, reordenação), e a crítica: estado global, dependência escondida, testes; escolhe <em>bean</em> injectado.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o âmbito por contentor e não por JVM, fugas por <em>class loader</em>, e o caso raro em que a unicidade por processo é mesmo um requisito e como o garantir.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque é que o <em>enum</em> resiste à desserialização e o singleton com campo estático não?»</li>
-      <li>«O que acontece exactamente sem o <code>volatile</code>, ao nível do modelo de memória?»</li>
-      <li>«Tem dois <code>ApplicationContext</code> no mesmo teste. Quantas instâncias do <em>bean</em> existem?»</li>
-      <li>«E se o singleton guardar uma <em>cache</em> mutável partilhada por 200 <em>threads</em>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Defender <code>getInstance()</code> espalhado pelo código de domínio como forma de «evitar passar dependências».</li>
-      <li>Confundir singleton com classe utilitária de métodos estáticos sem estado.</li>
-      <li>Não ver que estado mutável dentro do singleton é agora um problema de acesso concorrente.</li></ul></div>
-  </div>
-</div>
+@Component
+class SepaHandler implements PaymentHandler {
+    private static final BigDecimal INSTANT_LIMIT = new BigDecimal(&quot;15000&quot;);
 
-<div class="qa" id="q-16-2" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Tenho um objecto de domínio com 12 campos, 4 dos quais opcionais. <em>Builder</em>, <code>record</code>, ou outra coisa? Justifique com o custo de manutenção.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>As duas coisas não competem: o <code>record</code> é a representação, o <em>builder</em> é a forma de a construir. A resposta é <code>record</code> com construtor compacto a validar os invariantes, e um <em>builder</em> por cima apenas porque há 4 campos opcionais e 12 posições onde trocar dois <code>String</code> compila em silêncio. Com 12 campos todos obrigatórios e de tipos distintos, o <em>builder</em> seria custo puro.</p>
-      <p>O que se ganha com o <code>record</code>: imutabilidade real (campos <code>final</code>), <code>equals</code>, <code>hashCode</code> e <code>toString</code> derivados dos componentes — o que elimina a classe inteira de <em>bugs</em> em que alguém acrescenta um campo e esquece o <code>equals</code> — desconstrução por <em>record pattern</em> em <code>switch</code>, e serialização previsível. O que se perde: não há herança, não há campos não declarados como componentes, e as bibliotecas antigas que exigem construtor sem argumentos e <em>setters</em> não funcionam sem configuração (o Jackson liga-se a <code>record</code> desde a versão 2.12, mas JPA não: uma entidade não pode ser um <code>record</code>, só o pode ser um DTO ou um <em>value object</em> incorporado).</p>
-      <p>Sobre o custo do <em>builder</em>: o problema real não são as 70 linhas geradas, é que um <em>builder</em> clássico não garante em tempo de compilação que os obrigatórios foram preenchidos — falha em <code>build()</code>, em <em>runtime</em>, muitas vezes só no ambiente onde o campo é usado. Duas saídas: <em>staged builder</em>, em que cada passo devolve uma interface diferente e o compilador só deixa chamar <code>build()</code> no fim, ao custo de mais 4 interfaces; ou construtor canónico com os obrigatórios e um <em>builder</em> só para o bloco opcional. Em serviços grandes escolhe-se quase sempre a segunda, porque a primeira é ilegível para quem entra na equipa.</p>
-      <p>A alternativa que muitas equipas ignoram: não construir de fora. Se o objecto tem invariantes fortes, o que se expõe são fábricas estáticas com nomes de intenção — <code>TransferOrder.immediate(...)</code>, <code>TransferOrder.scheduled(...)</code> — em vez de um <em>builder</em> genérico que aceita qualquer combinação e depois a rejeita.</p>
-      <figure class="listing java" id="lst-16-2"><div class="lhead"><span class="lnum">Listagem 16.2</span>
-        <span class="lcap"><code>record</code> com validação central, cópia funcional e um <em>builder</em> só para o que é opcional.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public record TransferOrder(
-        OrderId id, Money amount, Iban from, Iban to, Instant requestedAt,
-        String reference, Priority priority, Optional&lt;Instant&gt; executeAt) {
+    @Override public PaymentMethod method() { return PaymentMethod.SEPA; }
 
-    public TransferOrder {                                   // construtor compacto: um só sítio de validação
-        Objects.requireNonNull(id, "id");
-        if (amount.isNotPositive()) throw new IllegalArgumentException("amount &lt;= 0");
-        if (from.equals(to))        throw new IllegalArgumentException("from == to");
-        reference = reference == null ? "" : reference.strip();   // normalização, não mutação
-        priority  = priority  == null ? Priority.NORMAL : priority;
-    }
-
-    // fábricas estáticas com nome de intenção: melhores do que um builder que aceita tudo
-    public static TransferOrder immediate(OrderId id, Money amount, Iban from, Iban to, Clock clock) {
-        return new TransferOrder(id, amount, from, to, clock.instant(), "", Priority.NORMAL, Optional.empty());
-    }
-
-    // "wither": cópia com um componente alterado, sem builder
-    public TransferOrder withPriority(Priority p) {
-        return new TransferOrder(id, amount, from, to, requestedAt, reference, p, executeAt);
-    }
-}</code></pre></figure></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Uso sempre Lombok <code>@Builder</code>» sem saber o que gera nem o que acontece aos invariantes.</td></tr>
-        <tr><td>Mid</td><td>Escolhe <code>record</code> e sabe o que é gerado, mas não distingue representação de construção nem vê a falha em <em>runtime</em> do <code>build()</code>.</td></tr>
-        <tr><td>Sénior</td><td>Combina os dois, valida no construtor compacto, conhece o limite (JPA, herança) e justifica o <em>builder</em> pelos 4 opcionais e pelos tipos repetidos.</td></tr>
-        <tr><td>Staff</td><td>Propõe fábricas com nome de intenção em vez de construção livre, discute <em>staged builder</em> e o seu custo de legibilidade, e liga a decisão à evolução do esquema de serialização.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como valida que os 4 opcionais não formam combinações impossíveis?»</li>
-      <li>«Este objecto vai para Kafka. O que muda quando acrescentar um 13.º campo?»</li>
-      <li>«Porque é que uma entidade JPA não pode ser um <code>record</code>?»</li>
-      <li>«Qual é o custo de alocação de um <em>builder</em> num caminho de 5 000 chamadas por segundo?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><em>Builder</em> mutável partilhado entre <em>threads</em> ou reutilizado entre construções.</li>
-      <li>Validação replicada no <em>builder</em> e no construtor, com regras que divergem ao fim de dois meses.</li>
-      <li>Usar <code>record</code> como entidade JPA e descobrir o problema em produção.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-16-3" data-box="qa" data-area="design" data-level="mid" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Qual é a diferença entre <em>static factory method</em>, <em>factory method</em> e <em>abstract factory</em>, e qual deles ainda escreve numa aplicação Spring?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>São três coisas diferentes com nomes parecidos. O <em>static factory method</em> nem sequer está no catálogo GoF: é um método estático que devolve uma instância, cujo valor está no nome, na possibilidade de devolver um subtipo e na de não criar nada — <code>Integer.valueOf</code>, <code>List.of</code>, <code>Optional.of</code>, <code>Duration.ofSeconds</code>. O <em>factory method</em> do GoF é polimorfismo: uma classe abstracta define um método que as subclasses implementam para decidir o tipo concreto; o esqueleto do algoritmo fica na classe base. A <em>abstract factory</em> é um objecto cuja função é produzir famílias coerentes de objectos relacionados, para que não se misture uma peça de uma família com outra.</p>
-      <p>Numa aplicação Spring, escreve-se o primeiro todos os dias e praticamente nunca os outros dois na forma clássica, porque o contentor é a <em>abstract factory</em>: <code>BeanFactory</code> é literalmente essa interface, e a escolha da família faz-se por <em>profiles</em>, <code>@Conditional</code> e configuração, não por hierarquia de classes. Escrever uma <code>AbstractRepositoryFactory</code> com duas subclasses para escolher entre PostgreSQL e um duplo em memória é reimplementar mal o que a configuração já faz.</p>
-      <p>Onde a fábrica escrita à mão continua a pagar-se é quando a escolha depende de um valor que só existe em <em>runtime</em>: o tipo de um evento Kafka, um código de país, um método de pagamento vindo do pedido. Aí o padrão idiomático não é uma hierarquia, é um <code>Map&lt;Chave, Estratégia&gt;</code> construído uma vez no arranque — e o Spring injecta esse mapa directamente se se declarar o parâmetro como <code>Map&lt;String, Handler&gt;</code>, preenchido com nome do <em>bean</em> para <em>bean</em>. Uma consulta a <code>HashMap</code> custa ~20 ns e não cresce com o número de casos, ao contrário de uma cadeia de <code>if</code>.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Trata os três como sinónimos; descreve «uma classe que cria objectos».</td></tr>
-        <tr><td>Mid</td><td>Distingue os três correctamente com exemplos do catálogo, mas não liga ao contentor de <em>beans</em>.</td></tr>
-        <tr><td>Sénior</td><td>Cita exemplos concretos do JDK, identifica <code>BeanFactory</code> como <em>abstract factory</em> e limita a fábrica manual a escolhas dependentes de dados de <em>runtime</em>.</td></tr>
-        <tr><td>Staff</td><td>Discute o registo por <code>Map</code> injectado, o custo de descoberta em arranque, e como garantir que um novo tipo de evento sem <em>handler</em> falha no arranque e não no primeiro pedido.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como é que o <code>Map&lt;String, Handler&gt;</code> injectado sabe as chaves?»</li>
-      <li>«Chega um evento de tipo desconhecido em produção. Onde é que isso falha e como quer que falhe?»</li>
-      <li>«Porque é que <code>List.of()</code> devolve classes diferentes conforme o número de elementos?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Hierarquia de fábricas com uma subclasse por implementação que o <em>profile</em> já escolhia.</li>
-      <li>Fábrica que faz <code>new</code> de <em>beans</em> com dependências, saltando o contentor.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-16-2" class="h2"><span class="secnum">16.2</span> Estruturais: adapter, decorator, facade e proxy<a class="anchor" href="#sec-16-2" aria-label="ligação">#</a></h2>
-
-<p>Os quatro padrões estruturais mais perguntados têm estruturas de classes quase idênticas — todos envolvem um objecto que contém outro e delega — e distinguem-se apenas pela intenção. O <em>adapter</em> muda a interface sem mudar o comportamento: existe porque duas partes do sistema falam línguas diferentes. O <em>decorator</em> mantém a interface e acrescenta comportamento: existe porque se quer somar responsabilidades em <em>runtime</em>. O <em>facade</em> cria uma interface nova e mais estreita sobre um subsistema com muitas peças. O <em>proxy</em> mantém a interface e controla o acesso: <em>lazy loading</em>, controlo de permissões, remoto, transacções.</p>
-
-<p>Se o candidato só souber dizer «são todos <em>wrappers</em>», perde a pergunta. A forma de responder bem é pela consequência: se se remover um <em>adapter</em>, o código deixa de compilar; se se remover um <em>decorator</em>, compila e funciona, apenas sem métricas ou sem <em>cache</em>; se se remover um <em>facade</em>, o chamador passa a conhecer 6 classes em vez de 1; se se remover um <em>proxy</em> do Spring, a transacção deixa de existir e ninguém repara até haver escrita parcial.</p>
-
-<p>O JDK é o repositório canónico de exemplos, e cita-se de memória: <code>java.io</code> é decorador puro — <code>new BufferedInputStream(new GZIPInputStream(new FileInputStream(f)))</code> — e o mesmo modelo aparece em <code>Collections.unmodifiableList</code> e <code>synchronizedList</code>; <code>InputStreamReader</code> é adaptador de <em>bytes</em> para caracteres e <code>Arrays.asList</code> adapta um <em>array</em> à interface <code>List</code>; <code>java.lang.reflect.Proxy</code> é a fábrica de <em>proxies</em> dinâmicos sobre interfaces em que assenta metade do Spring AOP.</p>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Decorador contra herança: com <em>n</em> comportamentos opcionais combináveis, a herança exige até 2<sup><em>n</em></sup> subclasses e fixa a combinação em tempo de compilação; os decoradores exigem <em>n</em> classes e compõem-se em <em>runtime</em>. O que se paga: pilhas de chamada mais profundas (uma cadeia de 4 decoradores acrescenta 4 <em>frames</em> a cada invocação e torna os <em>stack traces</em> menos legíveis), perda de identidade (<code>equals</code> e <code>instanceof</code> sobre o invólucro não vêem o alvo) e impossibilidade de aceder a estado protegido do decorado.</p></aside>
-
-<div class="qa" id="q-16-4" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Preciso de acrescentar <em>cache</em>, métricas e <em>retry</em> a um cliente HTTP existente. Herança ou decorador? Mostre a estrutura e diga o que perde.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Decorador, porque os três comportamentos são independentes e a ordem entre eles é uma decisão de configuração, não de tipo. Com herança seriam necessárias, no limite, 8 combinações (2<sup>3</sup>) fixadas em tempo de compilação, e acrescentar um quarto comportamento duplicaria esse número. Com decoradores são 3 classes, cada uma com uma responsabilidade, montadas numa expressão.</p>
-      <p>A ordem importa mais do que os candidatos assumem, e é o ponto onde a resposta se distingue. Métricas por fora de tudo medem a latência que o chamador observa, incluindo os acertos de <em>cache</em>; métricas por dentro do <em>retry</em> medem a chamada real ao serviço remoto. <em>Cache</em> por fora do <em>retry</em> significa que um acerto nunca ativa retentativas — que é o que se quer; <em>retry</em> por fora da <em>cache</em> repetiria a consulta à <em>cache</em> sem sentido. A montagem defensável é métricas → <em>cache</em> → <em>retry</em> → cliente real, e diz-se porquê.</p>
-      <p>Em Java 21 os decoradores escrevem-se como <code>record</code> que implementam a interface e guardam o delegado como componente: obtém-se imutabilidade e <code>toString</code> útil para diagnóstico sem código extra. Cada decorador é testável isoladamente com um duplo do delegado.</p>
-      <p>O que se perde: profundidade de pilha e legibilidade dos <em>stack traces</em> — quatro <em>frames</em> extra por chamada, o que não é mensurável em custo (a JIT alinha chamadas monomórficas) mas é visível no diagnóstico; perda de identidade, porque <code>decorado instanceof HttpRateSource</code> é falso do lado de fora; e a impossibilidade de um decorador aceder a estado interno do alvo — se precisar, o desenho está errado e o que se queria era herança ou uma mudança na interface. A alternativa a considerar é não escrever decoradores nenhuns e usar o que a plataforma dá: <code>@Cacheable</code>, <code>@Retryable</code> e <code>@Timed</code> fazem o mesmo por <em>proxy</em>, ao custo de a composição deixar de ser visível no código e de a ordem passar a depender de <code>@Order</code>.</p>
-      <figure class="listing java" id="lst-16-3"><div class="lhead"><span class="lnum">Listagem 16.3</span>
-        <span class="lcap">Decoradores como <code>record</code>: composição explícita e ordem justificada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public interface RateSource { Rate find(String pair); }
-
-record HttpRateSource(RestClient client) implements RateSource {
-    public Rate find(String pair) {
-        return client.get().uri("/rates/{p}", pair).retrieve().body(Rate.class);
-    }
-}
-
-record RetryingRateSource(RateSource delegate, int attempts) implements RateSource {
-    public Rate find(String pair) {
-        RuntimeException last = null;
-        for (int i = 0; i &lt; attempts; i++) {
-            try { return delegate.find(pair); }
-            catch (TransientRateException e) { last = e; }        // só o que é retentável
+    @Override public PaymentResult pay(PaymentRequest req) {
+        if (req.amount().compareTo(INSTANT_LIMIT) &gt; 0) {
+            throw new LimitExceeded(&quot;SEPA instantâneo até 15 000 EUR&quot;);
         }
-        throw last;
+        return PaymentResult.pending(sepa.submit(req.iban(), req.amount()));
     }
 }
 
-record CachingRateSource(RateSource delegate, Cache&lt;String, Rate&gt; cache) implements RateSource {
-    public Rate find(String pair) { return cache.get(pair, delegate::find); }
-}
-
-record TimedRateSource(RateSource delegate, Timer timer) implements RateSource {
-    public Rate find(String pair) { return timer.record(() -&gt; delegate.find(pair)); }
-}
-
-// métricas por fora (latência vista pelo chamador), cache antes do retry (acerto não faz retentativas)
-RateSource rates = new TimedRateSource(
-        new CachingRateSource(
-                new RetryingRateSource(new HttpRateSource(client), 3),
-                cache),
-        timer);</code></pre></figure></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Uma subclasse por combinação, ou tudo dentro da classe do cliente com <code>if (cacheEnabled)</code>.</td></tr>
-        <tr><td>Mid</td><td>Escolhe decorador e desenha-o correctamente, mas não discute a ordem nem o que se perde.</td></tr>
-        <tr><td>Sénior</td><td>Justifica a ordem pelo que cada métrica passa a significar, escreve decoradores imutáveis e nomeia as perdas (pilha, identidade, estado protegido).</td></tr>
-        <tr><td>Staff</td><td>Compara com a via de anotações e <em>proxy</em>, discute quando a composição explícita vale mais do que a implícita, e como testar a ordem em vez de a documentar.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Se puser as métricas por dentro da <em>cache</em>, o que passa a medir o p99?»</li>
-      <li>«Como testa que a ordem está certa e não regride numa refactorização?»</li>
-      <li>«Um decorador precisa de um campo <code>protected</code> do alvo. O que faz?»</li>
-      <li>«Porque é que <code>java.io</code> escolheu decoradores e não uma classe com opções?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Decorador que faz <em>retry</em> sobre erros não transitórios (400, violação de restrição) e amplifica o problema.</li>
-      <li>Decoradores com estado mutável partilhado sem controlo de acesso concorrente.</li>
-      <li>Não notar que a ordem muda o significado das métricas.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-16-5" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Spring e frameworks</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O Spring implementa <code>@Transactional</code> com <em>proxies</em>. Explique o mecanismo e diga-me porque é que um método anotado às vezes não abre transacção nenhuma.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O Spring AOP é o padrão <em>proxy</em> aplicado no arranque. Quando um <em>bean</em> tem um método com <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code> ou <code>@Retryable</code>, um pós-processador substitui a instância registada no contentor por um <em>proxy</em> que envolve o alvo. Há duas tecnologias: <em>proxy</em> dinâmico do JDK, gerado por <code>java.lang.reflect.Proxy</code>, que só implementa interfaces; e subclasse gerada por CGLIB, que herda da classe concreta. O Spring Boot usa a segunda por omissão, o que impõe duas condições práticas — a classe não pode ser <code>final</code>, os métodos interceptados também não, e tem de haver um construtor acessível. Uma classe <code>final</code> com <code>@Transactional</code> ou não arranca ou não é aconselhada, e é um erro comum ao converter classes para <code>record</code>, que são implicitamente <code>final</code>.</p>
-      <p>O caso em que a anotação não faz nada é a auto-invocação. Se um método público sem anotação chama <code>this.metodoTransaccional()</code>, a chamada é interna: não passa pelo <em>proxy</em>, e portanto nenhum interceptor corre. O mesmo vale para <code>@Cacheable</code> — a <em>cache</em> nunca é consultada — e para <code>@Async</code>, que passa a correr na <em>thread</em> do chamador sem qualquer aviso. É o <em>bug</em> mais caro desta família porque é silencioso: o código parece transaccional, os testes de unidade com um duplo passam, e só se descobre quando uma falha a meio deixa escrita parcial na base de dados.</p>
-      <p>As três saídas, por ordem de preferência: mover o método transaccional para outro <em>bean</em> e injectá-lo, o que normalmente revela que a fronteira transaccional estava no sítio errado; auto-injecção do próprio <em>bean</em> por interface e chamada através dessa referência; ou <code>AopContext.currentProxy()</code>, que exige <code>exposeProxy = true</code> e amarra o código ao Spring. A quarta via é abandonar os <em>proxies</em> e usar tecelagem AspectJ em tempo de compilação ou de carregamento, que intercepta mesmo chamadas internas e métodos <code>private</code>, ao custo de mais complexidade de <em>build</em> e de um modelo de execução que os colegas não conseguem depurar.</p>
-      <p>Outras armadilhas do mesmo mecanismo, que valem a menção: só métodos <code>public</code> são interceptados na configuração por omissão; a <code>RuntimeException</code> provoca <em>rollback</em> mas uma excepção verificada não, salvo <code>rollbackFor</code> explícito; e o <em>proxy</em> não existe durante <code>@PostConstruct</code>, pelo que uma transacção iniciada aí não é gerida.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«O Spring trata disso»; não sabe que existe um objecto intermédio.</td></tr>
-        <tr><td>Mid</td><td>Sabe que é um <em>proxy</em> e conhece a auto-invocação como regra decorada, sem explicar porquê nem distinguir JDK de CGLIB.</td></tr>
-        <tr><td>Sénior</td><td>Explica os dois tipos de <em>proxy</em>, as restrições (<code>final</code>, <code>public</code>, construtor), a auto-invocação pelo mecanismo, e escolhe a extracção para outro <em>bean</em> como solução.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta AspectJ e o seu custo, o comportamento de <em>rollback</em> com excepções verificadas, a interacção com <code>@PostConstruct</code>, e como detectar o problema com um teste de integração em vez de por revisão.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O <em>bean</em> tem duas anotações, <code>@Transactional</code> e <code>@Retryable</code>. Qual corre primeiro e como controla isso?»</li>
-      <li>«Como escreveria um teste que falha se alguém introduzir uma auto-invocação?»</li>
-      <li>«Porque é que o CGLIB não consegue interceptar um método <code>private</code>?»</li>
-      <li>«Converteu a classe para <code>record</code> e o arranque partiu. Porquê?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Pôr <code>@Transactional</code> no controlador para «garantir» consistência sobre chamadas HTTP externas.</li>
-      <li>Achar que <code>@Async</code> num método chamado internamente corre noutra <em>thread</em>.</li>
-      <li>Envolver o repositório inteiro numa transacção de leitura longa e culpar a base de dados pelas ligações esgotadas.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-16-6" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Vamos integrar um sistema externo de crédito com um SOAP horrível e 40 campos. <em>Adapter</em>, <em>facade</em>, ou os dois? Onde põe a fronteira?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Os dois, com papéis diferentes, e a fronteira desenha-se primeiro pela interface que o domínio quer, não pela que o sistema externo oferece. O domínio declara <code>CreditCheck.assess(Applicant) → Decision</code>, com os 4 conceitos que interessam. Um adaptador implementa essa interface traduzindo para os 40 campos do SOAP e de volta; um <em>facade</em> aparece se o mesmo caso de uso exigir três chamadas ao sistema externo em sequência, e a sua função é esconder essa coreografia.</p>
-      <p>Isto é o que o DDD chama camada anti-corrupção, e o valor mede-se por uma pergunta concreta: quando o fornecedor lançar a versão 3 da API, quantos ficheiros mudam? Com adaptador, um. Sem adaptador, todos os que tocam no tipo gerado pelo <em>stub</em> — que em sistemas reais são dezenas, porque os tipos gerados escorregam para dentro do domínio pela via mais fácil.</p>
-      <p>Três decisões que o entrevistador procura. Primeiro, os modos de falha traduzem-se: um <em>timeout</em>, um HTTP 500 e um código de erro «pedido inválido» do fornecedor não podem chegar ao domínio como <code>SoapFaultException</code>; convertem-se em tipos do domínio que distinguem «indisponível, tenta mais tarde» de «rejeitado definitivamente». Segundo, o adaptador é o sítio onde vivem <em>timeout</em>, <em>retry</em> e disjuntor, com um <em>timeout</em> orçamentado a partir do orçamento de latência do caso de uso (se o utilizador tem 800 ms, o adaptador não pode esperar 30 s). Terceiro, o adaptador é a única peça que precisa de testes de contrato contra um servidor simulado — o domínio testa-se com um duplo da interface, sem rede.</p>
-      <p>Quando <em>não</em> vale: se a integração for uma chamada REST a um serviço da mesma empresa, com um modelo já próximo do domínio e evolução coordenada, o adaptador é uma classe de reencaminhamento puro e a equipa paga indirecção por nada. A fronteira paga-se quando o modelo externo é estranho ao domínio ou quando a evolução é fora do controlo da equipa.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Usa os tipos gerados pelo <em>stub</em> directamente nos serviços de domínio.</td></tr>
-        <tr><td>Mid</td><td>Cria um adaptador e mapeia campos, mas deixa passar as excepções e os tipos do fornecedor.</td></tr>
-        <tr><td>Sénior</td><td>Interface definida pelo domínio, tradução de erros, <em>timeout</em> orçamentado e testes de contrato só no adaptador; mede o valor pelo custo de uma mudança de versão.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta quando a camada não se justifica, como versionar o contrato interno, e o plano de migração para a v3 sem parar a entrega.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O fornecedor devolve 200 com um código de erro no corpo. Onde trata isso?»</li>
-      <li>«Quanto tempo é razoável esperar, e o que faz quando estoura?»</li>
-      <li>«Como testa o adaptador sem depender do ambiente do fornecedor?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Modelo do domínio desenhado a partir do WSDL do fornecedor.</li>
-      <li>Adaptador que não define <em>timeout</em> e herda o valor por omissão da biblioteca.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-16-3" class="h2"><span class="secnum">16.3</span> Comportamentais: strategy, template method, observer e state<a class="anchor" href="#sec-16-3" aria-label="ligação">#</a></h2>
-
-<p>Os padrões comportamentais são os que mais mudaram com Java 8 e Java 21. Uma <em>strategy</em> com uma única operação é hoje uma interface funcional e escreve-se como <em>lambda</em>: <code>Comparator</code> é a estratégia mais usada do JDK e ninguém lhe chama padrão. Um <em>state</em> com transições fechadas é uma <code>sealed interface</code> mais <code>switch</code> com correspondência de padrões, e a exaustividade passa a ser verificada pelo compilador — acrescentar um estado novo produz erro de compilação em todos os sítios que decidem sobre estados, que é exactamente a propriedade que a versão com classes não dava.</p>
-
-<p>O que não desapareceu foi a decisão. A pergunta não é «sabe o que é <em>strategy</em>», é «o que varia, com que frequência, e quem escolhe». Se o que varia é uma expressão de duas linhas usada num sítio, um <em>lambda</em> chega. Se o que varia é um conjunto fechado e conhecido no arranque, um <code>enum</code> com corpo por constante dá nome, ordem, <code>valueOf</code> e exaustividade em <code>switch</code>. Se o que varia é aberto — cada país acrescenta uma implementação, possivelmente noutro módulo — é uma interface com implementações registadas como <em>beans</em> num mapa.</p>
-
-<p>Há um custo de execução que quase nenhum candidato menciona e que impressiona quando é mencionado: pontos de chamada polimórficos. A JIT alinha chamadas de interface enquanto vê um ou dois tipos de receptor no mesmo local (monomórfico e bimórfico); a partir do terceiro, o local torna-se megamórfico e a chamada passa a fazer-se por tabela, sem alinhamento e sem as optimizações que dele dependem. Não é razão para evitar estratégias — a diferença é de nanossegundos por chamada — mas é razão para não pôr uma estratégia dentro de um ciclo de 10<sup>8</sup> iterações num caminho quente.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 16.1</span> Forma idiomática em Java 21 e quando a versão clássica ainda ganha.</div>
-<div class="tscroll"><table><thead><tr><th>Padrão</th><th>Forma clássica</th><th>Forma idiomática em Java 21</th><th>Quando o clássico ainda ganha</th></tr></thead><tbody>
-<tr><td>Strategy</td><td>Interface mais N classes</td><td><em>Lambda</em>, referência de método ou <code>enum</code> com corpo por constante</td><td>A estratégia tem estado, várias operações ou precisa de configuração injectada</td></tr>
-<tr><td>State</td><td>Interface mais uma classe por estado</td><td><code>sealed interface</code> mais <code>switch</code> com padrões (exaustivo)</td><td>Cada estado tem muito comportamento próprio e é estendido por outros módulos</td></tr>
-<tr><td>Template method</td><td>Classe abstracta com métodos <code>protected</code></td><td>Método que recebe <code>Function</code> ou <code>Consumer</code></td><td>São 5 ou mais pontos de extensão com ordem fixa e nomes de domínio</td></tr>
-<tr><td>Command</td><td>Interface <code>Command</code> com <code>execute()</code></td><td><code>Runnable</code>, <code>Callable</code> ou <code>record</code> de comando enviado a um <em>handler</em></td><td>É preciso desfazer, registar ou serializar o comando</td></tr>
-<tr><td>Observer</td><td><code>Observable</code> e <code>Observer</code> do JDK (obsoletos desde Java 9)</td><td><code>ApplicationEventPublisher</code>, <code>Flow.Subscriber</code>, tópico Kafka</td><td>Notificação puramente intraprocesso, síncrona e sem durabilidade</td></tr>
-<tr><td>Visitor</td><td>Dupla despacho com <code>accept</code>/<code>visit</code></td><td><code>sealed</code> mais <em>record patterns</em> em <code>switch</code></td><td>A hierarquia é aberta e as operações são estáveis</td></tr>
-</tbody></table></div></div>
-
-<div class="qa" id="q-16-7" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos 7 políticas de comissão que variam por método de pagamento e mudam duas vezes por ano. Como as modela em Java 21? <em>Lambda</em>, <code>enum</code> ou interface com <em>beans</em>?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A pergunta decide-se por duas propriedades: o conjunto é fechado ou aberto, e a estratégia tem ou não dependências. Sete políticas conhecidas no arranque, sem dependências externas, é um <code>enum</code> que implementa a interface da política, com corpo por constante. Ganha-se nome estável para persistir em base de dados, <code>valueOf</code> para desserializar, exaustividade em <code>switch</code>, e uma única instância por constante. Se cada política precisar de consultar tabelas de escalões ou de um cliente HTTP, o <code>enum</code> deixa de servir — não se injectam dependências em constantes — e passa-se a uma interface com implementações anotadas como <em>beans</em>, recolhidas pelo Spring num <code>Map&lt;String, FeePolicy&gt;</code>.</p>
-      <p><em>Lambdas</em> em campo estático são a opção certa para políticas triviais de uma expressão, mas perdem duas coisas: nome em <em>stack traces</em> (aparece <code>lambda$static$0</code>) e a possibilidade de as descobrir por reflexão ou por configuração. Para 7 políticas com regras de negócio, o custo em diagnóstico não compensa a poupança de linhas.</p>
-      <p>«Mudam duas vezes por ano» é a parte que muda a resposta e que a maioria ignora. Se as políticas mudam, precisam de vigência: a política aplicada a uma transacção de Março tem de continuar a ser reproduzível em Novembro, para reconciliação e para reprocessamento. Isso implica versionar — <code>PERCENT_V2</code> em vez de alterar <code>PERCENT</code> — e escolher a política pela data do evento, não pela data actual. Alterar o corpo de uma constante existente reescreve o passado silenciosamente.</p>
-      <p>O que se garante em ambos os casos: a selecção falha ruidosamente. Um método de pagamento novo sem política associada tem de rebentar no arranque, com uma verificação que compara as constantes do <code>enum</code> de métodos com as chaves do mapa de políticas, e não no primeiro pedido a essa hora de ponta.</p>
-      <figure class="listing java" id="lst-16-4"><div class="lhead"><span class="lnum">Listagem 16.4</span>
-        <span class="lcap">Estratégia fechada como <code>enum</code>, estratégia aberta como <em>beans</em> num mapa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public interface FeePolicy { Money fee(Money amount); }
-
-// conjunto fechado, sem dependências: enum com corpo por constante
-public enum SimpleFeePolicy implements FeePolicy {
-    FLAT       { public Money fee(Money a) { return Money.eur("0.35"); } },
-    PERCENT_V1 { public Money fee(Money a) { return a.times("0.0140"); } },
-    PERCENT_V2 { public Money fee(Money a) { return a.times("0.0125"); } },   // versão, não alteração
-    TIERED     { public Money fee(Money a) {
-                     return a.isLessThan(Money.eur("100")) ? Money.eur("0.35") : a.times("0.0090"); } };
-}
-
-// conjunto aberto, com dependências: implementações recolhidas pelo contentor
 @Service
-public class FeeCalculator {
-    private final Map&lt;String, FeePolicy&gt; policies;             // nome do bean -&gt; estratégia
+public class PaymentService {
+    private final Map&lt;PaymentMethod, PaymentHandler&gt; handlers;
 
-    FeeCalculator(Map&lt;String, FeePolicy&gt; policies, Set&lt;String&gt; supportedMethods) {
-        this.policies = Map.copyOf(policies);
-        var missing = supportedMethods.stream().filter(m -&gt; !policies.containsKey(m)).toList();
-        if (!missing.isEmpty())                                  // falha no arranque, não no pico
-            throw new IllegalStateException("sem política de comissão para " + missing);
+    PaymentService(List&lt;PaymentHandler&gt; discovered) {          // o Spring injecta todos os beans
+        this.handlers = discovered.stream()
+                .collect(Collectors.toUnmodifiableMap(PaymentHandler::method, h -&gt; h));
     }
 
-    public Money fee(String method, Money amount) { return policies.get(method).fee(amount); }
-}</code></pre></figure></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td><code>switch</code> sobre <code>String</code> dentro do serviço, com as 7 fórmulas em linha.</td></tr>
-        <tr><td>Mid</td><td>Interface mais 7 classes, escolhidas por <code>if</code> ou <code>switch</code> numa fábrica escrita à mão.</td></tr>
-        <tr><td>Sénior</td><td>Escolhe entre <code>enum</code> e mapa de <em>beans</em> pelo critério fechado/aberto e por dependências; falha no arranque quando falta uma política.</td></tr>
-        <tr><td>Staff</td><td>Introduz vigência e versionamento das políticas, reprodutibilidade histórica, e discute o custo de despacho megamórfico se estiver num caminho quente.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Uma política nova tem de ser activada só para 5% dos comerciantes. Onde entra isso?»</li>
-      <li>«Como reprocessa transacções de há seis meses com a política que estava em vigor?»</li>
-      <li>«Porque não usa <em>lambdas</em> num <code>Map</code> estático?»</li>
-      <li>«Como testa as 7 políticas sem 7 testes quase iguais?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Alterar a fórmula de uma constante existente em vez de criar uma versão nova.</li>
-      <li>Guardar <code>ordinal()</code> do <code>enum</code> na base de dados.</li>
-      <li>Estratégia com estado mutável partilhada por todos os pedidos.</li></ul></div>
-  </div>
-</div>
+    public PaymentResult pay(PaymentRequest req) {
+        PaymentHandler h = handlers.get(req.method());
+        if (h == null) throw new UnsupportedPaymentMethod(req.method());
+        return h.pay(req);
+    }
+}</code></pre></figure>
 
-<div class="qa" id="q-16-8" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Herdámos uma classe abstracta com 6 métodos <code>protected</code> que as subclasses sobrepõem. Isto é <em>template method</em>. Mantinha ou substituía por composição?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Depende de duas medidas que se recolhem antes de decidir: quantas subclasses existem e quantos dos 6 pontos de extensão cada uma sobrepõe. Se houver 3 subclasses e cada uma sobrepuser 5 dos 6, a classe base está a fazer o seu trabalho — a ordem do algoritmo é o valor e mantém-se. Se houver 11 subclasses e cada uma sobrepuser 1 ou 2, o que existe é uma classe base a servir de armazém de código comum, e a composição é melhor.</p>
-      <p>O problema estrutural do <em>template method</em> é a classe base frágil: qualquer alteração ao esqueleto quebra subclasses que não são inspeccionadas, a herança consome a única extensão possível em Java, e o estado <code>protected</code> cria acoplamento em dois sentidos — a subclasse depende de campos da base e a base depende de a subclasse os manter coerentes. Em testes, testar uma subclasse exige exercitar o algoritmo inteiro da base.</p>
-      <p>A substituição por composição faz-se passando os pontos de variação como funções ou como um pequeno objecto de <em>callbacks</em>, mantendo o esqueleto num método único. O JDK e o Spring já mostram as duas formas lado a lado: <code>JdbcTemplate</code> chama-se «template» mas não é herança — é um esqueleto que recebe um <code>RowMapper</code>, ou seja, <em>template method</em> resolvido com estratégias passadas como argumento. Essa é a versão que se recomenda hoje em código novo, e é fácil de defender em entrevista porque tem precedente na biblioteca que todos usam.</p>
-      <p>O <em>trade-off</em> honesto: com 5 ou 6 pontos de variação, passar 6 <em>lambdas</em> a um método é pior do que sobrepor 6 métodos com nomes de domínio — perde-se legibilidade e a assinatura torna-se impossível de ler. Nesse caso mantém-se a herança, mas fecha-se: o método esqueleto passa a <code>final</code>, os pontos de extensão ficam documentados como contrato, e o resto dos métodos deixa de ser <code>protected</code>. Uma via intermédia é declarar uma interface com os 6 métodos e uma implementação por variante, injectada no esqueleto — mantém os nomes de domínio sem herança.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Herança é sempre má» ou «funciona, não mexo», sem medir nada.</td></tr>
-        <tr><td>Mid</td><td>Identifica o padrão e cita «composição sobre herança» como regra, sem critério de decisão.</td></tr>
-        <tr><td>Sénior</td><td>Mede subclasses e sobreposições, nomeia a fragilidade da classe base, e propõe <code>JdbcTemplate</code> com <code>RowMapper</code> como modelo de substituição.</td></tr>
-        <tr><td>Staff</td><td>Reconhece quando 6 pontos de variação tornam a composição ilegível, propõe a via intermédia com interface de <em>callbacks</em>, e um plano de migração incremental com as subclasses existentes a compilar.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como migra sem parar a entrega, com 11 subclasses em produção?»</li>
-      <li>«Uma subclasse chama <code>super</code> a meio e depende da ordem. Como o detecta?»</li>
-      <li>«Porque é que o <code>JdbcTemplate</code> não usa herança?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Métodos <code>protected</code> abstractos com efeitos colaterais sobre campos partilhados da base.</li>
-      <li>Chamar um método sobreponível a partir do construtor da classe base.</li></ul></div>
-  </div>
-</div>
+<p>O contra-argumento honesto: a Listagem 16.4 pagou um preço. O leitor que quer saber o que acontece com um pagamento SEPA já não o lê num sítio — tem de descobrir a implementação certa, e a construção do <code>Map</code> a partir de <em>beans</em> descobertos torna a configuração implícita. Se um <em>bean</em> se esquecer da anotação, o erro só aparece em <em>runtime</em>, com um pedido real. Enquanto houver dois meios de pagamento e um único ponto de decisão, o <code>switch</code> é mais legível, mais depurável e mais barato.</p>
 
-<div class="qa" id="q-16-9" data-box="qa" data-area="design" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Uma encomenda tem 6 estados e 9 transições legais. Modele isso em Java 21 de forma a que acrescentar um estado não deixe passar um caso esquecido.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A propriedade pedida — «não deixar passar um caso esquecido» — é exaustividade verificada pelo compilador, e em Java 21 obtém-se com <code>sealed interface</code> mais <code>switch</code> com correspondência de padrões. Declara-se a hierarquia fechada de estados, cada estado como <code>record</code> com os dados que só fazem sentido nele (o código de autorização só existe em <code>Authorized</code>), e a função de transição como um <code>switch</code> sobre o par estado/evento sem ramo <code>default</code>. Sem <code>default</code>, acrescentar um sétimo estado transforma todos os <code>switch</code> incompletos em erros de compilação. Com <code>default</code>, o compilador cala-se e o erro passa a ser de <em>runtime</em> — por isso a regra é nunca escrever <code>default</code> num <code>switch</code> sobre um tipo selado.</p>
-      <p>A alternativa clássica GoF é o padrão <em>state</em>: uma interface e uma classe por estado, cada uma a implementar as transições que aceita e a lançar excepção nas restantes. Continua defensável quando cada estado tem muito comportamento próprio, mas não dá exaustividade: acrescentar um estado não obriga ninguém a rever nada. A variante <code>enum</code> com transições declaradas num <code>EnumMap</code> fica a meio caminho — dá nomes persistíveis e uma tabela de transições legível, mas o compilador também não verifica a cobertura.</p>
-      <p>O que separa a resposta de nível staff é o que está à volta da máquina de estados. Primeiro, a transição é uma função pura <code>(estado, evento) → novo estado</code>, sem efeitos colaterais, o que a torna testável com uma tabela de casos e permite reconstituir o estado por reprodução de eventos. Segundo, a persistência guarda o nome do estado como texto, nunca <code>ordinal()</code>, e a transição na base de dados faz-se com actualização condicional (<code>UPDATE ... WHERE status = 'AUTHORIZED'</code>) verificando as linhas afectadas — sem isso, dois consumidores concorrentes aplicam duas transições sobre o mesmo estado lido e uma perde-se. Terceiro, os efeitos (publicar evento, chamar o adquirente) ficam fora da função de transição e são despoletados a partir do estado resultante, o que dá idempotência.</p>
-      <figure class="listing java" id="lst-16-5"><div class="lhead"><span class="lnum">Listagem 16.5</span>
-        <span class="lcap">Estados selados: transição pura e exaustividade garantida pelo compilador.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public sealed interface OrderState
-        permits OrderState.New, OrderState.Authorized, OrderState.Captured,
-                OrderState.Cancelled, OrderState.Refunded, OrderState.Expired {
+<p>Java moderno oferece a alternativa oposta e igualmente válida: fechar a hierarquia com <code>sealed</code> e abrir o comportamento com <code>switch</code> exaustivo sobre padrões. É a inversão deliberada do OCP clássico — o conjunto de tipos passa a ser fixo, mas acrescentar uma operação nova deixa de tocar em todas as classes, e o compilador falha o <em>build</em> em cada <code>switch</code> incompleto quando um tipo é acrescentado. É a resposta certa quando o eixo estável é o conjunto de casos (estados de uma encomenda, tipos de evento de um <em>ledger</em>) e o que varia são as operações.</p>
 
-    record New(Instant at) implements OrderState {}
-    record Authorized(String authCode, Instant at) implements OrderState {}
-    record Captured(String authCode, Money amount, Instant at) implements OrderState {}
-    record Cancelled(String reason, Instant at) implements OrderState {}
-    record Refunded(Money amount, Instant at) implements OrderState {}
-    record Expired(Instant at) implements OrderState {}
-}
+<figure class="listing java" id="lst-16-5"><div class="lhead"><span class="lnum">Listagem 16.5</span>
+<span class="lcap">Hierarquia selada com <em>switch</em> exaustivo: o compilador substitui a disciplina do programador.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public sealed interface LedgerEvent
+        permits Authorized, Captured, Refunded, ChargedBack { }
 
-public sealed interface OrderEvent permits Authorize, Capture, Cancel, Refund, Expire {}
+public record Authorized(String id, BigDecimal amount)  implements LedgerEvent { }
+public record Captured  (String id, BigDecimal amount)  implements LedgerEvent { }
+public record Refunded  (String id, BigDecimal amount)  implements LedgerEvent { }
+public record ChargedBack(String id, BigDecimal amount, String reason) implements LedgerEvent { }
 
-// transição pura: sem I/O, sem default -> um estado novo parte a compilação aqui
-static OrderState next(OrderState state, OrderEvent event) {
-    return switch (state) {
-        case OrderState.New n -&gt; switch (event) {
-            case Authorize a -&gt; new OrderState.Authorized(a.code(), a.at());
-            case Cancel c    -&gt; new OrderState.Cancelled(c.reason(), c.at());
-            case Expire e    -&gt; new OrderState.Expired(e.at());
-            default -&gt; throw new IllegalTransition(state, event);   // eventos: conjunto aberto no tempo
-        };
-        case OrderState.Authorized a -&gt; switch (event) {
-            case Capture c -&gt; new OrderState.Captured(a.authCode(), c.amount(), c.at());
-            case Cancel  c -&gt; new OrderState.Cancelled(c.reason(), c.at());
-            case Expire  e -&gt; new OrderState.Expired(e.at());
-            default -&gt; throw new IllegalTransition(state, event);
-        };
-        case OrderState.Captured c -&gt; switch (event) {
-            case Refund r -&gt; new OrderState.Refunded(r.amount(), r.at());
-            default -&gt; throw new IllegalTransition(state, event);
-        };
-        case OrderState.Cancelled c -&gt; throw new IllegalTransition(state, event);
-        case OrderState.Refunded r  -&gt; throw new IllegalTransition(state, event);
-        case OrderState.Expired e   -&gt; throw new IllegalTransition(state, event);
+// Sem `default`: acrescentar um tipo ao `permits` quebra a compilação aqui e em todos
+// os outros switch sobre LedgerEvent — falha no build, não em produção.
+static BigDecimal effect(LedgerEvent e) {
+    return switch (e) {
+        case Authorized a   -&gt; BigDecimal.ZERO;
+        case Captured c     -&gt; c.amount();
+        case Refunded r     -&gt; r.amount().negate();
+        case ChargedBack cb -&gt; cb.amount().negate();
     };
-}</code></pre></figure></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Campo <code>String status</code> e <code>if</code> espalhados por três serviços.</td></tr>
-        <tr><td>Mid</td><td><code>enum</code> de estados com validação num método <code>canGoTo</code>, sem garantia de cobertura.</td></tr>
-        <tr><td>Sénior</td><td><code>sealed</code> mais <code>switch</code> exaustivo sem <code>default</code>, transição pura e testável, estado persistido por nome.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta actualização condicional para acesso concorrente, efeitos fora da transição, idempotência e reprodução de eventos.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Dois consumidores processam o mesmo evento em paralelo. O que acontece?»</li>
-      <li>«Onde publica o evento de domínio, dentro ou fora da transacção?»</li>
-      <li>«Porque é que um <code>default</code> aqui é um erro de desenho?»</li>
-      <li>«Como migra as encomendas já persistidas quando acrescentar o sétimo estado?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Transições que fazem chamadas HTTP ou escritas dentro do <code>switch</code>.</li>
-      <li>Persistir <code>ordinal()</code> e reordenar o <code>enum</code> seis meses depois.</li>
-      <li>Assumir que a leitura seguida de escrita é atómica sem condição na cláusula <code>WHERE</code>.</li></ul></div>
-  </div>
-</div>
+}</code></pre></figure>
 
-<h2 id="sec-16-4" class="h2"><span class="secnum">16.4</span> Padrões que a linguagem e o Spring já resolvem<a class="anchor" href="#sec-16-4" aria-label="ligação">#</a></h2>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Strategy aberta (Listagem 16.4) torna barato acrescentar <strong>tipos</strong> e caro acrescentar <strong>operações</strong> — uma operação nova obriga a tocar em todas as implementações. Hierarquia selada (Listagem 16.5) inverte exactamente isso: operações novas são baratas, tipos novos partem todos os <code>switch</code> — o que é uma vantagem, porque parte em tempo de compilação e não em <em>runtime</em>. É o problema da expressão: escolhe-se o eixo que se espera que varie mais, sabendo que o outro fica mais caro. Meios de pagamento crescem: <code>sealed</code> não. Estados de uma encomenda são finitos e discutidos com o negócio: <code>sealed</code> ganha.</p></aside>
 
-<p>Metade do catálogo GoF resolvia limitações de C++ de 1994 que Java já não tem, e outra parte foi absorvida pelo JDK ou pelo Spring. Reimplementar essas peças é o erro mais visível numa revisão de código de um candidato: escrever um <em>iterator</em> à mão quando <code>Iterable</code> existe, um <em>command</em> quando <code>Runnable</code> serve, um <em>flyweight</em> de inteiros quando <code>Integer.valueOf</code> já tem a <em>cache</em> de −128 a 127, ou uma cadeia de responsabilidade quando o que se quer é um <code>Stream</code> sobre uma lista de validações.</p>
-
-<p>O <em>chain of responsibility</em> merece nota especial porque é o padrão que mais aparece disfarçado. A cadeia de <code>Filter</code> do Servlet e a cadeia de filtros do Spring Security são exactamente isso, e a decisão que se toma na prática nunca é «implemento a cadeia», é «entro na cadeia existente com que ordem». Escrever uma cadeia nova, com um campo <code>next</code> preenchido à mão, é quase sempre pior do que uma lista de funções percorrida com <code>Stream</code>: perde-se a possibilidade de reordenar por configuração e ganha-se um grafo de ligações difícil de inspeccionar.</p>
-
-<p>Saber citar os exemplos do JDK e do Spring vale pontos porque prova leitura de código de terceiros. Vale a pena ter meia dúzia na ponta da língua, com a variante correcta: <code>JdbcTemplate</code> não é herança, é esqueleto mais <em>callback</em>; <code>RestTemplate</code> é a mesma ideia sobre HTTP e está em modo de manutenção, substituído por <code>RestClient</code> na Spring Framework 6.1; <code>BeanFactory</code> é a fábrica abstracta do contentor; o carregamento preguiçoso do Hibernate é um <em>proxy</em> gerado que provoca <code>LazyInitializationException</code> fora da sessão.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 16.2</span> Padrões GoF vivos no JDK e no ecossistema Spring — exemplos para citar de memória.</div>
-<div class="tscroll"><table><thead><tr><th>Padrão</th><th>No JDK</th><th>No Spring</th><th>Consequência prática</th></tr></thead><tbody>
-<tr><td>Abstract factory</td><td><code>DocumentBuilderFactory</code></td><td><code>BeanFactory</code>, <code>FactoryBean</code></td><td>A escolha da família é configuração, não hierarquia de classes</td></tr>
-<tr><td>Builder</td><td><code>StringBuilder</code>, <code>HttpRequest.newBuilder()</code></td><td><code>UriComponentsBuilder</code>, <code>RestClient.builder()</code></td><td>Construção passo a passo com validação só no fim</td></tr>
-<tr><td>Decorator</td><td><code>BufferedInputStream</code>, <code>Collections.unmodifiableList</code></td><td><code>DelegatingFilterProxy</code>, <em>wrappers</em> de <code>DataSource</code></td><td>Comportamento somado em <em>runtime</em>; a ordem muda o significado</td></tr>
-<tr><td>Proxy</td><td><code>java.lang.reflect.Proxy</code></td><td>Spring AOP, <em>lazy loading</em> do Hibernate</td><td>Auto-invocação não é interceptada; classes <code>final</code> não são <em>proxiáveis</em></td></tr>
-<tr><td>Adapter</td><td><code>InputStreamReader</code>, <code>Arrays.asList</code></td><td><code>HandlerAdapter</code>, conversores de mensagens</td><td>A tradução vive num sítio só; o domínio não conhece o formato externo</td></tr>
-<tr><td>Template method mais estratégia</td><td>—</td><td><code>JdbcTemplate</code> com <code>RowMapper</code>, <code>TransactionTemplate</code></td><td>Esqueleto reutilizado sem herança</td></tr>
-<tr><td>Chain of responsibility</td><td><code>Filter</code> e <code>FilterChain</code> do Servlet</td><td>Cadeia de filtros do Spring Security, <code>HandlerInterceptor</code></td><td>Entra-se na cadeia existente e discute-se a ordem</td></tr>
-<tr><td>Observer</td><td><code>Flow.Subscriber</code>, ouvintes de eventos</td><td><code>ApplicationEventPublisher</code>, <code>@EventListener</code></td><td>Síncrono na mesma <em>thread</em> e na mesma transacção por omissão</td></tr>
-<tr><td>Flyweight</td><td><code>Integer.valueOf</code> (−128 a 127), <em>interning</em> de <code>String</code></td><td><em>Caches</em> de metadados de <em>beans</em></td><td>Comparação por <code>==</code> em <code>Integer</code> funciona por acidente e falha acima de 127</td></tr>
-</tbody></table></div></div>
-
-<div class="qa" id="q-16-10" data-box="qa" data-area="design" data-level="mid" data-freq="alta">
+<div class="qa" id="q-16-3" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Dê-me quatro padrões GoF que use todos os dias sem escrever uma linha deles, com o exemplo concreto no JDK ou no Spring.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Quatro com consequência prática, não quatro nomes. Primeiro, <em>decorator</em>: <code>java.io</code> inteiro, e <code>Collections.unmodifiableList</code>, que é a armadilha clássica — devolve uma vista imutável, não uma cópia, pelo que alterações à lista original continuam visíveis através dela. Segundo, <em>proxy</em>: <code>java.lang.reflect.Proxy</code> e todo o Spring AOP, com a consequência de a auto-invocação não ser interceptada e de o Hibernate devolver <em>proxies</em> que rebentam com <code>LazyInitializationException</code> quando a sessão já fechou.</p>
-      <p>Terceiro, <em>template method</em> com estratégia passada como argumento: <code>JdbcTemplate</code> executa o esqueleto — obter ligação, preparar, executar, iterar, fechar, traduzir a excepção — e delega a única parte variável no <code>RowMapper</code>. É o exemplo que se dá quando alguém defende herança para reutilizar algoritmos. Quarto, <em>abstract factory</em>: <code>BeanFactory</code>, com a consequência de que escrever fábricas para escolher implementações é duplicar o que <code>@Profile</code> e <code>@ConditionalOnProperty</code> já fazem por configuração.</p>
-      <p>Um quinto que vale a menção por ser o mais mal compreendido: <em>flyweight</em> na <em>cache</em> de <code>Integer.valueOf</code> entre −128 e 127. É a razão pela qual comparar dois <code>Integer</code> com <code>==</code> funciona para 100 e falha para 1000 — um dos <em>bugs</em> mais reproduzíveis em código Java antigo, e a razão pela qual a resposta correcta é usar sempre os tipos primitivos ou <code>equals</code>.</p>
-      <p>O que se deve acrescentar sem ser perguntado, porque é o que separa recitação de compreensão: em todos estes casos o valor não está em conhecer o nome, está em saber a consequência operacional — a ordem dos decoradores muda o que as métricas medem, o <em>proxy</em> tem uma fronteira que a chamada interna não atravessa, o esqueleto do <em>template</em> é quem faz a tradução de excepções que a aplicação depois apanha.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Recita nomes do catálogo sem conseguir apontar um exemplo real.</td></tr>
-        <tr><td>Mid</td><td>Dá exemplos correctos (<code>java.io</code>, <code>BeanFactory</code>) mas sem consequência prática associada.</td></tr>
-        <tr><td>Sénior</td><td>Cada exemplo vem com o efeito observável: vista contra cópia, auto-invocação, tradução de excepções, <em>cache</em> de <code>Integer</code>.</td></tr>
-        <tr><td>Staff</td><td>Usa os exemplos para argumentar contra reimplementações no código da equipa e cita a alternativa moderna (<code>RestClient</code> em vez de <code>RestTemplate</code>).</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«<code>Collections.unmodifiableList</code> devolve cópia ou vista? Que <em>bug</em> resulta disso?»</li>
-      <li>«Porque é que <code>==</code> entre <code>Integer</code> funciona para 100 e não para 1000?»</li>
-      <li>«O que faz exactamente o <code>JdbcTemplate</code> entre a sua consulta e o <code>RowMapper</code>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Descrever padrões apenas pela estrutura de classes, sem uma única consequência observável.</li>
-      <li>Não reconhecer os padrões nas bibliotecas que usa diariamente.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-16-11" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Quando uma encomenda é paga, três coisas têm de acontecer: e-mail, actualizar o inventário, enviar para a facturação. <em>Observer</em> com eventos do Spring, ou Kafka? Como decide?</div>
+  <div class="qprompt">Dê um exemplo do seu código em que aplicou o OCP. E convença-me do contrário: quando é que substituir um <code>switch</code> por strategy foi, ou seria, a decisão errada?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A decisão faz-se por três eixos: fronteira de processo, durabilidade e acoplamento transaccional. Eventos do Spring (<code>ApplicationEventPublisher</code> mais <code>@EventListener</code>) são <em>observer</em> intraprocesso: por omissão são síncronos, correm na <em>thread</em> do publicador e dentro da mesma transacção. Isso tem uma consequência que muitos candidatos desconhecem — se o ouvinte lançar excepção, a transacção do publicador reverte. É útil quando se quer exactamente isso, e desastroso quando o envio de e-mail faz reverter um pagamento já confirmado.</p>
-      <p>Se os três consumidores estiverem no mesmo processo e a operação for curta, os eventos do Spring chegam, com uma condição: usar <code>@TransactionalEventListener</code> na fase posterior à confirmação, para que o e-mail só seja enviado depois de a transacção fechar. O que ainda falta é durabilidade — se o processo morrer entre a confirmação e a execução do ouvinte, o evento perde-se e não há retentativa. Para inventário e facturação isso é inaceitável.</p>
-      <p>A resposta defensável para o caso descrito é mensageria com o padrão <em>outbox</em>: na mesma transacção que confirma o pagamento, insere-se uma linha numa tabela de saída; um processo separado lê essa tabela e publica em Kafka. Ganha-se atomicidade entre a mudança de estado e a publicação, durabilidade, retentativas e consumidores independentes com ritmos próprios. Paga-se latência adicional (o intervalo de sondagem da tabela, tipicamente 100 ms a 1 s), consistência eventual visível ao utilizador, e a obrigação de os consumidores serem idempotentes, porque a entrega é pelo menos uma vez.</p>
-      <p>A regra prática que se dá ao entrevistador: eventos de aplicação para desacoplar módulos dentro do mesmo processo, sem requisito de durabilidade; mensageria quando o consumidor está noutro processo, quando é preciso sobreviver a reinícios, ou quando o consumidor pode estar em baixo. E um aviso: eventos do Spring usados como forma de esconder chamadas entre serviços tornam o fluxo impossível de seguir num <em>stack trace</em> — quem publica não sabe quem escuta, e um ouvinte novo introduzido por outra equipa muda o comportamento sem alterar o código do publicador.</p></div>
+      <p>O exemplo tem de trazer o gatilho e o número. «Tínhamos um <code>switch</code> sobre o meio de pagamento em três locais: autorização, estorno e reconciliação. Ao acrescentar o MB WAY, esqueceu-se o terceiro, e a reconciliação nocturna passou a marcar 1 200 pagamentos por dia como órfãos durante quatro dias. Extraímos <code>PaymentHandler</code> com registo por injecção de colecção; o quarto meio entrou como uma classe nova de 60 linhas e um teste, sem tocar no serviço.»</p>
+      <p>Segue o mecanismo, que é o que distingue quem percebeu de quem copiou o padrão. O ponto de decisão deixa de conhecer as variantes; passa a conhecer a chave e o contrato. O Spring injecta <code>List&lt;PaymentHandler&gt;</code>, o construtor indexa por <code>method()</code>, e a única alteração num meio novo é o próprio <em>bean</em>. Um <em>test de arquitectura</em> garante que todo o valor do enum tem exactamente um <em>handler</em>, o que devolve em tempo de arranque a exaustividade que se perdeu ao sair do <code>switch</code>.</p>
+      <p>A parte contrária é obrigatória. Substituir um <code>switch</code> por strategy é errado quando há um único ponto de decisão e o conjunto de casos é fechado por natureza: estados de uma encomenda, tipos de evento de um livro-razão, formatos de um ficheiro legado. Nesses casos, a strategy espalha por seis ficheiros o que se lia em vinte linhas, e troca uma falha de compilação por uma falha de <em>runtime</em> quando falta um registo. A alternativa moderna é <code>sealed</code> mais <code>switch</code> sem <code>default</code>: mantém a leitura local e faz o compilador rejeitar o <em>build</em> quando aparece um caso novo.</p>
+      <p>O critério final é o custo esperado. Se a variação chegar duas vezes por ano e vier sempre acompanhada de mudanças no processo, o <code>switch</code> ganha porque a mudança nunca é isolada. Se a variação for mensal, vier de equipas diferentes e for aditiva, o OCP paga-se ao segundo ou terceiro caso.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Três chamadas directas em sequência dentro do método de pagamento, sem tratamento de falha parcial.</td></tr>
-        <tr><td>Mid</td><td>Usa eventos do Spring por «desacoplamento», sem saber que são síncronos e transaccionais por omissão.</td></tr>
-        <tr><td>Sénior</td><td>Distingue os dois mecanismos pelos três eixos, usa <code>@TransactionalEventListener</code> na fase posterior à confirmação, e escolhe mensageria pela durabilidade.</td></tr>
-        <tr><td>Staff</td><td>Propõe <em>outbox</em> com números (intervalo de sondagem, latência acrescentada), exige idempotência nos consumidores e discute o custo de legibilidade do desacoplamento por eventos.</td></tr>
+        <tr><td>Insuficiente</td><td>«Um <code>if</code> é sempre uma violação do OCP.» Não distingue ponto único de ponto replicado.</td></tr>
+        <tr><td>Mid</td><td>Descreve strategy correctamente e sabe que o Spring injecta colecções, mas não vê custo nenhum na indirecção nem sabe quando não a usar.</td></tr>
+        <tr><td>Sénior</td><td>Gatilho concreto (o mesmo <code>switch</code> em três sítios), impacto medido, mecanismo de registo, e um caso claro em que manteria o <code>switch</code>.</td></tr>
+        <tr><td>Staff</td><td>Enquadra como problema da expressão, escolhe o eixo pela taxa de variação observada, e devolve a exaustividade com <code>sealed</code> ou com um teste de arranque que valida a cobertura do enum.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O ouvinte do e-mail falha. O que acontece ao pagamento?»</li>
-      <li>«Como garante que o evento é publicado se o processo morrer logo após a confirmação?»</li>
-      <li>«O consumidor de inventário recebe o mesmo evento duas vezes. Que desenho o protege?»</li>
-      <li>«Quanto tempo demora o utilizador a ver o inventário actualizado, e isso é aceitável?»</li></ul></div>
+      <li>«Como garante, ao arrancar, que não falta nenhum <em>handler</em>?»</li>
+      <li>«E se dois <em>handlers</em> declararem o mesmo método de pagamento?»</li>
+      <li>«Onde é que a lógica comum aos <em>handlers</em> vive sem recriar herança profunda?»</li>
+      <li>«Quantas variantes justificaram o refactor no seu caso?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Publicar no <em>broker</em> dentro da transacção e assumir atomicidade entre base de dados e Kafka.</li>
-      <li>Ouvintes com efeitos externos irreversíveis a correr antes da confirmação da transacção.</li>
-      <li>Não distinguir «desacoplado» de «invisível» ao depurar um incidente.</li></ul></div>
+      <li>Introduzir strategy com uma única implementação «para o futuro».</li>
+      <li>Não notar que o registo dinâmico troca erros de compilação por erros de <em>runtime</em>.</li>
+      <li>Desconhecer <code>sealed</code> e <em>pattern matching</em> como alternativa em Java 21+.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-16-5" class="h2"><span class="secnum">16.5</span> Anti-padrões: god object, anemic domain, service locator<a class="anchor" href="#sec-16-5" aria-label="ligação">#</a></h2>
-
-<p>Nomear anti-padrões é fácil; a pergunta de entrevista é sempre a seguinte — como se mede, e quando é que a alternativa não vale a pena. Um <em>god object</em> mede-se: número de dependências injectadas no construtor, número de linhas, e sobretudo número de razões distintas para mudar. Acima de 7 colaboradores injectados, a classe está quase sempre a servir três casos de uso diferentes que podiam ser três classes. Mas cortar por cortar produz o problema inverso: dezenas de classes com um método cada, e um fluxo que exige abrir seis ficheiros para ser entendido.</p>
-
-<p>O <em>anemic domain model</em> — entidades só com <em>getters</em> e <em>setters</em>, e toda a lógica em classes de serviço — é o anti-padrão mais discutido e o que exige a resposta mais matizada. É genuinamente mau quando os invariantes de uma entidade ficam espalhados por cinco serviços que a manipulam por <em>setters</em>: nenhum deles pode garantir que a encomenda nunca fica com total negativo, porque qualquer um pode chamar <code>setTotal</code>. Mas é perfeitamente adequado num serviço maioritariamente CRUD, onde não há invariantes para proteger e onde um modelo rico só acrescenta cerimónia.</p>
-
-<p>O <em>service locator</em> — obter dependências chamando <code>context.getBean(X.class)</code> ou um registo estático — é a única das três sem defesa razoável em código novo. Esconde as dependências (a assinatura do construtor deixa de as declarar), transforma erros de configuração de falhas no arranque em falhas no primeiro pedido, e obriga a montar um contentor para testar uma unidade. Aparece quase sempre por um motivo: alguém tinha uma dependência circular e resolveu-a adiando a resolução, em vez de partir o ciclo.</p>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Injecção por campo com <code>@Autowired</code> é <em>service locator</em> disfarçado: o objecto não pode ser construído sem um contentor, dependências circulares deixam de ser detectadas na construção, e os campos não podem ser <code>final</code>. A injecção por construtor torna a dependência circular um erro de arranque — o que é a resposta certa, porque um ciclo entre dois serviços é um problema de fronteiras que se resolve extraindo o que ambos partilham.</p></aside>
-
-<div class="qa" id="q-16-12" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">As nossas entidades JPA só têm <em>getters</em> e <em>setters</em> e a lógica toda está em classes <code>...Service</code>. Isso é um problema? Convença-me numa direcção ou noutra.</div>
+<div class="qa" id="q-16-4" data-box="qa" data-area="spring" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa quer um sistema de <em>plugins</em>: regras de fraude carregadas por configuração, cada uma numa classe. Como desenha isto para ser aberto a extensão sem virar um labirinto de indirecção?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Só é problema se houver invariantes a proteger. O teste que aplico é este: existe alguma regra que tenha de ser verdadeira para todas as instâncias, em todos os momentos? «O total da encomenda é a soma das linhas», «uma encomenda expedida não aceita linhas novas», «o saldo nunca desce abaixo do limite de crédito». Se existem regras dessas e a entidade expõe <em>setters</em> públicos para os campos envolvidos, o modelo anémico é um problema real, porque a regra passa a estar replicada em todos os serviços que mexem na entidade e a próxima pessoa a escrever um serviço novo não sabe que ela existe.</p>
-      <p>A correcção não é reescrever tudo: é fechar os <em>setters</em> dos campos que participam em invariantes e substituí-los por métodos com nome de operação de domínio — <code>encomenda.adicionarLinha(produto, quantidade)</code> em vez de <code>encomenda.getLinhas().add(...)</code> seguido de <code>encomenda.setTotal(...)</code>. O invariante fica num sítio, verificado no fim de cada operação. O serviço mantém-se, mas passa a orquestrar (carregar, chamar o método de domínio, gravar, publicar evento) em vez de calcular.</p>
-      <p>Se não houver invariantes — um serviço que recebe um formulário, valida formato e grava — o modelo rico é cerimónia pura. Um CRUD com 40 tabelas e nenhuma regra ganha zero em ter 40 agregados com métodos de domínio. Defender modelo rico universalmente é tão mau sinal como não conhecer o problema.</p>
-      <p>Duas restrições práticas com JPA que se devem mencionar. O Hibernate exige construtor sem argumentos e acede aos campos, o que impede a imutabilidade total; a saída é ter o construtor sem argumentos com visibilidade reduzida e não expor <em>setters</em>. E colecções devolvidas por <em>getters</em> devem sair como vista imutável (<code>List.copyOf</code> ou <code>Collections.unmodifiableList</code>), senão o encapsulamento é aparente: qualquer chamador altera a colecção gerida por trás do agregado.</p></div>
+      <p>Três decisões resolvem o desenho: o contrato, a ordenação e a observabilidade. O contrato é uma interface mínima — <code>FraudRule</code> com <code>name()</code> e <code>Decision evaluate(Transaction t)</code>, onde <code>Decision</code> é um <code>record</code> com veredicto, pontuação e motivo. Tudo o que a regra precisa entra pelo argumento; nenhuma regra alcança repositórios directamente, porque isso transforma cada <em>plugin</em> numa fonte independente de latência e de carga na base de dados.</p>
+      <p>A ordenação e a activação vêm de configuração explícita, não de descoberta implícita. Uma lista ordenada em <code>application.yml</code> ou numa tabela — <code>fraud.rules: [velocity, geo-mismatch, device-reputation]</code> — resolvida contra o <code>Map&lt;String, FraudRule&gt;</code> dos <em>beans</em>. O arranque falha se um nome não resolver ou se houver duplicados. Assim o OCP mantém-se (regra nova é classe nova mais uma linha de configuração) sem se perder a resposta à pergunta «que regras correm, por que ordem?», que numa descoberta puramente automática só se responde com um <em>debugger</em>.</p>
+      <p>A observabilidade é o que impede o labirinto. Cada avaliação emite uma métrica por nome de regra (contador de decisões e <em>timer</em>), e o resultado agregado guarda a lista de regras que dispararam. Com 20 regras e um orçamento de 50 ms para a decisão, é preciso saber qual delas consome 30 ms — sem isso, o sistema de <em>plugins</em> torna-se uma caixa negra em que ninguém ousa mexer.</p>
+      <p>O limite honesto: isto só se justifica acima de meia dúzia de regras com donos diferentes e cadência própria. Com três regras estáveis escritas pela mesma equipa, um método com três <code>if</code> e um teste parametrizado é mais rápido de ler, de depurar e de alterar. E há um custo permanente que se assume ao escolher a extensibilidade: a garantia de que o conjunto de regras é coerente deixa de ser verificável pelo compilador e passa a depender de testes de contrato e de validação no arranque.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«É assim que se faz em Spring» ou «modelo anémico é sempre errado», sem critério.</td></tr>
-        <tr><td>Mid</td><td>Cita Fowler e defende modelo rico em abstracto, sem exemplo de invariante nem plano de migração.</td></tr>
-        <tr><td>Sénior</td><td>Decide pelo teste dos invariantes, fecha <em>setters</em> selectivamente, mantém os serviços como orquestradores e reconhece o caso CRUD.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta as restrições do Hibernate, colecções expostas como vista, fronteiras de agregado e um plano incremental que não bloqueia a entrega.</td></tr>
+        <tr><td>Insuficiente</td><td>Descreve uma interface e pouco mais; sem ordenação, sem falha no arranque, sem métricas.</td></tr>
+        <tr><td>Mid</td><td>Interface mais <code>@Order</code> e descoberta automática; não trata configuração explícita, conflitos de nome nem custo de latência acumulada.</td></tr>
+        <tr><td>Sénior</td><td>Contrato mínimo com dados a entrar por argumento, activação por configuração validada no arranque, métricas por regra, e um limite a partir do qual não vale a pena.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta orçamento de latência por regra com <em>timeout</em> e degradação, versionamento do contrato, isolamento de falhas (uma regra que rebenta não derruba a decisão) e propriedade por equipa.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Dê-me um invariante do seu sistema actual e diga onde está garantido hoje.»</li>
-      <li>«Com Hibernate, como consegue uma entidade sem <em>setters</em> públicos?»</li>
-      <li>«Onde põe a validação que precisa de consultar a base de dados?»</li>
-      <li>«Qual é a fronteira do agregado e porque é que a escolheu aí?»</li></ul></div>
+      <li>«Uma regra lança excepção em produção. O que acontece à transacção?»</li>
+      <li>«Como testa a interacção entre regras sem uma explosão combinatória?»</li>
+      <li>«Como faz <em>rollout</em> de uma regra nova sem risco?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><em>Getter</em> de colecção que devolve a lista gerida, permitindo alterações fora do agregado.</li>
-      <li>Regras de negócio duplicadas em serviço e em <em>trigger</em> de base de dados, divergentes.</li>
-      <li>Propor reescrever o domínio inteiro como condição para melhorar seja o que for.</li></ul></div>
+      <li>Deixar cada regra fazer as suas próprias consultas à base de dados.</li>
+      <li>Depender da ordem de descoberta dos <em>beans</em> para a semântica do resultado.</li>
+      <li>Não ter forma de responder «que regras correram nesta transacção».</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-16-13" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Encontra uma classe <code>OrderService</code> com 1 800 linhas e 12 dependências injectadas, e uma classe utilitária estática que faz <code>context.getBean()</code>. Qual ataca primeiro e como?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Primeiro o <em>service locator</em>, porque é mais barato de corrigir e porque bloqueia a correcção do outro. Enquanto houver uma classe estática a ir buscar <em>beans</em> ao contentor, qualquer parte do <code>OrderService</code> pode ter dependências invisíveis que não aparecem no construtor, e partir a classe em três torna-se adivinhação. Substituir <code>getBean()</code> por injecção por construtor é mecânico, e o próprio compilador mostra o grafo real de dependências à medida que se avança.</p>
-      <p>Depois o <em>god object</em>, e a divisão não se faz por camadas nem por tipo de operação: faz-se por razão de mudança. Listam-se os métodos públicos, agrupam-se por caso de uso e vê-se que dependências cada grupo usa. O padrão típico é claro — 4 métodos usam o <em>gateway</em> de pagamento e o repositório de encomendas, 3 usam o cliente de expedição e o de inventário, 5 são leituras que só usam o repositório. São três classes com 3 a 5 dependências cada, e nenhuma delas usa 12.</p>
-      <p>A sequência que se defende em entrevista tem uma condição de segurança à cabeça: testes de caracterização antes de mexer. Se os 1 800 linhas não tiverem cobertura, escrevem-se testes ao comportamento observável dos casos de uso principais (não à implementação), e só depois se extrai. Extrai-se uma classe de cada vez, mantendo o <code>OrderService</code> a delegar, para que os chamadores não mudem no mesmo <em>commit</em> — cada passo é revisível e reversível.</p>
-      <p>O critério de paragem é tão importante como o de arranque, e é o que distingue um sénior de quem gosta de refactorizar: para-se quando cada classe tem uma razão para mudar e menos de 5 ou 6 colaboradores. Não se continua até uma classe por método, porque isso troca um problema de acoplamento por um problema de navegabilidade — e a métrica que interessa ao negócio é o tempo que um colega demora a alterar o cálculo de comissão com confiança, não a contagem de linhas por ficheiro.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe reescrever de raiz, ou não vê problema nenhum nas 12 dependências.</td></tr>
-        <tr><td>Mid</td><td>Fala em «princípio da responsabilidade única» e divide por camadas técnicas, sem rede de testes.</td></tr>
-        <tr><td>Sénior</td><td>Ordena as duas correcções com justificação, divide por razão de mudança usando as dependências como sinal, e exige testes de caracterização antes.</td></tr>
-        <tr><td>Staff</td><td>Define critério de paragem, mantém compatibilidade por delegação para não bloquear a equipa, e liga a decisão ao custo de alteração medido em tempo de entrega.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como escreve testes de caracterização para código que chama três sistemas externos?»</li>
-      <li>«A extracção cria uma dependência circular entre duas das novas classes. O que faz?»</li>
-      <li>«Como convence o gestor de produto a pagar duas semanas disto?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Refactorizar sem testes e a garantir que «o comportamento é o mesmo».</li>
-      <li>Resolver a dependência circular com <code>@Lazy</code> em vez de rever as fronteiras.</li>
-      <li>Dividir por sufixos técnicos (<code>Helper</code>, <code>Manager</code>, <code>Util</code>) em vez de por caso de uso.</li></ul></div>
-  </div>
-</div>
+<h2 id="sec-16-3" class="h2"><span class="secnum">16.3</span> LSP: contratos, invariantes e o exemplo do quadrado<a class="anchor" href="#sec-16-3" aria-label="ligação">#</a></h2>
 
-<h2 id="sec-16-6" class="h2"><span class="secnum">16.6</span> Reconhecer padrões no código do entrevistador<a class="anchor" href="#sec-16-6" aria-label="ligação">#</a></h2>
+<p>O <em>Liskov Substitution Principle</em> diz que um subtipo tem de poder substituir o supertipo sem que o programa cliente, escrito contra o supertipo, deixe de estar correcto. Traduzido em regras verificáveis: o subtipo <strong>não pode reforçar pré-condições</strong> (não pode exigir mais do que o supertipo exigia), <strong>não pode enfraquecer pós-condições</strong> (tem de garantir pelo menos o mesmo), tem de <strong>preservar os invariantes</strong> do supertipo e não pode alterar propriedades que o supertipo declarava imutáveis ao longo do tempo — a regra da história.</p>
 
-<p>Numa ronda de leitura de código, o entrevistador mostra 40 a 60 linhas e pergunta o que ali está. O erro típico é responder com o nome e parar. A resposta que pontua tem quatro tempos, e cabe em noventa segundos: qual é a intenção (o que varia e o que se mantém fixo), qual é o nome do padrão se houver, se está bem aplicado neste contexto, e o que se mudaria. Um candidato que diz «é uma cadeia de responsabilidade, mas com um único elo e sem forma de reordenar — o que aqui está é uma lista de validações escrita com o vocabulário errado» demonstra mais do que quem acerta no nome e não vê o problema.</p>
+<p>O exemplo do quadrado é mal contado em 90% das entrevistas. O problema não é geometria: matematicamente um quadrado <em>é</em> um rectângulo. O problema é o <code>setWidth</code>. Se <code>Rectangle</code> expõe <code>setWidth</code> e <code>setHeight</code> e o cliente assume, correctamente, que <code>setWidth(5)</code> deixa a altura intacta, então <code>Square</code>, que tem de manter o invariante largura igual a altura, quebra essa pós-condição. Com tipos imutáveis — <code>record Rectangle(int w, int h)</code> e uma fábrica <code>square(int side)</code> — a violação simplesmente não existe. LSP é uma propriedade dos contratos mutáveis, não das taxonomias.</p>
 
-<p>Há três sinais de padrão desnecessário que se procuram de imediato. Interfaces com uma única implementação e nome derivado dela (<code>OrderServiceImpl</code>) não isolam nada: se não existe uma segunda implementação nem uma fronteira de módulo, a interface é indirecção paga sem retorno — o argumento de «facilita os testes» deixou de valer com bibliotecas que simulam classes concretas. Fábricas que fazem apenas <code>new</code> sem escolher entre alternativas. E hierarquias abstractas com um filho, criadas «para o futuro», que quase sempre têm de ser desfeitas quando o segundo caso finalmente aparece e não encaixa na abstracção adivinhada.</p>
+<p>Vale mais citar violações reais do JDK, que mostram que o candidato lê código a sério. <code>java.sql.Timestamp</code> estende <code>java.util.Date</code> e tem <code>equals</code> assimétrico: comparar nos dois sentidos dá resultados diferentes, o que quebra o contrato de <code>equals</code> herdado. <code>Arrays.asList</code> devolve uma lista de tamanho fixo cujo <code>add</code> lança <code>UnsupportedOperationException</code>, tal como as vistas de <code>Collections.unmodifiableList</code> e as colecções de <code>List.of</code>. O caso das colecções é subtil e digno de nota: o contrato de <code>List</code> declara operações <em>opcionais</em>, ou seja, o próprio supertipo legaliza o comportamento — o preço é que a verificação deixa de ser feita pelo compilador e passa a ser feita em <em>runtime</em>, o que é exactamente o sintoma que o LSP procura evitar.</p>
 
-<p>Vale também praticar a leitura no sentido inverso: dada uma cadeia de <code>if</code>/<code>else</code>, qual é o padrão que a substitui e qual é o custo. Nem toda a cadeia de <code>if</code> merece ser substituída — três ramos estáveis num sítio só são mais legíveis do que três classes espalhadas por três ficheiros. O critério é o mesmo de sempre: frequência de mudança, número de sítios onde a mesma decisão se repete, e se quem acrescenta um caso novo pertence à mesma equipa.</p>
+<figure class="listing java" id="lst-16-6"><div class="lhead"><span class="lnum">Listagem 16.6</span>
+<span class="lcap">Violação por reforço de pré-condição, e a correcção por composição em vez de herança.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ANTES — o cliente escreve contra AccountRepository e é surpreendido pelo subtipo.
+public class AccountRepository {
+    /** Guarda a conta. Aceita qualquer saldo, incluindo negativo (descoberto). */
+    public void save(Account a) { ... }
+}
 
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Uma resposta de alto sinal quando o candidato não reconhece o padrão: descrever o mecanismo em vez de adivinhar o nome. «Este objecto recebe outro do mesmo tipo e acrescenta comportamento antes de delegar» está correcto mesmo sem dizer «decorator»; adivinhar «é <em>facade</em>» quando é <em>adapter</em> custa mais do que não nomear.</p></aside>
-
-<div class="qa" id="q-16-14" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Este código valida um pagamento percorrendo uma lista de verificações, cada uma a decidir se continua ou pára. Que padrão é, está bem aplicado, e o que mudava em Java 21?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>É uma cadeia de responsabilidade. A intenção é permitir que um pedido percorra um conjunto de tratadores independentes até um deles decidir, sem que o chamador saiba quantos são nem quais. O que varia é o conjunto e a ordem dos tratadores; o que se mantém é o percurso e a regra de paragem.</p>
-      <p>Se estiver implementada da forma clássica — cada verificação com um campo <code>next</code> e a responsabilidade de chamar o seguinte — está mal aplicada, e diz-se porquê: cada elo tem duas responsabilidades (decidir e encaminhar), a ordem fica dispersa por seis classes em vez de estar num sítio, esquecer a chamada ao seguinte trunca a cadeia em silêncio, e não há forma de acrescentar uma verificação por configuração sem editar código existente.</p>
-      <p>Em Java 21 a mesma intenção escreve-se como uma lista de funções percorrida com um <code>Stream</code>: cada verificação é uma <code>Function&lt;Payment, Optional&lt;Rejection&gt;&gt;</code> que não conhece as outras, a ordem está declarada num único sítio, e a paragem no primeiro erro sai de graça da avaliação preguiçosa do <em>stream</em> — <code>findFirst</code> não avalia as verificações seguintes. Acrescentar uma verificação passa a ser acrescentar um elemento à lista, e testá-la é chamar uma função pura.</p>
-      <p>A crítica tem de ter limite: a versão clássica continua a ganhar quando um elo precisa de decidir <em>como</em> chamar o seguinte — envolver a chamada num <em>timeout</em>, num contexto transaccional, ou saltar dois elos. É por isso que a cadeia de <code>Filter</code> do Servlet passa o <code>FilterChain</code> ao filtro em vez de o executar por fora: um filtro tem de poder correr código antes e depois do resto da cadeia, e isso a versão com <code>Stream</code> não permite. Reconhecer essa diferença é o que distingue crítica informada de preferência de estilo.</p>
-      <figure class="listing java" id="lst-16-6"><div class="lhead"><span class="lnum">Listagem 16.6</span>
-        <span class="lcap">Cadeia de responsabilidade sem elos: ordem num sítio, paragem preguiçosa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>@FunctionalInterface
-public interface Check extends Function&lt;Payment, Optional&lt;Rejection&gt;&gt; {}
-
-@Configuration
-class ChecksConfig {
-    @Bean List&lt;Check&gt; paymentChecks(Blacklist bl, LimitService limits) {
-        return List.of(                                   // a ordem vive aqui, e só aqui
-                p -&gt; p.amount().isPositive() ? Optional.empty() : Optional.of(Rejection.AMOUNT),
-                p -&gt; bl.contains(p.card())   ? Optional.of(Rejection.BLACKLISTED) : Optional.empty(),
-                p -&gt; limits.exceeds(p)       ? Optional.of(Rejection.LIMIT) : Optional.empty());
+public class PremiumAccountRepository extends AccountRepository {
+    @Override public void save(Account a) {
+        if (a.balance().signum() &lt; 0) {                       // pré-condição REFORÇADA
+            throw new IllegalArgumentException(&quot;saldo negativo&quot;);
+        }
+        super.save(a);
     }
 }
 
-// paragem no primeiro erro: findFirst não avalia as verificações seguintes
-Optional&lt;Rejection&gt; firstFailure(Payment p, List&lt;Check&gt; checks) {
-    return checks.stream().map(c -&gt; c.apply(p)).flatMap(Optional::stream).findFirst();
-}</code></pre></figure></div>
+// Qualquer código que faça isto passa a rebentar consoante a instância injectada:
+void settle(AccountRepository repo, Account a) { repo.save(a.withdraw(overdraft)); }
+
+// DEPOIS — a regra deixa de ser um subtipo e passa a ser uma política explícita.
+public interface Accounts { void save(Account a); }
+
+public final class NoOverdraftAccounts implements Accounts {   // decorador, não subclasse
+    private final Accounts delegate;
+    private final OverdraftPolicy policy;
+
+    @Override public void save(Account a) {
+        policy.check(a);          // falha declarada no contrato de NoOverdraftAccounts
+        delegate.save(a);
+    }
+}</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>A violação de LSP mais comum em código Spring não está em hierarquias de domínio: está em duplos de teste. Um <em>mock</em> que devolve <code>null</code> onde a implementação real nunca devolve <code>null</code>, ou que aceita argumentos que a real rejeita, é um subtipo que enfraquece a pós-condição. O resultado é a suite verde e a produção vermelha. A defesa é o <em>contract test</em>: uma classe de teste abstracta escrita contra a interface, executada tanto contra a implementação real como contra o duplo — se o duplo não passar o mesmo contrato, não é substituível.</p></aside>
+
+<div class="qa" id="q-16-5" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique o LSP como se eu nunca tivesse ouvido falar, usando o exemplo do quadrado e do rectângulo — e diga-me depois porque é que esse exemplo é enganador.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>LSP é uma condição sobre o código do cliente: se um cliente correcto, escrito apenas contra o supertipo, deixa de estar correcto quando lhe passam um subtipo, o subtipo está errado — não o cliente. Operacionaliza-se em quatro regras: pré-condições não podem ser reforçadas, pós-condições não podem ser enfraquecidas, invariantes têm de ser preservados, e propriedades que o supertipo declarava estáveis não podem passar a mudar.</p>
+      <p>No exemplo clássico, <code>Rectangle</code> tem <code>setWidth</code> e <code>setHeight</code>, e o cliente escreve um teste legítimo: fixar a altura em 4, pôr a largura a 5, esperar área 20. <code>Square</code> herda de <code>Rectangle</code> e, para manter o seu invariante, faz <code>setWidth(5)</code> alterar também a altura — a área dá 25 e o cliente falha. A pós-condição implícita «alterar a largura não altera a altura» foi enfraquecida.</p>
+      <p>Onde o exemplo engana: sugere que o erro é a taxonomia, quando o erro é a mutabilidade. Um quadrado <em>é</em> um rectângulo em geometria; deixa de o ser como subtipo apenas porque existe um <em>setter</em> independente por dimensão. Com <code>record Rectangle(int width, int height)</code> e uma fábrica estática <code>Rectangle.square(int side)</code> não há violação nenhuma, porque não há pós-condição sobre mutação para quebrar. A conclusão prática não é «não usar herança para quadrados» — é «a herança de tipos mutáveis obriga a raciocinar sobre invariantes que o compilador não vê».</p>
+      <p>Um sénior fecha com exemplos que se encontram em produção. Reforçar uma pré-condição num <code>@Override</code> — validar um argumento que a classe base aceitava — é a violação mais frequente em Java empresarial, e não aparece em nenhum teste da classe base. Lançar <code>UnsupportedOperationException</code> num método herdado é a segunda; o JDK fá-lo em <code>Arrays.asList</code> e nas vistas imutáveis, e só se safa porque o contrato de <code>List</code> declara essas operações como opcionais — a verificação passou do compilador para o <em>runtime</em>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não reconhece nada, ou nomeia um padrão errado com confiança.</td></tr>
-        <tr><td>Mid</td><td>Nomeia a cadeia de responsabilidade correctamente e pára aí.</td></tr>
-        <tr><td>Sénior</td><td>Nomeia, critica o encaminhamento manual e a ordem dispersa, e reescreve com lista de funções explicando a paragem preguiçosa.</td></tr>
-        <tr><td>Staff</td><td>Diz quando a versão clássica ganha (comportamento à volta da chamada seguinte, como nos <code>Filter</code>) e como testar a ordem.</td></tr>
+        <tr><td>Insuficiente</td><td>«Um quadrado não é um rectângulo.» Definição decorada sem noção de pré/pós-condição.</td></tr>
+        <tr><td>Mid</td><td>Conta o exemplo correctamente e cita as quatro regras, mas não percebe que a mutabilidade é a causa e não a taxonomia.</td></tr>
+        <tr><td>Sénior</td><td>Enquadra em contratos, mostra que a imutabilidade dissolve o problema, e dá pelo menos um exemplo real (pré-condição reforçada, <code>UnsupportedOperationException</code>).</td></tr>
+        <tr><td>Staff</td><td>Liga a <em>design by contract</em> e a variância (parâmetros contravariantes, retornos covariantes), e propõe <em>contract tests</em> partilhados como forma de tornar o LSP verificável no CI.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quero recolher todos os erros em vez de parar no primeiro. O que muda?»</li>
-      <li>«Uma verificação precisa de chamar um serviço com 200 ms de latência. Reordena?»</li>
-      <li>«Como garante em teste que a ordem das verificações não muda por acidente?»</li>
-      <li>«Porque é que a cadeia de filtros do Servlet não podia usar esta forma?»</li></ul></div>
+      <li>«Java permite reforçar pré-condições sem erro de compilação. Como as apanha então?»</li>
+      <li>«<code>Timestamp</code> estende <code>Date</code>. Que contrato é que isso quebra?»</li>
+      <li>«Uma implementação mais lenta que a base viola o LSP?»</li>
+      <li>«Como escreveria um teste que corre contra todas as implementações de uma interface?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não notar que a versão clássica falha em silêncio quando um elo esquece a chamada ao seguinte.</li>
-      <li>Aplicar a crítica de forma absoluta, sem reconhecer o caso em que envolver a chamada seguinte é o objectivo.</li></ul></div>
+      <li>Confundir LSP com «não usar <code>instanceof</code>».</li>
+      <li>Achar que o compilador Java garante substituibilidade porque verifica assinaturas.</li>
+      <li>Não conseguir dar um único exemplo fora do quadrado e do rectângulo.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-16-6" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como detecta uma violação de LSP em <em>code review</em>, num sistema em que ninguém escreve <em>javadoc</em> com pré-condições e as hierarquias já têm três níveis?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Sem contratos escritos, procuram-se cinco padrões sintácticos no <em>diff</em>, todos identificáveis em segundos.</p>
+      <ul class="lst">
+        <li>Um <code>@Override</code> que começa com uma validação e um <code>throw</code> — pré-condição reforçada.</li>
+        <li>Um <code>@Override</code> cujo corpo é <code>throw new UnsupportedOperationException()</code> — o subtipo remove capacidade prometida.</li>
+        <li>Um <code>@Override</code> que <strong>não</strong> chama <code>super</code> num método que a base documenta como extensão e não como substituição — invariante da base potencialmente perdido.</li>
+        <li>Um <code>@Override</code> que devolve <code>null</code> onde a base garante colecção vazia, ou vice-versa.</li>
+        <li><code>instanceof</code> ou <code>getClass()</code> no <strong>cliente</strong> do supertipo: se o cliente precisa de saber qual é o subtipo, a substituibilidade já falhou e o código está a compensá-la.</li>
+      </ul>
+      <p>O último é o mais forte porque é evidência de sintoma, não de suspeita: alguém já sofreu com a diferença e escreveu o <em>workaround</em>. Numa base com três níveis de herança, o padrão típico é um <code>if (repo instanceof CachingRepository c) c.evict(...)</code> espalhado por serviços — o sinal de que a abstracção não cobre o que os clientes precisam.</p>
+      <p>A correcção estrutural raramente é ajustar o subtipo: é substituir herança por composição. Um decorador declara no seu próprio contrato aquilo que restringe, e o cliente escolhe explicitamente o decorador quando quer essa restrição, em vez de a receber por injecção sem saber. Quando a hierarquia tem de ficar, a defesa é o <em>contract test</em>: uma classe abstracta de testes com os casos que qualquer implementação tem de passar, herdada por cada teste concreto. Passa a ser o CI, e não o revisor, a verificar a substituibilidade.</p>
+      <p>Há um limite honesto. Diferenças de desempenho — uma implementação O(n) onde a base é O(1) — não violam o LSP em sentido estrito, porque o contrato não fala de tempo, mas partem clientes reais na mesma. Vale a pena tratá-las como violação quando o contrato tem consumidores sensíveis a latência, e nesse caso escrever a garantia de complexidade no próprio <em>javadoc</em>, como o JDK faz nas colecções.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Leio o código com atenção.» Nenhum padrão concreto.</td></tr>
+        <tr><td>Mid</td><td>Identifica <code>UnsupportedOperationException</code> e validações extra; propõe corrigir o subtipo caso a caso.</td></tr>
+        <tr><td>Sénior</td><td>Vários padrões incluindo <code>instanceof</code> no cliente; propõe composição/decorador e <em>contract tests</em> como mecanismo permanente.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta automação (regras ArchUnit sobre profundidade de herança e <code>final</code> por omissão) e trata desempenho como parte do contrato quando há consumidores sensíveis.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escreve um <em>contract test</em> reutilizável em JUnit 5?»</li>
+      <li>«O que faz quando a violação está numa biblioteca de terceiros?»</li>
+      <li>«Porque é que <code>final</code> por omissão ajuda aqui?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor herança mais profunda para resolver um problema causado por herança.</li>
+      <li>Não reconhecer <code>instanceof</code> no cliente como sintoma.</li>
+      <li>Assumir que mocks são automaticamente substituíveis pela implementação real.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-16-4" class="h2"><span class="secnum">16.4</span> ISP: interfaces gordas e clientes acorrentados<a class="anchor" href="#sec-16-4" aria-label="ligação">#</a></h2>
+
+<p>O <em>Interface Segregation Principle</em> diz que nenhum cliente deve ser forçado a depender de métodos que não usa. O custo que evita não é estético: é acoplamento de recompilação e de raciocínio. Um cliente que declara <code>UserRepository</code> com 22 métodos herda a superfície inteira — quando um método muda de assinatura, o cliente recompila mesmo que nunca o invoque; quando alguém lê o cliente, tem de excluir mentalmente 21 capacidades que ele não usa; e quem escreve um duplo de teste tem de decidir o que fazer com todos.</p>
+
+<p>A aplicação correcta é a das <em>role interfaces</em>: a interface é definida pelo papel que o cliente precisa, não pelo conjunto do que a implementação sabe fazer. Um serviço de autenticação precisa de <code>UserByEmail</code> com um método; o painel de administração precisa de <code>UserSearch</code>; o processo de registo precisa de <code>UserWriter</code>. Uma única classe <code>JpaUserRepository</code> implementa as três — a segregação está do lado do consumidor, que é onde o acoplamento dói.</p>
+
+<p>O contra-argumento tem de ser dado sem rodeios, porque o entrevistador vai testá-lo. <code>JpaRepository</code> do Spring Data expõe cerca de vinte métodos herdados e ninguém sensato o considera uma violação grave de ISP — porque nenhuma equipa implementa essa interface à mão (o <em>proxy</em> é gerado) e porque a maioria dos consumidores é um único serviço. O custo do ISP recai sobre quem <strong>implementa</strong> e sobre quem <strong>lê</strong>, não sobre a contagem de métodos em si. Segregar por segregar produz vinte ficheiros de uma linha, um catálogo de interfaces que ninguém consegue navegar, e nenhum benefício.</p>
+
+<figure class="listing java" id="lst-16-7"><div class="lhead"><span class="lnum">Listagem 16.7</span>
+<span class="lcap">Interface gorda que obriga a implementações vazias, e a mesma capacidade em <em>role interfaces</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ANTES — todos os canais implementam tudo; metade dos métodos não faz sentido.
+public interface NotificationChannel {
+    void send(Message m);
+    void sendBulk(List&lt;Message&gt; batch);
+    DeliveryReceipt track(String messageId);
+    void registerWebhook(URI callback);
+    boolean supportsAttachments();
+}
+
+public class SmsChannel implements NotificationChannel {
+    @Override public void sendBulk(List&lt;Message&gt; batch) {
+        throw new UnsupportedOperationException();     // LSP também parte aqui
+    }
+    @Override public void registerWebhook(URI callback) { /* vazio: o operador não tem */ }
+    @Override public boolean supportsAttachments() { return false; }
+    ...
+}
+
+// DEPOIS — o papel define a interface; cada cliente depende só do que invoca.
+public interface Sender      { void send(Message m); }
+public interface BulkSender  { void sendBulk(List&lt;Message&gt; batch); }
+public interface Trackable   { DeliveryReceipt track(String messageId); }
+
+public class SmsChannel implements Sender { ... }                       // só o que suporta
+public class EmailChannel implements Sender, BulkSender, Trackable { ... }
+
+// O cliente declara a capacidade que precisa; a incompatibilidade passa a ser de compilação.
+public class PasswordResetService {
+    private final Sender sender;          // não vê sendBulk, não recompila quando ele muda
+}</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O ganho decisivo da Listagem 16.7 não é a arrumação: é que <code>supportsAttachments()</code> desaparece. Métodos booleanos de capacidade são a marca da interface gorda — obrigam o cliente a perguntar em <em>runtime</em> o que o sistema de tipos podia responder em tempo de compilação. Sempre que apareça um <code>if (channel.supportsX())</code> num <em>review</em>, a pergunta certa é «porque é que X não é uma interface separada?».</p></aside>
+
+<div class="qa" id="q-16-7" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Dê um exemplo do seu código de uma interface gorda que segregou. E defenda o lado contrário: porque é que <code>JpaRepository</code>, com mais de vinte métodos, não é um problema?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O exemplo forte tem sempre uma implementação vazia ou uma excepção como sintoma. «Tínhamos <code>NotificationChannel</code> com cinco métodos. O canal de SMS lançava <code>UnsupportedOperationException</code> em <code>sendBulk</code> e tinha <code>registerWebhook</code> vazio; um <em>batch</em> nocturno chamou <code>sendBulk</code> num canal SMS e falhou 4 000 mensagens antes do alarme. Segregámos em <code>Sender</code>, <code>BulkSender</code> e <code>Trackable</code>: a partir daí, um canal sem envio em lote nem sequer compila num contexto que precise de lote.»</p>
+      <p>O mecanismo é converter uma verificação de <em>runtime</em> numa verificação de compilação. A interface gorda força o cliente a perguntar «suportas isto?» com um <code>boolean</code>; as <em>role interfaces</em> deixam o sistema de tipos responder. É também o que elimina o acoplamento de recompilação: um serviço que só declara <code>Sender</code> não é afectado quando a assinatura de <code>track</code> muda.</p>
+      <p>Quanto ao <code>JpaRepository</code>: não é um problema porque o custo do ISP recai sobre quem implementa e sobre quem lê, e ninguém implementa <code>JpaRepository</code> — o Spring Data gera o <em>proxy</em>. Não há implementações vazias, não há excepções por método não suportado, e a superfície herdada é estável há anos, logo o acoplamento de recompilação é teórico. Aplicar ISP dogmaticamente aqui produziria dezenas de interfaces de um método sem eliminar risco nenhum.</p>
+      <p>Dito isto, há um caso em que se segrega mesmo assim, e não é por ISP: quando o domínio não deve conhecer JPA. Aí declara-se uma porta com três métodos no pacote de domínio e um adaptador que delega no <code>JpaRepository</code>. A motivação é DIP — direcção de dependências — e não a contagem de métodos. Distinguir estas duas motivações é exactamente o que a pergunta testa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Define ISP e defende que qualquer interface com muitos métodos deve ser partida.</td></tr>
+        <tr><td>Mid</td><td>Exemplo válido de segregação, mas não sabe defender <code>JpaRepository</code> ou defende-o com «é <em>framework</em>, é diferente».</td></tr>
+        <tr><td>Sénior</td><td>Sintoma concreto (implementação vazia/excepção) com impacto, mecanismo de <em>runtime</em> para compilação, e o argumento de que o custo do ISP é de quem implementa e lê.</td></tr>
+        <tr><td>Staff</td><td>Separa a motivação ISP da motivação DIP, e discute quando a porta estreita compensa o custo de mais um nível de indirecção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se um cliente precisar mesmo de <code>Sender</code> e <code>Trackable</code> ao mesmo tempo?»</li>
+      <li>«Onde declara essas interfaces: no pacote do produtor ou no do consumidor?»</li>
+      <li>«Como evita acabar com trinta interfaces de um método?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar métodos booleanos de capacidade como solução em vez de sintoma.</li>
+      <li>Segregar até à interface de um método por regra fixa.</li>
+      <li>Confundir ISP com DIP e usar as duas siglas como sinónimos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-16-8" data-box="qa" data-area="design" data-level="mid" data-freq="baixa">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Encontra num <em>review</em> uma classe com dez métodos em que sete lançam <code>UnsupportedOperationException</code>. Que princípios estão a ser violados e por que ordem os resolveria?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Estão a ser violados dois princípios ao mesmo tempo, e a ordem importa. O ISP é a causa: a interface obriga a implementar o que este cliente não sabe fazer. O LSP é a consequência: a classe já não é substituível pelo seu tipo declarado, e qualquer código que a receba pode rebentar em <em>runtime</em>. Corrigir apenas o LSP — devolver valores neutros em vez de lançar — piora a situação, porque troca uma falha ruidosa por corrupção silenciosa.</p>
+      <p>A ordem de resolução é: primeiro medir quem chama o quê. Um <em>grep</em> pelos chamadores de cada método diz quais são os agrupamentos naturais; frequentemente descobre-se que sete dos dez métodos só são invocados por um único serviço, o que já dá a fronteira. Depois segregar a interface por esses agrupamentos, deixando cada implementação a declarar só o que suporta. Só no fim se remove o <code>UnsupportedOperationException</code> — que a essa altura já não compila em lado nenhum, porque o método deixou de estar no contrato.</p>
+      <p>Há uma condição de segurança que um mid costuma esquecer: se o tipo é usado por <em>reflection</em>, por serialização ou por código de terceiros, partir a interface é uma alteração incompatível. Nesse caso mantém-se a interface antiga como <code>default</code> a delegar nas novas, marca-se com <code>@Deprecated</code>, e migram-se os chamadores por fases — os métodos <code>default</code> das interfaces Java servem exactamente para este tipo de transição sem quebrar implementações existentes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Identifica apenas «código feio» ou propõe devolver <code>null</code> em vez de lançar.</td></tr>
+        <tr><td>Mid</td><td>Nomeia ISP e LSP correctamente e propõe segregar; não fala de chamadores nem de compatibilidade.</td></tr>
+        <tr><td>Sénior</td><td>Ordena causa (ISP) e consequência (LSP), usa os chamadores reais para desenhar o corte, e planeia a migração com <code>default</code> e depreciação.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o plano de <em>rollout</em> por fases com telemetria de uso dos métodos antigos antes de os remover.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a interface for pública numa biblioteca partilhada por seis equipas?»</li>
+      <li>«Como sabe que já ninguém usa o método antigo?»</li>
+      <li>«Métodos <code>default</code> não são eles próprios uma forma de esconder o problema?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Substituir a excepção por um retorno neutro e considerar o problema resolvido.</li>
+      <li>Partir uma interface pública sem plano de compatibilidade.</li>
+      <li>Não olhar para os chamadores antes de desenhar o corte.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-16-5" class="h2"><span class="secnum">16.5</span> DIP: inverter a dependência sem inverter tudo<a class="anchor" href="#sec-16-5" aria-label="ligação">#</a></h2>
+
+<p>O <em>Dependency Inversion Principle</em> é o mais mal compreendido dos cinco, porque toda a gente aprende a segunda metade — «depender de abstracções» — e ignora a primeira, que é a que dá o nome: módulos de alto nível não devem depender de módulos de baixo nível. A inversão não está em usar uma interface; está em <strong>quem é dono da interface</strong>. Se a interface vive no pacote de infraestrutura e o domínio a importa, não houve inversão nenhuma — o domínio continua a apontar para a infraestrutura, agora com um passo extra. A inversão acontece quando a porta é declarada no pacote da política, e a seta do <em>import</em> passa a apontar de fora para dentro.</p>
+
+<p>Daí decorre o teste que distingue quem percebeu: uma interface com uma única implementação e o nome <code>OrderServiceImpl</code> não é DIP. É cerimónia. A implementação chama-se pelo detalhe (<code>PostgresOrders</code>, <code>KafkaOrderEvents</code>), a interface chama-se pelo papel de negócio (<code>Orders</code>, <code>OrderEvents</code>), e existe porque há mais do que um mundo possível do outro lado — produção, teste, um segundo fornecedor — ou porque a direcção da dependência tem de ser invertida por razões de módulo.</p>
+
+<figure class="listing java" id="lst-16-8"><div class="lhead"><span class="lnum">Listagem 16.8</span>
+<span class="lcap">Porta no domínio, adaptador na infraestrutura, e a regra ArchUnit que impede a erosão da direcção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// com.acme.billing.domain — não importa Spring, JPA, Kafka ou HTTP.
+public interface Orders {
+    Optional&lt;Order&gt; byId(OrderId id);
+    void save(Order order);
+}
+
+public final class CancelOrder {                    // política: alto nível
+    private final Orders orders;
+    private final Clock clock;
+
+    public void handle(OrderId id, Reason reason) {
+        Order order = orders.byId(id).orElseThrow(() -&gt; new OrderNotFound(id));
+        order.cancel(reason, clock.instant());       // invariantes dentro do agregado
+        orders.save(order);
+    }
+}
+
+// com.acme.billing.infrastructure.persistence — importa o domínio, nunca o contrário.
+@Repository
+class JpaOrders implements Orders {
+    private final OrderJpaRepository jpa;            // JpaRepository fica escondido aqui
+
+    @Override public Optional&lt;Order&gt; byId(OrderId id) {
+        return jpa.findById(id.value()).map(OrderEntity::toDomain);
+    }
+    @Override public void save(Order order) { jpa.save(OrderEntity.from(order)); }
+}
+
+// Teste de arquitectura: a direcção deixa de depender da vigilância do revisor.
+@AnalyzeClasses(packages = &quot;com.acme.billing&quot;)
+class ArchitectureTest {
+    @ArchTest
+    static final ArchRule dominio_nao_conhece_infraestrutura =
+        noClasses().that().resideInAPackage(&quot;..domain..&quot;)
+            .should().dependOnClassesThat()
+            .resideInAnyPackage(&quot;..infrastructure..&quot;, &quot;org.springframework..&quot;, &quot;jakarta.persistence..&quot;);
+}</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Cada porta custa um salto de leitura e um ficheiro de mapeamento entre entidade e agregado. Num serviço com 12 casos de uso e um único motor de persistência, esse mapeamento pode representar 15 a 25% do código escrito, e não compra nenhuma flexibilidade real — ninguém vai trocar PostgreSQL por Cassandra. O que compra, quando compra, é velocidade de teste (política testada sem contexto) e independência de <em>upgrade</em> do <em>framework</em>. Se a equipa não tem testes de política nem sofre com <em>upgrades</em>, o padrão está a ser pago sem retorno; nesse caso, usar directamente Spring Data no serviço e concentrar os testes em Testcontainers é a decisão honesta.</p></aside>
+
+<div class="qa" id="q-16-9" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Qual é a diferença entre injecção de dependências e inversão de dependências? Muita gente usa as duas expressões como sinónimo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São coisas de níveis diferentes: DI é uma técnica de construção de objectos, DIP é uma regra sobre a direcção das dependências entre módulos. É perfeitamente possível ter injecção de dependências completa e violar o DIP em todo o lado — basta injectar classes concretas de infraestrutura em serviços de domínio, o que o Spring faz sem se queixar.</p>
+      <p>O critério prático é a seta do <em>import</em>. Se o pacote <code>domain</code> importa <code>org.springframework</code>, <code>jakarta.persistence</code> ou o cliente HTTP do fornecedor, a política depende do detalhe e não há inversão. A inversão dá-se quando a interface é <strong>declarada no pacote que a consome</strong> — a porta <code>Orders</code> vive com <code>CancelOrder</code> — e a infraestrutura importa o domínio para a implementar. O contentor de DI limita-se, no arranque, a ligar as duas pontas.</p>
+      <p>O contra-exemplo que convém dar é o do <code>Impl</code>. <code>OrderService</code> com um único <code>OrderServiceImpl</code> no mesmo pacote não inverte nada: o nome da interface é o nome da implementação com uma letra a menos, ninguém a substitui, e o único efeito é mais um ficheiro e mais um salto de navegação. Com <em>mocking</em> moderno nem sequer é preciso para testar. É o padrão que aparece quando se aprendeu a mecânica sem a razão.</p>
+      <p>O critério para criar uma porta são três perguntas: existem, ou vão existir a curto prazo, duas implementações reais? A dependência atravessa uma fronteira que se quer manter estável (módulo, equipa, <em>upgrade</em> de <em>framework</em>)? A política precisa de ser testada sem levantar infraestrutura? Se as três respostas forem não, a interface é custo puro. Numa <em>codebase</em> de 12 casos de uso, tipicamente três ou quatro portas — persistência, mensageria, relógio/identificadores, um ou dois serviços externos — cobrem tudo o que interessa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata as duas expressões como sinónimos, ou explica DIP como «usar <code>@Autowired</code> numa interface».</td></tr>
+        <tr><td>Mid</td><td>Distingue técnica de princípio, mas não fala de propriedade da interface nem da direcção do <em>import</em>.</td></tr>
+        <tr><td>Sénior</td><td>Explica que a inversão é sobre quem declara a abstracção, dá o contra-exemplo do <code>Impl</code>, e tem critério para decidir quando criar uma porta.</td></tr>
+        <tr><td>Staff</td><td>Liga a fronteiras de módulo e a evolução (JPMS, módulos Maven, ArchUnit no CI) e quantifica o custo de mapeamento face ao benefício.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde põe a interface: no pacote do domínio ou num pacote <code>ports</code> à parte?»</li>
+      <li>«Como impede, mecanicamente, que alguém importe JPA no domínio?»</li>
+      <li>«As entidades JPA podem ser os seus agregados de domínio? O que perde e o que ganha?»</li>
+      <li>«Quantas portas tem o seu serviço actual e porquê essas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Uma interface por classe, com sufixo <code>Impl</code>, apresentada como boa arquitectura.</li>
+      <li>Achar que usar Spring garante DIP.</li>
+      <li>Não conseguir nomear nenhum custo das portas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-16-10" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Herdou um serviço com 60 mil linhas em que os <em>controllers</em> chamam repositórios JPA directamente e há lógica de negócio em <em>entities</em> anotadas. Como aplica DIP sem parar a entrega durante três meses?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A resposta errada é o <em>big bang</em> arquitectural. A resposta certa começa por escolher o alvo pelo risco, não pela pureza: identificar as duas ou três áreas onde o custo é real — mais incidentes, mais tempo de <em>lead time</em>, mais dificuldade de teste — e deixar as restantes 50 mil linhas exactamente como estão. Uma <em>codebase</em> com uma área limpa e uma área legada é um estado estável; uma <em>codebase</em> meio migrada em toda a parte não é.</p>
+      <p>O mecanismo é o padrão de estrangulamento aplicado por caso de uso. Para o fluxo escolhido, cria-se o pacote de domínio com a porta e o agregado, escreve-se o caso de uso com testes puros, e o <em>controller</em> passa a chamá-lo. O adaptador implementa a porta delegando no repositório JPA que já existe — nenhuma migração de dados, nenhuma alteração de esquema, nenhum <em>freeze</em>. Cada fluxo migrado é um <em>pull request</em> pequeno, entregável e reversível.</p>
+      <p>A seguir vem o mecanismo que impede o retrocesso, que é a parte que distingue uma resposta de staff. Uma regra ArchUnit que proíbe <code>..domain..</code> de depender de <code>org.springframework..</code> e <code>jakarta.persistence..</code>, activa desde o primeiro dia, aplicada só aos pacotes novos. Sem isso, seis meses depois há imports de JPA no domínio outra vez e o esforço foi desperdiçado.</p>
+      <p>Sobre lógica em <em>entities</em> anotadas, há uma decisão honesta a tomar em vez de um dogma. Separar agregado de domínio e entidade JPA custa mapeamento — na ordem de 15 a 25% de código adicional na camada de persistência — e só compensa quando as regras de negócio são densas o suficiente para justificar testes sem base de dados. Onde a entidade é essencialmente um saco de dados com CRUD, mantê-la como está e testar com Testcontainers é mais barato e igualmente seguro. O critério que se apresenta ao <em>hiring manager</em> é este: converte-se onde as regras têm invariantes; não se converte onde há apenas persistência.</p>
+      <p>Finalmente, o argumento com que se vende isto à gestão não é «arquitectura limpa». É tempo: «o fluxo de cancelamento tem 40% dos nossos incidentes; hoje um teste dele demora 12 segundos e precisa de base de dados, o que faz com que ninguém o corra localmente. Depois desta mudança são 200 ms, e a próxima alteração de regra passa a ser de um dia em vez de uma semana.»</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe reescrever tudo, ou declara que o código legado «tem de ser limpo» sem plano nem critério.</td></tr>
+        <tr><td>Mid</td><td>Sabe descrever portas e adaptadores e propõe migração gradual, mas sem critério de selecção nem defesa contra o retrocesso.</td></tr>
+        <tr><td>Sénior</td><td>Selecciona por risco medido, aplica estrangulamento caso de uso a caso de uso com PRs reversíveis, e automatiza a direcção com ArchUnit.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério para <strong>não</strong> converter, aceita a coexistência de dois estilos como estado final, e apresenta o custo/benefício em tempo de entrega e incidentes, não em pureza.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escolhe o primeiro fluxo a migrar?»</li>
+      <li>«O que faz quando o mesmo agregado é tocado pelo código novo e pelo antigo?»</li>
+      <li>«Como mede que o refactor valeu a pena, seis meses depois?»</li>
+      <li>«Como responde a um colega que quer converter tudo por consistência?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Reescrita total como primeira proposta.</li>
+      <li>Nenhuma automação da regra arquitectural — confiar apenas no <em>review</em>.</li>
+      <li>Vender o refactor com vocabulário de arquitectura em vez de tempo e incidentes.</li></ul></div>
   </div>
 </div>
 
 <div class="lab" id="lab-16-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 16.1 — Da cadeia de <code>if</code>/<code>else</code> a estratégia com registo</span>
-    <div class="labpills"><span class="qpill">Alvo O(1) por despacho</span><span class="qpill">25 min</span></div></div>
+  <div class="labhead"><span class="labttl">Exercício 16.1 — Refactorizar uma classe que viola SRP, OCP e DIP</span>
+    <div class="labpills"><span class="qpill">Refactor guiado</span><span class="qpill">30 min</span></div></div>
   <div class="labbody">
-    <p>O método abaixo calcula a comissão de uma transacção e cresceu para 6 ramos em 18 meses; dois deles foram acrescentados por equipas diferentes e um está duplicado noutro serviço. O exercício: refactorizar para uma estratégia com selecção em tempo constante, garantindo que (1) um método de pagamento sem política falha no arranque da aplicação e não no primeiro pedido, (2) o código chamador não muda, (3) as políticas continuam testáveis sem contexto de Spring. No fim, argumentar quando <em>não</em> valeria a pena fazer esta refactorização. Entrada: <code>method = "CARD_CREDIT"</code>, <code>amount = 250,00 EUR</code>; saída esperada: <code>3,13 EUR</code> (1,25%).</p>
-    <figure class="listing java" id="lst-16-7"><div class="lhead"><span class="lnum">Listagem 16.7</span>
-      <span class="lcap">Código de partida: a decisão repete-se e cresce a cada método de pagamento novo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+    <p>A classe da Listagem 16.9 está em produção e funciona. O exercício não é reescrevê-la: é produzir uma sequência de passos pequenos, cada um com testes a passar no fim, e justificar cada passo pelo eixo de mudança que resolve. Restrições: não alterar o esquema da base de dados, não alterar a assinatura pública de <code>register</code> (é chamada por um <em>controller</em> e por um <em>consumer</em> de Kafka), e conseguir testar a regra de elegibilidade e o cálculo de pontos sem levantar Spring nem PostgreSQL. Entregar: o desenho final (pacotes, tipos, portas), a ordem dos passos e um critério objectivo para parar de separar.</p>
+    <figure class="listing java" id="lst-16-9"><div class="lhead"><span class="lnum">Listagem 16.9</span>
+      <span class="lcap">Ponto de partida: quatro eixos de mudança, um <code>switch</code> replicado e dependência directa em detalhes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
       <pre class="code" data-lang="java"><code>@Service
-public class FeeService {
+public class LoyaltyService {
 
-    public Money fee(String method, Money amount) {
-        if (method.equals("CARD_DEBIT")) {
-            return Money.eur("0.35");
-        } else if (method.equals("CARD_CREDIT")) {
-            return amount.times("0.0125");
-        } else if (method.equals("SEPA_CT")) {
-            return Money.eur("0.20");
-        } else if (method.equals("SEPA_DD")) {
-            return amount.times("0.0040").plus(Money.eur("0.10"));
-        } else if (method.equals("WALLET")) {
-            return amount.times("0.0180");
-        } else if (method.equals("VOUCHER")) {
-            return Money.ZERO_EUR;
+    @Autowired private JdbcTemplate jdbc;
+    @Autowired private JavaMailSender mail;
+    @Autowired private KafkaTemplate&lt;String, String&gt; kafka;
+    @Autowired private ObjectMapper json;
+
+    @Transactional
+    public void register(String customerId, String tier, BigDecimal amount, String country) {
+
+        if (&quot;PT&quot;.equals(country) &amp;&amp; amount.compareTo(new BigDecimal(&quot;10&quot;)) &lt; 0) return;
+        if (&quot;ES&quot;.equals(country) &amp;&amp; amount.compareTo(new BigDecimal(&quot;12&quot;)) &lt; 0) return;
+
+        int points;
+        switch (tier) {
+            case &quot;BRONZE&quot;: points = amount.intValue(); break;
+            case &quot;SILVER&quot;: points = (int) (amount.intValue() * 1.5); break;
+            case &quot;GOLD&quot;:   points = amount.intValue() * 2; break;
+            default: throw new IllegalArgumentException(tier);
         }
-        return amount.times("0.0200");   // e este ramo silencioso cobra 2% ao que ninguém previu
+        if (amount.compareTo(new BigDecimal(&quot;500&quot;)) &gt; 0) points += 100;   // bónus
+
+        jdbc.update(&quot;update loyalty set points = points + ? where customer_id = ?&quot;,
+                points, customerId);
+
+        Integer total = jdbc.queryForObject(
+                &quot;select points from loyalty where customer_id = ?&quot;, Integer.class, customerId);
+
+        if (total != null &amp;&amp; total &gt; 10_000) {
+            mail.send(m -&gt; { /* e-mail de promoção de nível */ });
+        }
+        try {
+            kafka.send(&quot;loyalty-events&quot;,
+                    json.writeValueAsString(Map.of(&quot;customer&quot;, customerId, &quot;points&quot;, points)));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }</code></pre></figure>
     <h4>A sua solução</h4>
@@ -717,108 +680,212 @@ public class FeeService {
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-16-8"><div class="lhead"><span class="lnum">Listagem 16.8</span>
-        <span class="lcap">Estratégia com registo imutável, validação de cobertura no arranque e fallback explícito.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public interface FeePolicy {
-    PaymentMethod method();
-    Money fee(Money amount);
-}
+      <figure class="listing java" id="lst-16-10"><div class="lhead"><span class="lnum">Listagem 16.10</span>
+        <span class="lcap">Política pura, variação por tabela de escalões, portas no domínio e um caso de uso que orquestra.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// ---------- domínio (sem Spring, sem JDBC, sem Kafka) ----------
 
-// políticas simples: sem dependências, testáveis com new, uma linha cada
-public record FlatFee(PaymentMethod method, Money flat) implements FeePolicy {
-    public Money fee(Money amount) { return flat; }
-}
+public record Money(BigDecimal amount, String country) { }
 
-public record PercentFee(PaymentMethod method, BigDecimal rate) implements FeePolicy {
-    public PercentFee {                                   // invariante no sítio certo
-        if (rate.signum() &lt; 0 || rate.compareTo(new BigDecimal("0.05")) &gt; 0)
-            throw new IllegalArgumentException("taxa fora de 0..5%: " + rate);
+/** Eixo 1: elegibilidade. Muda quando o marketing muda os mínimos por país. */
+public interface EligibilityPolicy { boolean qualifies(Money purchase); }
+
+public final class MinimumAmountPolicy implements EligibilityPolicy {
+    private final Map&lt;String, BigDecimal&gt; minimumByCountry;   // configuração, não código
+
+    @Override public boolean qualifies(Money p) {
+        BigDecimal min = minimumByCountry.getOrDefault(p.country(), BigDecimal.ZERO);
+        return p.amount().compareTo(min) &gt;= 0;
     }
-    public Money fee(Money amount) { return amount.times(rate); }
 }
 
-public record PercentPlusFlat(PaymentMethod method, BigDecimal rate, Money flat) implements FeePolicy {
-    public Money fee(Money amount) { return amount.times(rate).plus(flat); }
+/** Eixo 2: cálculo. Muda quando o programa de fidelização muda. */
+public enum Tier {
+    BRONZE(1.0), SILVER(1.5), GOLD(2.0);                      // OCP: escalão novo = valor novo
+    private final double multiplier;
+    Tier(double m) { this.multiplier = m; }
+
+    public Points award(Money p, BonusRule bonus) {
+        int base = p.amount().multiply(BigDecimal.valueOf(multiplier))
+                             .setScale(0, RoundingMode.DOWN).intValueExact();
+        return new Points(base + bonus.extraFor(p));
+    }
 }
 
-// registo: EnumMap dá O(1) por indexação de array, sem hashing
+/** Eixo 3 e 4: detalhes externos, atrás de portas declaradas AQUI. */
+public interface LoyaltyAccounts { Points addAndTotal(CustomerId id, Points earned); }
+public interface LoyaltyEvents   { void pointsAwarded(CustomerId id, Points earned); }
+public interface TierPromotions  { void promoted(CustomerId id, Points total); }
+
+// ---------- aplicação: só a sequência do processo ----------
+
 @Service
-public class FeeService {
+public class RegisterPurchase {
+    private static final Points PROMOTION_THRESHOLD = new Points(10_000);
 
-    private final Map&lt;PaymentMethod, FeePolicy&gt; registry;
+    private final EligibilityPolicy eligibility;
+    private final BonusRule bonus;
+    private final LoyaltyAccounts accounts;
+    private final LoyaltyEvents events;
+    private final TierPromotions promotions;
 
-    FeeService(List&lt;FeePolicy&gt; policies) {
-        var map = new EnumMap&lt;PaymentMethod, FeePolicy&gt;(PaymentMethod.class);
-        for (FeePolicy p : policies) {
-            FeePolicy previous = map.put(p.method(), p);
-            if (previous != null)                          // duas políticas para o mesmo método: erro
-                throw new IllegalStateException("política duplicada para " + p.method());
-        }
-        var missing = EnumSet.allOf(PaymentMethod.class);
-        missing.removeAll(map.keySet());
-        if (!missing.isEmpty())                            // falha no arranque, não no primeiro pedido
-            throw new IllegalStateException("sem política de comissão para " + missing);
-        this.registry = Collections.unmodifiableMap(map);
-    }
+    @Transactional
+    public void register(CustomerId id, Tier tier, Money purchase) {
+        if (!eligibility.qualifies(purchase)) return;
 
-    // assinatura mantida: o chamador não muda
-    public Money fee(String method, Money amount) {
-        return fee(PaymentMethod.valueOf(method), amount);
-    }
+        Points earned = tier.award(purchase, bonus);
+        Points total  = accounts.addAndTotal(id, earned);
 
-    public Money fee(PaymentMethod method, Money amount) {
-        return registry.get(method).fee(amount);           // sem null: cobertura garantida no arranque
+        events.pointsAwarded(id, earned);                     // publicado após commit
+        if (total.isAtLeast(PROMOTION_THRESHOLD)) promotions.promoted(id, total);
     }
 }
 
-@Configuration
-class FeePolicies {
-    @Bean FeePolicy debit()   { return new FlatFee(PaymentMethod.CARD_DEBIT, Money.eur("0.35")); }
-    @Bean FeePolicy credit()  { return new PercentFee(PaymentMethod.CARD_CREDIT, new BigDecimal("0.0125")); }
-    @Bean FeePolicy sepaCt()  { return new FlatFee(PaymentMethod.SEPA_CT, Money.eur("0.20")); }
-    @Bean FeePolicy sepaDd()  { return new PercentPlusFlat(PaymentMethod.SEPA_DD,
-                                        new BigDecimal("0.0040"), Money.eur("0.10")); }
-    @Bean FeePolicy wallet()  { return new PercentFee(PaymentMethod.WALLET, new BigDecimal("0.0180")); }
-    @Bean FeePolicy voucher() { return new FlatFee(PaymentMethod.VOUCHER, Money.ZERO_EUR); }
+// ---------- infraestrutura: importa o domínio, nunca o contrário ----------
+
+@Repository
+class JdbcLoyaltyAccounts implements LoyaltyAccounts {
+    private final JdbcTemplate jdbc;
+
+    @Override public Points addAndTotal(CustomerId id, Points earned) {
+        Integer total = jdbc.queryForObject(                  // uma ida à BD em vez de duas
+                &quot;&quot;&quot;
+                update loyalty set points = points + ?
+                 where customer_id = ?
+                returning points
+                &quot;&quot;&quot;, Integer.class, earned.value(), id.value());
+        return new Points(total);
+    }
+}
+
+@Component
+class KafkaLoyaltyEvents implements LoyaltyEvents {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)   // ou outbox
+    ...
 }</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>Despacho em O(1): <code>EnumMap</code> indexa um <em>array</em> pelo <code>ordinal()</code> internamente, sem cálculo de dispersão nem colisões; a cadeia de <code>if</code> era O(n) com n a crescer a cada método novo, e o pior caso caía sempre no ramo silencioso.</li>
-        <li>O ramo <code>return amount.times("0.0200")</code> do código de partida é o defeito mais grave: cobra 2% a qualquer valor não reconhecido, incluindo erros de escrita no método de pagamento. A solução troca isso por falha no arranque — o custo de um método novo passa a ser uma aplicação que não sobe em <em>staging</em>, e não uma cobrança errada em produção.</li>
-        <li><code>PaymentMethod</code> como <code>enum</code> em vez de <code>String</code> traz a verificação de cobertura de graça com <code>EnumSet.allOf</code>. Com <code>String</code> não há forma de saber o conjunto completo, e a garantia (1) do enunciado torna-se impossível.</li>
-        <li>Casos limite a mencionar sem ser perguntado: duas políticas para o mesmo método (detectado no construtor), <code>valueOf</code> com um texto inválido vindo de uma API externa (converte-se na fronteira, com erro 400, e não no <code>FeeService</code>), arredondamento monetário — a multiplicação por 0,0125 tem de ter modo de arredondamento e escala definidos no tipo <code>Money</code>, nunca <code>double</code>.</li>
-        <li>Testes: cada política testa-se com <code>new</code>, sem contexto de Spring nem duplos; o <code>FeeService</code> testa-se com uma lista construída à mão, e escreve-se um teste que verifica que falta uma política provoca excepção. Um teste de contexto vazio confirma a garantia (1) em CI.</li>
-        <li>Quando <em>não</em> vale a pena: com 2 ou 3 ramos estáveis há dois anos, usados num único sítio, esta refactorização troca 8 linhas legíveis por 6 ficheiros e uma configuração. O ganho aparece com a repetição da decisão em mais do que um sítio, com a frequência de novos casos, e quando quem acrescenta um caso é de outra equipa.</li>
-        <li>Alternativa a defender se o entrevistador empurrar: <code>enum</code> com corpo por constante elimina a configuração e o registo por completo, e é melhor enquanto nenhuma política precisar de dependências injectadas. A versão acima é a que sobrevive à primeira política que tenha de consultar uma tabela de escalões.</li>
+        <li><strong>Ordem dos passos, não o destino.</strong> A sequência esperada é: (1) tornar a assinatura tipada — <code>CustomerId</code>, <code>Tier</code>, <code>Money</code> — o que já elimina o <code>default</code> do <code>switch</code> e a validação de <em>strings</em>; (2) extrair o cálculo para o enum e testá-lo puro; (3) extrair a elegibilidade para uma política com os mínimos em configuração; (4) introduzir as três portas e mover o JDBC, o <em>e-mail</em> e o Kafka para adaptadores; (5) só no fim mexer na transacção e no evento. Cada passo é um <em>commit</em> com a suite verde.</li>
+        <li><strong>SRP.</strong> Os quatro eixos são independentes e observáveis: regra de país (marketing), multiplicadores (programa de fidelização), esquema SQL (dados), contrato de evento (consumidores a jusante). O sinal era o construtor com quatro dependências de infraestrutura e um teste que precisava de base de dados para verificar uma multiplicação.</li>
+        <li><strong>OCP.</strong> O <code>switch</code> sobre <code>String</code> desaparece: o multiplicador passa a ser um dado do enum, e um escalão novo é uma constante nova sem tocar no caso de uso. O bónus fixo de 100 pontos vira <code>BonusRule</code> injectável, porque é a parte que muda em campanhas. Nota honesta: se os escalões forem realmente três e estáveis há anos, transformar <code>BonusRule</code> numa interface é já indirecção paga sem retorno — a única extracção obrigatória é a do <code>switch</code>.</li>
+        <li><strong>DIP.</strong> As portas são declaradas no pacote de domínio e implementadas em infraestrutura; o domínio deixa de importar <code>org.springframework</code>. Uma regra ArchUnit fixa a direcção. O ganho medível: os testes de elegibilidade e de cálculo passam de ~40 ms com contexto para menos de 1 ms.</li>
+        <li><strong>Casos limite que o entrevistador vai perguntar.</strong> País desconhecido — a política devolve mínimo zero, o que é uma decisão de negócio que tem de ser explícita e não um <code>getOrDefault</code> silencioso; arredondamento — <code>1.5</code> em <code>double</code> sobre <code>BigDecimal</code> obriga a fixar <code>RoundingMode</code>, e a resposta melhor substitui o <code>double</code> por <code>BigDecimal</code> no enum; concorrência — o <code>update ... returning</code> resolve numa só ida a leitura suja que existia entre o <code>update</code> e o <code>select</code>; publicação de eventos — enviar para Kafka dentro da transacção pode publicar um evento cujo <em>commit</em> falha, pelo que se usa <code>AFTER_COMMIT</code> ou um <em>outbox</em>.</li>
+        <li><strong>Critério para parar.</strong> Parar quando cada teste de regra corre sem infraestrutura e cada eixo de mudança tem um único ficheiro. Não criar <code>PointsCalculatorFactory</code>, nem interface para o relógio se não houver lógica dependente de data, nem separar o caso de uso em <em>command handler</em> mais <em>validator</em> mais <em>mapper</em>: são divisões por camada técnica, não por eixo de mudança.</li>
       </ul>
     </div>
   </div>
 </div>
 
+<h2 id="sec-16-6" class="h2"><span class="secnum">16.6</span> Quando violar SOLID é a decisão certa<a class="anchor" href="#sec-16-6" aria-label="ligação">#</a></h2>
+
+<p>Esta é a secção que decide a nota da ronda. Um mid recita os cinco princípios; um sénior sabe que cada um deles é uma aposta sobre o futuro, e que apostas erradas custam dinheiro. A indirecção não é gratuita: cada abstracção acrescentada é um salto que qualquer leitor futuro tem de dar para responder à pergunta «o que é que este código faz».</p>
+
+<div class="formula">custo_de_leitura ≈ ficheiros_a_abrir × saltos_por_ficheiro × (1 + rotatividade_da_equipa)</div>
+
+<p>Quando um pedido HTTP atravessa <em>controller</em>, DTO, <em>mapper</em>, caso de uso, porta, adaptador, entidade e repositório, são oito ficheiros para uma leitura de base de dados. Se essa leitura nunca tiver regra de negócio nenhuma, sete desses ficheiros são imposto puro. A regra defensável é a assimetria: aplicar a estrutura completa onde há invariantes de domínio, e deixar as leituras de consulta irem directas do <em>controller</em> à consulta SQL — que é, aliás, o argumento central de CQRS quando visto pelo lado do custo e não pelo da moda.</p>
+
+<p>O mesmo se aplica ao DRY. Duplicação idêntica em dois contextos com donos diferentes não é duplicação: é coincidência. Extrair uma classe partilhada nesse caso acopla dois módulos que mudam por razões distintas, e a primeira alteração assimétrica introduz um parâmetro booleano na classe partilhada — depois dois, depois um <code>enum</code> de modos. A formulação madura é a de Sandi Metz: duplicação é mais barata do que a abstracção errada. A regra prática é esperar pela terceira ocorrência, e verificar se as três mudam pelo mesmo motivo antes de unificar.</p>
+
+<p>A Lei de Deméter merece o mesmo tratamento crítico. <code>order.getCustomer().getAddress().getCity()</code> é acoplamento a uma estrutura de três níveis: qualquer alteração no meio da cadeia parte o chamador, e o teste passa a exigir três objectos encadeados. Mas a lei fala de <strong>navegação em estruturas de dados</strong>, não de encadeamento sintáctico: <code>stream().filter().map().toList()</code> e um <em>builder</em> fluente devolvem sempre o mesmo tipo ou um tipo desenhado para encadear, e não expõem estrutura interna nenhuma. Confundir as duas coisas leva a proibir <em>streams</em> em nome de um princípio que elas não violam.</p>
+
+<p>Por fim, herança contra composição. A composição é o padrão por omissão porque a herança acopla ao <strong>estado interno</strong> da classe base e obriga a manter compatibilidade de invariantes através de todas as versões — o problema clássico do <code>HashSet</code> em que redefinir <code>add</code> e <code>addAll</code> conta elementos duas vezes, porque <code>addAll</code> chama <code>add</code> internamente. A herança justifica-se quando existe subtipagem genuína e a base é estável e desenhada para extensão, com pontos de extensão documentados. Em código de aplicação, escrever classes <code>final</code> por omissão e abrir explicitamente o que se pretende que seja estendido evita 90% destes casos.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 16.1</span> O que cada princípio compra, o que custa e o sintoma de aplicação excessiva.</div>
+<div class="tscroll"><table><thead><tr><th>Princípio</th><th>Compra</th><th>Custo</th><th>Sintoma de excesso</th></tr></thead><tbody>
+<tr><td>SRP</td><td>Alterações isoladas por interlocutor; testes rápidos de política.</td><td>Mais ficheiros por <em>pull request</em>; sequência do processo espalhada.</td><td>Divisão por camada técnica (<code>Validator</code>, <code>Mapper</code>, <code>Persister</code>) que muda sempre junta.</td></tr>
+<tr><td>OCP</td><td>Variante nova sem editar código testado.</td><td>Registo implícito; falha em <em>runtime</em> em vez de compilação; leitura não local.</td><td>Interface com uma só implementação criada «para o futuro».</td></tr>
+<tr><td>LSP</td><td>Clientes escritos contra o supertipo continuam correctos.</td><td>Contratos explícitos e <em>contract tests</em> para manter.</td><td>Hierarquias evitadas mesmo onde a subtipagem é genuína e útil.</td></tr>
+<tr><td>ISP</td><td>Menos acoplamento de recompilação; incompatibilidade detectada pelo compilador.</td><td>Mais tipos para navegar; capacidades espalhadas.</td><td>Dezenas de interfaces de um método sem nenhum cliente distinto.</td></tr>
+<tr><td>DIP</td><td>Política testável sem infraestrutura; <em>upgrades</em> isolados.</td><td>15-25% de código de mapeamento; um salto extra por chamada.</td><td>Uma interface por classe com sufixo <code>Impl</code> e uma implementação.</td></tr>
+</tbody></table></div></div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>SRP aplicado sem cuidado é a via mais comum para o <em>anemic domain model</em>: puxa-se toda a lógica das entidades para «serviços», ficam <em>records</em> com <em>getters</em> e <em>setters</em> e classes <code>OrderService</code> com a regra toda. O resultado é que os invariantes deixam de ter guardião — qualquer serviço pode construir uma encomenda em estado impossível. O corte correcto é entre <strong>política de domínio</strong> (fica dentro do agregado, junto ao estado que protege) e <strong>orquestração e I/O</strong> (fica no caso de uso). SRP separa razões para mudar, não separa comportamento de dados.</p></aside>
+
+<div class="qa" id="q-16-11" data-box="qa" data-area="design" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Conte-me uma vez em que violou deliberadamente um princípio SOLID e achou que foi a decisão certa. O que ponderou e como validou depois que estava certo?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A estrutura da resposta é: princípio, alternativa considerada, custo comparado, e como se verificou a posteriori. Um exemplo forte é o das leituras. «Tínhamos o padrão de portas e adaptadores em todos os fluxos, incluindo os de consulta. O ecrã de histórico de encomendas atravessava sete ficheiros para produzir uma listagem paginada, o mapeamento de agregado para DTO carregava colecções inteiras, e o p99 era de 380 ms com uma consulta que em SQL directo custava 12 ms.»</p>
+      <p>A decisão e o que a delimitou: «passámos as leituras a ir do <em>controller</em> a um <em>query service</em> com SQL e projecção directa para DTO, sem agregado e sem porta. Isso viola DIP e SRP no sentido estrito — o <em>controller</em> passa a estar a dois passos de SQL. A delimitação foi explícita: só leituras, sem escrita nenhuma; todas as escritas continuam a passar pelo agregado, que continua a ser o único guardião dos invariantes. O risco de a política ser contornada é zero porque a política não vive no caminho de leitura.»</p>
+      <p>A validação: «o p99 do ecrã passou de 380 para 45 ms, o número de ficheiros por alteração desse ecrã caiu de sete para dois, e escrevemos uma regra ArchUnit a garantir que classes no pacote <code>query</code> não fazem <code>save</code> nem publicam eventos. Seis meses depois não houve nenhum incidente de invariante violado por esse caminho, que era o risco que se assumiu.»</p>
+      <p>Vale acrescentar o segundo exemplo, mais desconfortável, porque mostra maturidade: manter um <code>switch</code> sobre um enum de estados em vez de o converter em strategy. «Estados de encomenda são discutidos com o negócio, mudam duas vezes por ano e são fechados por natureza. Com <code>sealed</code> e <code>switch</code> exaustivo, acrescentar um estado quebra a compilação em todos os sítios que precisam de o tratar — que é a garantia mais forte que existe. Com strategy, ficaria a depender de um <em>bean</em> registado e de um teste que alguém se lembrasse de escrever.»</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Nunca violei» ou «violei por falta de tempo». Não distingue dívida deliberada de descuido.</td></tr>
+        <tr><td>Mid</td><td>Dá um exemplo de atalho por prazo, sem alternativa ponderada nem validação posterior.</td></tr>
+        <tr><td>Sénior</td><td>Violação deliberada com alternativa comparada, custo quantificado, delimitação explícita do que não se aplicou, e verificação posterior.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o mecanismo que impede a violação de alastrar (regra automática, fronteira de pacote) e o critério de reversão se os números mudarem.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que sinal o faria reverter essa decisão?»</li>
+      <li>«Como impediu que a excepção se tornasse a regra no resto do código?»</li>
+      <li>«Como convenceu a equipa que preferia consistência?»</li>
+      <li>«Documentou a decisão em algum sítio? Onde?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Apresentar dogmatismo como virtude: «aplico sempre todos os cinco».</li>
+      <li>Chamar decisão deliberada a um atalho por prazo, sem alternativa considerada.</li>
+      <li>Nenhuma medição antes ou depois.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-16-12" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como concilia DRY com o risco de criar a abstracção errada? E onde é que a Lei de Deméter ajuda e onde é que a aplicam mal?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>DRY é sobre conhecimento, não sobre texto. Dois blocos de código idênticos que representam a mesma regra de negócio são duplicação e devem ser unificados; dois blocos idênticos que representam regras diferentes de contextos diferentes são coincidência, e unificá-los cria acoplamento entre módulos que mudam por razões distintas. O sintoma da unificação errada é sempre o mesmo: um parâmetro booleano acrescentado à função partilhada, depois um segundo, depois um <code>enum</code> de modos e um <code>switch</code> lá dentro.</p>
+      <p>A regra operacional tem três partes: esperar pela terceira ocorrência antes de extrair; verificar se as ocorrências mudam pelo mesmo motivo e têm o mesmo dono; e, quando se descobre tarde que a abstracção estava errada, inverter o refactor — voltar a duplicar dentro de cada contexto e só depois procurar a fronteira certa. É mais barato reverter uma duplicação do que desmontar uma abstracção com sete chamadores e três parâmetros de modo.</p>
+      <p>Sobre a Lei de Deméter, o valor real é limitar acoplamento estrutural. <code>order.getCustomer().getAddress().getCity()</code> torna o chamador dependente de três classes e das relações entre elas; se <code>Address</code> mudar, parte código que nunca deveria ter conhecido <code>Address</code>. A correcção é o agregado expor a informação de que o cliente precisa — <code>order.shippingCity()</code> — ou receber já a projecção correcta. Um sintoma prático é o teste: se preparar o cenário obriga a construir três objectos encadeados só para chegar a um campo, a lei está a ser violada.</p>
+      <p>Onde a aplicam mal: proibir encadeamento sintáctico. <code>list.stream().filter(...).map(...).toList()</code> não navega estrutura interna nenhuma — devolve sempre o mesmo tipo de <em>pipeline</em>. O mesmo vale para <em>builders</em> fluentes e para <code>Optional</code>. Confundir «não falar com estranhos» com «não usar pontos a mais» produz código pior: variáveis intermédias sem nome útil e <em>streams</em> substituídos por ciclos. O teste correcto não é contar pontos: é perguntar quantos tipos distintos o chamador tem de conhecer para escrever aquela linha.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«DRY é não repetir código» e «Deméter é usar poucos pontos», sem mais.</td></tr>
+        <tr><td>Mid</td><td>Percebe que DRY pode ser mal aplicado, mas não tem critério para decidir; aplica Deméter a encadeamentos de <em>stream</em>.</td></tr>
+        <tr><td>Sénior</td><td>DRY sobre conhecimento com regra do terceiro caso e critério do dono; distingue navegação estrutural de encadeamento fluente; sabe reverter uma abstracção errada.</td></tr>
+        <tr><td>Staff</td><td>Liga a fronteiras de contexto (o mesmo conceito com significados diferentes em dois domínios) e trata a duplicação entre contextos como decisão de <em>design</em> intencional, com custo assumido.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Já reverteu uma extracção que tinha feito? Como correu?»</li>
+      <li>«Duas equipas precisam da mesma validação de IBAN. Biblioteca partilhada ou cópia?»</li>
+      <li>«Como distingue duplicação de conhecimento de duplicação de texto num <em>review</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Extrair uma abstracção à segunda ocorrência por reflexo.</li>
+      <li>Proibir <em>streams</em> ou <em>builders</em> em nome da Lei de Deméter.</li>
+      <li>Defender uma biblioteca partilhada entre contextos sem falar de quem a mantém e de versionamento.</li></ul></div>
+  </div>
+</div>
+
 <h2 id="sec-16-7" class="h2"><span class="secnum">16.7</span> Resumo e checklist<a class="anchor" href="#sec-16-7" aria-label="ligação">#</a></h2>
 
-<p>O que uma ronda de padrões mede é a capacidade de justificar indirecção. Cada padrão introduz uma camada; a resposta de nível sénior diz sempre o que essa camada isola, quanto custa em legibilidade e execução, e em que condição a decisão se inverteria.</p>
+<p>O que reter deste capítulo, em oito pontos:</p>
 
 <ul class="lst">
-  <li>Um padrão isola um eixo de variação. Se não se consegue nomear o que varia e com que frequência, o padrão é indirecção paga sem retorno.</li>
-  <li>Java 21 absorveu metade do catálogo: <em>strategy</em> e <em>command</em> são interfaces funcionais, <em>state</em> e <em>visitor</em> são <code>sealed</code> com correspondência de padrões, <em>builder</em> perde para <code>record</code> abaixo de 8 componentes.</li>
-  <li>O singleton GoF é estado global com dependência escondida; o que se quer é âmbito <em>singleton</em> no contentor, único por <code>ApplicationContext</code> e não por JVM.</li>
-  <li>Adapter, decorator, facade e proxy têm a mesma estrutura e intenções diferentes; explicam-se pela consequência de os remover, não pelo diagrama de classes.</li>
-  <li>Spring AOP é <em>proxy</em> aplicado no arranque: auto-invocação não é interceptada, classes e métodos <code>final</code> não são <em>proxiáveis</em>, e o silêncio é o modo de falha.</li>
-  <li>Eventos do Spring são síncronos e transaccionais por omissão; durabilidade e consumidores noutro processo exigem mensageria com <em>outbox</em> e consumidores idempotentes.</li>
-  <li>Modelo anémico só é anti-padrão onde há invariantes a proteger; num CRUD sem regras, um modelo rico é cerimónia.</li>
-  <li><em>Service locator</em> e injecção por campo escondem dependências e adiam falhas de arranque para o primeiro pedido; injecção por construtor torna o ciclo um erro visível.</li>
-  <li>Numa ronda de leitura de código, responde-se em quatro tempos: intenção, nome, se está bem aplicado aqui, o que se mudaria.</li>
+  <li><strong>SRP é sobre interlocutores, não sobre tamanho.</strong> Uma razão para mudar equivale a uma pessoa ou equipa que pede a alteração; o histórico de <em>git</em> é a evidência mais barata de que há duas.</li>
+  <li><strong>OCP é uma aposta sobre o eixo que vai variar.</strong> Strategy aberta torna tipos baratos e operações caras; <code>sealed</code> com <code>switch</code> exaustivo faz o inverso e transforma o erro de <em>runtime</em> em erro de compilação.</li>
+  <li><strong>LSP é sobre contratos mutáveis.</strong> Pré-condições não se reforçam, pós-condições não se enfraquecem; a imutabilidade dissolve o problema do quadrado, e o sintoma mais fiável é <code>instanceof</code> no cliente.</li>
+  <li><strong>ISP protege quem implementa e quem lê</strong>, não a contagem de métodos: <code>JpaRepository</code> com vinte métodos não é violação porque ninguém a implementa à mão.</li>
+  <li><strong>DIP é sobre a propriedade da interface.</strong> A porta declarada no pacote de domínio inverte a seta; <code>OrderServiceImpl</code> não inverte nada.</li>
+  <li><strong>Cada abstracção é um salto de leitura.</strong> Estrutura completa onde há invariantes; caminho directo nas leituras sem regra de negócio.</li>
+  <li><strong>DRY é sobre conhecimento.</strong> Duplicação em contextos com donos diferentes é coincidência; a abstracção errada custa mais do que a cópia.</li>
+  <li><strong>Toda a resposta de nível sénior traz um número</strong> — tempo de teste, ficheiros por alteração, p99, conflitos de <em>merge</em> — e um caso em que não aplicaria o princípio.</li>
 </ul>
 
-<p>Checklist accionável antes de uma ronda de desenho orientada a objectos:</p>
+<p>Checklist de preparação, para correr antes da ronda de design:</p>
 
 <ul class="lst">
-  <li>Ter três exemplos do JDK prontos a citar por padrão discutido (decorator em <code>java.io</code>, proxy em <code>java.lang.reflect.Proxy</code>, template com <em>callback</em> em <code>JdbcTemplate</code>).</li>
-  <li>Preparar uma história real em que se <em>removeu</em> um padrão, com o antes e o depois medidos em tempo de alteração ou em número de ficheiros tocados.</li>
-  <li>Saber explicar em 60 segundos porque é que a auto-invocação anula <code>@Transactional</code> e quais são as três saídas por ordem de preferência.</li>
-  <li>Treinar a passagem de uma cadeia de <code>if</code>/<code>else</code> para estratégia com registo, incluindo a validação de cobertura no arranque, em menos de 20 minutos.</li>
-  <li>Ter um invariante concreto do sistema actual e saber dizer onde está garantido hoje e onde deveria estar.</li>
-  <li>Praticar a crítica: para cada padrão que se propõe, dizer sem ser perguntado em que condição não valeria a pena.</li>
-  <li>Verificar o vocabulário de <code>sealed</code>, <em>record patterns</em> e <code>switch</code> exaustivo — é o que separa uma resposta de 2015 de uma resposta de Java 21.</li>
+  <li>Ter pronto <strong>um exemplo próprio por princípio</strong>, com o antes, o corte, o depois e um número medido.</li>
+  <li>Preparar <strong>uma violação deliberada</strong> com alternativa ponderada, delimitação e verificação posterior.</li>
+  <li>Saber explicar o quadrado e o rectângulo em 60 segundos e dizer <strong>porque é que o exemplo engana</strong>.</li>
+  <li>Ter dois exemplos de <strong>violações de LSP no JDK</strong> (<code>Arrays.asList</code>, <code>Timestamp</code>/<code>Date</code>) e o que se aprende com elas.</li>
+  <li>Conseguir escrever de memória o <strong>registo de strategy por injecção de colecção</strong> no Spring e a validação de cobertura no arranque.</li>
+  <li>Conseguir escrever de memória uma <strong>regra ArchUnit</strong> que proíbe o domínio de importar o <em>framework</em>.</li>
+  <li>Ter o argumento contra <strong>uma interface por classe com sufixo <code>Impl</code></strong> pronto em duas frases.</li>
+  <li>Ter o critério de <strong>quando parar de separar</strong>: cada eixo de mudança num ficheiro, cada regra testável sem infraestrutura.</li>
+  <li>Ensaiar a passagem de <strong>princípio para custo</strong>: nunca dizer «viola o SRP» sem nomear a alteração futura que fica mais cara.</li>
 </ul>

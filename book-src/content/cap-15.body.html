@@ -1,891 +1,559 @@
-<p>Uma ronda de design orientada a SOLID não mede se o candidato sabe recitar cinco siglas — mede se sabe dizer, sobre código concreto, qual é o eixo de mudança que justifica uma separação e quanto custa essa separação a quem lê o código a seguir. O entrevistador procura três coisas: um exemplo real do próprio código do candidato, um critério de detecção que funcione em <em>code review</em> sem ser estético, e a fronteira — o ponto a partir do qual aplicar o princípio piora o sistema. Onde os candidatos caem é na primeira frase: definem SRP como «uma classe faz uma coisa só», o que é uma tautologia que não decide nada, e depois defendem uma <em>codebase</em> com quarenta interfaces de implementação única como se isso fosse arquitectura. Este capítulo trata cada princípio como uma ferramenta com preço: o mecanismo, o sinal que o dispara, o refactor mínimo, e o caso em que a decisão correcta é violá-lo conscientemente.</p>
+<p>Perguntar por Quarkus numa entrevista de Java sénior raramente é perguntar por Quarkus. É uma sonda para descobrir se o candidato sabe <em>porque</em> é que o Spring é lento a arrancar e caro em memória — ou seja, se percebe o que acontece entre o <code>main()</code> e o primeiro pedido servido. Quem responde «Quarkus é mais rápido» sem conseguir nomear o mecanismo (varrimento do <em>classpath</em>, construção do contexto e criação de <em>proxies</em> em tempo de execução contra geração de bytecode em tempo de compilação) mostra que nunca olhou para dentro de nenhum dos dois. O outro sinal que esta área mede é maturidade de decisão: um sénior que recomenda mudar 40 serviços para Quarkus porque o arranque desce de 3 s para 40 ms está a optimizar a métrica errada e a ignorar o custo humano da migração. Este capítulo cobre o modelo de arranque, os limites reais do <em>native image</em>, os números de memória que se podem defender, Mutiny contra Reactor, e como fundamentar uma recomendação que sobreviva a três follow-ups.</p>
 
-<h2 id="sec-15-1" class="h2"><span class="secnum">15.1</span> SRP: a razão para mudar<a class="anchor" href="#sec-15-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-15-1" class="h2"><span class="secnum">15.1</span> Quarkus vs Spring Boot: modelo de arranque e extensões<a class="anchor" href="#sec-15-1" aria-label="ligação">#</a></h2>
 
-<p>A formulação útil do <em>Single Responsibility Principle</em> não é «uma classe faz uma coisa»: é «um módulo deve ter uma, e apenas uma, razão para mudar», onde razão para mudar significa <strong>um interlocutor</strong> — o departamento fiscal, a equipa de contabilidade, o fornecedor de <em>e-mail</em>, o esquema da base de dados. Duas responsabilidades no mesmo ficheiro significam duas equipas a alterar as mesmas linhas por motivos que nada têm em comum, e por isso a merge de uma quebra a outra. É um princípio sobre pessoas e cadência de mudança, não sobre contagem de métodos.</p>
+<p>A diferença estrutural entre os dois não é o servidor HTTP nem a API de injecção: é <em>quando</em> se decide o grafo de dependências. O Spring Boot 3.x monta o <code>ApplicationContext</code> no arranque do processo. Isso implica varrer os pacotes indicados por <code>@ComponentScan</code>, ler anotações por reflexão, avaliar centenas de condições de auto-configuração (<code>@ConditionalOnClass</code>, <code>@ConditionalOnMissingBean</code>), instanciar as definições de <em>bean</em> por ordem topológica e gerar <em>proxies</em> — CGLIB para classes <code>@Configuration</code> e para <code>@Transactional</code> sobre classes, JDK dynamic proxies quando o alvo é uma interface. Tudo isto é trabalho que se repete em cada arranque de cada réplica, e escala com o número de classes no <em>classpath</em>, não com o número de <em>beans</em> que a aplicação realmente usa.</p>
 
-<p>Daí decorre o critério operacional: se, para responder «porque é que este ficheiro mudou no último ano», forem necessárias duas frases ligadas por «e também», há duas responsabilidades. O histórico de <em>git</em> é a evidência mais barata que existe — um ficheiro tocado em 60% dos <em>pull requests</em> de duas áreas de produto distintas é um candidato objectivo, sem discussão de gosto.</p>
+<p>O Quarkus desloca esse trabalho para a fase de <em>build</em>, a que chama <em>augmentation</em>. Durante o <code>mvn package</code>, o <code>quarkus-maven-plugin</code> corre os <em>build steps</em> de cada extensão sobre um índice Jandex do <em>classpath</em>, resolve as condições, decide que <em>beans</em> existem e gera bytecode concreto — incluindo as subclasses interceptoras que o Spring criaria em tempo de execução com CGLIB. O que sobra para o arranque é carregar classes já decididas e correr os poucos passos de <em>runtime init</em>. É por isso que o ganho existe mesmo sem <em>native image</em>: em JVM, uma aplicação REST + Hibernate típica arranca em cerca de 0,8 a 1,5 s em Quarkus contra 2 a 4 s em Spring Boot com o mesmo âmbito funcional.</p>
 
-<p>A armadilha simétrica é dividir por camada técnica em vez de por eixo de mudança. Partir uma classe em <code>Validator</code>, <code>Mapper</code>, <code>Calculator</code> e <code>Persister</code> quando as quatro mudam sempre ao mesmo tempo, pela mesma razão de negócio, não aplica SRP: multiplica por quatro o número de ficheiros que um <em>pull request</em> tem de tocar e reduz a coesão. SRP e coesão funcional são a mesma métrica vista de dois lados; a separação só compensa quando as partes têm ritmos de mudança diferentes.</p>
+<p>A consequência menos óbvia é sobre as extensões. Em Quarkus, uma biblioteca só participa plenamente no modelo se existir uma extensão que lhe forneça <em>build steps</em>: sem isso, ou funciona por reflexão em modo JVM e falha em <em>native</em>, ou obriga a configuração manual de metadados. O catálogo de extensões oficiais cobre bem o núcleo (Hibernate ORM/Reactive, RESTEasy Reactive, Kafka via SmallRye, Redis, gRPC, OIDC, Micrometer, Flyway), mas a cauda longa do ecossistema Java — bibliotecas internas, SDKs de fornecedores menores, agentes de APM antigos — não tem equivalente. O Spring, pelo contrário, aceita praticamente qualquer JAR porque decide tudo em tempo de execução com o <em>classpath</em> completo à frente. A troca é directa: velocidade e previsibilidade contra amplitude do ecossistema.</p>
 
-<figure class="listing java" id="lst-15-1"><div class="lhead"><span class="lnum">Listagem 15.1</span>
-<span class="lcap">Antes: quatro interlocutores no mesmo método — regra fiscal, esquema SQL, apresentação e notificação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@Service
-public class InvoiceService {
+<p>Desde o Spring Boot 3.0 a distância encurtou. O motor AOT (<code>spring-boot:process-aot</code>) gera, em tempo de compilação, código Java que substitui a leitura de anotações e as condições de auto-configuração por chamadas explícitas, e pré-gera as classes de <em>proxy</em>. Convém dizê-lo numa entrevista: o Spring adoptou o modelo <em>build-time</em> do Quarkus para o caminho AOT/native, mantendo o modo <em>runtime</em> clássico como omissão. Quem descreve o Spring como «puramente reflexivo» em 2026 está a citar documentação de 2019.</p>
 
-    private final JdbcTemplate jdbc;
-    private final JavaMailSender mail;
-    private final PdfEngine pdf;
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza defensáveis para um serviço REST com Hibernate, 30 a 60 <em>beans</em> aplicacionais e ligação a PostgreSQL: Spring Boot 3.x em JVM arranca em 2–4 s; Quarkus em JVM em 0,8–1,5 s; Quarkus em <em>native</em> em 20–50 ms; Spring Boot em <em>native</em> (AOT + GraalVM) em 50–150 ms. Em <em>native</em> a diferença entre os dois cai para um factor de 2 a 3; em JVM ronda um factor de 3. O número que interessa em produção não é nenhum destes isolado, mas o tempo até <em>readiness</em>, que inclui abrir o <em>pool</em> de ligações, correr o Flyway e aquecer os primeiros caminhos JIT.</p></aside>
 
-    public void issue(Order order) {
-        BigDecimal net = order.lines().stream()
-                .map(l -&gt; l.unitPrice().multiply(BigDecimal.valueOf(l.qty())))
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal vat = net.multiply(new BigDecimal(&quot;0.23&quot;));      // muda com a lei fiscal
-        Invoice inv = new Invoice(order.id(), net, net.add(vat));
+<div class="qa" id="q-15-1" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique-me, ao nível do mecanismo, porque é que uma aplicação Quarkus arranca mais depressa do que a mesma aplicação em Spring Boot. E antes de responder «porque é native», assuma que ambas correm na JVM.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o Quarkus faz em tempo de <em>build</em> aquilo que o Spring faz em tempo de arranque: decidir que <em>beans</em> existem, resolver as condições de configuração e gerar o código de ligação entre eles. Em JVM, o Quarkus arranca já com o grafo decidido; o Spring reconstrói esse grafo em cada processo.</p>
+      <p>Concretamente, o arranque de um Spring Boot gasta o tempo em quatro sítios. Primeiro, varrimento do <em>classpath</em>: abrir JARs, ler os metadados das classes candidatas e indexar anotações. Segundo, avaliação das auto-configurações — algumas centenas de classes com condições do tipo <code>@ConditionalOnClass</code>, cada uma a exigir uma tentativa de carregamento de classe. Terceiro, instanciação por reflexão e resolução de dependências. Quarto, geração de <em>proxies</em> CGLIB em tempo de execução, que é geração de bytecode e carregamento de classes adicionais. O quarto ponto é o que muitos candidatos esquecem e é o que explica porque é que activar <code>@Transactional</code> em muitas classes é visível no tempo de arranque.</p>
+      <p>O Quarkus corre a fase de <em>augmentation</em> durante o <code>mvn package</code>: constrói um índice Jandex do <em>classpath</em>, executa os <em>build steps</em> das extensões (que são código que corre no <em>build</em>, não na aplicação) e emite bytecode — incluindo as subclasses de intercepção que substituem os <em>proxies</em> dinâmicos. Em <em>runtime</em>, o que resta é carregar classes conhecidas e correr os passos marcados como <code>@Record(RUNTIME_INIT)</code>, tipicamente abrir sockets e o <em>pool</em> de ligações.</p>
+      <p>O trade-off é a rigidez: o que foi decidido no <em>build</em> não se muda por uma variável de ambiente. Alterar a lista de extensões, activar um perfil que muda o conjunto de <em>beans</em> ou substituir um <em>datasource</em> por outro tipo exige reconstruir o artefacto. No Spring, uma <em>property</em> muda o comportamento no arranque. Onde a escolha contrária ganha é em plataformas internas com <em>plugins</em> descobertos dinamicamente ou aplicações cujo perfil é definido pelo operador no <em>deploy</em>: aí o modelo <em>runtime</em> do Spring é uma funcionalidade, não um defeito.</p>
+      <p>Vale acrescentar que o Spring Boot 3.x tem o seu próprio caminho AOT, que aplica a mesma ideia e recupera boa parte da diferença — mas só quando o <em>pipeline</em> corre <code>process-aot</code>, o que na prática só acontece nas <em>builds</em> nativas ou com configuração explícita.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Quarkus é native e por isso é rápido»; não distingue modo JVM de modo nativo; atribui a diferença ao servidor HTTP.</td></tr>
+        <tr><td>Mid</td><td>Diz «build-time vs runtime» correctamente, mas não sabe nomear o que é feito no arranque do Spring nem o que sobra no arranque do Quarkus.</td></tr>
+        <tr><td>Sénior</td><td>Enumera varrimento, condições, reflexão e geração de <em>proxies</em>; explica <em>augmentation</em>, Jandex e bytecode gerado; dá números de arranque em JVM; identifica a perda de flexibilidade de configuração.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a distinção <em>static init</em> / <em>runtime init</em>, o efeito no <em>live reload</em> em desenvolvimento, e a observação de que o Spring AOT converge para o mesmo modelo — com o custo de o <em>pipeline</em> de CI passar a ter de correr o passo AOT.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se o grafo é decidido no <em>build</em>, como é que o <em>live reload</em> do <code>quarkus:dev</code> funciona?»</li>
+      <li>«Que parte do arranque é que o AOT do Spring <em>não</em> elimina?»</li>
+      <li>«O tempo de arranque afecta o p99 dos pedidos? Em que circunstâncias?»</li>
+      <li>«Como mediria onde é que os 3 s de arranque estão a ser gastos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confundir tempo de arranque com débito em regime estacionário e afirmar que Quarkus «serve mais pedidos por segundo» sem qualificação.</li>
+      <li>Não saber que o Spring Boot tem AOT desde a versão 3.0.</li>
+      <li>Descrever a injecção de dependências do Quarkus como reflexiva.</li></ul></div>
+  </div>
+</div>
 
-        jdbc.update(&quot;insert into invoice(id, net, gross) values (?,?,?)&quot;,
-                inv.id().value(), inv.net(), inv.gross());          // muda com o esquema
+<div class="qa" id="q-15-2" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa vem toda de Spring. Que diferenças concretas do modelo de <em>beans</em> CDI/ArC as vão morder na primeira semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São quatro diferenças que geram erros no primeiro dia: âmbitos declarados explicitamente, resolução por tipo e qualificadores em vez de nome, remoção de <em>beans</em> não usados, e intercepção sem <em>proxies</em> dinâmicos.</p>
+      <p>Primeiro, o âmbito. No Spring, uma classe anotada com <code>@Component</code> ou <code>@Service</code> é singleton por omissão. Em CDI, o âmbito faz parte do contrato: <code>@ApplicationScoped</code>, <code>@Singleton</code>, <code>@RequestScoped</code>, <code>@Dependent</code>. O erro clássico é esquecer a anotação e obter <code>@Dependent</code>, que cria uma instância por ponto de injecção — silenciosamente, com estado duplicado. E há uma subtileza que o Spring não tem: <code>@ApplicationScoped</code> é <em>lazy</em> e usa um <em>client proxy</em> gerado no <em>build</em>, enquanto <code>@Singleton</code> não tem <em>proxy</em>; isso muda o comportamento em ciclos de dependência e no momento em que o construtor corre.</p>
+      <p>Segundo, a resolução. O CDI resolve por tipo mais qualificadores. Duas implementações da mesma interface sem qualificador dão erro de <em>ambiguous dependency</em> no <em>build</em>, não no arranque — o que é melhor, mas o candidato tem de saber que a solução é <code>@Named</code> ou um qualificador próprio, e não a ordem de declaração. Não existe equivalente directo a <code>@Primary</code> a não ser <code>@DefaultBean</code> ou <code>@Alternative</code> com prioridade.</p>
+      <p>Terceiro, a remoção de <em>beans</em> não utilizados. O ArC elimina do artefacto <em>beans</em> que ninguém injecta, para reduzir memória e arranque. Se um <em>bean</em> só é usado por reflexão ou só existe pelos seus efeitos secundários (um observador de eventos, um <em>startup task</em>), desaparece e a aplicação comporta-se de forma diferente. A correcção é <code>@Unremovable</code> ou um ponto de injecção real.</p>
+      <p>Quarto, a intercepção. <code>@Transactional</code> em Spring sobre um método privado ou chamado internamente não intercepta, porque o <em>proxy</em> está fora do objecto. Em Quarkus, a intercepção é feita por uma subclasse gerada no <em>build</em>, logo o problema da auto-invocação existe na mesma — mas o compilador avisa em casos que o Spring deixa passar em silêncio. Na prática, a regra permanece: um método interceptado tem de ser chamado por outro <em>bean</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É igual, só mudam os nomes das anotações.»</td></tr>
+        <tr><td>Mid</td><td>Cita <code>@ApplicationScoped</code> vs <code>@Component</code> e pouco mais; não conhece <code>@Dependent</code> nem a remoção de <em>beans</em>.</td></tr>
+        <tr><td>Sénior</td><td>Cobre âmbitos com o perigo do <code>@Dependent</code>, resolução por qualificadores, <em>bean removal</em> e <code>@Unremovable</code>, e o modelo de intercepção sem <em>proxy</em> dinâmico.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito nos testes (<code>@QuarkusTest</code> e <code>@InjectMock</code> contra <code>@MockBean</code>), o custo de formação da equipa em semanas-pessoa, e uma estratégia de convenção interna para evitar a classe de erros do <code>@Dependent</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se injectar um <code>@RequestScoped</code> dentro de um <code>@ApplicationScoped</code>?»</li>
+      <li>«Como se substitui um <em>bean</em> só em testes?»</li>
+      <li>«Porque é que o ArC remove <em>beans</em> e o Spring não?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que a auto-invocação de <code>@Transactional</code> funciona em Quarkus.</li>
+      <li>Desconhecer o âmbito por omissão de CDI e assumir singleton.</li></ul></div>
+  </div>
+</div>
 
-        byte[] doc = pdf.render(&quot;invoice-a4.ftl&quot;, inv);             // muda com o marketing
+<figure class="listing text" id="lst-15-1"><div class="lhead"><span class="lnum">Listagem 15.1</span>
+<span class="lcap">Quarkus: configuração e acesso a dados equivalentes ao exemplo Spring da Listagem 15.2.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code># src/main/resources/application.properties
+quarkus.http.port=8080
+quarkus.datasource.db-kind=postgresql
+quarkus.datasource.username=${DB_USER}
+quarkus.datasource.password=${DB_PASSWORD}
+quarkus.datasource.jdbc.url=jdbc:postgresql://db:5432/orders
+quarkus.datasource.jdbc.max-size=20
+quarkus.hibernate-orm.database.generation=none
+quarkus.flyway.migrate-at-start=true
+quarkus.log.level=INFO
+quarkus.micrometer.export.prometheus.enabled=true
 
-        mail.send(mime -&gt; {                                         // muda com o fornecedor
-            var h = new MimeMessageHelper(mime, true);
-            h.setTo(order.customerEmail());
-            h.setSubject(&quot;Factura &quot; + inv.id().value());
-            h.addAttachment(&quot;factura.pdf&quot;, new ByteArrayResource(doc));
-        });
-    }
-}</code></pre></figure>
+# perfil: sobrepoe-se por prefixo, resolvido no arranque
+%dev.quarkus.hibernate-orm.log.sql=true
+%prod.quarkus.datasource.jdbc.max-size=40
 
-<p>O sintoma mensurável desta classe é o custo do teste: para exercitar a regra dos 23% é preciso levantar uma base de dados, um duplo de <em>e-mail</em> e um motor de PDF. Depois da separação, a regra fiscal testa-se com um <em>unit test</em> puro na ordem dos microssegundos, e os adaptadores testam-se uma vez cada, contra o contrato.</p>
+// ------------------------------------------------------------------
+// Order.java — entidade Panache (padrao active record)
+@Entity
+public class Order extends PanacheEntity {
+    public String reference;
+    public BigDecimal amount;
+    @Enumerated(EnumType.STRING) public Status status;
 
-<figure class="listing java" id="lst-15-2"><div class="lhead"><span class="lnum">Listagem 15.2</span>
-<span class="lcap">Depois: a política fiscal isolada, os detalhes atrás de portas, e um caso de uso que orquestra sem decidir.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// 1. Política: muda quando muda a lei. Sem Spring, sem I/O, testável em microssegundos.
-public final class InvoiceCalculator {
-    private final VatTable vat;
-
-    public InvoiceCalculator(VatTable vat) { this.vat = vat; }
-
-    public Invoice issue(Order order, LocalDate on) {
-        BigDecimal net = order.lines().stream()
-                .map(l -&gt; l.unitPrice().multiply(BigDecimal.valueOf(l.qty())))
-                .reduce(BigDecimal.ZERO, BigDecimal::add)
-                .setScale(2, RoundingMode.HALF_UP);
-        return new Invoice(order.id(), net, net.add(vat.rateFor(order.country(), on)
-                .multiply(net).setScale(2, RoundingMode.HALF_UP)));
+    public static List&lt;Order&gt; pendingOlderThan(Instant t) {
+        return list("status = ?1 and createdAt &lt; ?2", Status.PENDING, t);
     }
 }
 
-// 2. Portas: declaradas no pacote do domínio, uma por interlocutor externo.
-public interface Invoices          { void save(Invoice invoice); }
-public interface InvoiceDocuments  { Document render(Invoice invoice); }
-public interface CustomerNotifier  { void invoiceIssued(Invoice invoice, Document doc); }
-
-// 3. Caso de uso: a única razão para mudar é a sequência do processo de negócio.
-@Service
-public class IssueInvoice {
-    private final InvoiceCalculator calculator;
-    private final Invoices invoices;
-    private final InvoiceDocuments documents;
-    private final CustomerNotifier notifier;
-
-    @Transactional
-    public InvoiceId handle(Order order) {
-        Invoice invoice = calculator.issue(order, LocalDate.now());
-        invoices.save(invoice);
-        notifier.invoiceIssued(invoice, documents.render(invoice));
-        return invoice.id();
+// OrderResource.java
+@Path("/orders")
+public class OrderResource {
+    @GET @Path("/{id}")
+    public Order get(@RestPath Long id) {
+        return Order.findByIdOptional(id)
+                    .orElseThrow(() -&gt; new NotFoundException());
     }
-}</code></pre></figure>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O custo real da violação aparece na suite de testes. Um teste da regra fiscal sobre a Listagem 15.1 precisa de contexto Spring e de PostgreSQL em Testcontainers: 6 a 12 segundos de arranque e 30 a 80 ms por caso. O mesmo teste sobre <code>InvoiceCalculator</code> corre em menos de 1 ms, sem contexto. Numa suite com 400 casos de regra de negócio, é a diferença entre ~4 minutos e ~2 segundos — e é essa diferença que determina se a equipa corre os testes antes de cada <em>commit</em> ou só no CI.</p></aside>
+    @POST @Transactional
+    public Response create(@Valid NewOrder cmd) {
+        Order o = new Order();
+        o.reference = cmd.reference();
+        o.amount = cmd.amount();
+        o.status = Status.PENDING;
+        o.persist();                       // sem repositorio, sem save()
+        return Response.status(201).entity(o).build();
+    }
+}
+</code></pre></figure>
 
-<div class="qa" id="q-15-1" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Dê-me um exemplo concreto do seu próprio código em que aplicou o SRP: o que estava junto, porque decidiu separar, e o que melhorou de forma mensurável.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A resposta começa pelo eixo de mudança, não pela estrutura. «Tínhamos um <code>InvoiceService</code> que calculava IVA, escrevia em PostgreSQL, gerava o PDF e enviava o <em>e-mail</em>. Em nove meses, esse ficheiro apareceu em 31 <em>pull requests</em>: 12 por alterações de regra fiscal, 9 por mudanças de <em>template</em> do documento, 6 por migrações de esquema e 4 pela troca de fornecedor de <em>e-mail</em>. Quatro interlocutores, quatro cadências, um ficheiro — e três conflitos de <em>merge</em> por mês entre duas equipas.»</p>
-      <p>Depois, o critério que decidiu o corte. Não se separa por camada técnica; separa-se pelo interlocutor que pede a alteração. A regra fiscal ficou numa classe pura sem dependências de <em>framework</em>; a persistência, o documento e a notificação passaram a portas declaradas no domínio com adaptadores em infraestrutura; e ficou um caso de uso que apenas ordena os passos e desenha a fronteira transaccional.</p>
-      <p>Por fim, o número. «O teste da regra fiscal deixou de precisar de contexto Spring: passou de ~40 ms com Testcontainers para menos de 1 ms; a suite de regras de negócio caiu de 4 minutos para segundos. Os conflitos de <em>merge</em> nessa área desapareceram porque as duas equipas passaram a tocar em ficheiros distintos. E, quando a lei do IVA mudou em Janeiro, o <em>pull request</em> tinha 14 linhas em vez de tocar num ficheiro de 400.»</p>
-      <p>Um sénior fecha com o que não fez. «Não parti a classe em <code>Validator</code>, <code>Mapper</code> e <code>Persister</code>: essas três mudam sempre juntas e pela mesma razão. Separá-las só teria multiplicado ficheiros e reduzido a coesão. O corte foi por interlocutor, e parou aí.»</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Recita a definição («uma classe, uma responsabilidade») e não tem exemplo próprio; ou o exemplo é um <em>tutorial</em> de blogue.</td></tr>
-        <tr><td>Mid</td><td>Exemplo real, mas o critério é estético: «a classe tinha 500 linhas, era demasiado grande». Nenhuma referência a eixos de mudança nem a impacto medido.</td></tr>
-        <tr><td>Sénior</td><td>Identifica os interlocutores, mostra o sinal (histórico de alterações, número de mocks, tempo de teste) e quantifica o ganho. Diz onde parou de separar e porquê.</td></tr>
-        <tr><td>Staff</td><td>Liga SRP a fronteiras de equipa e de <em>deploy</em>: quem é dono de cada parte, o que isso fez ao <em>lead time</em>, e que regra automática (ArchUnit, <em>CODEOWNERS</em>) impede a erosão.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como decidiu que eram quatro responsabilidades e não duas ou sete?»</li>
-      <li>«O caso de uso que orquestra não é ele próprio uma segunda responsabilidade?»</li>
-      <li>«Se a regra fiscal e o esquema mudassem sempre juntos, ainda separava?»</li>
-      <li>«Quanto custou o refactor em dias e o que ficou por fazer?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Definir SRP como «uma classe faz uma coisa só» e não conseguir operacionalizar «uma coisa».</li>
-      <li>Apresentar a divisão por camadas técnicas como aplicação de SRP.</li>
-      <li>Zero números: nem tempo de teste, nem contagem de alterações, nem conflitos.</li>
-      <li>Não reconhecer nenhum custo na separação.</li></ul></div>
-  </div>
-</div>
+<figure class="listing yaml" id="lst-15-2"><div class="lhead"><span class="lnum">Listagem 15.2</span>
+<span class="lcap">Spring Boot 3.x: a mesma funcionalidade com <code>application.yml</code> e Spring Data JPA.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>server:
+  port: 8080
+spring:
+  datasource:
+    url: jdbc:postgresql://db:5432/orders
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+  jpa:
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    hikari:
+      maximum-pool-size: 40
+</code></pre></figure>
 
-<div class="qa" id="q-15-2" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+<div class="qa" id="q-15-3" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Está a rever um <em>pull request</em> de um colega. Que sinais objectivos o fazem escrever «isto viola o SRP» em vez de deixar passar, e como formula o comentário?</div>
+  <div class="qprompt">Comparando as duas listagens: o Panache troca o repositório por <code>Order.persist()</code>. Vale a pena? E que problemas é que o Spring Data resolve que o Panache não resolve?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Há quatro sinais que se verificam sem debate de gosto, todos observáveis no próprio <em>diff</em>.</p>
-      <ul class="lst">
-        <li><strong>Mistura de vocabulários nos <em>imports</em>.</strong> A mesma classe importa <code>javax.sql</code> ou <code>JdbcTemplate</code>, <code>MimeMessageHelper</code> e tipos de domínio. Três dialectos no mesmo ficheiro são três interlocutores.</li>
-        <li><strong>Número de colaboradores no construtor.</strong> Acima de quatro ou cinco dependências injectadas, a probabilidade de haver mais do que um eixo de mudança é alta; o teste correspondente precisa do mesmo número de duplos, e isso aparece no <em>diff</em> dos testes.</li>
-        <li><strong>O nome.</strong> <code>OrderManager</code>, <code>UserHelper</code>, <code>PaymentUtils</code> ou qualquer nome que só descreve o processo com «e» — o nome que não se consegue escrever sem conjunção denuncia a classe que não se consegue descrever sem conjunção.</li>
-        <li><strong>Histórico.</strong> <code>git log --format=%s -- ficheiro.java</code> com mensagens de duas áreas de produto sem relação. É o sinal mais forte porque é histórico, não previsão.</li>
-      </ul>
-      <p>A formulação do comentário é o que separa um sénior de um purista. Um comentário útil não diz «viola o SRP»; diz qual é o cenário de mudança que dói: «se o fornecedor de <em>e-mail</em> mudar, o teste da regra de IVA passa a ter de ser reescrito — proponho extrair a notificação para uma porta». O princípio é o argumento de segunda ordem; o custo concreto é o de primeira.</p>
-      <p>E há o critério de não comentar. Se a classe é uma folha estável, com um único dono, sem histórico de alterações cruzadas e coberta por testes rápidos, a violação teórica não paga o custo do refactor nem o do debate no <em>review</em>. A pergunta é sempre «que alteração futura, plausível a seis meses, fica mais cara por isto estar junto?» — se não houver resposta com nome, o comentário fica por escrever.</p></div>
+      <p>Vale a pena em serviços pequenos e com modelo de domínio simples, e deixa de valer quando o acesso a dados tem regras próprias que merecem ser testadas isoladamente. Ambos são camadas finas sobre Hibernate ORM; a diferença é onde colocam as consultas.</p>
+      <p>O Panache oferece dois modos: <em>active record</em> (a entidade estende <code>PanacheEntity</code> e traz <code>persist</code>, <code>list</code>, <code>findById</code>) e <em>repository</em> (<code>PanacheRepository&lt;Order&gt;</code>), que é praticamente o modelo do Spring Data sem geração de consultas por nome de método. O ganho mensurável é código: um CRUD com cinco consultas passa tipicamente de 60–80 linhas de repositório para 15–20 linhas na entidade, e a sintaxe abreviada de HQL (<code>list("status = ?1", ...)</code> em vez de <code>from Order o where o.status = ?1</code>) elimina outra dezena de linhas.</p>
+      <p>O Spring Data resolve três coisas que o Panache não resolve directamente. Primeira, derivação de consultas a partir do nome do método (<code>findByStatusAndCreatedAtBefore</code>), validada no arranque — o Panache exige HQL escrito à mão, com o erro a aparecer na primeira execução se o teste não cobrir a consulta. Segunda, projecções em interfaces e DTO com <em>constructor expressions</em> geridas pelo framework. Terceira, e a mais importante para quem tem um portefólio heterogéneo, a mesma abstracção sobre JPA, MongoDB, Redis, Cassandra e JDBC, o que permite reutilizar padrões de teste e paginação entre serviços.</p>
+      <p>Em ambos, o mesmo pecado continua a ser o mais caro: N+1. Nem <code>PanacheEntity.listAll()</code> nem <code>CrudRepository.findAll()</code> resolvem associações <em>lazy</em>; a correcção é a mesma nos dois — <code>join fetch</code> ou <code>@EntityGraph</code> — e é essa a resposta que o entrevistador quer ouvir a seguir. O <em>active record</em> tem ainda um custo de desenho: métodos estáticos na entidade são mais difíceis de substituir por duplos de teste, o que empurra para testes com base de dados real (Testcontainers ou os Dev Services do Quarkus). Numa equipa que já corre Testcontainers em CI isso é neutro; numa que dependa de <em>mocks</em> do repositório, é um custo real.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Vejo se a classe é muito grande.» Linhas de código como único critério.</td></tr>
-        <tr><td>Mid</td><td>Cita dois sinais válidos (nome, número de dependências) mas trata o princípio como regra absoluta; comentaria sempre.</td></tr>
-        <tr><td>Sénior</td><td>Sinais objectivos incluindo histórico e custo de teste; formula o comentário em termos de cenário de mudança; sabe quando não comentar.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta automação — regras ArchUnit para direcção de dependências, limites de fan-in no <em>build</em> — para que o <em>review</em> deixe de depender de vigilância humana.</td></tr>
+        <tr><td>Insuficiente</td><td>«Panache é mais simples» sem saber que ambos assentam em Hibernate ORM.</td></tr>
+        <tr><td>Mid</td><td>Descreve o <em>active record</em>, não conhece o modo repositório do Panache nem as implicações em testes.</td></tr>
+        <tr><td>Sénior</td><td>Compara os dois modos, quantifica a redução de código, aponta a derivação de consultas por nome e as projecções como o que se perde, e nota que N+1 é indiferente à escolha.</td></tr>
+        <tr><td>Staff</td><td>Liga a escolha à estratégia de testes da equipa e ao número de motores de persistência no portefólio; define a fronteira em que a lógica de consulta deixa de pertencer à entidade.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o autor responder que separar agora é <em>over-engineering</em>?»</li>
-      <li>«Que limite de dependências injectadas usa e porquê esse?»</li>
-      <li>«Como impede que a fronteira volte a erodir daqui a seis meses?»</li></ul></div>
+      <li>«Como detecta um N+1 antes de ir para produção, em qualquer das duas?»</li>
+      <li>«Como testa uma consulta Panache sem base de dados a correr?»</li>
+      <li>«Onde é que a paginação difere entre os dois?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Bloquear um <em>merge</em> por violação teórica sem cenário de custo.</li>
-      <li>Contar linhas ou métodos como prova de responsabilidade dupla.</li>
-      <li>Não distinguir código de fronteira (adaptadores, <em>controllers</em>) de código de política.</li></ul></div>
+      <li>Achar que o Panache substitui o Hibernate em vez de o embrulhar.</li>
+      <li>Defender <em>active record</em> para um agregado com invariantes de domínio complexos sem mencionar o custo de testabilidade.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-15-2" class="h2"><span class="secnum">15.2</span> OCP: extensão sem modificação em Java moderno<a class="anchor" href="#sec-15-2" aria-label="ligação">#</a></h2>
+<h2 id="sec-15-2" class="h2"><span class="secnum">15.2</span> Build-time metadata, reflexão e GraalVM native<a class="anchor" href="#sec-15-2" aria-label="ligação">#</a></h2>
 
-<p>O <em>Open-Closed Principle</em> pede que se acrescente comportamento sem editar código já testado e em produção. Em 1988 isso significava herança; em Java 25 significa quase sempre uma abstracção com várias implementações registadas — e o Spring dá o registo de graça, porque injectar <code>List&lt;PaymentHandler&gt;</code> ou <code>Map&lt;String, PaymentHandler&gt;</code> entrega todos os <em>beans</em> do tipo sem que o ponto de decisão os conheça.</p>
+<p>O compilador nativo do GraalVM opera sob a hipótese do mundo fechado: tudo o que a aplicação pode executar tem de ser alcançável a partir dos pontos de entrada, estaticamente, no momento da compilação. O analisador percorre o grafo de chamadas, descarta o que não é alcançável e produz um executável que já não tem carregador de classes dinâmico nem compilador JIT. Daí vêm, de uma só vez, os ganhos (arranque em dezenas de milissegundos, RSS baixo, sem aquecimento) e todas as limitações.</p>
 
-<p>O sinal da violação é o <code>if</code>/<code>switch</code> sobre um tipo ou um enum que reaparece em três sítios diferentes do <em>codebase</em>. Um único <code>switch</code> não é um problema; três <code>switch</code> sobre o mesmo enum são: acrescentar um valor obriga a lembrar de três locais, e o compilador não ajuda se houver <code>default</code>. A regra prática é a regra do terceiro caso — ao primeiro <code>if</code> escreve-se o <code>if</code>, ao segundo hesita-se, ao terceiro extrai-se a abstracção, porque só ao terceiro se conhece o verdadeiro eixo de variação.</p>
+<p>As limitações são quatro e valem a pena decorar. A reflexão sobre nomes calculados em tempo de execução é invisível ao analisador: <code>Class.forName(prefixo + sufixo)</code> não é resolúvel, e a classe é eliminada. Os <em>proxies</em> dinâmicos JDK exigem que a lista de interfaces seja conhecida no <em>build</em>. Os recursos do <em>classpath</em> (ficheiros de mensagens, <em>templates</em>, certificados) não são incluídos por omissão — só os que forem declarados por padrão. E a serialização, o JNI e os <em>agents</em> Java precisam de configuração explícita; agentes de APM que instrumentam bytecode em tempo de execução simplesmente não funcionam.</p>
+
+<p>A forma de resolver é a mesma nos dois frameworks, com ergonomia diferente. Em Quarkus, cada extensão contribui os metadados dos seus próprios tipos durante a <em>augmentation</em>; para as classes da aplicação usa-se <code>@RegisterForReflection</code> ou uma <code>ReflectiveClassBuildItem</code>. Em Spring Boot, o AOT infere hints das anotações conhecidas e o resto declara-se num <code>RuntimeHintsRegistrar</code> ou com <code>@RegisterReflectionForBinding</code>. Fora dos frameworks, a rede de segurança é o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos durante uma execução de testes e produz os ficheiros de configuração — com a limitação óbvia de só cobrir os caminhos que os testes exercitaram.</p>
+
+<p>O custo de <em>build</em> é o item que mais surpreende quem nunca o fez em CI. Compilar nativamente não é compilar Java: é uma análise de todo o grafo mais optimização, e consome memória e tempo em proporção ao tamanho da aplicação. Um serviço pequeno leva 2 a 4 minutos; um serviço médio com Hibernate, Kafka e OIDC leva com facilidade 5 a 12 minutos, e precisa de 8 a 16 GB de RAM disponível no <em>runner</em>. Um <em>runner</em> de CI com 4 GB falha com <code>OutOfMemoryError</code> no meio da análise, e a mensagem não é evidente.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O modo JVM e o modo nativo não são o mesmo artefacto: uma <em>build</em> nativa pode falhar apenas em tempo de execução, num caminho de código que o teste de integração em JVM nunca percorre — tipicamente uma <em>exception</em> serializada, um <em>template</em> de e-mail lido do <em>classpath</em> ou um <em>parser</em> de JSON sobre uma classe sem metadados. A regra prática é: se se envia nativo para produção, a suite de integração tem de correr contra o executável nativo (em Quarkus, <code>@QuarkusIntegrationTest</code>), e não só contra a versão JVM. Sem isso, o primeiro <code>ClassNotFoundException</code> aparece ao utilizador.</p></aside>
 
 <figure class="listing java" id="lst-15-3"><div class="lhead"><span class="lnum">Listagem 15.3</span>
-<span class="lcap">Antes: o ponto de decisão conhece todos os meios de pagamento; cada novo meio edita código em produção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@Service
-public class PaymentService {
+<span class="lcap">Metadados de reflexão: Quarkus à esquerda, o equivalente em Spring Boot AOT.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ---------- Quarkus ----------
+// Tipos so tocados por reflexao (ex.: DTO de um SDK externo)
+@RegisterForReflection(targets = { PaymentCallback.class, RiskScore.class })
+public class ReflectionConfig { }
 
-    public PaymentResult pay(PaymentRequest req) {
-        switch (req.method()) {
-            case CARD -&gt; {
-                var auth = stripe.authorize(req.amount(), req.cardToken());
-                return PaymentResult.of(auth.id(), auth.status());
-            }
-            case SEPA -&gt; {
-                if (req.amount().compareTo(new BigDecimal(&quot;15000&quot;)) &gt; 0) {
-                    throw new LimitExceeded(&quot;SEPA instantâneo até 15 000 EUR&quot;);
-                }
-                return PaymentResult.pending(sepa.submit(req.iban(), req.amount()));
-            }
-            case MBWAY -&gt; return PaymentResult.pending(mbway.push(req.msisdn(), req.amount()));
-            default -&gt; throw new IllegalArgumentException(&quot;método &quot; + req.method());
-        }
-    }
-}</code></pre></figure>
+// Recursos que tem de ir para dentro do executavel
+// application.properties:
+//   quarkus.native.resources.includes=templates/**,messages/*.properties
+//   quarkus.native.additional-build-args=--initialize-at-run-time=com.acme.LegacyCipher
 
-<figure class="listing java" id="lst-15-4"><div class="lhead"><span class="lnum">Listagem 15.4</span>
-<span class="lcap">Depois: registo por injecção de colecção — um meio novo é uma classe nova, zero edições no ponto de decisão.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>public interface PaymentHandler {
-    PaymentMethod method();
-    PaymentResult pay(PaymentRequest req);
-}
-
-@Component
-class SepaHandler implements PaymentHandler {
-    private static final BigDecimal INSTANT_LIMIT = new BigDecimal(&quot;15000&quot;);
-
-    @Override public PaymentMethod method() { return PaymentMethod.SEPA; }
-
-    @Override public PaymentResult pay(PaymentRequest req) {
-        if (req.amount().compareTo(INSTANT_LIMIT) &gt; 0) {
-            throw new LimitExceeded(&quot;SEPA instantâneo até 15 000 EUR&quot;);
-        }
-        return PaymentResult.pending(sepa.submit(req.iban(), req.amount()));
+// ---------- Spring Boot 3.x ----------
+public class AppRuntimeHints implements RuntimeHintsRegistrar {
+    @Override
+    public void registerHints(RuntimeHints hints, ClassLoader cl) {
+        hints.reflection()
+             .registerType(PaymentCallback.class,
+                 MemberCategory.INVOKE_DECLARED_CONSTRUCTORS,
+                 MemberCategory.INVOKE_DECLARED_METHODS);
+        hints.resources().registerPattern("templates/*.html");
+        hints.proxies().registerJdkProxy(RiskClient.class);
     }
 }
 
-@Service
-public class PaymentService {
-    private final Map&lt;PaymentMethod, PaymentHandler&gt; handlers;
+@Configuration
+@ImportRuntimeHints(AppRuntimeHints.class)
+class HintsConfig { }
 
-    PaymentService(List&lt;PaymentHandler&gt; discovered) {          // o Spring injecta todos os beans
-        this.handlers = discovered.stream()
-                .collect(Collectors.toUnmodifiableMap(PaymentHandler::method, h -&gt; h));
-    }
+// Alternativa declarativa para tipos usados apenas em (de)serializacao:
+// @RegisterReflectionForBinding({ PaymentCallback.class, RiskScore.class })
+</code></pre></figure>
 
-    public PaymentResult pay(PaymentRequest req) {
-        PaymentHandler h = handlers.get(req.method());
-        if (h == null) throw new UnsupportedPaymentMethod(req.method());
-        return h.pay(req);
-    }
-}</code></pre></figure>
-
-<p>O contra-argumento honesto: a Listagem 15.4 pagou um preço. O leitor que quer saber o que acontece com um pagamento SEPA já não o lê num sítio — tem de descobrir a implementação certa, e a construção do <code>Map</code> a partir de <em>beans</em> descobertos torna a configuração implícita. Se um <em>bean</em> se esquecer da anotação, o erro só aparece em <em>runtime</em>, com um pedido real. Enquanto houver dois meios de pagamento e um único ponto de decisão, o <code>switch</code> é mais legível, mais depurável e mais barato.</p>
-
-<p>Java moderno oferece a alternativa oposta e igualmente válida: fechar a hierarquia com <code>sealed</code> e abrir o comportamento com <code>switch</code> exaustivo sobre padrões. É a inversão deliberada do OCP clássico — o conjunto de tipos passa a ser fixo, mas acrescentar uma operação nova deixa de tocar em todas as classes, e o compilador falha o <em>build</em> em cada <code>switch</code> incompleto quando um tipo é acrescentado. É a resposta certa quando o eixo estável é o conjunto de casos (estados de uma encomenda, tipos de evento de um <em>ledger</em>) e o que varia são as operações.</p>
-
-<figure class="listing java" id="lst-15-5"><div class="lhead"><span class="lnum">Listagem 15.5</span>
-<span class="lcap">Hierarquia selada com <em>switch</em> exaustivo: o compilador substitui a disciplina do programador.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>public sealed interface LedgerEvent
-        permits Authorized, Captured, Refunded, ChargedBack { }
-
-public record Authorized(String id, BigDecimal amount)  implements LedgerEvent { }
-public record Captured  (String id, BigDecimal amount)  implements LedgerEvent { }
-public record Refunded  (String id, BigDecimal amount)  implements LedgerEvent { }
-public record ChargedBack(String id, BigDecimal amount, String reason) implements LedgerEvent { }
-
-// Sem `default`: acrescentar um tipo ao `permits` quebra a compilação aqui e em todos
-// os outros switch sobre LedgerEvent — falha no build, não em produção.
-static BigDecimal effect(LedgerEvent e) {
-    return switch (e) {
-        case Authorized a   -&gt; BigDecimal.ZERO;
-        case Captured c     -&gt; c.amount();
-        case Refunded r     -&gt; r.amount().negate();
-        case ChargedBack cb -&gt; cb.amount().negate();
-    };
-}</code></pre></figure>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Strategy aberta (Listagem 15.4) torna barato acrescentar <strong>tipos</strong> e caro acrescentar <strong>operações</strong> — uma operação nova obriga a tocar em todas as implementações. Hierarquia selada (Listagem 15.5) inverte exactamente isso: operações novas são baratas, tipos novos partem todos os <code>switch</code> — o que é uma vantagem, porque parte em tempo de compilação e não em <em>runtime</em>. É o problema da expressão: escolhe-se o eixo que se espera que varie mais, sabendo que o outro fica mais caro. Meios de pagamento crescem: <code>sealed</code> não. Estados de uma encomenda são finitos e discutidos com o negócio: <code>sealed</code> ganha.</p></aside>
-
-<div class="qa" id="q-15-3" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Dê um exemplo do seu código em que aplicou o OCP. E convença-me do contrário: quando é que substituir um <code>switch</code> por strategy foi, ou seria, a decisão errada?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O exemplo tem de trazer o gatilho e o número. «Tínhamos um <code>switch</code> sobre o meio de pagamento em três locais: autorização, estorno e reconciliação. Ao acrescentar o MB WAY, esqueceu-se o terceiro, e a reconciliação nocturna passou a marcar 1 200 pagamentos por dia como órfãos durante quatro dias. Extraímos <code>PaymentHandler</code> com registo por injecção de colecção; o quarto meio entrou como uma classe nova de 60 linhas e um teste, sem tocar no serviço.»</p>
-      <p>Segue o mecanismo, que é o que distingue quem percebeu de quem copiou o padrão. O ponto de decisão deixa de conhecer as variantes; passa a conhecer a chave e o contrato. O Spring injecta <code>List&lt;PaymentHandler&gt;</code>, o construtor indexa por <code>method()</code>, e a única alteração num meio novo é o próprio <em>bean</em>. Um <em>test de arquitectura</em> garante que todo o valor do enum tem exactamente um <em>handler</em>, o que devolve em tempo de arranque a exaustividade que se perdeu ao sair do <code>switch</code>.</p>
-      <p>A parte contrária é obrigatória. Substituir um <code>switch</code> por strategy é errado quando há um único ponto de decisão e o conjunto de casos é fechado por natureza: estados de uma encomenda, tipos de evento de um livro-razão, formatos de um ficheiro legado. Nesses casos, a strategy espalha por seis ficheiros o que se lia em vinte linhas, e troca uma falha de compilação por uma falha de <em>runtime</em> quando falta um registo. A alternativa moderna é <code>sealed</code> mais <code>switch</code> sem <code>default</code>: mantém a leitura local e faz o compilador rejeitar o <em>build</em> quando aparece um caso novo.</p>
-      <p>O critério final é o custo esperado. Se a variação chegar duas vezes por ano e vier sempre acompanhada de mudanças no processo, o <code>switch</code> ganha porque a mudança nunca é isolada. Se a variação for mensal, vier de equipas diferentes e for aditiva, o OCP paga-se ao segundo ou terceiro caso.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Um <code>if</code> é sempre uma violação do OCP.» Não distingue ponto único de ponto replicado.</td></tr>
-        <tr><td>Mid</td><td>Descreve strategy correctamente e sabe que o Spring injecta colecções, mas não vê custo nenhum na indirecção nem sabe quando não a usar.</td></tr>
-        <tr><td>Sénior</td><td>Gatilho concreto (o mesmo <code>switch</code> em três sítios), impacto medido, mecanismo de registo, e um caso claro em que manteria o <code>switch</code>.</td></tr>
-        <tr><td>Staff</td><td>Enquadra como problema da expressão, escolhe o eixo pela taxa de variação observada, e devolve a exaustividade com <code>sealed</code> ou com um teste de arranque que valida a cobertura do enum.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como garante, ao arrancar, que não falta nenhum <em>handler</em>?»</li>
-      <li>«E se dois <em>handlers</em> declararem o mesmo método de pagamento?»</li>
-      <li>«Onde é que a lógica comum aos <em>handlers</em> vive sem recriar herança profunda?»</li>
-      <li>«Quantas variantes justificaram o refactor no seu caso?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Introduzir strategy com uma única implementação «para o futuro».</li>
-      <li>Não notar que o registo dinâmico troca erros de compilação por erros de <em>runtime</em>.</li>
-      <li>Desconhecer <code>sealed</code> e <em>pattern matching</em> como alternativa em Java 21+.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-15-4" data-box="qa" data-area="spring" data-level="staff" data-freq="media">
+<div class="qa" id="q-15-4" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Spring e frameworks</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">A equipa quer um sistema de <em>plugins</em>: regras de fraude carregadas por configuração, cada uma numa classe. Como desenha isto para ser aberto a extensão sem virar um labirinto de indirecção?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Três decisões resolvem o desenho: o contrato, a ordenação e a observabilidade. O contrato é uma interface mínima — <code>FraudRule</code> com <code>name()</code> e <code>Decision evaluate(Transaction t)</code>, onde <code>Decision</code> é um <code>record</code> com veredicto, pontuação e motivo. Tudo o que a regra precisa entra pelo argumento; nenhuma regra alcança repositórios directamente, porque isso transforma cada <em>plugin</em> numa fonte independente de latência e de carga na base de dados.</p>
-      <p>A ordenação e a activação vêm de configuração explícita, não de descoberta implícita. Uma lista ordenada em <code>application.yml</code> ou numa tabela — <code>fraud.rules: [velocity, geo-mismatch, device-reputation]</code> — resolvida contra o <code>Map&lt;String, FraudRule&gt;</code> dos <em>beans</em>. O arranque falha se um nome não resolver ou se houver duplicados. Assim o OCP mantém-se (regra nova é classe nova mais uma linha de configuração) sem se perder a resposta à pergunta «que regras correm, por que ordem?», que numa descoberta puramente automática só se responde com um <em>debugger</em>.</p>
-      <p>A observabilidade é o que impede o labirinto. Cada avaliação emite uma métrica por nome de regra (contador de decisões e <em>timer</em>), e o resultado agregado guarda a lista de regras que dispararam. Com 20 regras e um orçamento de 50 ms para a decisão, é preciso saber qual delas consome 30 ms — sem isso, o sistema de <em>plugins</em> torna-se uma caixa negra em que ninguém ousa mexer.</p>
-      <p>O limite honesto: isto só se justifica acima de meia dúzia de regras com donos diferentes e cadência própria. Com três regras estáveis escritas pela mesma equipa, um método com três <code>if</code> e um teste parametrizado é mais rápido de ler, de depurar e de alterar. E há um custo permanente que se assume ao escolher a extensibilidade: a garantia de que o conjunto de regras é coerente deixa de ser verificável pelo compilador e passa a depender de testes de contrato e de validação no arranque.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Descreve uma interface e pouco mais; sem ordenação, sem falha no arranque, sem métricas.</td></tr>
-        <tr><td>Mid</td><td>Interface mais <code>@Order</code> e descoberta automática; não trata configuração explícita, conflitos de nome nem custo de latência acumulada.</td></tr>
-        <tr><td>Sénior</td><td>Contrato mínimo com dados a entrar por argumento, activação por configuração validada no arranque, métricas por regra, e um limite a partir do qual não vale a pena.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta orçamento de latência por regra com <em>timeout</em> e degradação, versionamento do contrato, isolamento de falhas (uma regra que rebenta não derruba a decisão) e propriedade por equipa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Uma regra lança excepção em produção. O que acontece à transacção?»</li>
-      <li>«Como testa a interacção entre regras sem uma explosão combinatória?»</li>
-      <li>«Como faz <em>rollout</em> de uma regra nova sem risco?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Deixar cada regra fazer as suas próprias consultas à base de dados.</li>
-      <li>Depender da ordem de descoberta dos <em>beans</em> para a semântica do resultado.</li>
-      <li>Não ter forma de responder «que regras correram nesta transacção».</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-15-3" class="h2"><span class="secnum">15.3</span> LSP: contratos, invariantes e o exemplo do quadrado<a class="anchor" href="#sec-15-3" aria-label="ligação">#</a></h2>
-
-<p>O <em>Liskov Substitution Principle</em> diz que um subtipo tem de poder substituir o supertipo sem que o programa cliente, escrito contra o supertipo, deixe de estar correcto. Traduzido em regras verificáveis: o subtipo <strong>não pode reforçar pré-condições</strong> (não pode exigir mais do que o supertipo exigia), <strong>não pode enfraquecer pós-condições</strong> (tem de garantir pelo menos o mesmo), tem de <strong>preservar os invariantes</strong> do supertipo e não pode alterar propriedades que o supertipo declarava imutáveis ao longo do tempo — a regra da história.</p>
-
-<p>O exemplo do quadrado é mal contado em 90% das entrevistas. O problema não é geometria: matematicamente um quadrado <em>é</em> um rectângulo. O problema é o <code>setWidth</code>. Se <code>Rectangle</code> expõe <code>setWidth</code> e <code>setHeight</code> e o cliente assume, correctamente, que <code>setWidth(5)</code> deixa a altura intacta, então <code>Square</code>, que tem de manter o invariante largura igual a altura, quebra essa pós-condição. Com tipos imutáveis — <code>record Rectangle(int w, int h)</code> e uma fábrica <code>square(int side)</code> — a violação simplesmente não existe. LSP é uma propriedade dos contratos mutáveis, não das taxonomias.</p>
-
-<p>Vale mais citar violações reais do JDK, que mostram que o candidato lê código a sério. <code>java.sql.Timestamp</code> estende <code>java.util.Date</code> e tem <code>equals</code> assimétrico: comparar nos dois sentidos dá resultados diferentes, o que quebra o contrato de <code>equals</code> herdado. <code>Arrays.asList</code> devolve uma lista de tamanho fixo cujo <code>add</code> lança <code>UnsupportedOperationException</code>, tal como as vistas de <code>Collections.unmodifiableList</code> e as colecções de <code>List.of</code>. O caso das colecções é subtil e digno de nota: o contrato de <code>List</code> declara operações <em>opcionais</em>, ou seja, o próprio supertipo legaliza o comportamento — o preço é que a verificação deixa de ser feita pelo compilador e passa a ser feita em <em>runtime</em>, o que é exactamente o sintoma que o LSP procura evitar.</p>
-
-<figure class="listing java" id="lst-15-6"><div class="lhead"><span class="lnum">Listagem 15.6</span>
-<span class="lcap">Violação por reforço de pré-condição, e a correcção por composição em vez de herança.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// ANTES — o cliente escreve contra AccountRepository e é surpreendido pelo subtipo.
-public class AccountRepository {
-    /** Guarda a conta. Aceita qualquer saldo, incluindo negativo (descoberto). */
-    public void save(Account a) { ... }
-}
-
-public class PremiumAccountRepository extends AccountRepository {
-    @Override public void save(Account a) {
-        if (a.balance().signum() &lt; 0) {                       // pré-condição REFORÇADA
-            throw new IllegalArgumentException(&quot;saldo negativo&quot;);
-        }
-        super.save(a);
-    }
-}
-
-// Qualquer código que faça isto passa a rebentar consoante a instância injectada:
-void settle(AccountRepository repo, Account a) { repo.save(a.withdraw(overdraft)); }
-
-// DEPOIS — a regra deixa de ser um subtipo e passa a ser uma política explícita.
-public interface Accounts { void save(Account a); }
-
-public final class NoOverdraftAccounts implements Accounts {   // decorador, não subclasse
-    private final Accounts delegate;
-    private final OverdraftPolicy policy;
-
-    @Override public void save(Account a) {
-        policy.check(a);          // falha declarada no contrato de NoOverdraftAccounts
-        delegate.save(a);
-    }
-}</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>A violação de LSP mais comum em código Spring não está em hierarquias de domínio: está em duplos de teste. Um <em>mock</em> que devolve <code>null</code> onde a implementação real nunca devolve <code>null</code>, ou que aceita argumentos que a real rejeita, é um subtipo que enfraquece a pós-condição. O resultado é a suite verde e a produção vermelha. A defesa é o <em>contract test</em>: uma classe de teste abstracta escrita contra a interface, executada tanto contra a implementação real como contra o duplo — se o duplo não passar o mesmo contrato, não é substituível.</p></aside>
-
-<div class="qa" id="q-15-5" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Explique o LSP como se eu nunca tivesse ouvido falar, usando o exemplo do quadrado e do rectângulo — e diga-me depois porque é que esse exemplo é enganador.</div>
+  <div class="qprompt">Compilámos o serviço para <em>native image</em> e em produção rebenta com <code>ClassNotFoundException</code> num tipo que existe claramente no código. Como é que isso é possível e como se resolve?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>LSP é uma condição sobre o código do cliente: se um cliente correcto, escrito apenas contra o supertipo, deixa de estar correcto quando lhe passam um subtipo, o subtipo está errado — não o cliente. Operacionaliza-se em quatro regras: pré-condições não podem ser reforçadas, pós-condições não podem ser enfraquecidas, invariantes têm de ser preservados, e propriedades que o supertipo declarava estáveis não podem passar a mudar.</p>
-      <p>No exemplo clássico, <code>Rectangle</code> tem <code>setWidth</code> e <code>setHeight</code>, e o cliente escreve um teste legítimo: fixar a altura em 4, pôr a largura a 5, esperar área 20. <code>Square</code> herda de <code>Rectangle</code> e, para manter o seu invariante, faz <code>setWidth(5)</code> alterar também a altura — a área dá 25 e o cliente falha. A pós-condição implícita «alterar a largura não altera a altura» foi enfraquecida.</p>
-      <p>Onde o exemplo engana: sugere que o erro é a taxonomia, quando o erro é a mutabilidade. Um quadrado <em>é</em> um rectângulo em geometria; deixa de o ser como subtipo apenas porque existe um <em>setter</em> independente por dimensão. Com <code>record Rectangle(int width, int height)</code> e uma fábrica estática <code>Rectangle.square(int side)</code> não há violação nenhuma, porque não há pós-condição sobre mutação para quebrar. A conclusão prática não é «não usar herança para quadrados» — é «a herança de tipos mutáveis obriga a raciocinar sobre invariantes que o compilador não vê».</p>
-      <p>Um sénior fecha com exemplos que se encontram em produção. Reforçar uma pré-condição num <code>@Override</code> — validar um argumento que a classe base aceitava — é a violação mais frequente em Java empresarial, e não aparece em nenhum teste da classe base. Lançar <code>UnsupportedOperationException</code> num método herdado é a segunda; o JDK fá-lo em <code>Arrays.asList</code> e nas vistas imutáveis, e só se safa porque o contrato de <code>List</code> declara essas operações como opcionais — a verificação passou do compilador para o <em>runtime</em>.</p></div>
+      <p>Porque o GraalVM compila sob a hipótese do mundo fechado e elimina tudo o que a análise estática não consegue alcançar. Se a única referência ao tipo é reflexiva — <code>Class.forName</code> com um nome construído, desserialização por nome, um <em>proxy</em> dinâmico criado a partir de uma lista lida de configuração — o analisador não vê aresta nenhuma para essa classe e ela não entra no executável. O erro em tempo de execução é honesto: a classe realmente não existe no binário.</p>
+      <p>A resolução tem três passos, por ordem de custo. Primeiro, declarar os metadados: <code>@RegisterForReflection</code> em Quarkus, <code>RuntimeHintsRegistrar</code> ou <code>@RegisterReflectionForBinding</code> em Spring. Segundo, se a origem é uma biblioteca de terceiros, verificar se tem metadados no <em>reachability metadata repository</em> do GraalVM, que o plugin Maven consegue consumir automaticamente — evita escrever configuração à mão para bibliotecas conhecidas. Terceiro, quando não se sabe o que falta, correr a suite de testes com o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos observados e gera os ficheiros de configuração. O agente é rede de segurança, não solução: só cobre os caminhos executados, portanto um caminho de erro raro continua a faltar.</p>
+      <p>O que separa uma resposta sénior de uma resposta correcta mas incompleta é a prevenção. A causa raiz não é o GraalVM, é o <em>pipeline</em>: testou-se o artefacto JVM e enviou-se o artefacto nativo. A correcção estrutural é correr os testes de integração contra o binário nativo — <code>@QuarkusIntegrationTest</code> em Quarkus, um perfil de CI com o executável em Spring — e aceitar que isso acrescenta 5 a 12 minutos por <em>build</em>. Em equipas que fazem 30 <em>merges</em> por dia, a prática usual é correr a <em>build</em> nativa apenas no ramo principal e antes de cada <em>release</em>, mantendo os PR em JVM, o que reduz o custo diário mas aceita descobrir o problema algumas horas mais tarde.</p>
+      <p>Onde a escolha contrária ganha: se a aplicação depende de bibliotecas com muita magia reflexiva ou de agentes de APM que instrumentam bytecode, o custo de manter os metadados é recorrente e não vale os 100 MB de RSS poupados. Nesse caso a alternativa razoável é ficar em JVM com CDS/AppCDS e ajustar as <em>flags</em> de heap.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Um quadrado não é um rectângulo.» Definição decorada sem noção de pré/pós-condição.</td></tr>
-        <tr><td>Mid</td><td>Conta o exemplo correctamente e cita as quatro regras, mas não percebe que a mutabilidade é a causa e não a taxonomia.</td></tr>
-        <tr><td>Sénior</td><td>Enquadra em contratos, mostra que a imutabilidade dissolve o problema, e dá pelo menos um exemplo real (pré-condição reforçada, <code>UnsupportedOperationException</code>).</td></tr>
-        <tr><td>Staff</td><td>Liga a <em>design by contract</em> e a variância (parâmetros contravariantes, retornos covariantes), e propõe <em>contract tests</em> partilhados como forma de tornar o LSP verificável no CI.</td></tr>
+        <tr><td>Insuficiente</td><td>Sugere adicionar a dependência outra vez ou limpar a cache do Maven; não menciona reflexão.</td></tr>
+        <tr><td>Mid</td><td>Diz «é reflexão, falta a configuração» e nomeia uma anotação, sem falar de recursos, <em>proxies</em>, serialização ou de como descobrir o que falta.</td></tr>
+        <tr><td>Sénior</td><td>Explica o mundo fechado; enumera as quatro categorias de metadados; conhece o <em>tracing agent</em> e o repositório de <em>reachability metadata</em>; aponta o teste de integração nativo como a correcção estrutural, com o custo em minutos.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a política de <em>pipeline</em> (nativo no ramo principal, JVM nos PR), quantifica o custo, e sabe dizer quando a decisão certa é desistir do nativo.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Java permite reforçar pré-condições sem erro de compilação. Como as apanha então?»</li>
-      <li>«<code>Timestamp</code> estende <code>Date</code>. Que contrato é que isso quebra?»</li>
-      <li>«Uma implementação mais lenta que a base viola o LSP?»</li>
-      <li>«Como escreveria um teste que corre contra todas as implementações de uma interface?»</li></ul></div>
+      <li>«E se o que falta for um ficheiro de <em>template</em> em vez de uma classe?»</li>
+      <li>«O que muda para <em>proxies</em> dinâmicos JDK?»</li>
+      <li>«Como é que o <em>tracing agent</em> pode dar falsa confiança?»</li>
+      <li>«Que memória e tempo é preciso reservar no <em>runner</em> de CI?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confundir LSP com «não usar <code>instanceof</code>».</li>
-      <li>Achar que o compilador Java garante substituibilidade porque verifica assinaturas.</li>
-      <li>Não conseguir dar um único exemplo fora do quadrado e do rectângulo.</li></ul></div>
+      <li>Não distinguir erro de <em>build</em> de erro de execução no contexto nativo.</li>
+      <li>Prometer nativo em produção sem qualquer teste contra o binário nativo.</li>
+      <li>Ignorar que agentes de instrumentação em tempo de execução deixam de funcionar.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-15-6" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Como detecta uma violação de LSP em <em>code review</em>, num sistema em que ninguém escreve <em>javadoc</em> com pré-condições e as hierarquias já têm três níveis?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Sem contratos escritos, procuram-se cinco padrões sintácticos no <em>diff</em>, todos identificáveis em segundos.</p>
-      <ul class="lst">
-        <li>Um <code>@Override</code> que começa com uma validação e um <code>throw</code> — pré-condição reforçada.</li>
-        <li>Um <code>@Override</code> cujo corpo é <code>throw new UnsupportedOperationException()</code> — o subtipo remove capacidade prometida.</li>
-        <li>Um <code>@Override</code> que <strong>não</strong> chama <code>super</code> num método que a base documenta como extensão e não como substituição — invariante da base potencialmente perdido.</li>
-        <li>Um <code>@Override</code> que devolve <code>null</code> onde a base garante colecção vazia, ou vice-versa.</li>
-        <li><code>instanceof</code> ou <code>getClass()</code> no <strong>cliente</strong> do supertipo: se o cliente precisa de saber qual é o subtipo, a substituibilidade já falhou e o código está a compensá-la.</li>
-      </ul>
-      <p>O último é o mais forte porque é evidência de sintoma, não de suspeita: alguém já sofreu com a diferença e escreveu o <em>workaround</em>. Numa base com três níveis de herança, o padrão típico é um <code>if (repo instanceof CachingRepository c) c.evict(...)</code> espalhado por serviços — o sinal de que a abstracção não cobre o que os clientes precisam.</p>
-      <p>A correcção estrutural raramente é ajustar o subtipo: é substituir herança por composição. Um decorador declara no seu próprio contrato aquilo que restringe, e o cliente escolhe explicitamente o decorador quando quer essa restrição, em vez de a receber por injecção sem saber. Quando a hierarquia tem de ficar, a defesa é o <em>contract test</em>: uma classe abstracta de testes com os casos que qualquer implementação tem de passar, herdada por cada teste concreto. Passa a ser o CI, e não o revisor, a verificar a substituibilidade.</p>
-      <p>Há um limite honesto. Diferenças de desempenho — uma implementação O(n) onde a base é O(1) — não violam o LSP em sentido estrito, porque o contrato não fala de tempo, mas partem clientes reais na mesma. Vale a pena tratá-las como violação quando o contrato tem consumidores sensíveis a latência, e nesse caso escrever a garantia de complexidade no próprio <em>javadoc</em>, como o JDK faz nas colecções.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Leio o código com atenção.» Nenhum padrão concreto.</td></tr>
-        <tr><td>Mid</td><td>Identifica <code>UnsupportedOperationException</code> e validações extra; propõe corrigir o subtipo caso a caso.</td></tr>
-        <tr><td>Sénior</td><td>Vários padrões incluindo <code>instanceof</code> no cliente; propõe composição/decorador e <em>contract tests</em> como mecanismo permanente.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta automação (regras ArchUnit sobre profundidade de herança e <code>final</code> por omissão) e trata desempenho como parte do contrato quando há consumidores sensíveis.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como escreve um <em>contract test</em> reutilizável em JUnit 5?»</li>
-      <li>«O que faz quando a violação está numa biblioteca de terceiros?»</li>
-      <li>«Porque é que <code>final</code> por omissão ajuda aqui?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor herança mais profunda para resolver um problema causado por herança.</li>
-      <li>Não reconhecer <code>instanceof</code> no cliente como sintoma.</li>
-      <li>Assumir que mocks são automaticamente substituíveis pela implementação real.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-15-4" class="h2"><span class="secnum">15.4</span> ISP: interfaces gordas e clientes acorrentados<a class="anchor" href="#sec-15-4" aria-label="ligação">#</a></h2>
-
-<p>O <em>Interface Segregation Principle</em> diz que nenhum cliente deve ser forçado a depender de métodos que não usa. O custo que evita não é estético: é acoplamento de recompilação e de raciocínio. Um cliente que declara <code>UserRepository</code> com 22 métodos herda a superfície inteira — quando um método muda de assinatura, o cliente recompila mesmo que nunca o invoque; quando alguém lê o cliente, tem de excluir mentalmente 21 capacidades que ele não usa; e quem escreve um duplo de teste tem de decidir o que fazer com todos.</p>
-
-<p>A aplicação correcta é a das <em>role interfaces</em>: a interface é definida pelo papel que o cliente precisa, não pelo conjunto do que a implementação sabe fazer. Um serviço de autenticação precisa de <code>UserByEmail</code> com um método; o painel de administração precisa de <code>UserSearch</code>; o processo de registo precisa de <code>UserWriter</code>. Uma única classe <code>JpaUserRepository</code> implementa as três — a segregação está do lado do consumidor, que é onde o acoplamento dói.</p>
-
-<p>O contra-argumento tem de ser dado sem rodeios, porque o entrevistador vai testá-lo. <code>JpaRepository</code> do Spring Data expõe cerca de vinte métodos herdados e ninguém sensato o considera uma violação grave de ISP — porque nenhuma equipa implementa essa interface à mão (o <em>proxy</em> é gerado) e porque a maioria dos consumidores é um único serviço. O custo do ISP recai sobre quem <strong>implementa</strong> e sobre quem <strong>lê</strong>, não sobre a contagem de métodos em si. Segregar por segregar produz vinte ficheiros de uma linha, um catálogo de interfaces que ninguém consegue navegar, e nenhum benefício.</p>
-
-<figure class="listing java" id="lst-15-7"><div class="lhead"><span class="lnum">Listagem 15.7</span>
-<span class="lcap">Interface gorda que obriga a implementações vazias, e a mesma capacidade em <em>role interfaces</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// ANTES — todos os canais implementam tudo; metade dos métodos não faz sentido.
-public interface NotificationChannel {
-    void send(Message m);
-    void sendBulk(List&lt;Message&gt; batch);
-    DeliveryReceipt track(String messageId);
-    void registerWebhook(URI callback);
-    boolean supportsAttachments();
-}
-
-public class SmsChannel implements NotificationChannel {
-    @Override public void sendBulk(List&lt;Message&gt; batch) {
-        throw new UnsupportedOperationException();     // LSP também parte aqui
-    }
-    @Override public void registerWebhook(URI callback) { /* vazio: o operador não tem */ }
-    @Override public boolean supportsAttachments() { return false; }
-    ...
-}
-
-// DEPOIS — o papel define a interface; cada cliente depende só do que invoca.
-public interface Sender      { void send(Message m); }
-public interface BulkSender  { void sendBulk(List&lt;Message&gt; batch); }
-public interface Trackable   { DeliveryReceipt track(String messageId); }
-
-public class SmsChannel implements Sender { ... }                       // só o que suporta
-public class EmailChannel implements Sender, BulkSender, Trackable { ... }
-
-// O cliente declara a capacidade que precisa; a incompatibilidade passa a ser de compilação.
-public class PasswordResetService {
-    private final Sender sender;          // não vê sendBulk, não recompila quando ele muda
-}</code></pre></figure>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O ganho decisivo da Listagem 15.7 não é a arrumação: é que <code>supportsAttachments()</code> desaparece. Métodos booleanos de capacidade são a marca da interface gorda — obrigam o cliente a perguntar em <em>runtime</em> o que o sistema de tipos podia responder em tempo de compilação. Sempre que apareça um <code>if (channel.supportsX())</code> num <em>review</em>, a pergunta certa é «porque é que X não é uma interface separada?».</p></aside>
-
-<div class="qa" id="q-15-7" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Dê um exemplo do seu código de uma interface gorda que segregou. E defenda o lado contrário: porque é que <code>JpaRepository</code>, com mais de vinte métodos, não é um problema?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O exemplo forte tem sempre uma implementação vazia ou uma excepção como sintoma. «Tínhamos <code>NotificationChannel</code> com cinco métodos. O canal de SMS lançava <code>UnsupportedOperationException</code> em <code>sendBulk</code> e tinha <code>registerWebhook</code> vazio; um <em>batch</em> nocturno chamou <code>sendBulk</code> num canal SMS e falhou 4 000 mensagens antes do alarme. Segregámos em <code>Sender</code>, <code>BulkSender</code> e <code>Trackable</code>: a partir daí, um canal sem envio em lote nem sequer compila num contexto que precise de lote.»</p>
-      <p>O mecanismo é converter uma verificação de <em>runtime</em> numa verificação de compilação. A interface gorda força o cliente a perguntar «suportas isto?» com um <code>boolean</code>; as <em>role interfaces</em> deixam o sistema de tipos responder. É também o que elimina o acoplamento de recompilação: um serviço que só declara <code>Sender</code> não é afectado quando a assinatura de <code>track</code> muda.</p>
-      <p>Quanto ao <code>JpaRepository</code>: não é um problema porque o custo do ISP recai sobre quem implementa e sobre quem lê, e ninguém implementa <code>JpaRepository</code> — o Spring Data gera o <em>proxy</em>. Não há implementações vazias, não há excepções por método não suportado, e a superfície herdada é estável há anos, logo o acoplamento de recompilação é teórico. Aplicar ISP dogmaticamente aqui produziria dezenas de interfaces de um método sem eliminar risco nenhum.</p>
-      <p>Dito isto, há um caso em que se segrega mesmo assim, e não é por ISP: quando o domínio não deve conhecer JPA. Aí declara-se uma porta com três métodos no pacote de domínio e um adaptador que delega no <code>JpaRepository</code>. A motivação é DIP — direcção de dependências — e não a contagem de métodos. Distinguir estas duas motivações é exactamente o que a pergunta testa.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Define ISP e defende que qualquer interface com muitos métodos deve ser partida.</td></tr>
-        <tr><td>Mid</td><td>Exemplo válido de segregação, mas não sabe defender <code>JpaRepository</code> ou defende-o com «é <em>framework</em>, é diferente».</td></tr>
-        <tr><td>Sénior</td><td>Sintoma concreto (implementação vazia/excepção) com impacto, mecanismo de <em>runtime</em> para compilação, e o argumento de que o custo do ISP é de quem implementa e lê.</td></tr>
-        <tr><td>Staff</td><td>Separa a motivação ISP da motivação DIP, e discute quando a porta estreita compensa o custo de mais um nível de indirecção.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se um cliente precisar mesmo de <code>Sender</code> e <code>Trackable</code> ao mesmo tempo?»</li>
-      <li>«Onde declara essas interfaces: no pacote do produtor ou no do consumidor?»</li>
-      <li>«Como evita acabar com trinta interfaces de um método?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar métodos booleanos de capacidade como solução em vez de sintoma.</li>
-      <li>Segregar até à interface de um método por regra fixa.</li>
-      <li>Confundir ISP com DIP e usar as duas siglas como sinónimos.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-15-8" data-box="qa" data-area="design" data-level="mid" data-freq="baixa">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Ocasional</span></div></div>
-  <div class="qprompt">Encontra num <em>review</em> uma classe com dez métodos em que sete lançam <code>UnsupportedOperationException</code>. Que princípios estão a ser violados e por que ordem os resolveria?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Estão a ser violados dois princípios ao mesmo tempo, e a ordem importa. O ISP é a causa: a interface obriga a implementar o que este cliente não sabe fazer. O LSP é a consequência: a classe já não é substituível pelo seu tipo declarado, e qualquer código que a receba pode rebentar em <em>runtime</em>. Corrigir apenas o LSP — devolver valores neutros em vez de lançar — piora a situação, porque troca uma falha ruidosa por corrupção silenciosa.</p>
-      <p>A ordem de resolução é: primeiro medir quem chama o quê. Um <em>grep</em> pelos chamadores de cada método diz quais são os agrupamentos naturais; frequentemente descobre-se que sete dos dez métodos só são invocados por um único serviço, o que já dá a fronteira. Depois segregar a interface por esses agrupamentos, deixando cada implementação a declarar só o que suporta. Só no fim se remove o <code>UnsupportedOperationException</code> — que a essa altura já não compila em lado nenhum, porque o método deixou de estar no contrato.</p>
-      <p>Há uma condição de segurança que um mid costuma esquecer: se o tipo é usado por <em>reflection</em>, por serialização ou por código de terceiros, partir a interface é uma alteração incompatível. Nesse caso mantém-se a interface antiga como <code>default</code> a delegar nas novas, marca-se com <code>@Deprecated</code>, e migram-se os chamadores por fases — os métodos <code>default</code> das interfaces Java servem exactamente para este tipo de transição sem quebrar implementações existentes.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Identifica apenas «código feio» ou propõe devolver <code>null</code> em vez de lançar.</td></tr>
-        <tr><td>Mid</td><td>Nomeia ISP e LSP correctamente e propõe segregar; não fala de chamadores nem de compatibilidade.</td></tr>
-        <tr><td>Sénior</td><td>Ordena causa (ISP) e consequência (LSP), usa os chamadores reais para desenhar o corte, e planeia a migração com <code>default</code> e depreciação.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o plano de <em>rollout</em> por fases com telemetria de uso dos métodos antigos antes de os remover.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se a interface for pública numa biblioteca partilhada por seis equipas?»</li>
-      <li>«Como sabe que já ninguém usa o método antigo?»</li>
-      <li>«Métodos <code>default</code> não são eles próprios uma forma de esconder o problema?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Substituir a excepção por um retorno neutro e considerar o problema resolvido.</li>
-      <li>Partir uma interface pública sem plano de compatibilidade.</li>
-      <li>Não olhar para os chamadores antes de desenhar o corte.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-15-5" class="h2"><span class="secnum">15.5</span> DIP: inverter a dependência sem inverter tudo<a class="anchor" href="#sec-15-5" aria-label="ligação">#</a></h2>
-
-<p>O <em>Dependency Inversion Principle</em> é o mais mal compreendido dos cinco, porque toda a gente aprende a segunda metade — «depender de abstracções» — e ignora a primeira, que é a que dá o nome: módulos de alto nível não devem depender de módulos de baixo nível. A inversão não está em usar uma interface; está em <strong>quem é dono da interface</strong>. Se a interface vive no pacote de infraestrutura e o domínio a importa, não houve inversão nenhuma — o domínio continua a apontar para a infraestrutura, agora com um passo extra. A inversão acontece quando a porta é declarada no pacote da política, e a seta do <em>import</em> passa a apontar de fora para dentro.</p>
-
-<p>Daí decorre o teste que distingue quem percebeu: uma interface com uma única implementação e o nome <code>OrderServiceImpl</code> não é DIP. É cerimónia. A implementação chama-se pelo detalhe (<code>PostgresOrders</code>, <code>KafkaOrderEvents</code>), a interface chama-se pelo papel de negócio (<code>Orders</code>, <code>OrderEvents</code>), e existe porque há mais do que um mundo possível do outro lado — produção, teste, um segundo fornecedor — ou porque a direcção da dependência tem de ser invertida por razões de módulo.</p>
-
-<figure class="listing java" id="lst-15-8"><div class="lhead"><span class="lnum">Listagem 15.8</span>
-<span class="lcap">Porta no domínio, adaptador na infraestrutura, e a regra ArchUnit que impede a erosão da direcção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// com.acme.billing.domain — não importa Spring, JPA, Kafka ou HTTP.
-public interface Orders {
-    Optional&lt;Order&gt; byId(OrderId id);
-    void save(Order order);
-}
-
-public final class CancelOrder {                    // política: alto nível
-    private final Orders orders;
-    private final Clock clock;
-
-    public void handle(OrderId id, Reason reason) {
-        Order order = orders.byId(id).orElseThrow(() -&gt; new OrderNotFound(id));
-        order.cancel(reason, clock.instant());       // invariantes dentro do agregado
-        orders.save(order);
-    }
-}
-
-// com.acme.billing.infrastructure.persistence — importa o domínio, nunca o contrário.
-@Repository
-class JpaOrders implements Orders {
-    private final OrderJpaRepository jpa;            // JpaRepository fica escondido aqui
-
-    @Override public Optional&lt;Order&gt; byId(OrderId id) {
-        return jpa.findById(id.value()).map(OrderEntity::toDomain);
-    }
-    @Override public void save(Order order) { jpa.save(OrderEntity.from(order)); }
-}
-
-// Teste de arquitectura: a direcção deixa de depender da vigilância do revisor.
-@AnalyzeClasses(packages = &quot;com.acme.billing&quot;)
-class ArchitectureTest {
-    @ArchTest
-    static final ArchRule dominio_nao_conhece_infraestrutura =
-        noClasses().that().resideInAPackage(&quot;..domain..&quot;)
-            .should().dependOnClassesThat()
-            .resideInAnyPackage(&quot;..infrastructure..&quot;, &quot;org.springframework..&quot;, &quot;jakarta.persistence..&quot;);
-}</code></pre></figure>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Cada porta custa um salto de leitura e um ficheiro de mapeamento entre entidade e agregado. Num serviço com 12 casos de uso e um único motor de persistência, esse mapeamento pode representar 15 a 25% do código escrito, e não compra nenhuma flexibilidade real — ninguém vai trocar PostgreSQL por Cassandra. O que compra, quando compra, é velocidade de teste (política testada sem contexto) e independência de <em>upgrade</em> do <em>framework</em>. Se a equipa não tem testes de política nem sofre com <em>upgrades</em>, o padrão está a ser pago sem retorno; nesse caso, usar directamente Spring Data no serviço e concentrar os testes em Testcontainers é a decisão honesta.</p></aside>
-
-<div class="qa" id="q-15-9" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Qual é a diferença entre injecção de dependências e inversão de dependências? Muita gente usa as duas expressões como sinónimo.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>São coisas de níveis diferentes: DI é uma técnica de construção de objectos, DIP é uma regra sobre a direcção das dependências entre módulos. É perfeitamente possível ter injecção de dependências completa e violar o DIP em todo o lado — basta injectar classes concretas de infraestrutura em serviços de domínio, o que o Spring faz sem se queixar.</p>
-      <p>O critério prático é a seta do <em>import</em>. Se o pacote <code>domain</code> importa <code>org.springframework</code>, <code>jakarta.persistence</code> ou o cliente HTTP do fornecedor, a política depende do detalhe e não há inversão. A inversão dá-se quando a interface é <strong>declarada no pacote que a consome</strong> — a porta <code>Orders</code> vive com <code>CancelOrder</code> — e a infraestrutura importa o domínio para a implementar. O contentor de DI limita-se, no arranque, a ligar as duas pontas.</p>
-      <p>O contra-exemplo que convém dar é o do <code>Impl</code>. <code>OrderService</code> com um único <code>OrderServiceImpl</code> no mesmo pacote não inverte nada: o nome da interface é o nome da implementação com uma letra a menos, ninguém a substitui, e o único efeito é mais um ficheiro e mais um salto de navegação. Com <em>mocking</em> moderno nem sequer é preciso para testar. É o padrão que aparece quando se aprendeu a mecânica sem a razão.</p>
-      <p>O critério para criar uma porta são três perguntas: existem, ou vão existir a curto prazo, duas implementações reais? A dependência atravessa uma fronteira que se quer manter estável (módulo, equipa, <em>upgrade</em> de <em>framework</em>)? A política precisa de ser testada sem levantar infraestrutura? Se as três respostas forem não, a interface é custo puro. Numa <em>codebase</em> de 12 casos de uso, tipicamente três ou quatro portas — persistência, mensageria, relógio/identificadores, um ou dois serviços externos — cobrem tudo o que interessa.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Trata as duas expressões como sinónimos, ou explica DIP como «usar <code>@Autowired</code> numa interface».</td></tr>
-        <tr><td>Mid</td><td>Distingue técnica de princípio, mas não fala de propriedade da interface nem da direcção do <em>import</em>.</td></tr>
-        <tr><td>Sénior</td><td>Explica que a inversão é sobre quem declara a abstracção, dá o contra-exemplo do <code>Impl</code>, e tem critério para decidir quando criar uma porta.</td></tr>
-        <tr><td>Staff</td><td>Liga a fronteiras de módulo e a evolução (JPMS, módulos Maven, ArchUnit no CI) e quantifica o custo de mapeamento face ao benefício.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Onde põe a interface: no pacote do domínio ou num pacote <code>ports</code> à parte?»</li>
-      <li>«Como impede, mecanicamente, que alguém importe JPA no domínio?»</li>
-      <li>«As entidades JPA podem ser os seus agregados de domínio? O que perde e o que ganha?»</li>
-      <li>«Quantas portas tem o seu serviço actual e porquê essas?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Uma interface por classe, com sufixo <code>Impl</code>, apresentada como boa arquitectura.</li>
-      <li>Achar que usar Spring garante DIP.</li>
-      <li>Não conseguir nomear nenhum custo das portas.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-15-10" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+<div class="qa" id="q-15-5" data-box="qa" data-area="devops" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Herdou um serviço com 60 mil linhas em que os <em>controllers</em> chamam repositórios JPA directamente e há lógica de negócio em <em>entities</em> anotadas. Como aplica DIP sem parar a entrega durante três meses?</div>
+  <div class="qprompt">Quer meter compilação nativa no nosso CI. Descreva-me o impacto no <em>pipeline</em> e como o justificaria ao responsável pela plataforma.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A resposta errada é o <em>big bang</em> arquitectural. A resposta certa começa por escolher o alvo pelo risco, não pela pureza: identificar as duas ou três áreas onde o custo é real — mais incidentes, mais tempo de <em>lead time</em>, mais dificuldade de teste — e deixar as restantes 50 mil linhas exactamente como estão. Uma <em>codebase</em> com uma área limpa e uma área legada é um estado estável; uma <em>codebase</em> meio migrada em toda a parte não é.</p>
-      <p>O mecanismo é o padrão de estrangulamento aplicado por caso de uso. Para o fluxo escolhido, cria-se o pacote de domínio com a porta e o agregado, escreve-se o caso de uso com testes puros, e o <em>controller</em> passa a chamá-lo. O adaptador implementa a porta delegando no repositório JPA que já existe — nenhuma migração de dados, nenhuma alteração de esquema, nenhum <em>freeze</em>. Cada fluxo migrado é um <em>pull request</em> pequeno, entregável e reversível.</p>
-      <p>A seguir vem o mecanismo que impede o retrocesso, que é a parte que distingue uma resposta de staff. Uma regra ArchUnit que proíbe <code>..domain..</code> de depender de <code>org.springframework..</code> e <code>jakarta.persistence..</code>, activa desde o primeiro dia, aplicada só aos pacotes novos. Sem isso, seis meses depois há imports de JPA no domínio outra vez e o esforço foi desperdiçado.</p>
-      <p>Sobre lógica em <em>entities</em> anotadas, há uma decisão honesta a tomar em vez de um dogma. Separar agregado de domínio e entidade JPA custa mapeamento — na ordem de 15 a 25% de código adicional na camada de persistência — e só compensa quando as regras de negócio são densas o suficiente para justificar testes sem base de dados. Onde a entidade é essencialmente um saco de dados com CRUD, mantê-la como está e testar com Testcontainers é mais barato e igualmente seguro. O critério que se apresenta ao <em>hiring manager</em> é este: converte-se onde as regras têm invariantes; não se converte onde há apenas persistência.</p>
-      <p>Finalmente, o argumento com que se vende isto à gestão não é «arquitectura limpa». É tempo: «o fluxo de cancelamento tem 40% dos nossos incidentes; hoje um teste dele demora 12 segundos e precisa de base de dados, o que faz com que ninguém o corra localmente. Depois desta mudança são 200 ms, e a próxima alteração de regra passa a ser de um dia em vez de uma semana.»</p></div>
+      <p>O impacto é em três eixos — tempo, recursos e superfície de teste — e a justificação tem de ser feita com o custo da plataforma, não com a elegância do binário.</p>
+      <p>Tempo: a <em>build</em> nativa acrescenta 5 a 12 minutos ao que hoje demora 2 a 3 minutos, para um serviço médio. Se o <em>pipeline</em> corre em cada <em>push</em>, com 30 <em>merges</em> diários isso são 3 a 6 horas de <em>runner</em> por dia por serviço. A mitigação padrão é diferenciada: PR em JVM (rápido), <em>build</em> nativa no ramo principal e em <em>tags</em> de <em>release</em>, com um teste nocturno completo contra o binário.</p>
+      <p>Recursos: o compilador precisa de 8 a 16 GB de RAM e vários núcleos; <em>runners</em> partilhados com 2 vCPU e 4 GB não servem, e a falha manifesta-se como um processo morto, não como um erro claro. Há custo directo de <em>runners</em> maiores a comparar com a poupança em produção.</p>
+      <p>Superfície de teste: a suite de integração passa a ter de existir em duas variantes ou a correr contra o executável. Isso não é gratuito em manutenção — <em>fixtures</em> que dependem de <em>mocks</em> de bytecode não sobrevivem.</p>
+      <p>A justificação quantitativa é do lado da produção. Se o serviço corre 40 réplicas com pedido de 512 MB e o nativo permite descer para 192 MB com margem, poupam-se cerca de 12,8 GB de memória reservada; a 30 GB alocáveis por nó, é aproximadamente meio nó. Multiplicado por 12 serviços, chega para desligar cinco a seis nós. Este é o número que convence — e é também o teste à honestidade da proposta: se o parque tem 4 réplicas de 2 serviços, o ganho não paga a complexidade e a resposta correcta é não fazer.</p>
+      <p>O contra-argumento a antecipar é a alternativa mais barata: em muitos casos, ajustar <code>-XX:MaxRAMPercentage</code>, activar AppCDS e reduzir o pedido de memória com base em observação real captura metade do ganho com zero alterações ao <em>pipeline</em>. Um staff apresenta essa opção primeiro e só depois defende o nativo, se os números o justificarem.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe reescrever tudo, ou declara que o código legado «tem de ser limpo» sem plano nem critério.</td></tr>
-        <tr><td>Mid</td><td>Sabe descrever portas e adaptadores e propõe migração gradual, mas sem critério de selecção nem defesa contra o retrocesso.</td></tr>
-        <tr><td>Sénior</td><td>Selecciona por risco medido, aplica estrangulamento caso de uso a caso de uso com PRs reversíveis, e automatiza a direcção com ArchUnit.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o critério para <strong>não</strong> converter, aceita a coexistência de dois estilos como estado final, e apresenta o custo/benefício em tempo de entrega e incidentes, não em pureza.</td></tr>
+        <tr><td>Insuficiente</td><td>«Compila-se com um perfil Maven e está feito»; não menciona tempo nem memória de <em>build</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que demora mais e que é preciso GraalVM, mas não propõe estratégia diferenciada de <em>pipeline</em> nem quantifica.</td></tr>
+        <tr><td>Sénior</td><td>Quantifica minutos e GB, propõe JVM nos PR e nativo no ramo principal, exige testes contra o binário, e traduz a poupança de RSS em nós.</td></tr>
+        <tr><td>Staff</td><td>Apresenta primeiro a alternativa barata (afinação de heap, AppCDS, pedidos realistas), define o limiar de escala a partir do qual o nativo compensa, e assume o custo de manutenção recorrente dos metadados.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como escolhe o primeiro fluxo a migrar?»</li>
-      <li>«O que faz quando o mesmo agregado é tocado pelo código novo e pelo antigo?»</li>
-      <li>«Como mede que o refactor valeu a pena, seis meses depois?»</li>
-      <li>«Como responde a um colega que quer converter tudo por consistência?»</li></ul></div>
+      <li>«Como é que faz <em>rollback</em> se o binário nativo falhar em produção?»</li>
+      <li>«Que observabilidade perde ao deixar de ter agente JVM?»</li>
+      <li>«Qual é o limiar de réplicas a partir do qual isto compensa?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Reescrita total como primeira proposta.</li>
-      <li>Nenhuma automação da regra arquitectural — confiar apenas no <em>review</em>.</li>
-      <li>Vender o refactor com vocabulário de arquitectura em vez de tempo e incidentes.</li></ul></div>
+      <li>Propor migrar todo o parque de uma vez.</li>
+      <li>Ignorar o custo de <em>runners</em> e apresentar apenas o benefício.</li></ul></div>
   </div>
 </div>
 
-<div class="lab" id="lab-15-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 15.1 — Refactorizar uma classe que viola SRP, OCP e DIP</span>
-    <div class="labpills"><span class="qpill">Refactor guiado</span><span class="qpill">30 min</span></div></div>
-  <div class="labbody">
-    <p>A classe da Listagem 15.9 está em produção e funciona. O exercício não é reescrevê-la: é produzir uma sequência de passos pequenos, cada um com testes a passar no fim, e justificar cada passo pelo eixo de mudança que resolve. Restrições: não alterar o esquema da base de dados, não alterar a assinatura pública de <code>register</code> (é chamada por um <em>controller</em> e por um <em>consumer</em> de Kafka), e conseguir testar a regra de elegibilidade e o cálculo de pontos sem levantar Spring nem PostgreSQL. Entregar: o desenho final (pacotes, tipos, portas), a ordem dos passos e um critério objectivo para parar de separar.</p>
-    <figure class="listing java" id="lst-15-9"><div class="lhead"><span class="lnum">Listagem 15.9</span>
-      <span class="lcap">Ponto de partida: quatro eixos de mudança, um <code>switch</code> replicado e dependência directa em detalhes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-      <pre class="code" data-lang="java"><code>@Service
-public class LoyaltyService {
+<h2 id="sec-15-3" class="h2"><span class="secnum">15.3</span> Consumo de memória, arranque e custo em Kubernetes<a class="anchor" href="#sec-15-3" aria-label="ligação">#</a></h2>
 
-    @Autowired private JdbcTemplate jdbc;
-    @Autowired private JavaMailSender mail;
-    @Autowired private KafkaTemplate&lt;String, String&gt; kafka;
-    @Autowired private ObjectMapper json;
+<p>Numa entrevista, os números de memória são uma armadilha de precisão: quem cita valores exactos de um <em>benchmark</em> de marketing perde credibilidade ao primeiro follow-up. A resposta forte dá ordens de grandeza, diz sobre que aplicação foram medidas, e distingue três quantidades que os candidatos misturam — <em>heap</em> usado, memória total da JVM (heap + metaspace + <em>code cache</em> + pilhas de <em>thread</em> + buffers directos) e RSS do processo, que é o que o <em>cgroup</em> do contentor conta e o que provoca o <code>OOMKilled</code>.</p>
 
-    @Transactional
-    public void register(String customerId, String tier, BigDecimal amount, String country) {
+<p>O erro operacional mais comum não tem nada a ver com o framework: é dar ao contentor um <em>limit</em> de 512 MB e à JVM um <code>-Xmx</code> igual ou próximo desse valor. O <em>heap</em> é apenas uma parte do RSS; o resto — facilmente 80 a 200 MB numa aplicação com muitas classes e várias dezenas de <em>threads</em> — vive fora dele. A regra defensável é <code>-XX:MaxRAMPercentage</code> entre 50% e 75% do limite, calibrada com observação, e nunca <code>-Xmx</code> fixo escrito à mão num contentor cujo tamanho muda.</p>
 
-        if (&quot;PT&quot;.equals(country) &amp;&amp; amount.compareTo(new BigDecimal(&quot;10&quot;)) &lt; 0) return;
-        if (&quot;ES&quot;.equals(country) &amp;&amp; amount.compareTo(new BigDecimal(&quot;12&quot;)) &lt; 0) return;
+<p>Dito isso, a diferença estrutural existe e explica-se: o executável nativo não tem metaspace com milhares de classes carregadas, não tem <em>code cache</em> JIT a crescer durante o aquecimento e não tem estruturas de <em>profiling</em>. O que fica é <em>heap</em> mais o binário mapeado. Daí virem os valores típicos de 30 a 60 MB de RSS para um serviço REST simples nativo, contra 110 a 160 MB em Quarkus JVM e 180 a 280 MB em Spring Boot JVM na mesma aplicação. Em contrapartida, o nativo não beneficia do JIT: em regime estacionário e sob carga sustentada, o débito máximo é tipicamente 10 a 30% inferior ao da JVM aquecida, porque o C2 optimiza com informação de perfil que o compilador estático não tem.</p>
 
-        int points;
-        switch (tier) {
-            case &quot;BRONZE&quot;: points = amount.intValue(); break;
-            case &quot;SILVER&quot;: points = (int) (amount.intValue() * 1.5); break;
-            case &quot;GOLD&quot;:   points = amount.intValue() * 2; break;
-            default: throw new IllegalArgumentException(tier);
-        }
-        if (amount.compareTo(new BigDecimal(&quot;500&quot;)) &gt; 0) points += 100;   // bónus
-
-        jdbc.update(&quot;update loyalty set points = points + ? where customer_id = ?&quot;,
-                points, customerId);
-
-        Integer total = jdbc.queryForObject(
-                &quot;select points from loyalty where customer_id = ?&quot;, Integer.class, customerId);
-
-        if (total != null &amp;&amp; total &gt; 10_000) {
-            mail.send(m -&gt; { /* e-mail de promoção de nível */ });
-        }
-        try {
-            kafka.send(&quot;loyalty-events&quot;,
-                    json.writeValueAsString(Map.of(&quot;customer&quot;, customerId, &quot;points&quot;, points)));
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-}</code></pre></figure>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-15-10"><div class="lhead"><span class="lnum">Listagem 15.10</span>
-        <span class="lcap">Política pura, variação por tabela de escalões, portas no domínio e um caso de uso que orquestra.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>// ---------- domínio (sem Spring, sem JDBC, sem Kafka) ----------
-
-public record Money(BigDecimal amount, String country) { }
-
-/** Eixo 1: elegibilidade. Muda quando o marketing muda os mínimos por país. */
-public interface EligibilityPolicy { boolean qualifies(Money purchase); }
-
-public final class MinimumAmountPolicy implements EligibilityPolicy {
-    private final Map&lt;String, BigDecimal&gt; minimumByCountry;   // configuração, não código
-
-    @Override public boolean qualifies(Money p) {
-        BigDecimal min = minimumByCountry.getOrDefault(p.country(), BigDecimal.ZERO);
-        return p.amount().compareTo(min) &gt;= 0;
-    }
-}
-
-/** Eixo 2: cálculo. Muda quando o programa de fidelização muda. */
-public enum Tier {
-    BRONZE(1.0), SILVER(1.5), GOLD(2.0);                      // OCP: escalão novo = valor novo
-    private final double multiplier;
-    Tier(double m) { this.multiplier = m; }
-
-    public Points award(Money p, BonusRule bonus) {
-        int base = p.amount().multiply(BigDecimal.valueOf(multiplier))
-                             .setScale(0, RoundingMode.DOWN).intValueExact();
-        return new Points(base + bonus.extraFor(p));
-    }
-}
-
-/** Eixo 3 e 4: detalhes externos, atrás de portas declaradas AQUI. */
-public interface LoyaltyAccounts { Points addAndTotal(CustomerId id, Points earned); }
-public interface LoyaltyEvents   { void pointsAwarded(CustomerId id, Points earned); }
-public interface TierPromotions  { void promoted(CustomerId id, Points total); }
-
-// ---------- aplicação: só a sequência do processo ----------
-
-@Service
-public class RegisterPurchase {
-    private static final Points PROMOTION_THRESHOLD = new Points(10_000);
-
-    private final EligibilityPolicy eligibility;
-    private final BonusRule bonus;
-    private final LoyaltyAccounts accounts;
-    private final LoyaltyEvents events;
-    private final TierPromotions promotions;
-
-    @Transactional
-    public void register(CustomerId id, Tier tier, Money purchase) {
-        if (!eligibility.qualifies(purchase)) return;
-
-        Points earned = tier.award(purchase, bonus);
-        Points total  = accounts.addAndTotal(id, earned);
-
-        events.pointsAwarded(id, earned);                     // publicado após commit
-        if (total.isAtLeast(PROMOTION_THRESHOLD)) promotions.promoted(id, total);
-    }
-}
-
-// ---------- infraestrutura: importa o domínio, nunca o contrário ----------
-
-@Repository
-class JdbcLoyaltyAccounts implements LoyaltyAccounts {
-    private final JdbcTemplate jdbc;
-
-    @Override public Points addAndTotal(CustomerId id, Points earned) {
-        Integer total = jdbc.queryForObject(                  // uma ida à BD em vez de duas
-                &quot;&quot;&quot;
-                update loyalty set points = points + ?
-                 where customer_id = ?
-                returning points
-                &quot;&quot;&quot;, Integer.class, earned.value(), id.value());
-        return new Points(total);
-    }
-}
-
-@Component
-class KafkaLoyaltyEvents implements LoyaltyEvents {
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)   // ou outbox
-    ...
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Ordem dos passos, não o destino.</strong> A sequência esperada é: (1) tornar a assinatura tipada — <code>CustomerId</code>, <code>Tier</code>, <code>Money</code> — o que já elimina o <code>default</code> do <code>switch</code> e a validação de <em>strings</em>; (2) extrair o cálculo para o enum e testá-lo puro; (3) extrair a elegibilidade para uma política com os mínimos em configuração; (4) introduzir as três portas e mover o JDBC, o <em>e-mail</em> e o Kafka para adaptadores; (5) só no fim mexer na transacção e no evento. Cada passo é um <em>commit</em> com a suite verde.</li>
-        <li><strong>SRP.</strong> Os quatro eixos são independentes e observáveis: regra de país (marketing), multiplicadores (programa de fidelização), esquema SQL (dados), contrato de evento (consumidores a jusante). O sinal era o construtor com quatro dependências de infraestrutura e um teste que precisava de base de dados para verificar uma multiplicação.</li>
-        <li><strong>OCP.</strong> O <code>switch</code> sobre <code>String</code> desaparece: o multiplicador passa a ser um dado do enum, e um escalão novo é uma constante nova sem tocar no caso de uso. O bónus fixo de 100 pontos vira <code>BonusRule</code> injectável, porque é a parte que muda em campanhas. Nota honesta: se os escalões forem realmente três e estáveis há anos, transformar <code>BonusRule</code> numa interface é já indirecção paga sem retorno — a única extracção obrigatória é a do <code>switch</code>.</li>
-        <li><strong>DIP.</strong> As portas são declaradas no pacote de domínio e implementadas em infraestrutura; o domínio deixa de importar <code>org.springframework</code>. Uma regra ArchUnit fixa a direcção. O ganho medível: os testes de elegibilidade e de cálculo passam de ~40 ms com contexto para menos de 1 ms.</li>
-        <li><strong>Casos limite que o entrevistador vai perguntar.</strong> País desconhecido — a política devolve mínimo zero, o que é uma decisão de negócio que tem de ser explícita e não um <code>getOrDefault</code> silencioso; arredondamento — <code>1.5</code> em <code>double</code> sobre <code>BigDecimal</code> obriga a fixar <code>RoundingMode</code>, e a resposta melhor substitui o <code>double</code> por <code>BigDecimal</code> no enum; concorrência — o <code>update ... returning</code> resolve numa só ida a leitura suja que existia entre o <code>update</code> e o <code>select</code>; publicação de eventos — enviar para Kafka dentro da transacção pode publicar um evento cujo <em>commit</em> falha, pelo que se usa <code>AFTER_COMMIT</code> ou um <em>outbox</em>.</li>
-        <li><strong>Critério para parar.</strong> Parar quando cada teste de regra corre sem infraestrutura e cada eixo de mudança tem um único ficheiro. Não criar <code>PointsCalculatorFactory</code>, nem interface para o relógio se não houver lógica dependente de data, nem separar o caso de uso em <em>command handler</em> mais <em>validator</em> mais <em>mapper</em>: são divisões por camada técnica, não por eixo de mudança.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<h2 id="sec-15-6" class="h2"><span class="secnum">15.6</span> Quando violar SOLID é a decisão certa<a class="anchor" href="#sec-15-6" aria-label="ligação">#</a></h2>
-
-<p>Esta é a secção que decide a nota da ronda. Um mid recita os cinco princípios; um sénior sabe que cada um deles é uma aposta sobre o futuro, e que apostas erradas custam dinheiro. A indirecção não é gratuita: cada abstracção acrescentada é um salto que qualquer leitor futuro tem de dar para responder à pergunta «o que é que este código faz».</p>
-
-<div class="formula">custo_de_leitura ≈ ficheiros_a_abrir × saltos_por_ficheiro × (1 + rotatividade_da_equipa)</div>
-
-<p>Quando um pedido HTTP atravessa <em>controller</em>, DTO, <em>mapper</em>, caso de uso, porta, adaptador, entidade e repositório, são oito ficheiros para uma leitura de base de dados. Se essa leitura nunca tiver regra de negócio nenhuma, sete desses ficheiros são imposto puro. A regra defensável é a assimetria: aplicar a estrutura completa onde há invariantes de domínio, e deixar as leituras de consulta irem directas do <em>controller</em> à consulta SQL — que é, aliás, o argumento central de CQRS quando visto pelo lado do custo e não pelo da moda.</p>
-
-<p>O mesmo se aplica ao DRY. Duplicação idêntica em dois contextos com donos diferentes não é duplicação: é coincidência. Extrair uma classe partilhada nesse caso acopla dois módulos que mudam por razões distintas, e a primeira alteração assimétrica introduz um parâmetro booleano na classe partilhada — depois dois, depois um <code>enum</code> de modos. A formulação madura é a de Sandi Metz: duplicação é mais barata do que a abstracção errada. A regra prática é esperar pela terceira ocorrência, e verificar se as três mudam pelo mesmo motivo antes de unificar.</p>
-
-<p>A Lei de Deméter merece o mesmo tratamento crítico. <code>order.getCustomer().getAddress().getCity()</code> é acoplamento a uma estrutura de três níveis: qualquer alteração no meio da cadeia parte o chamador, e o teste passa a exigir três objectos encadeados. Mas a lei fala de <strong>navegação em estruturas de dados</strong>, não de encadeamento sintáctico: <code>stream().filter().map().toList()</code> e um <em>builder</em> fluente devolvem sempre o mesmo tipo ou um tipo desenhado para encadear, e não expõem estrutura interna nenhuma. Confundir as duas coisas leva a proibir <em>streams</em> em nome de um princípio que elas não violam.</p>
-
-<p>Por fim, herança contra composição. A composição é o padrão por omissão porque a herança acopla ao <strong>estado interno</strong> da classe base e obriga a manter compatibilidade de invariantes através de todas as versões — o problema clássico do <code>HashSet</code> em que redefinir <code>add</code> e <code>addAll</code> conta elementos duas vezes, porque <code>addAll</code> chama <code>add</code> internamente. A herança justifica-se quando existe subtipagem genuína e a base é estável e desenhada para extensão, com pontos de extensão documentados. Em código de aplicação, escrever classes <code>final</code> por omissão e abrir explicitamente o que se pretende que seja estendido evita 90% destes casos.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 15.1</span> O que cada princípio compra, o que custa e o sintoma de aplicação excessiva.</div>
-<div class="tscroll"><table><thead><tr><th>Princípio</th><th>Compra</th><th>Custo</th><th>Sintoma de excesso</th></tr></thead><tbody>
-<tr><td>SRP</td><td>Alterações isoladas por interlocutor; testes rápidos de política.</td><td>Mais ficheiros por <em>pull request</em>; sequência do processo espalhada.</td><td>Divisão por camada técnica (<code>Validator</code>, <code>Mapper</code>, <code>Persister</code>) que muda sempre junta.</td></tr>
-<tr><td>OCP</td><td>Variante nova sem editar código testado.</td><td>Registo implícito; falha em <em>runtime</em> em vez de compilação; leitura não local.</td><td>Interface com uma só implementação criada «para o futuro».</td></tr>
-<tr><td>LSP</td><td>Clientes escritos contra o supertipo continuam correctos.</td><td>Contratos explícitos e <em>contract tests</em> para manter.</td><td>Hierarquias evitadas mesmo onde a subtipagem é genuína e útil.</td></tr>
-<tr><td>ISP</td><td>Menos acoplamento de recompilação; incompatibilidade detectada pelo compilador.</td><td>Mais tipos para navegar; capacidades espalhadas.</td><td>Dezenas de interfaces de um método sem nenhum cliente distinto.</td></tr>
-<tr><td>DIP</td><td>Política testável sem infraestrutura; <em>upgrades</em> isolados.</td><td>15-25% de código de mapeamento; um salto extra por chamada.</td><td>Uma interface por classe com sufixo <code>Impl</code> e uma implementação.</td></tr>
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 15.1</span> Ordens de grandeza para o mesmo serviço REST + Hibernate + PostgreSQL. Valores indicativos, para raciocinar em entrevista, não para citar como medição.</div>
+<div class="tscroll"><table><thead><tr><th>Configuração</th><th>Arranque até <em>ready</em></th><th>RSS em repouso</th><th>Débito em regime</th><th>Tempo de <em>build</em></th></tr></thead><tbody>
+<tr><td>Spring Boot 3.x, JVM</td><td>2–4 s</td><td>180–280 MB</td><td>Referência (100%)</td><td>1–3 min</td></tr>
+<tr><td>Spring Boot 3.x, AOT + native</td><td>50–150 ms</td><td>90–140 MB</td><td>70–90%</td><td>6–15 min</td></tr>
+<tr><td>Quarkus, JVM</td><td>0,8–1,5 s</td><td>110–160 MB</td><td>95–110%</td><td>1–2 min</td></tr>
+<tr><td>Quarkus, native</td><td>20–50 ms</td><td>30–60 MB</td><td>70–90%</td><td>4–10 min</td></tr>
 </tbody></table></div></div>
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>SRP aplicado sem cuidado é a via mais comum para o <em>anemic domain model</em>: puxa-se toda a lógica das entidades para «serviços», ficam <em>records</em> com <em>getters</em> e <em>setters</em> e classes <code>OrderService</code> com a regra toda. O resultado é que os invariantes deixam de ter guardião — qualquer serviço pode construir uma encomenda em estado impossível. O corte correcto é entre <strong>política de domínio</strong> (fica dentro do agregado, junto ao estado que protege) e <strong>orquestração e I/O</strong> (fica no caso de uso). SRP separa razões para mudar, não separa comportamento de dados.</p></aside>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Nativo troca débito de pico e observabilidade por arranque e densidade. Ganha-se um factor de 3 a 5 em RSS e de 50 a 100 em tempo de arranque; perde-se 10 a 30% de débito sob carga sustentada, perdem-se agentes de APM baseados em instrumentação de bytecode, e perde-se a possibilidade de tirar um <em>heap dump</em> ou anexar um <em>profiler</em> JFR com as ferramentas habituais. Para um serviço de tráfego constante 24×7 com 8 réplicas, o nativo é quase sempre a escolha errada. Para 200 réplicas com escala elástica agressiva ou para funções que arrancam a cada invocação, é quase sempre a certa.</p></aside>
 
-<div class="qa" id="q-15-11" data-box="qa" data-area="design" data-level="staff" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Conte-me uma vez em que violou deliberadamente um princípio SOLID e achou que foi a decisão certa. O que ponderou e como validou depois que estava certo?</div>
+<div class="qa" id="q-15-6" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Em que situações é que o tempo de arranque de um serviço é uma métrica de negócio e não uma curiosidade? Dê-me casos concretos.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A estrutura da resposta é: princípio, alternativa considerada, custo comparado, e como se verificou a posteriori. Um exemplo forte é o das leituras. «Tínhamos o padrão de portas e adaptadores em todos os fluxos, incluindo os de consulta. O ecrã de histórico de encomendas atravessava sete ficheiros para produzir uma listagem paginada, o mapeamento de agregado para DTO carregava colecções inteiras, e o p99 era de 380 ms com uma consulta que em SQL directo custava 12 ms.»</p>
-      <p>A decisão e o que a delimitou: «passámos as leituras a ir do <em>controller</em> a um <em>query service</em> com SQL e projecção directa para DTO, sem agregado e sem porta. Isso viola DIP e SRP no sentido estrito — o <em>controller</em> passa a estar a dois passos de SQL. A delimitação foi explícita: só leituras, sem escrita nenhuma; todas as escritas continuam a passar pelo agregado, que continua a ser o único guardião dos invariantes. O risco de a política ser contornada é zero porque a política não vive no caminho de leitura.»</p>
-      <p>A validação: «o p99 do ecrã passou de 380 para 45 ms, o número de ficheiros por alteração desse ecrã caiu de sete para dois, e escrevemos uma regra ArchUnit a garantir que classes no pacote <code>query</code> não fazem <code>save</code> nem publicam eventos. Seis meses depois não houve nenhum incidente de invariante violado por esse caminho, que era o risco que se assumiu.»</p>
-      <p>Vale acrescentar o segundo exemplo, mais desconfortável, porque mostra maturidade: manter um <code>switch</code> sobre um enum de estados em vez de o converter em strategy. «Estados de encomenda são discutidos com o negócio, mudam duas vezes por ano e são fechados por natureza. Com <code>sealed</code> e <code>switch</code> exaustivo, acrescentar um estado quebra a compilação em todos os sítios que precisam de o tratar — que é a garantia mais forte que existe. Com strategy, ficaria a depender de um <em>bean</em> registado e de um teste que alguém se lembrasse de escrever.»</p></div>
+      <p>O arranque passa a ser métrica de negócio sempre que um utilizador espera por ele ou que dinheiro depende dele. São quatro cenários.</p>
+      <p>Primeiro, <em>serverless</em> com arranque a frio no caminho do pedido. Numa função invocada esporadicamente, um arranque de 4 s é latência que o utilizador sente; 40 ms desaparece no ruído. É aqui que o nativo dá o maior retorno. A alternativa sem nativo existe e deve ser mencionada: instantâneos de <em>snapshot</em> do tipo AWS Lambda SnapStart, ou CRaC, que restauram um processo já inicializado e cortam o arranque para a ordem das centenas de milissegundos sem sair da JVM.</p>
+      <p>Segundo, <em>scale-to-zero</em> em Kubernetes (Knative, KEDA). Um serviço com tráfego intermitente — <em>webhooks</em>, tarefas internas, ambientes de pré-produção — pode ficar a zero réplicas. O arranque entra no p99 do primeiro pedido de cada janela de actividade. Com 3 s de arranque, escalar a zero é inaceitável e paga-se uma réplica permanente; com 50 ms, escalar a zero é trivial e o custo aproxima-se de zero fora do horário.</p>
+      <p>Terceiro, elasticidade sob picos rápidos. Se o tráfego duplica em 60 segundos — abertura de vendas, campanha, evento desportivo — a diferença entre uma réplica útil em 3 s e em 0,05 s determina se o HPA consegue acompanhar. Aqui é preciso ser honesto: o factor limitante costuma ser o tempo de <em>pull</em> da imagem e o agendamento do <em>pod</em>, na ordem das dezenas de segundos, e a imagem nativa também é menor (tipicamente 60–110 MB contra 250–400 MB com JRE), o que ajuda nesse eixo.</p>
+      <p>Quarto, rapidez de recuperação e velocidade de <em>deploy</em>. Um <em>rolling update</em> de 200 réplicas com <em>readiness</em> de 4 s e janelas de estabilização demora dezenas de minutos; a 100 ms, minutos. Isso muda a frequência de <em>deploy</em> que a equipa tolera e encurta a janela de exposição durante um <em>rollback</em>.</p>
+      <p>Onde não importa: serviço interno com número fixo de réplicas, tráfego estável e <em>deploys</em> semanais. Aí, optimizar o arranque de 3 s para 50 ms não altera nenhum indicador. Dizer isto explicitamente é o que marca a resposta como sénior.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Nunca violei» ou «violei por falta de tempo». Não distingue dívida deliberada de descuido.</td></tr>
-        <tr><td>Mid</td><td>Dá um exemplo de atalho por prazo, sem alternativa ponderada nem validação posterior.</td></tr>
-        <tr><td>Sénior</td><td>Violação deliberada com alternativa comparada, custo quantificado, delimitação explícita do que não se aplicou, e verificação posterior.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o mecanismo que impede a violação de alastrar (regra automática, fronteira de pacote) e o critério de reversão se os números mudarem.</td></tr>
+        <tr><td>Insuficiente</td><td>«Arrancar depressa é sempre melhor.»</td></tr>
+        <tr><td>Mid</td><td>Refere <em>serverless</em> e mais nada; não conhece <em>scale-to-zero</em> nem o efeito no <em>rolling update</em>.</td></tr>
+        <tr><td>Sénior</td><td>Dá três ou mais cenários com números, conhece SnapStart/CRaC como alternativa dentro da JVM, e nomeia explicitamente os casos em que não importa.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta que o <em>pull</em> da imagem e o agendamento dominam a latência de escala, liga a decisão ao custo por réplica e à política de <em>deploy</em>, e propõe medir antes de decidir.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que sinal o faria reverter essa decisão?»</li>
-      <li>«Como impediu que a excepção se tornasse a regra no resto do código?»</li>
-      <li>«Como convenceu a equipa que preferia consistência?»</li>
-      <li>«Documentou a decisão em algum sítio? Onde?»</li></ul></div>
+      <li>«Com <em>scale-to-zero</em>, o que faz às ligações de base de dados no arranque?»</li>
+      <li>«Que parte do tempo até <em>ready</em> é do framework e que parte é do Flyway e do <em>pool</em>?»</li>
+      <li>«SnapStart resolve tudo? O que fica de fora?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Apresentar dogmatismo como virtude: «aplico sempre todos os cinco».</li>
-      <li>Chamar decisão deliberada a um atalho por prazo, sem alternativa considerada.</li>
-      <li>Nenhuma medição antes ou depois.</li></ul></div>
+      <li>Confundir tempo de arranque do processo com tempo até <em>readiness</em>.</li>
+      <li>Não conhecer nenhuma alternativa ao nativo para reduzir arranque frio.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-15-12" data-box="qa" data-area="design" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+<div class="qa" id="q-15-7" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Dizem-me que passar para Quarkus nativo corta a memória para um terço. Que números é que consegue defender, e o que é que exactamente desaparece?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um factor de 3 a 5 em RSS é defensável para um serviço REST simples; para um serviço com <em>caches</em> grandes em <em>heap</em> o factor cai para perto de 1, porque o que domina é o <em>heap</em> e o <em>heap</em> não muda. A pergunta certa é sempre: que fracção do RSS actual é <em>heap</em>?</p>
+      <p>O que desaparece no nativo é a memória fora do <em>heap</em> que existe para suportar execução dinâmica. Metaspace com os metadados de milhares de classes carregadas — numa aplicação Spring típica são facilmente 60 a 120 MB. <em>Code cache</em> do JIT, que cresce durante o aquecimento e estabiliza em algumas dezenas de MB. Estruturas de perfil do C1/C2 e as próprias <em>threads</em> do compilador. O que fica é <em>heap</em> vivo, pilhas de <em>thread</em> (1 MB por <em>thread</em> de plataforma por omissão) e o binário mapeado.</p>
+      <p>Como se mede sem acreditar em ninguém: <code>Native Memory Tracking</code> na JVM (<code>-XX:NativeMemoryTracking=summary</code> e <code>jcmd VM.native_memory</code>) dá a repartição por categoria; do lado do contentor, <code>container_memory_working_set_bytes</code> é a métrica que o <em>kubelet</em> usa para decidir o <code>OOMKilled</code>. Comparar essas duas fontes durante uma semana de tráfego real é o que permite dizer um número em vez de repetir um <em>benchmark</em>.</p>
+      <p>O trade-off que fecha a resposta: a poupança em memória compra-se com débito. Sem JIT com informação de perfil, o pico sustentado é tipicamente 10 a 30% inferior, o que significa mais réplicas para o mesmo tráfego — e mais réplicas de 50 MB podem custar menos do que menos réplicas de 250 MB, ou não, consoante o serviço seja limitado por CPU ou por memória. Se o serviço é limitado por CPU, o nativo pode aumentar o custo total. Esse cálculo faz-se antes da migração, não depois.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Repete «um terço» sem saber o que compõe o RSS; confunde <em>heap</em> com memória do processo.</td></tr>
+        <tr><td>Mid</td><td>Distingue <em>heap</em> de não-<em>heap</em>, mas não sabe o que o nativo elimina nem como medir.</td></tr>
+        <tr><td>Sénior</td><td>Reparte o RSS por metaspace, <em>code cache</em>, pilhas e <em>heap</em>; condiciona o ganho à fracção de <em>heap</em>; nomeia NMT e <em>working set</em>; refere a perda de débito.</td></tr>
+        <tr><td>Staff</td><td>Transforma a poupança em decisão de custo (CPU-bound vs memory-bound), define o critério de medição prévia e recusa dar um número sem medir.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se puser <code>-Xmx</code> igual ao limite do contentor?»</li>
+      <li>«Como é que <em>virtual threads</em> mudam a conta das pilhas?»</li>
+      <li>«Que ganho consegue sem sair da JVM?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Citar números de <em>benchmark</em> de marketing como medições próprias.</li>
+      <li>Ignorar que serviços dominados por <em>cache</em> em <em>heap</em> não ganham quase nada.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-15-4" class="h2"><span class="secnum">15.4</span> Reactive com Mutiny e Vert.x<a class="anchor" href="#sec-15-4" aria-label="ligação">#</a></h2>
+
+<p>Por baixo do Quarkus está o Vert.x, e por baixo do Spring WebFlux está o Reactor Netty. Ambos executam um modelo de <em>event loop</em>: um número pequeno de <em>threads</em> (tipicamente proporcional ao número de núcleos) processa todos os eventos de I/O sem bloquear. A regra de ouro é a mesma nos dois mundos e é a única coisa que interessa mesmo numa entrevista: bloquear uma <em>thread</em> de <em>event loop</em> paralisa todos os pedidos que estavam a ser servidos por ela. Uma chamada JDBC síncrona dentro de um método reactivo não é um detalhe de estilo, é um incidente à espera de tráfego.</p>
+
+<p>A diferença de API entre Mutiny e Reactor é sobretudo ergonómica. O Reactor tem <code>Mono&lt;T&gt;</code> (0 ou 1) e <code>Flux&lt;T&gt;</code> (0..N), com uma superfície de centenas de operadores e nomes herdados da programação funcional (<code>flatMap</code>, <code>switchIfEmpty</code>, <code>zipWhen</code>). O Mutiny tem <code>Uni&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> e uma API de navegação explícita: começa-se por dizer sobre <em>o quê</em> se está a agir (<code>.onItem()</code>, <code>.onFailure()</code>, <code>.onCancellation()</code>) e só depois qual a acção (<code>.transform()</code>, <code>.transformToUni()</code>, <code>.retry()</code>). Isso torna o código mais longo e muito mais legível para quem não vive em Reactor, e faz a lista de sugestões do IDE ser navegável em vez de ter 300 entradas.</p>
+
+<p>Do ponto de vista de decisão, há um ponto que não se pode ignorar em 2026: com Java 21 e <em>virtual threads</em>, o argumento de escalabilidade que justificava o estilo reactivo perdeu força. Uma <em>thread</em> virtual bloqueada em I/O não retém uma <em>thread</em> de plataforma, o que permite servir dezenas de milhares de pedidos concorrentes com código imperativo, testável com <em>stack traces</em> legíveis. Quarkus expõe <code>@RunOnVirtualThread</code> e Spring Boot activa-as com <code>spring.threads.virtual.enabled=true</code>. O estilo reactivo continua a ganhar em dois casos: <em>streaming</em> com <em>backpressure</em> ponta a ponta, e composição declarativa de muitas chamadas paralelas com política de erro e tempo limite. Fora disso, é complexidade a pagar.</p>
+
+<figure class="listing java" id="lst-15-4"><div class="lhead"><span class="lnum">Listagem 15.4</span>
+<span class="lcap">A mesma composição — duas chamadas em paralelo, tempo limite e recuperação — em Mutiny e em Reactor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// ---------- Quarkus / Mutiny ----------
+@GET @Path("/{id}")
+public Uni&lt;OrderView&gt; view(@RestPath Long id) {
+    Uni&lt;Order&gt;   order = orders.findById(id);
+    Uni&lt;Risk&gt;    risk  = riskClient.score(id)
+            .ifNoItem().after(Duration.ofMillis(200)).recoverWithItem(Risk.unknown())
+            .onFailure().recoverWithItem(Risk.unknown());
+
+    return Uni.combine().all().unis(order, risk)
+              .with(OrderView::of)
+              .onFailure(NotFoundException.class).transform(e -&gt; new WebApplicationException(404));
+}
+
+// Codigo bloqueante tem de sair do event loop:
+@GET @Path("/report") @Blocking            // ou @RunOnVirtualThread com Java 21
+public Report heavyReport() { return legacyJdbcReport(); }
+
+// ---------- Spring WebFlux / Reactor ----------
+@GetMapping("/{id}")
+public Mono&lt;OrderView&gt; view(@PathVariable Long id) {
+    Mono&lt;Order&gt; order = orders.findById(id)
+            .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND)));
+    Mono&lt;Risk&gt;  risk  = riskClient.score(id)
+            .timeout(Duration.ofMillis(200))
+            .onErrorReturn(Risk.unknown());
+
+    return Mono.zip(order, risk).map(t -&gt; OrderView.of(t.getT1(), t.getT2()));
+}
+
+// Codigo bloqueante em WebFlux:
+return Mono.fromCallable(this::legacyJdbcReport)
+           .subscribeOn(Schedulers.boundedElastic());
+</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O Quarkus deixa escolher por método: <code>@Blocking</code> desvia para o <em>pool</em> de <em>worker</em>, <code>@NonBlocking</code> mantém no <em>event loop</em>, <code>@RunOnVirtualThread</code> executa numa <em>thread</em> virtual. Em Spring, a fronteira é a do <em>stack</em>: WebFlux inteiro ou Web MVC inteiro, com <code>publishOn</code>/<code>subscribeOn</code> a mover trabalho para <code>boundedElastic</code>. Um serviço maioritariamente síncrono com dois <em>endpoints</em> de <em>streaming</em> é mais simples de exprimir em Quarkus; um serviço inteiramente reactivo é igualmente natural nos dois.</p></aside>
+
+<div class="qa" id="q-15-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Concorrência</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Como concilia DRY com o risco de criar a abstracção errada? E onde é que a Lei de Deméter ajuda e onde é que a aplicam mal?</div>
+  <div class="qprompt">Vem de Reactor e vai escrever Mutiny. O que muda de facto, e como decide hoje entre reactivo e imperativo com <em>virtual threads</em>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>DRY é sobre conhecimento, não sobre texto. Dois blocos de código idênticos que representam a mesma regra de negócio são duplicação e devem ser unificados; dois blocos idênticos que representam regras diferentes de contextos diferentes são coincidência, e unificá-los cria acoplamento entre módulos que mudam por razões distintas. O sintoma da unificação errada é sempre o mesmo: um parâmetro booleano acrescentado à função partilhada, depois um segundo, depois um <code>enum</code> de modos e um <code>switch</code> lá dentro.</p>
-      <p>A regra operacional tem três partes: esperar pela terceira ocorrência antes de extrair; verificar se as ocorrências mudam pelo mesmo motivo e têm o mesmo dono; e, quando se descobre tarde que a abstracção estava errada, inverter o refactor — voltar a duplicar dentro de cada contexto e só depois procurar a fronteira certa. É mais barato reverter uma duplicação do que desmontar uma abstracção com sete chamadores e três parâmetros de modo.</p>
-      <p>Sobre a Lei de Deméter, o valor real é limitar acoplamento estrutural. <code>order.getCustomer().getAddress().getCity()</code> torna o chamador dependente de três classes e das relações entre elas; se <code>Address</code> mudar, parte código que nunca deveria ter conhecido <code>Address</code>. A correcção é o agregado expor a informação de que o cliente precisa — <code>order.shippingCity()</code> — ou receber já a projecção correcta. Um sintoma prático é o teste: se preparar o cenário obriga a construir três objectos encadeados só para chegar a um campo, a lei está a ser violada.</p>
-      <p>Onde a aplicam mal: proibir encadeamento sintáctico. <code>list.stream().filter(...).map(...).toList()</code> não navega estrutura interna nenhuma — devolve sempre o mesmo tipo de <em>pipeline</em>. O mesmo vale para <em>builders</em> fluentes e para <code>Optional</code>. Confundir «não falar com estranhos» com «não usar pontos a mais» produz código pior: variáveis intermédias sem nome útil e <em>streams</em> substituídos por ciclos. O teste correcto não é contar pontos: é perguntar quantos tipos distintos o chamador tem de conhecer para escrever aquela linha.</p></div>
+      <p>Muda a ergonomia, não o modelo. Mutiny e Reactor implementam ambos <em>Reactive Streams</em> com <em>backpressure</em>, são interoperáveis via <code>Publisher</code>, e o Mutiny até oferece conversores directos. <code>Uni&lt;T&gt;</code> corresponde a <code>Mono&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> a <code>Flux&lt;T&gt;</code>, com uma diferença de contrato relevante: <code>Uni</code> não tem <em>backpressure</em>, porque um único item não precisa dele.</p>
+      <p>A diferença prática é a API de navegação por evento. Em Reactor escolhe-se o operador entre centenas; em Mutiny escreve-se <code>.onItem().transformToUni(...)</code> ou <code>.onFailure(TimeoutException.class).retry().atMost(3)</code>. O código fica 20 a 40% mais longo em caracteres e substancialmente mais fácil de rever numa equipa que não é especialista — que é exactamente o argumento a usar numa entrevista, porque a manutenção é o custo dominante em código reactivo.</p>
+      <p>Sobre a decisão de hoje: com Java 21 em produção, o critério mudou. A justificação clássica do reactivo era não gastar uma <em>thread</em> de plataforma por pedido bloqueado; as <em>threads</em> virtuais resolvem isso mantendo código imperativo com <em>stack traces</em> legíveis, <code>try/finally</code> que funciona e depuração normal. Por isso o meu critério é: imperativo com <em>threads</em> virtuais por omissão; reactivo quando existe <em>streaming</em> real com <em>backpressure</em> ponta a ponta (SSE, Kafka a alimentar um consumidor lento, ficheiros grandes), ou quando a lógica é composição paralela de muitas chamadas com políticas de erro e tempo limite, onde o estilo declarativo é genuinamente mais claro.</p>
+      <p>As duas armadilhas a mencionar: bloquear o <em>event loop</em> continua a ser fatal e não é resolvido por <em>threads</em> virtuais se o código estiver no <em>event loop</em> — em Quarkus marca-se <code>@Blocking</code>; e <code>ThreadLocal</code> usado como contexto (segurança, <em>tenant</em>, MDC de <em>logging</em>) não sobrevive à travessia de operadores reactivos, o que obriga a propagação explícita de contexto e é a origem mais frequente de <em>logs</em> sem <em>trace id</em>. Com <em>threads</em> virtuais, <code>ScopedValue</code> ou o próprio <code>ThreadLocal</code> voltam a funcionar de forma previsível.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«DRY é não repetir código» e «Deméter é usar poucos pontos», sem mais.</td></tr>
-        <tr><td>Mid</td><td>Percebe que DRY pode ser mal aplicado, mas não tem critério para decidir; aplica Deméter a encadeamentos de <em>stream</em>.</td></tr>
-        <tr><td>Sénior</td><td>DRY sobre conhecimento com regra do terceiro caso e critério do dono; distingue navegação estrutural de encadeamento fluente; sabe reverter uma abstracção errada.</td></tr>
-        <tr><td>Staff</td><td>Liga a fronteiras de contexto (o mesmo conceito com significados diferentes em dois domínios) e trata a duplicação entre contextos como decisão de <em>design</em> intencional, com custo assumido.</td></tr>
+        <tr><td>Insuficiente</td><td>«São a mesma coisa com outros nomes», ou defende reactivo por ser «mais rápido».</td></tr>
+        <tr><td>Mid</td><td>Mapeia <code>Uni</code>/<code>Mono</code> correctamente, mas não fala de <em>backpressure</em>, de contexto nem do impacto das <em>threads</em> virtuais.</td></tr>
+        <tr><td>Sénior</td><td>Explica a API de navegação, a ausência de <em>backpressure</em> em <code>Uni</code>, o perigo de bloquear o <em>event loop</em> e um critério explícito para escolher entre reactivo e imperativo em Java 21.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta propagação de contexto e observabilidade, o custo de formação da equipa em código reactivo, e uma estratégia de coexistência (reactivo só nos <em>endpoints</em> que o justificam).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Já reverteu uma extracção que tinha feito? Como correu?»</li>
-      <li>«Duas equipas precisam da mesma validação de IBAN. Biblioteca partilhada ou cópia?»</li>
-      <li>«Como distingue duplicação de conhecimento de duplicação de texto num <em>review</em>?»</li></ul></div>
+      <li>«Como propaga o <em>trace id</em> através de uma cadeia Mutiny?»</li>
+      <li>«O que acontece se chamar JDBC dentro de um <code>Uni</code> sem <code>@Blocking</code>?»</li>
+      <li>«Quando é que <em>virtual threads</em> ainda não chegam?»</li>
+      <li>«Como testa <em>backpressure</em>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Extrair uma abstracção à segunda ocorrência por reflexo.</li>
-      <li>Proibir <em>streams</em> ou <em>builders</em> em nome da Lei de Deméter.</li>
-      <li>Defender uma biblioteca partilhada entre contextos sem falar de quem a mantém e de versionamento.</li></ul></div>
+      <li>Achar que <em>virtual threads</em> tornam seguro bloquear no <em>event loop</em>.</li>
+      <li>Usar <code>ThreadLocal</code> como contexto em código reactivo sem propagação explícita.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-15-7" class="h2"><span class="secnum">15.7</span> Resumo e checklist<a class="anchor" href="#sec-15-7" aria-label="ligação">#</a></h2>
+<h2 id="sec-15-5" class="h2"><span class="secnum">15.5</span> Quando recomendar cada stack numa entrevista<a class="anchor" href="#sec-15-5" aria-label="ligação">#</a></h2>
 
-<p>O que reter deste capítulo, em oito pontos:</p>
+<p>Esta é a pergunta em que mais candidatos sénior falham, e falham por excesso de convicção. O entrevistador não quer saber qual o framework preferido; quer ver se a recomendação tem critérios, se o custo humano entra na conta e se existe um cenário em que o candidato mudaria de ideias. A estrutura de resposta que funciona tem três partes: as perguntas que faria antes de decidir, a decisão por omissão dado o contexto mais provável, e a condição que inverteria essa decisão.</p>
+
+<p>As perguntas que valem a pena são poucas e concretas: quantos serviços existem e qual o perfil de tráfego (constante ou intermitente); quantas réplicas por serviço e se o custo é dominado por CPU ou por memória; qual a experiência da equipa e a taxa de rotação; que bibliotecas internas e agentes de observabilidade existem e se têm suporte nativo; e qual o prazo — porque uma migração de <em>framework</em> compete directamente com o <em>roadmap</em> de produto.</p>
+
+<p>A decisão por omissão numa scale-up europeia com 15 a 60 serviços em Spring Boot, equipa de 20 a 60 engenheiros e tráfego razoavelmente constante é manter o Spring e não migrar nada. O ganho técnico existe mas é pequeno em relação ao custo: revalidar bibliotecas, reescrever testes, formar toda a gente, e perder velocidade de entrega durante meses. Aquilo que se faz é abrir uma excepção deliberada: novos serviços com perfil claramente intermitente ou <em>serverless</em> nascem em Quarkus (ou em Spring nativo), como piloto controlado, com um dono e com métricas de saída definidas à partida.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 15.2</span> Critérios de decisão, com o sinal que os torna decisivos.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th>Favorece Spring Boot</th><th>Favorece Quarkus</th></tr></thead><tbody>
+<tr><td>Perfil de tráfego</td><td>Constante, 24×7, réplicas fixas</td><td>Intermitente, <em>scale-to-zero</em>, picos rápidos</td></tr>
+<tr><td>Restrição de custo</td><td>Limitado por CPU</td><td>Limitado por memória, centenas de réplicas</td></tr>
+<tr><td>Ecossistema</td><td>Bibliotecas internas, SDKs invulgares, agentes de APM</td><td>Stack alinhado com extensões existentes</td></tr>
+<tr><td>Equipa</td><td>Experiência profunda em Spring, rotação alta</td><td>Equipa pequena, disposta a investir 2–4 semanas</td></tr>
+<tr><td>Contratação</td><td>Mercado muito maior de candidatos</td><td>Menos relevante em equipas estáveis</td></tr>
+<tr><td>Destino de execução</td><td>Kubernetes clássico, VM</td><td><em>Functions</em>, <em>edge</em>, Knative, dispositivos com pouca RAM</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Uma migração de <em>framework</em> num serviço médio (50 a 120 classes, Hibernate, Kafka, OIDC) custa tipicamente 3 a 8 semanas-pessoa, mais 2 a 4 semanas de curva de aprendizagem por engenheiro que nunca usou CDI. Contra isso, a poupança de infra-estrutura de um serviço com 10 réplicas é da ordem de 1,5 GB de memória reservada — irrelevante. A conta só fecha quando a migração é repetível ao longo de dezenas de serviços ou quando o arranque desbloqueia uma arquitectura nova (escala a zero, <em>functions</em>). É por isso que a resposta honesta a «devíamos migrar?» começa quase sempre por «para quantos serviços?».</p></aside>
+
+<div class="qa" id="q-15-9" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos 30 serviços em Spring Boot 3 e o CTO quer avaliar migrar para Quarkus para cortar custos de cloud. Como conduziria essa avaliação e o que espera concluir?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começaria por separar o objectivo declarado — cortar custos de cloud — da solução proposta, porque na maioria dos parques a migração de <em>framework</em> não é a alavanca mais barata para esse objectivo.</p>
+      <p>Primeiro, medir onde está o custo. Se a factura é dominada por bases de dados geridas, tráfego entre zonas ou armazenamento, mudar de <em>framework</em> não move nada. Se é dominada por computação, é preciso saber se os <em>pods</em> estão limitados por CPU ou por memória, e comparar o pedido de recursos com o uso real: em muitos parques os pedidos estão sobredimensionados por hábito, e ajustá-los com base em observação de duas semanas dá 20 a 40% de redução sem tocar numa linha de código.</p>
+      <p>Segundo, esgotar as alavancas dentro da stack actual: <code>-XX:MaxRAMPercentage</code> calibrado, AppCDS para arranque, remoção de dependências não usadas, consolidação de serviços com 2 réplicas ociosas, e escala automática a sério em vez de réplicas fixas. Isto costuma capturar metade do ganho teórico da migração, em dias.</p>
+      <p>Terceiro, se ainda restar caso, fazer um piloto medido: escolher dois serviços representativos — um do caminho crítico, um intermitente —, migrar, e medir RSS, débito por <em>core</em>, arranque até <em>readiness</em>, tempo de <em>build</em> e horas gastas. Só com esses números se extrapola para 30 serviços. Definir à partida o critério de paragem: se a poupança projectada for inferior a, digamos, dois meses de trabalho de equipa por ano, não se avança.</p>
+      <p>A conclusão que espero é a mais frequente na realidade: manter o Spring Boot no parque existente, adoptar Spring Boot AOT/native apenas onde o arranque tem valor, e usar Quarkus em serviços novos com perfil <em>serverless</em> ou intermitente. E há um ponto que um staff diz em voz alta: recomendar «não migrar» é uma recomendação legítima, e é a que exige mais coragem numa conversa com um CTO entusiasmado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Responde com preferência pessoal por um dos frameworks; não pergunta nada sobre o parque nem sobre a factura.</td></tr>
+        <tr><td>Mid</td><td>Propõe um piloto, mas não questiona se o custo é sequer de computação nem considera alternativas mais baratas.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, esgota alavancas dentro da stack, faz piloto com dois serviços e métricas definidas, extrapola com números e assume o custo humano.</td></tr>
+        <tr><td>Staff</td><td>Separa objectivo de solução, define critério de paragem quantitativo antes de começar, propõe estratégia mista por perfil de serviço, e está disposto a recomendar não migrar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que dois serviços escolheria para o piloto e porquê?»</li>
+      <li>«Como convence a equipa que gosta de Spring?»</li>
+      <li>«E se metade da poupança vier de reduzir pedidos de recursos? Ainda migra?»</li>
+      <li>«Quanto tempo dá ao piloto antes de decidir?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Aceitar a premissa da pergunta sem a questionar.</li>
+      <li>Prometer percentagens de poupança antes de qualquer medição.</li>
+      <li>Não mencionar o custo de formação nem o impacto no <em>roadmap</em>.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-15-10" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Que riscos de ecossistema é que assume ao escolher Quarkus para um serviço que vai viver cinco anos, e como os mitigaria desde o primeiro <em>commit</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Quatro riscos, todos mitigáveis com desenho, e nenhum deles é «o projecto vai desaparecer» — o Quarkus tem patrocínio empresarial estável e ciclo de <em>releases</em> previsível com versões de suporte alargado.</p>
+      <p>Primeiro, cobertura de extensões. Uma biblioteca sem extensão pode funcionar em JVM e falhar em nativo, ou exigir metadados mantidos à mão. Mitigação: inventariar as dependências antes de começar e, para as que não têm extensão, isolá-las atrás de uma interface de domínio, de modo a que substituí-las seja um adaptador e não uma reescrita.</p>
+      <p>Segundo, observabilidade. Se a organização depende de um agente de APM comercial que instrumenta bytecode, o nativo pode não o suportar. Mitigação: normalizar em OpenTelemetry por instrumentação suportada pelo <em>framework</em> desde o primeiro dia, e validar <em>traces</em>, métricas e <em>logs</em> correlacionados no piloto, não depois.</p>
+      <p>Terceiro, mercado de contratação e rotação. Há muito mais engenheiros com Spring no currículo. Mitigação real: manter a arquitectura interna independente do <em>framework</em> — domínio em Java puro, sem anotações do <em>framework</em> nas entidades de negócio, adaptadores nas fronteiras. Assim, quem chega aprende CDI em dias porque a maior parte do código é Java comum, e uma eventual reversão fica confinada às camadas de fronteira.</p>
+      <p>Quarto, divergência operacional. Ter duas stacks significa dois modelos de configuração, duas imagens base, dois manuais de <em>troubleshooting</em> e duas versões de <em>chart</em>. Mitigação: bibliotecas partilhadas de <em>logging</em> e configuração alinhadas entre as duas, e um limite explícito — por exemplo, no máximo dois serviços na segunda stack até haver decisão formal de a alargar.</p>
+      <p>O trade-off honesto: estas mitigações custam tempo e algumas (domínio sem anotações) são boas práticas independentemente do <em>framework</em>. Se a equipa não estiver disposta a mantê-las, o risco de heterogeneidade supera o ganho e a recomendação passa a ser stack única.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Não há riscos, é Java na mesma.»</td></tr>
+        <tr><td>Mid</td><td>Menciona só o risco de a comunidade ser menor, sem mitigações concretas.</td></tr>
+        <tr><td>Sénior</td><td>Enumera extensões, observabilidade, contratação e custo operacional de duas stacks, com uma mitigação accionável por risco.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o limite explícito de proliferação de stacks, a estratégia de domínio independente do <em>framework</em> como seguro de reversão, e a condição em que recomendaria stack única.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como isola uma biblioteca sem extensão?»</li>
+      <li>«O que muda no manual de plantão com um binário nativo?»</li>
+      <li>«Quantas stacks é demasiado para uma equipa de 40 pessoas?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar heterogeneidade de stacks como custo zero.</li>
+      <li>Não ter plano de reversão para uma decisão com horizonte de cinco anos.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-15-6" class="h2"><span class="secnum">15.6</span> Resumo e checklist<a class="anchor" href="#sec-15-6" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na forma em que é útil dizê-lo em voz alta numa ronda:</p>
 
 <ul class="lst">
-  <li><strong>SRP é sobre interlocutores, não sobre tamanho.</strong> Uma razão para mudar equivale a uma pessoa ou equipa que pede a alteração; o histórico de <em>git</em> é a evidência mais barata de que há duas.</li>
-  <li><strong>OCP é uma aposta sobre o eixo que vai variar.</strong> Strategy aberta torna tipos baratos e operações caras; <code>sealed</code> com <code>switch</code> exaustivo faz o inverso e transforma o erro de <em>runtime</em> em erro de compilação.</li>
-  <li><strong>LSP é sobre contratos mutáveis.</strong> Pré-condições não se reforçam, pós-condições não se enfraquecem; a imutabilidade dissolve o problema do quadrado, e o sintoma mais fiável é <code>instanceof</code> no cliente.</li>
-  <li><strong>ISP protege quem implementa e quem lê</strong>, não a contagem de métodos: <code>JpaRepository</code> com vinte métodos não é violação porque ninguém a implementa à mão.</li>
-  <li><strong>DIP é sobre a propriedade da interface.</strong> A porta declarada no pacote de domínio inverte a seta; <code>OrderServiceImpl</code> não inverte nada.</li>
-  <li><strong>Cada abstracção é um salto de leitura.</strong> Estrutura completa onde há invariantes; caminho directo nas leituras sem regra de negócio.</li>
-  <li><strong>DRY é sobre conhecimento.</strong> Duplicação em contextos com donos diferentes é coincidência; a abstracção errada custa mais do que a cópia.</li>
-  <li><strong>Toda a resposta de nível sénior traz um número</strong> — tempo de teste, ficheiros por alteração, p99, conflitos de <em>merge</em> — e um caso em que não aplicaria o princípio.</li>
+  <li>A diferença estrutural é <em>quando</em> se resolve o grafo de <em>beans</em>: <em>augmentation</em> no <em>build</em> em Quarkus, construção do contexto no arranque em Spring — e o Spring Boot 3.x tem AOT que converge para o mesmo modelo no caminho nativo.</li>
+  <li>Em JVM, o arranque típico é 0,8–1,5 s em Quarkus contra 2–4 s em Spring Boot; em nativo, dezenas de milissegundos contra 50–150 ms. O que interessa em produção é o tempo até <em>readiness</em>, que inclui Flyway e <em>pool</em> de ligações.</li>
+  <li>O <em>native image</em> compila sob mundo fechado: reflexão dinâmica, <em>proxies</em> JDK, recursos do <em>classpath</em>, serialização, JNI e agentes de bytecode exigem metadados ou deixam de funcionar.</li>
+  <li>A <em>build</em> nativa custa 4 a 15 minutos e 8 a 16 GB de RAM no <em>runner</em>; enviar nativo sem testes de integração contra o binário é como enviar sem testes.</li>
+  <li>O ganho de RSS é de um factor 3 a 5 num serviço REST simples e aproxima-se de 1 num serviço dominado por <em>cache</em> em <em>heap</em>; em contrapartida perdem-se 10 a 30% de débito em regime estacionário.</li>
+  <li>O arranque só é métrica de negócio em <em>serverless</em>, <em>scale-to-zero</em>, picos rápidos e <em>rolling updates</em> de centenas de réplicas; SnapStart e CRaC são alternativas dentro da JVM.</li>
+  <li>Mutiny e Reactor implementam o mesmo modelo com ergonomia diferente; com Java 21, o critério por omissão passou a ser imperativo com <em>threads</em> virtuais, e reactivo só para <em>streaming</em> com <em>backpressure</em> ou composição paralela complexa.</li>
+  <li>Uma migração de serviço médio custa 3 a 8 semanas-pessoa mais formação; só compensa se for repetível em dezenas de serviços ou se desbloquear uma arquitectura nova.</li>
+  <li>Recomendar «não migrar» com números é uma resposta forte; recomendar migrar tudo sem medir é a falha mais comum nesta pergunta.</li>
 </ul>
 
-<p>Checklist de preparação, para correr antes da ronda de design:</p>
+<p>Checklist accionável antes de uma ronda em que este tema possa aparecer:</p>
 
 <ul class="lst">
-  <li>Ter pronto <strong>um exemplo próprio por princípio</strong>, com o antes, o corte, o depois e um número medido.</li>
-  <li>Preparar <strong>uma violação deliberada</strong> com alternativa ponderada, delimitação e verificação posterior.</li>
-  <li>Saber explicar o quadrado e o rectângulo em 60 segundos e dizer <strong>porque é que o exemplo engana</strong>.</li>
-  <li>Ter dois exemplos de <strong>violações de LSP no JDK</strong> (<code>Arrays.asList</code>, <code>Timestamp</code>/<code>Date</code>) e o que se aprende com elas.</li>
-  <li>Conseguir escrever de memória o <strong>registo de strategy por injecção de colecção</strong> no Spring e a validação de cobertura no arranque.</li>
-  <li>Conseguir escrever de memória uma <strong>regra ArchUnit</strong> que proíbe o domínio de importar o <em>framework</em>.</li>
-  <li>Ter o argumento contra <strong>uma interface por classe com sufixo <code>Impl</code></strong> pronto em duas frases.</li>
-  <li>Ter o critério de <strong>quando parar de separar</strong>: cada eixo de mudança num ficheiro, cada regra testável sem infraestrutura.</li>
-  <li>Ensaiar a passagem de <strong>princípio para custo</strong>: nunca dizer «viola o SRP» sem nomear a alteração futura que fica mais cara.</li>
+  <li>Saber descrever, em 60 segundos e sem notas, os quatro custos do arranque do Spring: varrimento, condições de auto-configuração, instanciação reflexiva e geração de <em>proxies</em>.</li>
+  <li>Ter na ponta da língua um par de números de arranque e de RSS para cada uma das quatro combinações da Tabela 15.1, sempre apresentados como ordens de grandeza.</li>
+  <li>Conseguir listar as quatro categorias de metadados nativos e a anotação ou API correspondente em cada <em>framework</em>.</li>
+  <li>Saber explicar a diferença entre <em>heap</em>, memória total da JVM e RSS, e dizer como se mede cada uma (NMT, <code>container_memory_working_set_bytes</code>).</li>
+  <li>Ter um critério pessoal, formulado numa frase, para escolher entre reactivo e <em>threads</em> virtuais.</li>
+  <li>Preparar uma resposta de «não migrar» com o cálculo de semanas-pessoa contra GB poupados, para o caso de a pergunta vir na forma de proposta do entrevistador.</li>
+  <li>Confirmar que consegue nomear pelo menos três armadilhas de CDI que mordem quem vem de Spring: <code>@Dependent</code> por omissão, remoção de <em>beans</em> e auto-invocação de métodos interceptados.</li>
 </ul>

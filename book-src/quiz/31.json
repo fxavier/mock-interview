@@ -1,46 +1,46 @@
 {"chapter": 31, "questions": [
-  {"q": "Um encurtador de URLs cria 3,15 mil milhões de códigos por ano. O candidato propõe códigos base62 de 6 caracteres. Qual é o problema quantitativo?",
+  {"q": "Um tópico tem 24 partições e o produtor escreve com `enable.idempotence=true` e `max.in.flight.requests.per.connection=5`. Que garantia de ordenação existe?",
    "options": [
-     "62^6 ≈ 5,7 × 10^10, o que dá cerca de 18 anos de espaço e já 5,5% de ocupação ao fim do primeiro ano, com colisões frequentes na geração aleatória",
-     "62^6 é suficiente para mais de mil anos; o problema é apenas estético",
-     "6 caracteres impedem o uso de `base62` e obrigam a base64, que não é seguro em URLs",
-     "O número de caracteres não afecta as colisões porque a chave primária da tabela garante unicidade"],
-   "answer": 0,
-   "explain": "62^6 ≈ 5,7 × 10^10 contra 62^7 ≈ 3,5 × 10^12: um factor de 62. Com 3,15 mil milhões por ano, 6 caracteres esgotam-se em cerca de 18 anos e a ocupação sobe depressa, o que faz explodir o número de tentativas na geração aleatória. A chave primária detecta a colisão mas não a evita, e cada colisão custa uma escrita extra no caminho crítico."},
-
-  {"q": "Num feed com 8,3 publicações por segundo e 300 seguidores em média, uma conta com 5 milhões de seguidores publica. Com fan-out on write puro e um orçamento de 12 000 escritas por segundo no índice, o que acontece?",
-   "options": [
-     "Nada de relevante: 5 milhões de escritas distribuem-se pelos shards e concluem em menos de um segundo",
-     "A publicação ocupa a fila de fan-out durante cerca de 7 minutos e faz todos os outros utilizadores violarem o requisito de 30 segundos de propagação",
-     "O Redis rejeita a operação porque `ZADD` tem um limite de um milhão de membros",
-     "O problema resolve-se aumentando o TTL das entradas de feed"],
+     "Ordem total no tópico, porque a idempotência numera todas as mensagens do produtor.",
+     "Ordem total dentro de cada partição, incluindo em caso de retentativa, porque o broker reordena pela sequência do produtor.",
+     "Nenhuma ordem garantida, porque com `max.in.flight` acima de 1 as mensagens podem ser reordenadas.",
+     "Ordem apenas entre mensagens enviadas no mesmo lote (`batch.size`)."],
    "answer": 1,
-   "explain": "5 000 000 ÷ 12 000 ≈ 417 segundos, ou seja cerca de 7 minutos em que a fila está ocupada com um único autor. O requisito de propagação em 30 segundos passa a ser violado para todos os restantes. É por isto que o desenho correcto é híbrido, com as contas acima de um limiar servidas na leitura; aumentar TTL ou acrescentar shards não altera o total de escritas necessárias."},
+   "explain": "A idempotência atribui um PID e um número de sequência por partição; o broker rejeita ou reordena pedidos fora de sequência, o que torna seguro manter até 5 pedidos em voo sem perder ordem dentro da partição. Ordem total no tópico nunca existe, porque partições diferentes são logs independentes. Sem idempotência é que `max.in.flight` acima de 1 admitiria reordenação numa retentativa; o `batch.size` só afecta agrupamento, não garantias."},
 
-  {"q": "Um rate limiter usa janela fixa de 1 minuto com limite de 1 000 pedidos. Um cliente com retentativa agressiva descobre o padrão. Qual é o pior caso e qual é a correcção mais barata em memória?",
+  {"q": "O consumidor tem `enable.auto.commit=true`, `auto.commit.interval.ms=5000` e cada mensagem demora 300 ms a processar. O pod é morto com SIGKILL a meio de um lote. Qual é o resultado mais provável?",
    "options": [
-     "2 000 pedidos em cerca de 200 ms na fronteira das janelas; corrige-se com contador de janela deslizante ou token bucket, ambos com ~32 B por chave",
-     "1 000 pedidos por segundo em permanência; corrige-se aumentando o período para 5 minutos",
-     "Não há pior caso: a janela fixa é exacta por construção",
-     "2 000 pedidos na fronteira; a única correcção correcta é o sliding log exacto, com 16 kB por chave"],
-   "answer": 0,
-   "explain": "A janela fixa permite 1 000 no fim de uma janela e 1 000 no início da seguinte — 2× o limite num intervalo curto. O token bucket e o contador de janela deslizante resolvem-no com dois inteiros por chave (~32 B). O sliding log também resolve, mas a 16 kB por chave são 32 GB para 2 milhões de chaves contra 200 MB, pelo que não é a correcção mais barata."},
+     "Todas as mensagens do lote serão reprocessadas, porque nada foi confirmado.",
+     "Mensagens já confirmadas mas ainda não processadas são perdidas, porque o commit automático confirma o lote devolvido pelo `poll()`.",
+     "Nada se perde nem se repete: o commit automático é transaccional com o processamento.",
+     "O grupo bloqueia até `session.timeout.ms` e depois reprocessa a partir do início do tópico."],
+   "answer": 1,
+   "explain": "O commit automático confirma periodicamente o offset do último lote devolvido pelo `poll()`, não do último efectivamente processado, pelo que a queda pode deixar trabalho confirmado por fazer — perda silenciosa. Reprocessar tudo seria o comportamento de commit manual após o efeito. Não há transacção entre commit e processamento, e `auto.offset.reset` só entraria se não houvesse offset guardado."},
 
-  {"q": "A chamada de autorização a um fornecedor de pagamentos dá timeout ao fim de 3 segundos. O que deve fazer o orquestrador da saga?",
+  {"q": "Um serviço lê `pedidos`, escreve em `pedidos-validados` e faz um `INSERT` no PostgreSQL. A equipa activa transacções Kafka com `transactional.id` fixo e `isolation.level=read_committed` nos consumidores. Que garantia passa a existir de ponta a ponta?",
    "options": [
-     "Marcar o pagamento como falhado e compensar imediatamente, repondo o stock",
-     "Retentar com uma nova chave de idempotência para garantir que a segunda tentativa é tratada como pedido novo",
-     "Manter a tentativa em estado indeterminado, retentar com a mesma chave de idempotência e deixar a reconciliação consultar o fornecedor como fonte de verdade",
-     "Consultar o webhook recebido: se não chegou nenhum em 3 segundos, o pagamento não foi feito"],
+     "Exactly-once entre Kafka e PostgreSQL, porque o offset e o INSERT ficam na mesma transacção.",
+     "At-most-once, porque a transacção Kafka reverte o INSERT em caso de falha.",
+     "Exactly-once entre os tópicos Kafka, mas at-least-once para o INSERT, que continua a precisar de deduplicação.",
+     "Nenhuma garantia adicional, porque `read_committed` só afecta a latência de leitura."],
    "answer": 2,
-   "explain": "Um timeout de cliente não distingue «não chegou», «falhou» e «foi autorizado e a resposta perdeu-se». Compensar com base num timeout produz duplo débito quando a autorização de facto ocorreu, e retentar com chave nova garante a segunda cobrança. A ausência de webhook em 3 segundos não prova nada, porque a entrega é assíncrona; a fonte de verdade é a consulta ao fornecedor pelo identificador da tentativa."},
+   "explain": "A transacção do Kafka é atómica sobre escritas em tópicos Kafka e sobre o commit dos offsets consumidos, e nada mais. Um `INSERT` no PostgreSQL fica fora dessa fronteira: se o processo cair entre o INSERT e o commit da transacção Kafka, a mensagem é reprocessada e o INSERT repete-se, pelo que é preciso uma chave de deduplicação. `read_committed` tem efeito real — esconde registos de transacções não confirmadas e limita a leitura ao Last Stable Offset."},
 
-  {"q": "Num sistema de matching, o serviço reserva o motorista com `SET lock:drv:{id} NX PX 15000` antes de enviar a oferta. Porque é que isto, sozinho, não garante que o motorista nunca fica com duas viagens activas?",
+  {"q": "Um consumidor entra em ciclo de rebalance: processa cerca de 4 minutos por lote e é expulso do grupo, mesmo com a rede saudável. Qual é a correcção certa?",
    "options": [
-     "Porque `SET NX` não é atómico entre vários clientes do Redis",
-     "Porque o TTL de 15 s é inferior ao tempo de vida da oferta e a reserva expira sempre antes da aceitação",
-     "Porque uma pausa de GC superior ao TTL pode fazer o detentor perder a reserva sem saber; a garantia tem de ser um índice único parcial na base de dados",
-     "Porque `PX` só aceita valores até 10 000 ms, pelo que o lock nunca chega a ser criado"],
-   "answer": 2,
-   "explain": "`SET NX` é atómico, mas um lock com TTL não sobrevive a uma pausa do processo maior do que o TTL: o detentor continua a agir julgando-se dono enquanto outro já adquiriu a reserva. O TTL de 15 s é deliberadamente maior do que os 12 s da oferta. A correcção é tratar o lock como optimização e pôr a garantia na base de dados, com um índice único parcial sobre `driver_id` para viagens em estado activo."}
+     "Aumentar `session.timeout.ms` para 600000, porque é o timeout que expulsa o membro.",
+     "Baixar `max.poll.records` (ou subir `max.poll.interval.ms`), porque o membro é expulso por demorar demasiado entre chamadas a `poll()`.",
+     "Baixar `heartbeat.interval.ms` para 500 ms para o coordenador saber que o membro está vivo.",
+     "Mudar `auto.offset.reset` para `latest` para saltar o lote lento."],
+   "answer": 1,
+   "explain": "Os batimentos são enviados por uma thread de fundo e continuam durante o processamento, por isso `session.timeout.ms` e `heartbeat.interval.ms` não são a causa: o membro é expulso por exceder `max.poll.interval.ms` entre chamadas consecutivas a `poll()`. A correcção é reduzir o trabalho por lote com `max.poll.records` ou alargar o intervalo máximo. `auto.offset.reset` só se aplica quando não há offset guardado ou ele expirou."},
+
+  {"q": "Um tópico `precos` com `cleanup.policy=compact` alimenta uma vista local em cada serviço. Que afirmação está correcta?",
+   "options": [
+     "Um consumidor que leia do início obtém o histórico completo de alterações de cada preço.",
+     "Um registo com valor nulo é um tombstone: marca a chave para eliminação e desaparece após `delete.retention.ms`.",
+     "A compactação é síncrona com a escrita, pelo que nunca se vêem duas versões da mesma chave.",
+     "Compactação e `retention.ms` são mutuamente exclusivas, pelo que o tópico cresce sem limite."],
+   "answer": 1,
+   "explain": "O tombstone (valor nulo) é o mecanismo de eliminação por chave num log compactado, e `delete.retention.ms` define a janela em que os consumidores ainda o conseguem ver antes de a chave desaparecer. A compactação mantém pelo menos o último valor por chave, logo o histórico de transições não é recuperável; actua de forma assíncrona sobre segmentos fechados, pelo que se podem ler versões antigas; e as políticas combinam-se com `cleanup.policy=compact,delete`."}
 ]}

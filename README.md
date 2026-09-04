@@ -1,6 +1,6 @@
 # Mock Interview: Java Backend Sénior — React app
 
-Versão React do livro interactivo (36 capítulos, 416 perguntas de entrevista, 68 exercícios de código, 180 perguntas de quiz). Funciona offline, sem backend; todo o estado (progresso, auto-avaliações, notas, código dos exercícios, quizzes, simulações) fica no `localStorage`.
+Versão React do livro interactivo (37 capítulos, 430 perguntas de entrevista, 76 exercícios de código, 185 perguntas de quiz). Funciona offline, sem backend; todo o estado (progresso, auto-avaliações, notas, código dos exercícios, quizzes, simulações) fica no `localStorage`.
 
 ## Stack
 

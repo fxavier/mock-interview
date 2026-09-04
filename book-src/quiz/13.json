@@ -1,42 +1,46 @@
 {"chapter": 13, "questions": [
-  {"q": "Um serviço expõe `DELETE /v1/subscricoes/{id}`. A primeira chamada apaga a subscrição e devolve `204`. Um retry automático do cliente, causado por um timeout de rede, chega logo a seguir. Qual é o comportamento que melhor respeita o contrato de HTTP?",
+  {"q": "Uma entidade `Encomenda` implementa `equals` e `hashCode` sobre o campo `id`, gerado por sequência. O código cria a encomenda com `new`, adiciona-a a um `HashSet` do agregado pai e só depois chama `persist`. Que defeito surge?",
    "options": [
-    "Devolver `404 Not Found`, porque o recurso já não existe.",
-    "Devolver `204 No Content` outra vez, porque `DELETE` é idempotente e o estado final é o mesmo.",
-    "Devolver `409 Conflict`, para o cliente saber que houve uma tentativa duplicada.",
-    "Devolver `200 OK` com um corpo a indicar que a subscrição já tinha sido apagada."],
+     "Nenhum: o `HashSet` recalcula os códigos de dispersão quando o elemento é alterado.",
+     "Depois do `flush`, o `id` deixa de ser nulo, o `hashCode` muda e o elemento fica num *bucket* errado — `contains` devolve `false` sobre o próprio objecto que lá está.",
+     "O `persist` falha com `IdentifierGenerationException` porque o `id` ainda é nulo no momento da inserção no `HashSet`.",
+     "O Hibernate substitui automaticamente `equals` e `hashCode` por comparação de identidade no *proxy*, pelo que o comportamento é sempre correcto."],
    "answer": 1,
-   "explain": "`DELETE` é idempotente: N chamadas deixam o servidor no mesmo estado que uma, portanto a repetição deve devolver o mesmo sucesso. `404` faz um retry legítimo parecer erro e polui a taxa de 4xx do cliente; `409` promete que uma releitura permite repetir com sucesso, o que aqui é falso; `200` com corpo explicativo introduz um estado que o cliente tem de interpretar sem ganho nenhum."},
+   "explain": "O `HashSet` calcula o *bucket* no momento da inserção e nunca o recalcula. Com o `hashCode` dependente de um `id` que passa de `null` a um valor no `flush`, o elemento fica inacessível: `contains` e `remove` falham e `orphanRemoval` pode apagar o que não devia. A correcção é uma chave de negócio imutável no `equals` e um `hashCode` constante por classe. As restantes opções inventam comportamentos que nem o `HashSet` nem o Hibernate têm."},
 
-  {"q": "Numa cadeia de quatro serviços, cada um configurado com `maxAttempts: 3` no Resilience4j, o serviço mais a jusante começa a falhar. Quantos pedidos, no pior caso, chegam ao serviço em falha por cada pedido original do utilizador?",
-   "options": ["3", "12", "81", "64"],
+  {"q": "É preciso importar 2 milhões de linhas de um ficheiro CSV para PostgreSQL num serviço Spring Boot 3.5. O primeiro protótipo usa `repository.saveAll(lista)` com `hibernate.jdbc.batch_size=50`. Qual é a avaliação correcta?",
+   "options": [
+     "É a abordagem certa: com `batch_size` definido, o JPA atinge o mesmo débito que o `COPY` do PostgreSQL.",
+     "Basta aumentar `batch_size` para 5 000 para resolver tanto o débito como o consumo de memória.",
+     "O contexto de persistência acumula 2 milhões de entidades e respectivos *snapshots*; para volumes destes usa-se `JdbcTemplate.batchUpdate` ou o `CopyManager`, com uma ordem de grandeza de diferença.",
+     "O problema resolve-se envolvendo o `saveAll` em `@Transactional(readOnly = true)` para desligar o *dirty checking*."],
    "answer": 2,
-   "explain": "As tentativas multiplicam-se ao longo da cadeia: 3 × 3 × 3 × 3 = 3⁴ = 81 pedidos no pior caso. Este efeito multiplicativo é a razão pela qual a repetição deve viver num único nível da cadeia, com jitter e um orçamento de retries limitado a uma percentagem do débito; 12 (3×4) confunde multiplicação com soma e 64 corresponderia a 4³."},
+   "explain": "Com 2 milhões de entidades geridas, o contexto de persistência guarda cada objecto mais o seu *snapshot* e o *dirty checking* varre tudo a cada *flush*: é `OutOfMemoryError` antes de ser lentidão. Aumentar o `batch_size` agrava a memória e não toca no problema estrutural; `readOnly` numa escrita é contraditório e o PostgreSQL rejeitaria as inserções. Carregamentos em massa saem do contexto de persistência: `batchUpdate` ou `COPY`, com ganhos entre 25× e 75×."},
 
-  {"q": "Um disjuntor do Resilience4j está configurado com `failureRateThreshold: 50`, `slidingWindowSize: 100` e sem `slowCallRateThreshold`. A dependência degrada: deixa de devolver erros mas passa de 80 ms para 750 ms de p99. O que acontece?",
+  {"q": "Depois de definir `hibernate.jdbc.batch_size=50`, `order_inserts=true` e `order_updates=true`, a contagem de idas e voltas ao inserir entidades continua igual. A chave primária está declarada com `@GeneratedValue(strategy = GenerationType.IDENTITY)`. Porquê?",
    "options": [
-    "O circuito abre, porque as chamadas lentas contam como falhas por omissão.",
-    "O circuito permanece fechado e as threads acumulam-se à espera, degradando também pedidos que não usam essa dependência.",
-    "O circuito passa a meio-aberto e limita automaticamente o débito para proteger a dependência.",
-    "O `TimeLimiter` transforma as chamadas lentas em falhas contadas, pelo que o circuito abre sem configuração adicional."],
+     "Porque `IDENTITY` obriga o Hibernate a executar cada `INSERT` imediatamente para obter o identificador gerado, o que desactiva o *batching* de inserções.",
+     "Porque `order_inserts` só actua em entidades com `@Version` e a entidade não a tem.",
+     "Porque `batch_size` acima de 20 é ignorado pelo *driver* PostgreSQL.",
+     "Porque o *batching* só funciona com `@Transactional(propagation = REQUIRES_NEW)`."],
+   "answer": 0,
+   "explain": "O Hibernate precisa do identificador para registar a entidade no mapa de identidade, e uma coluna `identity` só o devolve depois de a instrução correr — logo não pode adiar nem agrupar os `INSERT`. A correcção é `GenerationType.SEQUENCE` com `allocationSize` igual ao tamanho do lote. `order_inserts` não depende de `@Version`, o *driver* não ignora o tamanho do lote, e a propagação não tem qualquer relação com o agrupamento JDBC."},
+
+  {"q": "Uma consulta JPQL faz `join fetch` de duas colecções da mesma raiz, ambas mapeadas como `List` sem `@OrderColumn`. O que acontece e qual é a correcção adequada?",
+   "options": [
+     "Corre normalmente; o Hibernate deduplica as linhas do produto cartesiano de forma transparente desde a versão 6.",
+     "Lança `MultipleBagFetchException` no arranque; corrige-se trazendo uma colecção por `join fetch` e a outra por lote, com `default_batch_fetch_size`.",
+     "Lança `LazyInitializationException` na primeira leitura; corrige-se ligando o `open-in-view`.",
+     "Lança `MultipleBagFetchException`; corrige-se mudando `FetchType` das duas colecções para `EAGER`."],
    "answer": 1,
-   "explain": "Sem `slowCallDurationThreshold`/`slowCallRateThreshold`, o disjuntor só conta excepções, e uma degradação sem erros mantém-no fechado enquanto as threads e as ligações se esgotam — a saturação alastra a pedidos que nem tocam nessa dependência. O estado meio-aberto só surge após abrir; e o `TimeLimiter`, se não estiver configurado com um timeout menor que 750 ms, também não gera falhas."},
+   "explain": "Duas *bags* — `List` sem índice de ordem — não podem ser trazidas na mesma consulta porque o produto cartesiano tornaria impossível reconstruir as multiplicidades; o Hibernate falha na criação do repositório com `MultipleBagFetchException`. A saída sã é trazer uma colecção por `join fetch` e as restantes por lote de *fetch*. Passar a `EAGER` mantém o mesmo conflito e alastra-o a todas as consultas; o `open-in-view` é irrelevante aqui."},
 
-  {"q": "Um endpoint `POST /v1/pagamentos` guarda a chave de idempotência numa tabela própria, mas fá-lo depois de a transacção de negócio ter feito commit. Qual é a consequência exacta?",
+  {"q": "Um método executa `@Modifying @Query(\"update Artigo a set a.stock = a.stock - 1 where a.id = :id\")` e, na mesma transacção, faz depois `repository.findById(id)` para devolver o novo valor. O valor devolvido está errado. Porquê?",
    "options": [
-    "Nenhuma, desde que a tabela tenha uma restrição de unicidade sobre a chave.",
-    "Existe uma janela entre o commit do pagamento e a gravação da chave em que um retry cria um pagamento duplicado.",
-    "A chave nunca é gravada se o pagamento falhar, o que impede repetições legítimas.",
-    "O pagamento fica bloqueado até o registo de idempotência ser confirmado por outra instância."],
-   "answer": 1,
-   "explain": "A restrição de unicidade só protege depois de a linha existir; entre o commit do pagamento e a inserção da chave há uma janela de milissegundos — precisamente onde o timeout do cliente dispara — em que uma repetição não encontra chave nenhuma e cria um segundo pagamento. A correcção é reservar a chave antes (com `ON CONFLICT DO NOTHING` numa transacção própria) e concluir o registo na mesma transacção do efeito de negócio."},
-
-  {"q": "Uma API pública devolve `HTTP 200` com `{\"sucesso\": false, \"erro\": \"SALDO_INSUFICIENTE\"}` para falhas de negócio. Qual é o custo operacional mais grave desta decisão?",
-   "options": [
-    "O corpo da resposta fica maior do que o necessário, aumentando o consumo de largura de banda.",
-    "Os clientes têm de fazer parsing do JSON para descobrir se o pedido falhou, o que aumenta a latência.",
-    "A taxa de erro medida pelo gateway, pelos painéis e pelos SLO fica a 0% enquanto uma fracção real dos pedidos falha.",
-    "O tipo de conteúdo deixa de ser `application/problem+json`, o que quebra os SDKs gerados por OpenAPI."],
-   "answer": 2,
-   "explain": "O código de estado é a única informação que proxies, painéis e alertas sabem ler sem conhecer o domínio; devolver `200` para falhas torna a métrica de disponibilidade cega e um alerta que nunca dispara. O tamanho do corpo e o parsing são irrelevantes em ordem de grandeza, e o tipo de conteúdo é uma consequência menor face à perda de sinal operacional."}
+     "Porque a consulta de modificação em massa não passa pelo contexto de persistência: a entidade já carregada continua na *cache* de primeiro nível com o valor antigo e o `findById` devolve-a sem tocar na base de dados.",
+     "Porque `@Modifying` obriga a `REQUIRES_NEW` e a alteração ainda não foi confirmada.",
+     "Porque o nível de isolamento `READ COMMITTED` impede ler o que a própria transacção escreveu.",
+     "Porque `@Modifying` executa a instrução apenas no `commit`, depois do `findById`."],
+   "answer": 0,
+   "explain": "As instruções de modificação em massa em JPQL ou SQL nativo são enviadas directamente à base de dados: não fazem *dirty checking*, não incrementam `@Version` e não sincronizam o contexto de persistência. O `findById` devolve a instância gerida obsoleta a partir da *cache* de primeiro nível. Resolve-se com `clearAutomatically = true` e `flushAutomatically = true` em `@Modifying`, ou recarregando após `em.clear()`. Uma transacção vê sempre as suas próprias escritas, e `@Modifying` não muda a propagação nem adia a execução."}
 ]}

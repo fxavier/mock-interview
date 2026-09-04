@@ -1,559 +1,918 @@
-<p>Perguntar por Quarkus numa entrevista de Java sénior raramente é perguntar por Quarkus. É uma sonda para descobrir se o candidato sabe <em>porque</em> é que o Spring é lento a arrancar e caro em memória — ou seja, se percebe o que acontece entre o <code>main()</code> e o primeiro pedido servido. Quem responde «Quarkus é mais rápido» sem conseguir nomear o mecanismo (varrimento do <em>classpath</em>, construção do contexto e criação de <em>proxies</em> em tempo de execução contra geração de bytecode em tempo de compilação) mostra que nunca olhou para dentro de nenhum dos dois. O outro sinal que esta área mede é maturidade de decisão: um sénior que recomenda mudar 40 serviços para Quarkus porque o arranque desce de 3 s para 40 ms está a optimizar a métrica errada e a ignorar o custo humano da migração. Este capítulo cobre o modelo de arranque, os limites reais do <em>native image</em>, os números de memória que se podem defender, Mutiny contra Reactor, e como fundamentar uma recomendação que sobreviva a três follow-ups.</p>
+<p>Uma ronda sobre APIs REST raramente mede se o candidato sabe o que significa REST. Mede se já viu um contrato sobreviver a três anos de clientes que não controla, a um <em>retry</em> automático que duplicou 4 000 pagamentos, e a um <em>timeout</em> de 30 segundos herdado por omissão que transformou uma dependência lenta numa indisponibilidade total. Os candidatos caem em três sítios previsíveis: descrevem métodos e códigos de estado sem os ligar a garantias operacionais, tratam idempotência como sinónimo de «não faz mal repetir», e desenham resiliência com uma anotação de <em>retry</em> sem calcular o orçamento de latência em que ela cabe. Este capítulo trata o contrato como aquilo que é — uma promessa com custo de rescisão — e liga cada escolha de desenho a um número mensurável em produção.</p>
 
-<h2 id="sec-14-1" class="h2"><span class="secnum">14.1</span> Quarkus vs Spring Boot: modelo de arranque e extensões<a class="anchor" href="#sec-14-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-14-1" class="h2"><span class="secnum">14.1</span> Desenhar o contrato: recursos, verbos e códigos<a class="anchor" href="#sec-14-1" aria-label="ligação">#</a></h2>
 
-<p>A diferença estrutural entre os dois não é o servidor HTTP nem a API de injecção: é <em>quando</em> se decide o grafo de dependências. O Spring Boot 3.x monta o <code>ApplicationContext</code> no arranque do processo. Isso implica varrer os pacotes indicados por <code>@ComponentScan</code>, ler anotações por reflexão, avaliar centenas de condições de auto-configuração (<code>@ConditionalOnClass</code>, <code>@ConditionalOnMissingBean</code>), instanciar as definições de <em>bean</em> por ordem topológica e gerar <em>proxies</em> — CGLIB para classes <code>@Configuration</code> e para <code>@Transactional</code> sobre classes, JDK dynamic proxies quando o alvo é uma interface. Tudo isto é trabalho que se repete em cada arranque de cada réplica, e escala com o número de classes no <em>classpath</em>, não com o número de <em>beans</em> que a aplicação realmente usa.</p>
+<p>O ponto de partida de um contrato HTTP não é a lista de <em>endpoints</em>, é a lista de recursos com identidade estável e a semântica que cada método promete sobre eles. Dessa semântica saem duas propriedades que a infra-estrutura assume sem perguntar: <strong>segurança</strong> (o método não altera estado observável) e <strong>idempotência</strong> (N execuções idênticas deixam o servidor no mesmo estado que uma). Não são adornos de documentação: um <em>proxy</em>, uma <em>CDN</em>, um cliente HTTP com <em>retry</em> por omissão e uma <em>service mesh</em> tomam decisões automáticas com base nelas. O Envoy, por exemplo, só reenvia por omissão os métodos que a configuração declara reidentificáveis; se um <code>POST</code> for marcado como reidentificável porque «na prática é seguro», o serviço acabou de contratar duplicação silenciosa.</p>
 
-<p>O Quarkus desloca esse trabalho para a fase de <em>build</em>, a que chama <em>augmentation</em>. Durante o <code>mvn package</code>, o <code>quarkus-maven-plugin</code> corre os <em>build steps</em> de cada extensão sobre um índice Jandex do <em>classpath</em>, resolve as condições, decide que <em>beans</em> existem e gera bytecode concreto — incluindo as subclasses interceptoras que o Spring criaria em tempo de execução com CGLIB. O que sobra para o arranque é carregar classes já decididas e correr os poucos passos de <em>runtime init</em>. É por isso que o ganho existe mesmo sem <em>native image</em>: em JVM, uma aplicação REST + Hibernate típica arranca em cerca de 0,8 a 1,5 s em Quarkus contra 2 a 4 s em Spring Boot com o mesmo âmbito funcional.</p>
+<p>A discussão prática que aparece em quase todas as entrevistas é a fronteira entre acção e recurso. Um sistema de pagamentos precisa de «capturar», «estornar» e «cancelar»; nenhum destes é um substantivo. Há duas saídas defensáveis. A primeira é modelar a acção como recurso subordinado com identidade própria — <code>POST /v1/pagamentos/{id}/capturas</code> cria uma captura, devolve <code>201</code> com <code>Location</code>, e a captura passa a ser consultável, auditável e idempotentizável por chave. A segunda é assumir o estilo RPC sobre HTTP num sufixo explícito — <code>POST /v1/pagamentos/{id}:capturar</code> — e documentar que não é REST. A escolha errada é a terceira: <code>PUT /v1/pagamentos/{id}</code> com um campo <code>estado: "CAPTURADO"</code>, que obriga o servidor a inferir a transição a partir de um diff e destrói a auditoria.</p>
 
-<p>A consequência menos óbvia é sobre as extensões. Em Quarkus, uma biblioteca só participa plenamente no modelo se existir uma extensão que lhe forneça <em>build steps</em>: sem isso, ou funciona por reflexão em modo JVM e falha em <em>native</em>, ou obriga a configuração manual de metadados. O catálogo de extensões oficiais cobre bem o núcleo (Hibernate ORM/Reactive, RESTEasy Reactive, Kafka via SmallRye, Redis, gRPC, OIDC, Micrometer, Flyway), mas a cauda longa do ecossistema Java — bibliotecas internas, SDKs de fornecedores menores, agentes de APM antigos — não tem equivalente. O Spring, pelo contrário, aceita praticamente qualquer JAR porque decide tudo em tempo de execução com o <em>classpath</em> completo à frente. A troca é directa: velocidade e previsibilidade contra amplitude do ecossistema.</p>
+<p>Nos códigos de estado, o erro sénior não é escolher <code>422</code> em vez de <code>400</code> — é usar <code>200</code> com um campo <code>sucesso: false</code> no corpo. Essa decisão retira aos <em>proxies</em>, aos painéis e aos alertas a única informação que eles sabem ler sem conhecer o domínio, e transforma a taxa de erro do serviço numa métrica que mente. Um serviço que devolve <code>200</code> para falhas de negócio aparece com 0% de erros num painel enquanto 12% dos pedidos falham.</p>
 
-<p>Desde o Spring Boot 3.0 a distância encurtou. O motor AOT (<code>spring-boot:process-aot</code>) gera, em tempo de compilação, código Java que substitui a leitura de anotações e as condições de auto-configuração por chamadas explícitas, e pré-gera as classes de <em>proxy</em>. Convém dizê-lo numa entrevista: o Spring adoptou o modelo <em>build-time</em> do Quarkus para o caminho AOT/native, mantendo o modo <em>runtime</em> clássico como omissão. Quem descreve o Spring como «puramente reflexivo» em 2026 está a citar documentação de 2019.</p>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Ordens de grandeza defensáveis para um serviço REST com Hibernate, 30 a 60 <em>beans</em> aplicacionais e ligação a PostgreSQL: Spring Boot 3.x em JVM arranca em 2–4 s; Quarkus em JVM em 0,8–1,5 s; Quarkus em <em>native</em> em 20–50 ms; Spring Boot em <em>native</em> (AOT + GraalVM) em 50–150 ms. Em <em>native</em> a diferença entre os dois cai para um factor de 2 a 3; em JVM ronda um factor de 3. O número que interessa em produção não é nenhum destes isolado, mas o tempo até <em>readiness</em>, que inclui abrir o <em>pool</em> de ligações, correr o Flyway e aquecer os primeiros caminhos JIT.</p></aside>
-
-<div class="qa" id="q-14-1" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Spring e frameworks</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Explique-me, ao nível do mecanismo, porque é que uma aplicação Quarkus arranca mais depressa do que a mesma aplicação em Spring Boot. E antes de responder «porque é native», assuma que ambas correm na JVM.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque o Quarkus faz em tempo de <em>build</em> aquilo que o Spring faz em tempo de arranque: decidir que <em>beans</em> existem, resolver as condições de configuração e gerar o código de ligação entre eles. Em JVM, o Quarkus arranca já com o grafo decidido; o Spring reconstrói esse grafo em cada processo.</p>
-      <p>Concretamente, o arranque de um Spring Boot gasta o tempo em quatro sítios. Primeiro, varrimento do <em>classpath</em>: abrir JARs, ler os metadados das classes candidatas e indexar anotações. Segundo, avaliação das auto-configurações — algumas centenas de classes com condições do tipo <code>@ConditionalOnClass</code>, cada uma a exigir uma tentativa de carregamento de classe. Terceiro, instanciação por reflexão e resolução de dependências. Quarto, geração de <em>proxies</em> CGLIB em tempo de execução, que é geração de bytecode e carregamento de classes adicionais. O quarto ponto é o que muitos candidatos esquecem e é o que explica porque é que activar <code>@Transactional</code> em muitas classes é visível no tempo de arranque.</p>
-      <p>O Quarkus corre a fase de <em>augmentation</em> durante o <code>mvn package</code>: constrói um índice Jandex do <em>classpath</em>, executa os <em>build steps</em> das extensões (que são código que corre no <em>build</em>, não na aplicação) e emite bytecode — incluindo as subclasses de intercepção que substituem os <em>proxies</em> dinâmicos. Em <em>runtime</em>, o que resta é carregar classes conhecidas e correr os passos marcados como <code>@Record(RUNTIME_INIT)</code>, tipicamente abrir sockets e o <em>pool</em> de ligações.</p>
-      <p>O trade-off é a rigidez: o que foi decidido no <em>build</em> não se muda por uma variável de ambiente. Alterar a lista de extensões, activar um perfil que muda o conjunto de <em>beans</em> ou substituir um <em>datasource</em> por outro tipo exige reconstruir o artefacto. No Spring, uma <em>property</em> muda o comportamento no arranque. Onde a escolha contrária ganha é em plataformas internas com <em>plugins</em> descobertos dinamicamente ou aplicações cujo perfil é definido pelo operador no <em>deploy</em>: aí o modelo <em>runtime</em> do Spring é uma funcionalidade, não um defeito.</p>
-      <p>Vale acrescentar que o Spring Boot 3.x tem o seu próprio caminho AOT, que aplica a mesma ideia e recupera boa parte da diferença — mas só quando o <em>pipeline</em> corre <code>process-aot</code>, o que na prática só acontece nas <em>builds</em> nativas ou com configuração explícita.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Quarkus é native e por isso é rápido»; não distingue modo JVM de modo nativo; atribui a diferença ao servidor HTTP.</td></tr>
-        <tr><td>Mid</td><td>Diz «build-time vs runtime» correctamente, mas não sabe nomear o que é feito no arranque do Spring nem o que sobra no arranque do Quarkus.</td></tr>
-        <tr><td>Sénior</td><td>Enumera varrimento, condições, reflexão e geração de <em>proxies</em>; explica <em>augmentation</em>, Jandex e bytecode gerado; dá números de arranque em JVM; identifica a perda de flexibilidade de configuração.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais a distinção <em>static init</em> / <em>runtime init</em>, o efeito no <em>live reload</em> em desenvolvimento, e a observação de que o Spring AOT converge para o mesmo modelo — com o custo de o <em>pipeline</em> de CI passar a ter de correr o passo AOT.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Se o grafo é decidido no <em>build</em>, como é que o <em>live reload</em> do <code>quarkus:dev</code> funciona?»</li>
-      <li>«Que parte do arranque é que o AOT do Spring <em>não</em> elimina?»</li>
-      <li>«O tempo de arranque afecta o p99 dos pedidos? Em que circunstâncias?»</li>
-      <li>«Como mediria onde é que os 3 s de arranque estão a ser gastos?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confundir tempo de arranque com débito em regime estacionário e afirmar que Quarkus «serve mais pedidos por segundo» sem qualificação.</li>
-      <li>Não saber que o Spring Boot tem AOT desde a versão 3.0.</li>
-      <li>Descrever a injecção de dependências do Quarkus como reflexiva.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-14-2" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Spring e frameworks</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">A equipa vem toda de Spring. Que diferenças concretas do modelo de <em>beans</em> CDI/ArC as vão morder na primeira semana?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>São quatro diferenças que geram erros no primeiro dia: âmbitos declarados explicitamente, resolução por tipo e qualificadores em vez de nome, remoção de <em>beans</em> não usados, e intercepção sem <em>proxies</em> dinâmicos.</p>
-      <p>Primeiro, o âmbito. No Spring, uma classe anotada com <code>@Component</code> ou <code>@Service</code> é singleton por omissão. Em CDI, o âmbito faz parte do contrato: <code>@ApplicationScoped</code>, <code>@Singleton</code>, <code>@RequestScoped</code>, <code>@Dependent</code>. O erro clássico é esquecer a anotação e obter <code>@Dependent</code>, que cria uma instância por ponto de injecção — silenciosamente, com estado duplicado. E há uma subtileza que o Spring não tem: <code>@ApplicationScoped</code> é <em>lazy</em> e usa um <em>client proxy</em> gerado no <em>build</em>, enquanto <code>@Singleton</code> não tem <em>proxy</em>; isso muda o comportamento em ciclos de dependência e no momento em que o construtor corre.</p>
-      <p>Segundo, a resolução. O CDI resolve por tipo mais qualificadores. Duas implementações da mesma interface sem qualificador dão erro de <em>ambiguous dependency</em> no <em>build</em>, não no arranque — o que é melhor, mas o candidato tem de saber que a solução é <code>@Named</code> ou um qualificador próprio, e não a ordem de declaração. Não existe equivalente directo a <code>@Primary</code> a não ser <code>@DefaultBean</code> ou <code>@Alternative</code> com prioridade.</p>
-      <p>Terceiro, a remoção de <em>beans</em> não utilizados. O ArC elimina do artefacto <em>beans</em> que ninguém injecta, para reduzir memória e arranque. Se um <em>bean</em> só é usado por reflexão ou só existe pelos seus efeitos secundários (um observador de eventos, um <em>startup task</em>), desaparece e a aplicação comporta-se de forma diferente. A correcção é <code>@Unremovable</code> ou um ponto de injecção real.</p>
-      <p>Quarto, a intercepção. <code>@Transactional</code> em Spring sobre um método privado ou chamado internamente não intercepta, porque o <em>proxy</em> está fora do objecto. Em Quarkus, a intercepção é feita por uma subclasse gerada no <em>build</em>, logo o problema da auto-invocação existe na mesma — mas o compilador avisa em casos que o Spring deixa passar em silêncio. Na prática, a regra permanece: um método interceptado tem de ser chamado por outro <em>bean</em>.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«É igual, só mudam os nomes das anotações.»</td></tr>
-        <tr><td>Mid</td><td>Cita <code>@ApplicationScoped</code> vs <code>@Component</code> e pouco mais; não conhece <code>@Dependent</code> nem a remoção de <em>beans</em>.</td></tr>
-        <tr><td>Sénior</td><td>Cobre âmbitos com o perigo do <code>@Dependent</code>, resolução por qualificadores, <em>bean removal</em> e <code>@Unremovable</code>, e o modelo de intercepção sem <em>proxy</em> dinâmico.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o efeito nos testes (<code>@QuarkusTest</code> e <code>@InjectMock</code> contra <code>@MockBean</code>), o custo de formação da equipa em semanas-pessoa, e uma estratégia de convenção interna para evitar a classe de erros do <code>@Dependent</code>.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que acontece se injectar um <code>@RequestScoped</code> dentro de um <code>@ApplicationScoped</code>?»</li>
-      <li>«Como se substitui um <em>bean</em> só em testes?»</li>
-      <li>«Porque é que o ArC remove <em>beans</em> e o Spring não?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Afirmar que a auto-invocação de <code>@Transactional</code> funciona em Quarkus.</li>
-      <li>Desconhecer o âmbito por omissão de CDI e assumir singleton.</li></ul></div>
-  </div>
-</div>
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.1</span> Propriedades que a infra-estrutura assume por método, e o que se perde ao contrariá-las.</div>
+<div class="tscroll"><table><thead><tr><th>Método</th><th>Seguro</th><th>Idempotente</th><th>Sucesso típico</th><th>O que quebra se for mal usado</th></tr></thead><tbody>
+<tr><td><code>GET</code></td><td>Sim</td><td>Sim</td><td><code>200</code>, <code>304</code></td><td>Um <code>GET</code> que altera estado é reexecutado por <em>prefetch</em> do browser e por <em>crawlers</em> internos.</td></tr>
+<tr><td><code>POST</code></td><td>Não</td><td>Não</td><td><code>201</code> + <code>Location</code>, <code>202</code></td><td>Reenvio automático duplica recursos; exige chave de idempotência explícita.</td></tr>
+<tr><td><code>PUT</code></td><td>Não</td><td>Sim</td><td><code>200</code>, <code>204</code></td><td>Substituição total: campos omitidos são apagados, e clientes antigos apagam campos novos.</td></tr>
+<tr><td><code>PATCH</code></td><td>Não</td><td>Não garantida</td><td><code>200</code>, <code>204</code></td><td>Um <em>patch</em> com <code>{"saldo": {"incremento": 10}}</code> repetido soma duas vezes.</td></tr>
+<tr><td><code>DELETE</code></td><td>Não</td><td>Sim</td><td><code>204</code>, <code>200</code></td><td>Devolver <code>404</code> na segunda chamada faz um <em>retry</em> legítimo parecer erro.</td></tr>
+</tbody></table></div></div>
 
 <figure class="listing text" id="lst-14-1"><div class="lhead"><span class="lnum">Listagem 14.1</span>
-<span class="lcap">Quarkus: configuração e acesso a dados equivalentes ao exemplo Spring da Listagem 14.2.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code># src/main/resources/application.properties
-quarkus.http.port=8080
-quarkus.datasource.db-kind=postgresql
-quarkus.datasource.username=${DB_USER}
-quarkus.datasource.password=${DB_PASSWORD}
-quarkus.datasource.jdbc.url=jdbc:postgresql://db:5432/orders
-quarkus.datasource.jdbc.max-size=20
-quarkus.hibernate-orm.database.generation=none
-quarkus.flyway.migrate-at-start=true
-quarkus.log.level=INFO
-quarkus.micrometer.export.prometheus.enabled=true
+<span class="lcap">Merge patch (RFC 7386) e JSON Patch (RFC 6902) sobre o mesmo recurso: semânticas diferentes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>PATCH /v1/clientes/8842 HTTP/1.1
+Content-Type: application/merge-patch+json
+If-Match: "w/rev-17"
 
-# perfil: sobrepoe-se por prefixo, resolvido no arranque
-%dev.quarkus.hibernate-orm.log.sql=true
-%prod.quarkus.datasource.jdbc.max-size=40
+{"email": "ana@exemplo.pt", "telefoneAlternativo": null}
+--&gt; 200 OK   (email actualizado; telefoneAlternativo REMOVIDO: null significa apagar)
 
-// ------------------------------------------------------------------
-// Order.java — entidade Panache (padrao active record)
-@Entity
-public class Order extends PanacheEntity {
-    public String reference;
-    public BigDecimal amount;
-    @Enumerated(EnumType.STRING) public Status status;
+PATCH /v1/clientes/8842 HTTP/1.1
+Content-Type: application/json-patch+json
+If-Match: "w/rev-17"
 
-    public static List&lt;Order&gt; pendingOlderThan(Instant t) {
-        return list("status = ?1 and createdAt &lt; ?2", Status.PENDING, t);
-    }
-}
+[
+  {"op": "test",    "path": "/email", "value": "ana.antiga@exemplo.pt"},
+  {"op": "replace", "path": "/email", "value": "ana@exemplo.pt"},
+  {"op": "add",     "path": "/etiquetas/-", "value": "vip"}
+]
+--&gt; 200 OK   se o test passar; 409 Conflict se outro cliente já mudou o email
+--&gt; 412 Precondition Failed se o ETag deixou de corresponder</code></pre></figure>
 
-// OrderResource.java
-@Path("/orders")
-public class OrderResource {
-    @GET @Path("/{id}")
-    public Order get(@RestPath Long id) {
-        return Order.findByIdOptional(id)
-                    .orElseThrow(() -&gt; new NotFoundException());
-    }
-
-    @POST @Transactional
-    public Response create(@Valid NewOrder cmd) {
-        Order o = new Order();
-        o.reference = cmd.reference();
-        o.amount = cmd.amount();
-        o.status = Status.PENDING;
-        o.persist();                       // sem repositorio, sem save()
-        return Response.status(201).entity(o).build();
-    }
-}
-</code></pre></figure>
-
-<figure class="listing yaml" id="lst-14-2"><div class="lhead"><span class="lnum">Listagem 14.2</span>
-<span class="lcap">Spring Boot 3.x: a mesma funcionalidade com <code>application.yml</code> e Spring Data JPA.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="yaml"><code>server:
-  port: 8080
-spring:
-  datasource:
-    url: jdbc:postgresql://db:5432/orders
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
-    hikari:
-      maximum-pool-size: 20
-  jpa:
-    hibernate:
-      ddl-auto: none
-  flyway:
-    enabled: true
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,prometheus
----
-spring:
-  config:
-    activate:
-      on-profile: prod
-  datasource:
-    hikari:
-      maximum-pool-size: 40
-</code></pre></figure>
-
-<div class="qa" id="q-14-3" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Comparando as duas listagens: o Panache troca o repositório por <code>Order.persist()</code>. Vale a pena? E que problemas é que o Spring Data resolve que o Panache não resolve?</div>
+<div class="qa" id="q-14-1" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos um recurso de perfil de cliente com 40 campos. A equipa móvel quer alterar só o email. Qual escolhe — <code>PUT</code>, <code>PATCH</code> ou <code>POST</code> — e o que muda em cada um?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Vale a pena em serviços pequenos e com modelo de domínio simples, e deixa de valer quando o acesso a dados tem regras próprias que merecem ser testadas isoladamente. Ambos são camadas finas sobre Hibernate ORM; a diferença é onde colocam as consultas.</p>
-      <p>O Panache oferece dois modos: <em>active record</em> (a entidade estende <code>PanacheEntity</code> e traz <code>persist</code>, <code>list</code>, <code>findById</code>) e <em>repository</em> (<code>PanacheRepository&lt;Order&gt;</code>), que é praticamente o modelo do Spring Data sem geração de consultas por nome de método. O ganho mensurável é código: um CRUD com cinco consultas passa tipicamente de 60–80 linhas de repositório para 15–20 linhas na entidade, e a sintaxe abreviada de HQL (<code>list("status = ?1", ...)</code> em vez de <code>from Order o where o.status = ?1</code>) elimina outra dezena de linhas.</p>
-      <p>O Spring Data resolve três coisas que o Panache não resolve directamente. Primeira, derivação de consultas a partir do nome do método (<code>findByStatusAndCreatedAtBefore</code>), validada no arranque — o Panache exige HQL escrito à mão, com o erro a aparecer na primeira execução se o teste não cobrir a consulta. Segunda, projecções em interfaces e DTO com <em>constructor expressions</em> geridas pelo framework. Terceira, e a mais importante para quem tem um portefólio heterogéneo, a mesma abstracção sobre JPA, MongoDB, Redis, Cassandra e JDBC, o que permite reutilizar padrões de teste e paginação entre serviços.</p>
-      <p>Em ambos, o mesmo pecado continua a ser o mais caro: N+1. Nem <code>PanacheEntity.listAll()</code> nem <code>CrudRepository.findAll()</code> resolvem associações <em>lazy</em>; a correcção é a mesma nos dois — <code>join fetch</code> ou <code>@EntityGraph</code> — e é essa a resposta que o entrevistador quer ouvir a seguir. O <em>active record</em> tem ainda um custo de desenho: métodos estáticos na entidade são mais difíceis de substituir por duplos de teste, o que empurra para testes com base de dados real (Testcontainers ou os Dev Services do Quarkus). Numa equipa que já corre Testcontainers em CI isso é neutro; numa que dependa de <em>mocks</em> do repositório, é um custo real.</p></div>
+      <p><code>PATCH</code> com <code>application/merge-patch+json</code> e controlo de concorrência optimista por <code>ETag</code>/<code>If-Match</code>. A razão não é economia de largura de banda — 40 campos são talvez 2 KB, irrelevante — é evitar a perda de escrita que o <code>PUT</code> garante neste cenário.</p>
+      <p>O mecanismo: <code>PUT</code> é substituição total do recurso. Se a aplicação móvel foi compilada quando o perfil tinha 40 campos e o servidor entretanto acrescentou <code>consentimentoMarketing</code>, o <code>PUT</code> do cliente antigo omite esse campo e o servidor, cumprindo a semântica, apaga-o. Este é o modo de falha clássico das APIs móveis: uma versão da aplicação que fica um ano no terreno começa a apagar campos que nunca conheceu. O <code>PUT</code> só é seguro quando o cliente leu o recurso completo imediatamente antes e o devolve integralmente — e mesmo aí precisa de <code>If-Match</code> para não sobrepor uma escrita concorrente.</p>
+      <p>O preço do <code>PATCH</code> é perder a idempotência garantida pelo método. Um <em>merge patch</em> puro (só substituições e remoções por <code>null</code>) é de facto idempotente e um <em>retry</em> é inofensivo; um <em>patch</em> com operações relativas — incrementos, <code>add</code> a um <em>array</em> — não é, e repetir duplica. A regra prática: se o corpo do <code>PATCH</code> contém apenas valores finais, é idempotente na prática e pode ser reenviado; se contém operações, exige chave de idempotência ou um <code>test</code> de JSON Patch que falhe na segunda passagem.</p>
+      <p><code>POST</code> entra quando a alteração é uma acção com regras próprias, não uma edição de campo. Mudar o email num sistema com verificação não é escrever uma coluna: dispara um fluxo de confirmação, invalida sessões e regista um evento de segurança. Nesse caso <code>POST /v1/clientes/8842/alteracoes-de-email</code> cria um recurso de pedido com o seu próprio ciclo de vida, devolve <code>202 Accepted</code> e torna o estado intermédio consultável — o que o <code>PATCH</code> não consegue exprimir.</p>
+      <p>Quando a escolha inversa ganha: em APIs internas de configuração, geridas por Terraform ou GitOps, o <code>PUT</code> total é preferível porque o ficheiro declarativo <em>é</em> a verdade e a convergência total é o objectivo. Aí, apagar o que não está no documento é a funcionalidade, não o defeito.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Panache é mais simples» sem saber que ambos assentam em Hibernate ORM.</td></tr>
-        <tr><td>Mid</td><td>Descreve o <em>active record</em>, não conhece o modo repositório do Panache nem as implicações em testes.</td></tr>
-        <tr><td>Sénior</td><td>Compara os dois modos, quantifica a redução de código, aponta a derivação de consultas por nome e as projecções como o que se perde, e nota que N+1 é indiferente à escolha.</td></tr>
-        <tr><td>Staff</td><td>Liga a escolha à estratégia de testes da equipa e ao número de motores de persistência no portefólio; define a fronteira em que a lógica de consulta deixa de pertencer à entidade.</td></tr>
+        <tr><td>Insuficiente</td><td>«<code>PUT</code> é para actualizar e <code>POST</code> é para criar.» Nenhuma menção a substituição total ou a concorrência.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>PATCH</code> pela poupança de tráfego; sabe que <code>PUT</code> substitui tudo mas não liga isso a versões de cliente antigas.</td></tr>
+        <tr><td>Sénior</td><td>Perda de escrita com clientes desactualizados, <code>If-Match</code>/<code>ETag</code>, distingue <em>merge patch</em> idempotente de operações relativas, e sabe quando a acção merece recurso próprio.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo de suporte de JSON Patch (validação, superfície de ataque em <code>path</code>), a política da organização para os dois formatos, e o caso em que o <code>PUT</code> declarativo é a escolha certa.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como detecta um N+1 antes de ir para produção, em qualquer das duas?»</li>
-      <li>«Como testa uma consulta Panache sem base de dados a correr?»</li>
-      <li>«Onde é que a paginação difere entre os dois?»</li></ul></div>
+      <li>«Como distingue "campo não enviado" de "campo posto a null" num <code>PATCH</code> em Java?»</li>
+      <li>«O cliente não envia <code>If-Match</code>. Rejeita ou aceita?»</li>
+      <li>«O <em>merge patch</em> é idempotente? Justifique.»</li>
+      <li>«Como valida um <code>PATCH</code> com Bean Validation se metade dos campos está ausente?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Achar que o Panache substitui o Hibernate em vez de o embrulhar.</li>
-      <li>Defender <em>active record</em> para um agregado com invariantes de domínio complexos sem mencionar o custo de testabilidade.</li></ul></div>
+      <li>Usar <code>PUT</code> parcial (ignorar campos ausentes) e continuar a chamar-lhe <code>PUT</code>.</li>
+      <li>Não perceber que <code>Optional&lt;String&gt;</code> num DTO não resolve a ambiguidade de <code>null</code> sem configuração explícita do Jackson.</li>
+      <li>Responder «depende» sem escolher e sem enunciar o critério de decisão.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-14-2" class="h2"><span class="secnum">14.2</span> Build-time metadata, reflexão e GraalVM native<a class="anchor" href="#sec-14-2" aria-label="ligação">#</a></h2>
+<div class="qa" id="q-14-2" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um pedido de pagamento chega bem formado, mas o cartão não tem saldo. Que código de estado devolve, e como decide em geral entre 4xx e 5xx?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>422 Unprocessable Content</code>. O pedido é sintacticamente válido e autorizado, mas o estado do domínio impede-o. O critério geral tem uma pergunta única: <em>repetir o mesmo pedido, sem alterar nada, pode ter sucesso?</em> Se não, é 4xx — o cliente tem de mudar alguma coisa. Se sim, é 5xx — o servidor tem de melhorar.</p>
+      <p>Esse critério é operacional, não filosófico. A taxa de 5xx é o que alimenta o SLO de disponibilidade, dispara o alerta às 3 da manhã e conta para o orçamento de erro; a taxa de 4xx é um sinal de qualidade de integração dos clientes. Classificar «saldo insuficiente» como <code>500</code> significa que 3% do tráfego normal consome permanentemente o orçamento de erro e o alerta é desligado por ruído em duas semanas. O inverso — devolver <code>400</code> quando a base de dados está indisponível — esconde uma indisponibilidade real atrás de uma métrica que ninguém vigia.</p>
+      <p>A grelha que se defende numa entrevista: <code>400</code> para JSON malformado ou tipo errado; <code>401</code> sem credencial válida e <code>403</code> com credencial válida mas sem permissão; <code>404</code> quando o recurso não existe ou não deve ser revelado; <code>409</code> para conflito de estado que o cliente pode resolver relendo (versão desactualizada, duplicado detectado); <code>422</code> para regra de negócio violada; <code>429</code> com <code>Retry-After</code> para limitação de débito; <code>503</code> com <code>Retry-After</code> quando o próprio serviço se está a proteger; <code>504</code> quando uma dependência excedeu o <em>timeout</em>.</p>
+      <p>A distinção entre <code>409</code> e <code>422</code> é onde os candidatos fortes se separam: <code>409</code> promete que o cliente pode reler o estado e voltar a tentar com sucesso — é retentável depois de uma leitura; <code>422</code> promete que só um pedido diferente resolve. Essa promessa é lida por SDKs gerados e por camadas de <em>retry</em> automático, por isso é contratual e não estética.</p>
+      <p>Quando a escolha inversa ganha: em <em>gateways</em> públicos, é comum colapsar toda a família de erros de negócio em <code>400</code> com um código de domínio no corpo, precisamente porque clientes escritos em linguagens diversas tratam mal os códigos menos comuns e alguns <em>proxies</em> corporativos reescrevem <code>422</code>. É uma cedência deliberada de expressividade em troca de compatibilidade, e deve ser documentada como tal.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Devolvo <code>200</code> com uma flag de erro no corpo» ou «<code>500</code>, que é erro».</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>400</code> e sabe que 4xx é do cliente e 5xx do servidor, sem ligar isso a alertas ou SLO.</td></tr>
+        <tr><td>Sénior</td><td>Aplica o critério da retentabilidade, distingue <code>409</code> de <code>422</code>, liga 5xx ao orçamento de erro e usa <code>Retry-After</code>.</td></tr>
+        <tr><td>Staff</td><td>Discute o efeito nos clientes gerados por OpenAPI, a política de colapso de códigos em APIs públicas e a governação da tabela de erros entre equipas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«A dependência a jusante devolveu <code>429</code>. O que devolve ao seu cliente?»</li>
+      <li>«E se o utilizador não tem permissão para saber que o recurso existe?»</li>
+      <li>«Que código dá a um pedido que aceitou mas ainda não processou?»</li>
+      <li>«Como impede que um <code>422</code> em massa dispare o alerta de disponibilidade?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>200</code> para falhas, com <code>{"ok": false}</code> no corpo.</li>
+      <li>Deixar escapar <code>500</code> por excepções não tratadas, com <em>stack trace</em> no corpo da resposta.</li>
+      <li>Não saber que a escolha do código determina se um cliente automático repete o pedido.</li></ul></div>
+  </div>
+</div>
 
-<p>O compilador nativo do GraalVM opera sob a hipótese do mundo fechado: tudo o que a aplicação pode executar tem de ser alcançável a partir dos pontos de entrada, estaticamente, no momento da compilação. O analisador percorre o grafo de chamadas, descarta o que não é alcançável e produz um executável que já não tem carregador de classes dinâmico nem compilador JIT. Daí vêm, de uma só vez, os ganhos (arranque em dezenas de milissegundos, RSS baixo, sem aquecimento) e todas as limitações.</p>
+<div class="qa" id="q-14-3" data-box="qa" data-area="api" data-level="senior" data-freq="baixa">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">HATEOAS é o nível 3 do modelo de maturidade de Richardson. Usa-o? Justifique a decisão com o que ganha e o que custa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Na prática, quase nunca na forma completa; parcialmente, sim, e em dois sítios onde paga: ligações de paginação e ligações de transição de estado. A resposta honesta numa entrevista é que a maioria das APIs de sucesso está no nível 2 e que HATEOAS completo falha por uma razão empírica — nenhum cliente real descobre o contrato em tempo de execução; todos codificam os caminhos a partir da documentação ou de um SDK gerado.</p>
+      <p>O que HATEOAS promete é desacoplar o cliente da estrutura de URLs para permitir mudá-la sem quebrar ninguém. O custo é que o cliente tem de percorrer ligações a partir de uma raiz, o que multiplica as idas ao servidor: uma operação que era uma chamada passa a três, e com 40 ms de latência por salto na Europa, uma travessia de três níveis acrescenta 80 ms ao p50. Além disso, um corpo HAL ou <em>application/hal+json</em> com 12 ligações por elemento numa página de 100 elementos cresce 30% a 60% em bytes — relevante em redes móveis.</p>
+      <p>As duas partes que sobrevivem ao teste de utilidade são concretas. Primeira, paginação: devolver <code>next</code> e <code>prev</code> como URL opaca permite ao servidor mudar de <em>offset</em> para cursor sem que o cliente saiba, e é a única forma limpa de esconder um cursor cifrado. Segunda, transições permitidas: incluir num pagamento as acções actualmente legais (<code>capturar</code>, <code>anular</code>) evita que o cliente reimplemente a máquina de estados e mostre botões que vão dar <code>422</code>. Isto reduz erros de integração de forma mensurável — é comum ver a taxa de 4xx de um parceiro cair para metade depois de expor as transições.</p>
+      <p>Quando a escolha inversa ganha: em APIs internas entre equipas com contrato versionado e testes de contrato automatizados, HATEOAS acrescenta peso sem benefício, porque a coordenação de mudança já existe por outra via. Em APIs públicas com centenas de integradores que nunca se poderá contactar, esconder URLs por trás de ligações é o que permite reestruturar o encaminhamento sem uma migração coordenada.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe o que é, ou recita a definição sem opinião.</td></tr>
+        <tr><td>Mid</td><td>Descreve HAL e o modelo de Richardson correctamente, mas sem custo nem caso de uso concreto.</td></tr>
+        <tr><td>Sénior</td><td>Rejeita a forma completa com argumento empírico e adopta as duas partes úteis (paginação e transições), com números de custo.</td></tr>
+        <tr><td>Staff</td><td>Liga a decisão ao modelo de governação: quem se pode coordenar com os clientes determina quanto acoplamento de URL é aceitável.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como serializaria as ligações — HAL, JSON:API ou um campo próprio?»</li>
+      <li>«As transições permitidas dependem de permissões. Calcula-as por pedido?»</li>
+      <li>«Isso não duplica a máquina de estados no servidor e no cliente?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Defender HATEOAS completo por pureza, sem nunca o ter posto em produção.</li>
+      <li>Desprezar totalmente a ideia sem reconhecer o valor das ligações de paginação.</li></ul></div>
+  </div>
+</div>
 
-<p>As limitações são quatro e valem a pena decorar. A reflexão sobre nomes calculados em tempo de execução é invisível ao analisador: <code>Class.forName(prefixo + sufixo)</code> não é resolúvel, e a classe é eliminada. Os <em>proxies</em> dinâmicos JDK exigem que a lista de interfaces seja conhecida no <em>build</em>. Os recursos do <em>classpath</em> (ficheiros de mensagens, <em>templates</em>, certificados) não são incluídos por omissão — só os que forem declarados por padrão. E a serialização, o JNI e os <em>agents</em> Java precisam de configuração explícita; agentes de APM que instrumentam bytecode em tempo de execução simplesmente não funcionam.</p>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Expor identificadores internos (chaves primárias sequenciais) em URLs custa uma fuga de informação — um concorrente estima o volume de negócio pela diferença entre dois ids em 24 horas — e uma superfície de enumeração. Identificadores opacos (UUIDv7, ULID) fecham isso, mas um UUID como chave primária em PostgreSQL 17 aumenta o índice em cerca de 60% face a um <code>bigint</code> e, se for UUIDv4, fragmenta o B-tree por inserção aleatória. O compromisso comum: <code>bigint</code> interno como chave primária e um identificador público ordenável no tempo com índice único próprio.</p></aside>
 
-<p>A forma de resolver é a mesma nos dois frameworks, com ergonomia diferente. Em Quarkus, cada extensão contribui os metadados dos seus próprios tipos durante a <em>augmentation</em>; para as classes da aplicação usa-se <code>@RegisterForReflection</code> ou uma <code>ReflectiveClassBuildItem</code>. Em Spring Boot, o AOT infere hints das anotações conhecidas e o resto declara-se num <code>RuntimeHintsRegistrar</code> ou com <code>@RegisterReflectionForBinding</code>. Fora dos frameworks, a rede de segurança é o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos durante uma execução de testes e produz os ficheiros de configuração — com a limitação óbvia de só cobrir os caminhos que os testes exercitaram.</p>
+<h2 id="sec-14-2" class="h2"><span class="secnum">14.2</span> Versionamento e evolução sem quebrar clientes<a class="anchor" href="#sec-14-2" aria-label="ligação">#</a></h2>
 
-<p>O custo de <em>build</em> é o item que mais surpreende quem nunca o fez em CI. Compilar nativamente não é compilar Java: é uma análise de todo o grafo mais optimização, e consome memória e tempo em proporção ao tamanho da aplicação. Um serviço pequeno leva 2 a 4 minutos; um serviço médio com Hibernate, Kafka e OIDC leva com facilidade 5 a 12 minutos, e precisa de 8 a 16 GB de RAM disponível no <em>runner</em>. Um <em>runner</em> de CI com 4 GB falha com <code>OutOfMemoryError</code> no meio da análise, e a mensagem não é evidente.</p>
+<p>Versionar é a última linha de defesa, não a primeira. A primeira é a disciplina de compatibilidade: acrescentar campos opcionais, nunca remover nem mudar o tipo de um existente, nunca alterar o significado de um valor, nunca tornar obrigatório algo que era opcional, e tolerar campos desconhecidos na desserialização — em Jackson, isso significa garantir que <code>FAIL_ON_UNKNOWN_PROPERTIES</code> está desactivado nos clientes, o que o Spring Boot já faz por omissão desde há muito. Uma equipa que segue estas regras evolui durante anos dentro de <code>v1</code>. Só quando a mudança é genuinamente incompatível — remover um campo de que 200 clientes dependem, ou mudar a unidade de um montante — é que a versão entra em jogo, e nessa altura o custo é de operação, não de sintaxe.</p>
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O modo JVM e o modo nativo não são o mesmo artefacto: uma <em>build</em> nativa pode falhar apenas em tempo de execução, num caminho de código que o teste de integração em JVM nunca percorre — tipicamente uma <em>exception</em> serializada, um <em>template</em> de e-mail lido do <em>classpath</em> ou um <em>parser</em> de JSON sobre uma classe sem metadados. A regra prática é: se se envia nativo para produção, a suite de integração tem de correr contra o executável nativo (em Quarkus, <code>@QuarkusIntegrationTest</code>), e não só contra a versão JVM. Sem isso, o primeiro <code>ClassNotFoundException</code> aparece ao utilizador.</p></aside>
+<p>Os dois formatos que se discutem são versão no caminho (<code>/v1/pagamentos</code>) e versão em cabeçalho ou tipo de conteúdo (<code>Accept: application/vnd.acme.pagamento+json;version=2</code>). O caminho vence em quase todas as organizações por razões que nada têm a ver com pureza REST: é visível nos <em>logs</em> de acesso sem <em>parsing</em>, é encaminhável por regra de <em>ingress</em> sem inspecção de cabeçalhos, é testável com um <em>browser</em> e um <code>curl</code>, e sobrevive a <em>proxies</em> corporativos que descartam cabeçalhos desconhecidos. O cabeçalho vence quando se quer versionar recursos individualmente em vez de toda a API, evitando o salto colectivo de <code>v1</code> para <code>v2</code> que obriga todos os clientes a migrar mesmo os <em>endpoints</em> que não mudaram.</p>
+
+<p>O custo real do versionamento é a duplicação em produção. Manter <code>v1</code> e <code>v2</code> significa duas superfícies de teste, dois caminhos de correcção de <em>bugs</em> e a tentação de bifurcar o domínio. A técnica que reduz esse custo é uma só implementação interna com adaptadores de tradução na fronteira: <code>v1</code> e <code>v2</code> são dois <em>mappers</em> sobre o mesmo modelo, e a versão antiga vive como uma projecção. Uma janela de descontinuação típica em API pública é de 12 a 18 meses, com cabeçalhos <code>Deprecation</code> e <code>Sunset</code> a partir do primeiro dia e um painel de utilização por versão e por cliente — sem esse painel, não há como saber quando é seguro desligar.</p>
+
+<div class="qa" id="q-14-4" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Precisamos de mudar o campo <code>montante</code> de euros decimais para cêntimos inteiros numa API com 300 integradores externos. Como executa isso?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Nunca mudando o significado do campo existente. Uma alteração de unidade no mesmo nome e no mesmo tipo é o pior tipo de quebra: não falha na desserialização, não aparece nos testes de contrato de esquema, e produz transacções com valor 100 vezes errado. A execução tem quatro fases.</p>
+      <p>Fase 1, expansão: acrescentar <code>montanteEmCentimos</code> como campo opcional na resposta, mantendo <code>montante</code> intacto. Na escrita, aceitar qualquer um dos dois e rejeitar com <code>400</code> se ambos vierem com valores inconsistentes. Isto é adição pura e não quebra ninguém; entra em produção numa semana.</p>
+      <p>Fase 2, medição: instrumentar o uso por campo, por versão e por <code>client_id</code>. Sem essa métrica, a fase 4 é adivinhação. O painel útil tem três números por integrador: pedidos por dia, percentagem que ainda envia o campo antigo, e data da última utilização.</p>
+      <p>Fase 3, migração assistida: publicar <code>Deprecation: true</code> e <code>Sunset: Sat, 30 Jan 2027 23:59:59 GMT</code> nas respostas que ainda usam o campo antigo, contactar os integradores por ordem decrescente de volume, e dar ambiente de teste. Na prática, 80% do tráfego costuma concentrar-se em menos de 20 integradores — esses migram-se com pessoas, os restantes com prazo.</p>
+      <p>Fase 4, remoção: só depois de o painel mostrar zero utilização durante um período de observação superior ao ciclo de <em>release</em> mais lento dos clientes, tipicamente 30 a 90 dias. A remoção acontece na versão nova; a antiga desliga-se com <code>410 Gone</code> e um <em>problem detail</em> que diz onde ler a migração.</p>
+      <p>Quando a escolha inversa ganha: numa API interna com todos os consumidores no mesmo <em>monorepo</em> e implantação coordenada, o processo colapsa em duas fases — mudar tudo num <em>pull request</em> atómico é mais barato do que manter dois campos. A diferença é quem controla o calendário de implantação dos clientes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Mudo o campo e aviso os clientes por email.»</td></tr>
+        <tr><td>Mid</td><td>Cria <code>/v2</code> imediatamente e duplica o controlador, sem medir utilização nem planear a remoção.</td></tr>
+        <tr><td>Sénior</td><td>Expansão e contracção com campo novo, telemetria por cliente, <code>Deprecation</code>/<code>Sunset</code>, e critério objectivo para desligar.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a política organizacional (janela de suporte, comunicação, contrato de SLA), e reconhece o risco específico de mudança de unidade sem mudança de tipo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se um integrador não migrar até à data limite?»</li>
+      <li>«Como testa que <code>v1</code> e <code>v2</code> produzem o mesmo resultado económico?»</li>
+      <li>«Porque não usar <code>long</code> em cêntimos desde o início em vez de <code>BigDecimal</code>?»</li>
+      <li>«Como faz a mesma mudança no evento Kafka que já publicou?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Reutilizar o nome do campo com outra unidade ou outro tipo.</li>
+      <li>Assumir que os clientes actualizam quando lhes é pedido, sem telemetria que o confirme.</li>
+      <li>Criar <code>v2</code> para uma mudança que era aditiva.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-5" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como garante, em CI, que uma alteração ao nosso controlador não quebra três serviços consumidores que não controlamos?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com duas camadas complementares: verificação de compatibilidade do esquema OpenAPI a cada <em>commit</em>, e testes de contrato dirigidos pelo consumidor. Uma sozinha deixa passar metade dos problemas.</p>
+      <p>A primeira camada é barata e determinística: gerar o OpenAPI a partir do código (springdoc-openapi no Spring Boot 3.x), guardar o documento aprovado no repositório e falhar a construção se a comparação com a versão anterior detectar uma quebra — campo obrigatório novo na entrada, campo removido na saída, tipo alterado, <em>enum</em> com valor retirado. Corre em segundos e apanha as quebras estruturais. O que não apanha: semântica. Mudar o significado de um <em>enum</em> mantendo o nome passa incólume.</p>
+      <p>A segunda camada é o contrato dirigido pelo consumidor, ao estilo Pact ou Spring Cloud Contract. Cada consumidor publica as interacções de que depende — «para <code>GET /v1/pagamentos/42</code> preciso de <code>estado</code> e de <code>montanteEmCentimos</code>» — e o <em>pipeline</em> do produtor verifica todos os contratos publicados antes de fundir. A propriedade valiosa é o inverso do teste ponta-a-ponta: o produtor descobre a quebra sem executar os consumidores, em 30 segundos em vez de 30 minutos, e sem ambientes partilhados instáveis.</p>
+      <p>A peça que separa quem já o fez de quem leu sobre isso é o portão de implantação. Um contrato só protege se o <em>pipeline</em> souber que versão do consumidor está em produção — em Pact, isso é <code>can-i-deploy</code> contra a matriz de versões implantadas. Sem isso, verificam-se contratos de versões de consumidor que já ninguém corre, e a suite dá falsa confiança.</p>
+      <p>Quando a escolha inversa ganha: com mais de 20 consumidores heterogéneos, ou consumidores externos que nunca vão publicar contratos, o esforço de manter Pact ultrapassa o benefício. Aí a defesa passa a ser esquema estrito, versionamento explícito e uma bateria de exemplos de resposta congelados como testes de aproximação — mais fraca, mas sustentável.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Temos testes de integração num ambiente de <em>staging</em>.»</td></tr>
+        <tr><td>Mid</td><td>Conhece OpenAPI e talvez Pact de nome; descreve a ideia sem o portão de implantação nem o custo de manutenção.</td></tr>
+        <tr><td>Sénior</td><td>Combina verificação de esquema com contratos do consumidor, explica o que cada camada não apanha, e menciona a matriz de versões.</td></tr>
+        <tr><td>Staff</td><td>Discute onde o contrato deixa de compensar, a propriedade dos contratos entre equipas, e como evitar que a suite se torne um travão social à mudança.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quem é o dono do ficheiro de contrato: produtor ou consumidor?»</li>
+      <li>«Um consumidor depende de um campo que queremos remover e não responde. O que faz?»</li>
+      <li>«Como testa contratos de eventos Kafka, onde não há pedido/resposta?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Escrever o OpenAPI à mão em paralelo com o código, deixando os dois divergir.</li>
+      <li>Confundir teste de contrato com teste ponta-a-ponta com todos os serviços a correr.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Tornar um campo obrigatório numa resposta é aditivo; torná-lo obrigatório num pedido é uma quebra. A simetria é enganadora e é a origem mais comum de incidentes de compatibilidade: a validação nova passa em todos os testes internos, porque os testes internos já enviam o campo. Regra prática: qualquer <code>@NotNull</code> acrescentado a um DTO de entrada exige o mesmo processo de descontinuação que uma remoção de campo.</p></aside>
+
+<h2 id="sec-14-3" class="h2"><span class="secnum">14.3</span> Erros: RFC 9457, correlação e mensagens accionáveis<a class="anchor" href="#sec-14-3" aria-label="ligação">#</a></h2>
+
+<p>A RFC 9457 — que substituiu a RFC 7807 mantendo o formato — define um corpo de erro legível por máquinas com <code>Content-Type: application/problem+json</code> e cinco campos padrão: <code>type</code> (URI que identifica o tipo de problema e serve de chave estável), <code>title</code> (resumo legível, constante por tipo), <code>status</code>, <code>detail</code> (específico desta ocorrência) e <code>instance</code>. Tudo o resto são extensões livres, e é aí que vive o valor prático: código de erro do domínio, lista de campos inválidos, identificador de correlação e, quando aplicável, <code>retryAfter</code>.</p>
+
+<p>A regra que separa um erro útil de um erro decorativo é a estabilidade: <code>type</code> e o código de domínio são contrato e nunca mudam; <code>detail</code> é texto e pode mudar a qualquer momento. Quem inverte isto obriga os clientes a fazer correspondência de <em>strings</em> em mensagens — e depois não pode corrigir uma gralha sem quebrar integrações. O segundo critério é a accionabilidade: «pedido inválido» não permite acção; «o campo <code>iban</code> falhou a validação de dígitos de controlo» permite. O terceiro é o sigilo: nada de <em>stack traces</em>, nomes de tabelas, SQL ou nomes de sistemas internos no corpo — isso vai para o <em>log</em>, ligado ao <code>traceId</code> que também vai na resposta.</p>
+
+<p>O Spring Boot 3.x traz suporte de primeira classe: <code>ProblemDetail</code> como tipo de retorno, <code>ErrorResponseException</code> para excepções que já carregam o problema, e a propriedade <code>spring.mvc.problemdetails.enabled=true</code> para converter automaticamente as excepções tratadas pelo <code>ResponseEntityExceptionHandler</code>. O trabalho que sobra é traduzir as excepções de domínio e garantir que nenhuma excepção escapa sem tradução — um <em>handler</em> genérico de último recurso que devolve <code>500</code> com um <code>type</code> genérico e o <code>traceId</code>, nunca a mensagem da excepção.</p>
+
+<figure class="listing text" id="lst-14-2"><div class="lhead"><span class="lnum">Listagem 14.2</span>
+<span class="lcap">Resposta de erro RFC 9457 com extensões de domínio e correlação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "type": "https://api.acme.pt/problemas/saldo-insuficiente",
+  "title": "Saldo insuficiente",
+  "status": 422,
+  "detail": "A conta 8842 tem 1250 cêntimos disponíveis e o pedido exige 4990.",
+  "instance": "/v1/pagamentos/9f1c2e6a-3b7d-7c11-9a4e-0f2b8d6a1c33",
+  "codigo": "PAG_SALDO_INSUFICIENTE",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "disponivelEmCentimos": 1250,
+  "exigidoEmCentimos": 4990
+}</code></pre></figure>
 
 <figure class="listing java" id="lst-14-3"><div class="lhead"><span class="lnum">Listagem 14.3</span>
-<span class="lcap">Metadados de reflexão: Quarkus à esquerda, o equivalente em Spring Boot AOT.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// ---------- Quarkus ----------
-// Tipos so tocados por reflexao (ex.: DTO de um SDK externo)
-@RegisterForReflection(targets = { PaymentCallback.class, RiskScore.class })
-public class ReflectionConfig { }
+<span class="lcap">Tradução de excepções de domínio para <code>ProblemDetail</code> em Spring Boot 3.x.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@RestControllerAdvice
+class TradutorDeErros extends ResponseEntityExceptionHandler {
 
-// Recursos que tem de ir para dentro do executavel
-// application.properties:
-//   quarkus.native.resources.includes=templates/**,messages/*.properties
-//   quarkus.native.additional-build-args=--initialize-at-run-time=com.acme.LegacyCipher
+    private static final URI BASE = URI.create("https://api.acme.pt/problemas/");
+    private static final Logger log = LoggerFactory.getLogger(TradutorDeErros.class);
 
-// ---------- Spring Boot 3.x ----------
-public class AppRuntimeHints implements RuntimeHintsRegistrar {
-    @Override
-    public void registerHints(RuntimeHints hints, ClassLoader cl) {
-        hints.reflection()
-             .registerType(PaymentCallback.class,
-                 MemberCategory.INVOKE_DECLARED_CONSTRUCTORS,
-                 MemberCategory.INVOKE_DECLARED_METHODS);
-        hints.resources().registerPattern("templates/*.html");
-        hints.proxies().registerJdkProxy(RiskClient.class);
+    @ExceptionHandler(SaldoInsuficienteException.class)
+    ProblemDetail saldo(SaldoInsuficienteException e) {
+        ProblemDetail p = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "A conta %d tem %d cêntimos disponíveis e o pedido exige %d."
+                        .formatted(e.conta(), e.disponivel(), e.exigido()));
+        p.setType(BASE.resolve("saldo-insuficiente"));
+        p.setTitle("Saldo insuficiente");
+        p.setProperty("codigo", "PAG_SALDO_INSUFICIENTE");
+        p.setProperty("disponivelEmCentimos", e.disponivel());
+        p.setProperty("exigidoEmCentimos", e.exigido());
+        return correlacionar(p);                 // 422: não se regista como erro
+    }
+
+    @ExceptionHandler(AdquirenteIndisponivelException.class)
+    ProblemDetail adquirente(AdquirenteIndisponivelException e) {
+        ProblemDetail p = ProblemDetail.forStatusAndDetail(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "Serviço temporariamente indisponível. Repita mais tarde.");
+        p.setType(BASE.resolve("dependencia-indisponivel"));
+        p.setTitle("Dependência indisponível");
+        p.setProperty("codigo", "PAG_ADQUIRENTE_INDISPONIVEL");
+        p.setProperty("retryAfterSegundos", 5);
+        log.warn("adquirente {} indisponível", e.adquirente(), e);   // detalhe fica no log
+        return correlacionar(p);
+    }
+
+    @ExceptionHandler(Exception.class)            // rede de segurança: nada escapa por traduzir
+    ProblemDetail inesperado(Exception e) {
+        ProblemDetail p = ProblemDetail.forStatusAndDetail(
+                HttpStatus.INTERNAL_SERVER_ERROR, "Erro interno.");
+        p.setType(BASE.resolve("erro-interno"));
+        p.setTitle("Erro interno");
+        log.error("excepção não tratada", e);     // a mensagem NUNCA vai no corpo
+        return correlacionar(p);
+    }
+
+    private ProblemDetail correlacionar(ProblemDetail p) {
+        SpanContext ctx = Span.current().getSpanContext();
+        if (ctx.isValid()) {
+            p.setProperty("traceId", ctx.getTraceId());
+        }
+        return p;
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-14-6" data-box="qa" data-area="api" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Desenhe o formato de erro da nossa API pública. O que vai no corpo, o que fica de fora, e como é que o cliente distingue erros programaticamente?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>application/problem+json</code> conforme a RFC 9457, com três extensões obrigatórias: um código de domínio estável em maiúsculas, o <code>traceId</code>, e — quando o erro é de validação — uma lista de erros por campo. A distinção programática faz-se pelo par (<code>status</code>, <code>codigo</code>), nunca pelo texto.</p>
+      <p>A razão para o código de domínio existir além do <code>type</code> é prática: o <code>type</code> é uma URI e obriga a comparações longas e frágeis em <em>switch</em>; um código curto entra directamente num <em>enum</em> gerado. A razão para o <code>traceId</code> ir no corpo é ainda mais prática: reduz o ciclo de suporte de dias para minutos, porque o integrador cola o identificador no <em>ticket</em> e a equipa salta directamente para o rasto no Tempo ou no Jaeger, em vez de procurar por janela temporal.</p>
+      <p>Fica de fora tudo o que ajude um atacante ou revele a implementação: <em>stack traces</em>, mensagens de excepção cruas, SQL, nomes de tabelas ou de serviços internos, e — em erros de autenticação — a distinção entre «utilizador não existe» e «palavra-passe errada», que permite enumeração de contas. Fica também de fora o texto localizado por omissão; a localização é responsabilidade do cliente a partir do código, e o servidor só a faz se receber <code>Accept-Language</code> e tiver as traduções sob controlo.</p>
+      <p>Para validação, a estrutura que funciona é uma extensão <code>erros</code> com um objecto por campo — <code>{"campo": "iban", "codigo": "IBAN_INVALIDO", "detalhe": "dígitos de controlo não conferem"}</code> — devolvendo <strong>todos</strong> os campos inválidos de uma vez. Devolver o primeiro erro obriga o cliente a um ciclo de tentativa por campo; num formulário de 12 campos isso são 12 idas ao servidor em vez de uma.</p>
+      <p>Quando a escolha inversa ganha: numa API de altíssimo débito onde o corpo de erro é medido em bytes por segundo agregados, ou num <em>gateway</em> antigo que não deixa passar tipos de conteúdo desconhecidos, aceita-se <code>application/json</code> com a mesma estrutura de campos. O que não se cede é a estabilidade do código e a presença do <code>traceId</code>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Um campo <code>mensagem</code> com o <code>getMessage()</code> da excepção.</td></tr>
+        <tr><td>Mid</td><td>Estrutura própria com código e mensagem; não conhece a RFC nem separa contrato de texto.</td></tr>
+        <tr><td>Sénior</td><td>RFC 9457, código estável versus <code>detail</code> mutável, <code>traceId</code>, lista completa de erros de validação, e o que se omite por segurança.</td></tr>
+        <tr><td>Staff</td><td>Trata o catálogo de erros como artefacto versionado e gerado, com propriedade clara e teste que impede a introdução de códigos novos sem documentação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quem garante que dois serviços não usam o mesmo código para coisas diferentes?»</li>
+      <li>«O <code>traceId</code> no corpo não é fuga de informação?»</li>
+      <li>«Como evita que uma excepção nova escape sem tradução?»</li>
+      <li>«Localiza as mensagens no servidor ou no cliente?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><em>Stack trace</em> ou mensagem crua de excepção no corpo da resposta pública.</li>
+      <li>Clientes obrigados a comparar <em>strings</em> de <code>detail</code> para decidir o comportamento.</li>
+      <li>Erros de validação devolvidos um de cada vez.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-7" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um parceiro diz que «às vezes o pagamento falha». Não tem <em>timestamp</em> nem identificador. O que é que a API devia ter feito para esta conversa ser de cinco minutos?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Devia propagar contexto de rasto normalizado e devolvê-lo em todas as respostas, de sucesso e de erro. Concretamente: aceitar <code>traceparent</code> do W3C Trace Context à entrada, gerar um novo se não vier, propagar a todas as chamadas a jusante e ao Kafka, e incluir o <code>traceId</code> no corpo do <em>problem detail</em> e num cabeçalho de resposta. Com isso, o parceiro cola um identificador e a investigação começa no rasto completo.</p>
+      <p>O segundo elemento é a distinção entre correlação técnica e correlação de negócio. O <code>traceId</code> vive tipicamente 7 a 30 dias no sistema de rastos e cobre um pedido; a chave de negócio — número de referência do pagamento, chave de idempotência — vive anos na base de dados e cobre todas as tentativas relacionadas. Um bom desenho devolve as duas: <code>traceId</code> para depurar agora, referência para reconciliar depois. Se o parceiro só tiver a referência, a consulta faz-se na base de dados; se tiver o <code>traceId</code>, no rastreador.</p>
+      <p>O terceiro elemento é a amostragem. Com amostragem de cabeça a 1%, 99 em cada 100 rastos não existem quando o parceiro liga — e o <code>traceId</code> devolvido aponta para o vazio. A correcção é amostragem baseada em cauda ou, mais simples e mais barata, uma regra que force a amostragem para 100% quando a resposta é 5xx ou quando a latência excede o p99, mantendo 1% no tráfego normal. Num serviço com 2 000 pedidos por segundo e 0,3% de erros, isso significa guardar cerca de 20 rastos por segundo do caminho normal e 6 por segundo de erros — volume perfeitamente comportável.</p>
+      <p>Em Spring Boot 3.x, isto é Micrometer Tracing com a ponte OpenTelemetry: o <code>traceId</code> entra automaticamente no MDC e nos <em>logs</em> estruturados, o que fecha o ciclo entre rasto e registo sem código de cola.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Procuramos nos <em>logs</em> pela hora aproximada.»</td></tr>
+        <tr><td>Mid</td><td>Gera um UUID de correlação por pedido e põe-no no <em>log</em>; não o devolve ao cliente nem o propaga a jusante.</td></tr>
+        <tr><td>Sénior</td><td>W3C Trace Context propagado ponta a ponta, devolvido ao cliente, com distinção entre chave técnica e chave de negócio.</td></tr>
+        <tr><td>Staff</td><td>Discute retenção, custo de armazenamento, amostragem enviesada para erros e latência, e o efeito disso no tempo médio de diagnóstico.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O <code>traceId</code> atravessa o Kafka? Como?»</li>
+      <li>«Com 1% de amostragem, o rasto do incidente existe?»</li>
+      <li>«Que campos põe no <em>log</em> estruturado além do <code>traceId</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Inventar um cabeçalho próprio de correlação ignorando o <code>traceparent</code> normalizado.</li>
+      <li>Não devolver identificador nenhum ao cliente nas respostas de erro.</li>
+      <li>Registar o corpo completo do pedido «para depurar», incluindo dados pessoais e números de cartão.</li></ul></div>
+  </div>
+</div>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>A RFC 9457 substituiu a RFC 7807 sem alterar o formato do corpo nem o tipo de conteúdo <code>application/problem+json</code>; clarificou o registo de tipos de problema e o uso de várias instâncias de problema. Código escrito para 7807 continua conforme. Numa entrevista, saber que o formato é estável e que a mudança foi editorial vale mais do que citar o número da RFC.</p></aside>
+
+<h2 id="sec-14-4" class="h2"><span class="secnum">14.4</span> Idempotência, retries e exactly-once aparente<a class="anchor" href="#sec-14-4" aria-label="ligação">#</a></h2>
+
+<p>Numa rede, o cliente nunca sabe a diferença entre «o pedido não chegou» e «o pedido chegou e a resposta perdeu-se». Como não pode distinguir, tem de repetir; como repete, o servidor tem de ser capaz de reconhecer a repetição. Não existe <em>exactly-once</em> na entrega — existe <em>at-least-once</em> na entrega mais desduplicação no receptor, o que produz <em>efeito</em> exactly-once. Esta frase, dita assim, é um dos sinais mais fiáveis de senioridade nesta área.</p>
+
+<p>O mecanismo padrão para HTTP é a chave de idempotência: o cliente gera um identificador único por intenção de negócio (não por tentativa) e envia-o no cabeçalho <code>Idempotency-Key</code>; o servidor guarda-o com o resultado e devolve a resposta memorizada em qualquer repetição. Três detalhes distinguem uma implementação real de um esboço. Primeiro, a chave tem de ser gravada na <strong>mesma transacção</strong> que o efeito de negócio, ou com um registo prévio em estado «em curso» — se for gravada depois, existe uma janela em que a operação já aconteceu e a chave ainda não, e um <em>retry</em> nessa janela duplica. Segundo, é preciso guardar a impressão digital do pedido (<em>hash</em> do corpo e do caminho) e devolver <code>422</code> se a mesma chave voltar com corpo diferente — caso contrário um erro do cliente transforma-se em silêncio. Terceiro, é preciso decidir o que fazer quando chega uma repetição enquanto a primeira ainda corre: devolver <code>409</code> com <code>Retry-After</code> é a resposta mais segura, porque esperar por um <em>lock</em> ocupa uma <em>thread</em> e propaga a lentidão.</p>
+
+<p>A retenção é uma decisão de custo. Uma janela de 24 horas cobre praticamente todos os <em>retries</em> automáticos; 7 dias cobrem repetições manuais de operadores e reconciliações diárias. Com 5 milhões de pedidos por dia e cerca de 400 bytes por registo (chave, impressão, estado, corpo memorizado truncado), 7 dias custam aproximadamente 14 GB — barato face ao custo de um único pagamento duplicado. A limpeza faz-se por partição temporal ou por índice em <code>expira_em</code> com um trabalho periódico, nunca por <code>DELETE</code> sem limite numa tabela quente.</p>
+
+<div class="qa" id="q-14-8" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O nosso <code>POST /v1/pagamentos</code> criou 4 000 pagamentos duplicados numa noite em que a rede oscilou. Explique porquê e como o corrige.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque <code>POST</code> não é idempotente e o cliente não tem forma de distinguir «não chegou» de «chegou e a resposta perdeu-se». Com <em>timeouts</em> a disparar, o cliente repetiu e o servidor criou um recurso novo em cada tentativa — o comportamento correcto para a semântica do método. A correcção é dar ao servidor a capacidade de reconhecer a intenção repetida: chave de idempotência com garantia transaccional.</p>
+      <p>O desenho: o cliente gera a chave uma vez por intenção — tipicamente um UUIDv7 derivado do carrinho ou da encomenda, não um valor novo a cada tentativa — e envia-a em <code>Idempotency-Key</code>. O servidor insere <code>(chave, impressao_do_pedido, estado=EM_CURSO)</code> numa tabela com restrição de unicidade. Se a inserção passa, é a primeira vez: executa e, na mesma transacção que o efeito de negócio, actualiza o registo para <code>CONCLUIDO</code> com o estado HTTP e o corpo da resposta. Se a inserção viola a unicidade, é repetição: se a impressão digital diferir, devolve <code>422</code>; se o estado for <code>EM_CURSO</code>, devolve <code>409</code> com <code>Retry-After: 1</code>; se estiver <code>CONCLUIDO</code>, devolve a resposta memorizada com o mesmo código e um cabeçalho que indique que foi repetida.</p>
+      <p>O erro subtil que quase todos cometem: escrever a chave numa transacção separada, depois da operação. Isso deixa uma janela de alguns milissegundos — precisamente a janela em que o <em>timeout</em> do cliente dispara — em que a operação existe e a chave não. Em PostgreSQL há outro detalhe operacional: uma violação de unicidade dentro de uma transacção aborta-a, pelo que a inserção da chave deve ocorrer numa transacção própria (propagação <code>REQUIRES_NEW</code>) ou protegida por um <em>savepoint</em>, sob pena de o tratamento do duplicado falhar com «transacção actual abortada».</p>
+      <p>Segunda linha de defesa, independente da primeira: uma restrição de unicidade de negócio na tabela de pagamentos — por exemplo <code>(id_comerciante, referencia_externa)</code>. A chave de idempotência protege contra repetições da mesma tentativa; a restrição de negócio protege contra dois caminhos de código distintos que criam o mesmo pagamento. Uma não substitui a outra.</p>
+      <p>Quando a escolha inversa ganha: se a operação for naturalmente idempotente por identificador fornecido pelo cliente — <code>PUT /v1/pagamentos/{uuid-do-cliente}</code> — não é preciso tabela de idempotência nenhuma; a chave primária faz o trabalho. É a solução mais simples e deve ser a primeira a considerar em APIs internas onde se pode exigir ao cliente que gere o identificador.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Verificamos antes de inserir se já existe um pagamento igual» — leitura seguida de escrita, sem restrição, com condição de corrida.</td></tr>
+        <tr><td>Mid</td><td>Propõe <code>Idempotency-Key</code> com uma tabela, mas grava-a depois da operação e não trata a repetição concorrente.</td></tr>
+        <tr><td>Sénior</td><td>Chave gravada transaccionalmente, impressão digital do pedido, tratamento de <code>EM_CURSO</code>, resposta memorizada, retenção com números.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a restrição de unicidade de negócio como defesa independente, a reconciliação diária como terceira rede, e o efeito da tabela no débito de escrita.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quanto tempo guarda as chaves e porquê esse valor?»</li>
+      <li>«O cliente reutiliza a chave com um corpo diferente. O que devolve?»</li>
+      <li>«Duas repetições chegam em simultâneo a dois nós. O que acontece?»</li>
+      <li>«Como isto se comporta se a base de dados for particionada por comerciante?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confiar numa verificação de existência sem restrição de unicidade na base de dados.</li>
+      <li>Gerar a chave de idempotência no servidor — não resolve nada, porque muda a cada tentativa.</li>
+      <li>Afirmar que Kafka ou HTTP dão <em>exactly-once</em> na entrega.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-9" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Configure a política de <em>retry</em> do nosso cliente para um serviço a jusante que ocasionalmente devolve 503. Que parâmetros escolhe e porquê?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Três tentativas no total, recuo exponencial com base de 100 ms e multiplicador 2, aleatorização de pelo menos 50% do intervalo, e um orçamento global de <em>retries</em> limitado a cerca de 10% do débito. Só se repete o que é seguro repetir: <code>503</code>, <code>429</code> respeitando <code>Retry-After</code>, <code>504</code>, erros de ligação e de <em>timeout</em> — nunca <code>400</code>, <code>401</code>, <code>403</code>, <code>404</code> ou <code>422</code>, e nunca um <code>POST</code> sem chave de idempotência.</p>
+      <p>A aleatorização é o parâmetro que os candidatos esquecem e é o que evita o efeito de rebanho. Sem <em>jitter</em>, mil clientes que falharam no mesmo segundo repetem todos aos 100 ms, depois todos aos 300 ms: o serviço que estava a recuperar recebe mil pedidos sincronizados e volta a cair. Com aleatorização de 50%, as mil repetições espalham-se por uma janela e o pico instantâneo cai para uma fracção. Em Resilience4j, isto é <code>enableRandomizedWait</code> com <code>randomizedWaitFactor</code>.</p>
+      <p>O número de tentativas é limitado pelo orçamento de latência, não pelo optimismo. Se o <em>timeout</em> por tentativa é 800 ms e há 3 tentativas com esperas de 100 ms e 200 ms, o pior caso é 2,7 s — que tem de caber no <em>timeout</em> que o chamador impõe a este serviço. Se o orçamento a montante for 2 s, três tentativas são impossíveis e a resposta correcta é duas, ou uma degradação em vez de repetição.</p>
+      <p>O ponto que separa sénior de staff é o efeito multiplicativo em cadeia. Numa cadeia de quatro serviços em que cada um repete três vezes, uma falha na base gera até 3<sup>4</sup> = 81 pedidos por pedido original. Uma dependência que oscila 2% transforma-se numa tempestade. As duas defesas são: repetir apenas na fronteira mais próxima da falha (idealmente num único nível da cadeia, não em todos) e usar orçamento de <em>retries</em> — o cliente do Google e o Envoy implementam isto como um limite de percentagem de repetições sobre pedidos activos, que corta os <em>retries</em> assim que a taxa de erro sobe, exactamente quando eles fazem mais mal.</p>
+      <p>Quando a escolha inversa ganha: em operações de leitura baratas e idempotentes com p99 de 10 ms, cinco tentativas rápidas com recuo curto podem ser preferíveis, porque o custo marginal é desprezável e a taxa de sucesso sobe. A regra é sempre a mesma — o orçamento de latência decide.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Repetimos até funcionar», ou repete todos os códigos de erro, incluindo <code>400</code>.</td></tr>
+        <tr><td>Mid</td><td>Recuo exponencial com número fixo de tentativas; não menciona <em>jitter</em> nem o efeito em cadeia.</td></tr>
+        <tr><td>Sénior</td><td><em>Jitter</em>, lista explícita de condições retentáveis, ligação ao orçamento de latência, e exigência de idempotência para repetir escritas.</td></tr>
+        <tr><td>Staff</td><td>Amplificação multiplicativa em cadeia, orçamento de <em>retries</em> como percentagem do débito, e política de repetir num único nível.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde na cadeia é que a repetição deve viver: cliente, <em>gateway</em> ou <em>mesh</em>?»</li>
+      <li>«O serviço devolveu <code>429</code> com <code>Retry-After: 30</code>. Respeita ou usa o seu recuo?»</li>
+      <li>«Como combina <em>retry</em> com disjuntor sem que um anule o outro?»</li>
+      <li>«Que métrica lhe diz que a política de repetição está a piorar a situação?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Repetir sem <em>jitter</em> e não perceber o efeito de rebanho.</li>
+      <li>Repetir <code>POST</code> não idempotente «porque provavelmente não chegou».</li>
+      <li>Configurar repetição em todas as camadas sem contar o produto das tentativas.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-14-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 14.1 — Endpoint idempotente com chave e repetição segura</span>
+    <div class="labpills"><span class="qpill">Correcção sob concorrência</span><span class="qpill">30 min</span></div></div>
+  <div class="labbody">
+    <p>Implemente <code>POST /v1/pagamentos</code> em Spring Boot 3.x de forma a que N chamadas com o mesmo <code>Idempotency-Key</code> produzam exactamente um pagamento e devolvam sempre a mesma resposta. Restrições: PostgreSQL como única fonte de verdade (sem Redis, sem <em>lock</em> distribuído externo); duas instâncias do serviço a receber as repetições em paralelo; a chave é opcional apenas para clientes internos, obrigatória para os externos. Comportamento exigido: primeira chamada devolve <code>201</code> com <code>Location</code>; repetição depois de concluída devolve o mesmo <code>201</code> e o mesmo corpo, com <code>Idempotent-Replay: true</code>; repetição enquanto a primeira ainda corre devolve <code>409</code> com <code>Retry-After: 1</code>; mesma chave com corpo diferente devolve <code>422</code>. Exemplo: dois <code>POST</code> simultâneos com chave <code>7f3a…</code> e corpo <code>{"contaOrigem": 8842, "montanteEmCentimos": 4990}</code> resultam em um único registo em <code>pagamento</code> e duas respostas <code>201</code> idênticas (uma delas marcada como repetição).</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-14-4"><div class="lhead"><span class="lnum">Listagem 14.4</span>
+        <span class="lcap">Idempotência ancorada numa restrição de unicidade, com registo prévio em estado <code>EM_CURSO</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@RestController
+@RequestMapping("/v1/pagamentos")
+class PagamentoController {
+
+    private final ServicoIdempotente idempotencia;
+    private final PagamentoService pagamentos;
+    private final ObjectMapper json;
+
+    PagamentoController(ServicoIdempotente idempotencia, PagamentoService pagamentos,
+                        ObjectMapper json) {
+        this.idempotencia = idempotencia;
+        this.pagamentos = pagamentos;
+        this.json = json;
+    }
+
+    @PostMapping
+    ResponseEntity&lt;String&gt; criar(@RequestHeader(name = "Idempotency-Key", required = false) String chave,
+                                 @Valid @RequestBody PedidoPagamento pedido) throws Exception {
+
+        if (chave == null || chave.isBlank()) {           // clientes internos: caminho directo
+            Pagamento p = pagamentos.criar(pedido);
+            return criado(p, false);
+        }
+        String impressao = impressaoDigital(pedido);      // SHA-256 do corpo canonizado
+        Resultado r = idempotencia.executar(chave, impressao, () -&gt; {
+            Pagamento p = pagamentos.criar(pedido);       // corre na MESMA transacção
+            return new Resposta(201, escrever(p), p.id().toString());
+        });
+
+        return switch (r) {
+            case Resultado.Primeira f -&gt; ResponseEntity.status(f.resposta().estado())
+                    .location(URI.create("/v1/pagamentos/" + f.resposta().id()))
+                    .body(f.resposta().corpo());
+            case Resultado.Repetida rep -&gt; ResponseEntity.status(rep.resposta().estado())
+                    .header("Idempotent-Replay", "true")
+                    .location(URI.create("/v1/pagamentos/" + rep.resposta().id()))
+                    .body(rep.resposta().corpo());
+            case Resultado.EmCurso ignorado -&gt; throw new PedidoEmCursoException();   // -&gt; 409
+            case Resultado.CorpoDiferente ignorado -&gt; throw new ChaveReutilizadaException(); // -&gt; 422
+        };
     }
 }
 
-@Configuration
-@ImportRuntimeHints(AppRuntimeHints.class)
-class HintsConfig { }
+@Service
+class ServicoIdempotente {
 
-// Alternativa declarativa para tipos usados apenas em (de)serializacao:
-// @RegisterReflectionForBinding({ PaymentCallback.class, RiskScore.class })
-</code></pre></figure>
+    private final JdbcClient db;
+    private final Duration retencao = Duration.ofDays(7);
 
-<div class="qa" id="q-14-4" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    ServicoIdempotente(JdbcClient db) { this.db = db; }
+
+    /** A reserva da chave corre em transacção PRÓPRIA: uma violação de unicidade
+     *  aborta a transacção onde ocorre, e não pode arrastar a transacção de negócio. */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    boolean reservar(String chave, String impressao) {
+        int linhas = db.sql("""
+                INSERT INTO idempotencia (chave, impressao, estado, expira_em)
+                VALUES (?, ?, 'EM_CURSO', ?)
+                ON CONFLICT (chave) DO NOTHING
+                """)
+                .params(chave, impressao, Instant.now().plus(retencao))
+                .update();
+        return linhas == 1;                                // 1 = ganhou a corrida
+    }
+
+    @Transactional                                         // transacção de negócio
+    Resultado executar(String chave, String impressao, Supplier&lt;Resposta&gt; accao) {
+        if (!reservar(chave, impressao)) {
+            Registo existente = db.sql("SELECT * FROM idempotencia WHERE chave = ?")
+                    .param(chave).query(Registo.class).single();
+            if (!MessageDigest.isEqual(existente.impressao().getBytes(UTF_8),
+                                       impressao.getBytes(UTF_8))) {
+                return new Resultado.CorpoDiferente();
+            }
+            if (existente.estado() == Estado.EM_CURSO) {
+                return new Resultado.EmCurso();            // não bloqueia uma thread à espera
+            }
+            return new Resultado.Repetida(existente.resposta());
+        }
+
+        Resposta resposta = accao.get();                   // efeito de negócio
+
+        db.sql("""
+                UPDATE idempotencia
+                   SET estado = 'CONCLUIDO', estado_http = ?, corpo = ?, recurso_id = ?
+                 WHERE chave = ?
+                """)
+                .params(resposta.estado(), resposta.corpo(), resposta.id(), chave)
+                .update();                                 // MESMA transacção do efeito
+
+        return new Resultado.Primeira(resposta);
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>Custo por pedido: uma inserção com <code>ON CONFLICT</code> e uma actualização, ambas por chave primária — O(log n) no B-tree, na ordem de 0,2 a 0,5 ms cada em PostgreSQL 17 com a tabela em memória. O acréscimo de latência ronda 1 ms; a duplicação de um pagamento custa ordens de grandeza mais.</li>
+        <li>A corrida entre duas instâncias resolve-se na base de dados, não na aplicação: <code>ON CONFLICT (chave) DO NOTHING</code> devolve 0 linhas ao perdedor. Quem propõe «verificar se existe e depois inserir» tem uma condição de corrida e o entrevistador vai atrás dela.</li>
+        <li>A actualização para <code>CONCLUIDO</code> tem de estar na mesma transacção que o efeito de negócio. Se estiverem separadas, uma falha entre as duas deixa a chave presa em <code>EM_CURSO</code> e todas as repetições recebem <code>409</code> para sempre — daí ser indispensável um prazo de expiração de <code>EM_CURSO</code> (por exemplo 60 s) que permita a uma nova tentativa reclamar a chave.</li>
+        <li>Se a transacção de negócio falhar, a reserva feita em <code>REQUIRES_NEW</code> não é revertida — é o comportamento desejado para evitar corridas, mas exige o mesmo mecanismo de expiração para não bloquear repetições legítimas.</li>
+        <li>A impressão digital deve ser calculada sobre uma forma canónica do corpo (chaves ordenadas, espaços normalizados); comparar bytes crus faz um cliente que reordena campos JSON receber <code>422</code> indevidamente. A comparação usa <code>MessageDigest.isEqual</code> para não depender do tempo de execução.</li>
+        <li>Guardar o corpo da resposta memorizada tem limite: acima de alguns KB, guarda-se apenas o identificador do recurso e reconstrói-se a resposta por leitura. Guardar 2 MB por chave numa tabela quente é como se destrói o <em>cache</em> de páginas.</li>
+        <li>Casos limite a mencionar sem ser perguntado: chave reutilizada depois da expiração (comporta-se como pedido novo — daí a retenção ter de exceder a janela de repetição do cliente), chave partilhada entre comerciantes diferentes (a unicidade deve ser sobre <code>(id_comerciante, chave)</code>), e limpeza dos registos expirados por partição em vez de <code>DELETE</code> massivo.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<figure class="listing sql" id="lst-14-5"><div class="lhead"><span class="lnum">Listagem 14.5</span>
+<span class="lcap">Tabela de idempotência particionada por dia, com expiração barata.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE idempotencia (
+    id_comerciante bigint       NOT NULL,
+    chave          text         NOT NULL,
+    impressao      char(64)     NOT NULL,          -- SHA-256 hex do corpo canónico
+    estado         text         NOT NULL CHECK (estado IN ('EM_CURSO', 'CONCLUIDO')),
+    estado_http    smallint,
+    recurso_id     uuid,
+    corpo          text,                            -- truncado; acima de 8 KB guarda-se só recurso_id
+    criado_em      timestamptz  NOT NULL DEFAULT now(),
+    expira_em      timestamptz  NOT NULL,
+    PRIMARY KEY (id_comerciante, chave, criado_em)
+) PARTITION BY RANGE (criado_em);
+
+-- Uma partição por dia: a limpeza é DROP PARTITION (milissegundos),
+-- não um DELETE de milhões de linhas numa tabela quente.
+CREATE TABLE idempotencia_2026_09_01 PARTITION OF idempotencia
+    FOR VALUES FROM ('2026-09-01') TO ('2026-09-02');
+
+-- Reclamar chaves presas em EM_CURSO por falha de processo (janela de 60 s).
+UPDATE idempotencia
+   SET estado = 'EM_CURSO', criado_em = now()
+ WHERE id_comerciante = $1 AND chave = $2
+   AND estado = 'EM_CURSO' AND criado_em &lt; now() - interval '60 seconds';</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Com 5 milhões de pedidos por dia, 400 bytes por registo de idempotência e 7 dias de retenção, a tabela ronda 14 GB — cerca de 2 GB por partição diária. O <code>DROP</code> de uma partição demora milissegundos; um <code>DELETE</code> equivalente de 5 milhões de linhas gera dezenas de GB de WAL, prende o <em>autovacuum</em> durante horas e degrada o p99 de escrita da tabela.</p></aside>
+
+<h2 id="sec-14-5" class="h2"><span class="secnum">14.5</span> Timeouts, circuit breakers e bulkheads<a class="anchor" href="#sec-14-5" aria-label="ligação">#</a></h2>
+
+<p>Um serviço sem <em>timeout</em> explícito herda o do cliente HTTP, que historicamente é infinito ou dezenas de segundos. É a causa mais comum de indisponibilidade em cascata: a dependência não falha, apenas fica lenta; as <em>threads</em> do serviço ficam retidas à espera; o <em>pool</em> esgota-se; e o serviço deixa de responder também aos pedidos que nem sequer tocam nessa dependência. A defesa não é uma técnica, são três em camada — orçamento de <em>timeout</em>, isolamento de recursos e disjuntor — e cada uma resolve um problema distinto.</p>
+
+<p>O orçamento parte do compromisso externo e distribui-se para dentro. Se o SLO da API é p99 de 500 ms, e a chamada a jusante mais lenta tem p99 de 120 ms, o <em>timeout</em> dessa chamada deve ficar entre o p99,9 observado e a fracção do orçamento que lhe cabe — tipicamente 2 a 3 vezes o p99, nunca 30 segundos «para não falhar». O erro clássico é o <em>timeout</em> do chamador ser menor do que o tempo total que o chamado precisa com as suas próprias repetições: o chamador desiste, repete, e o chamado continua a trabalhar em pedidos que já ninguém espera — trabalho fantasma que consome capacidade exactamente durante o incidente.</p>
+
+<div class="formula">orçamento_ponta_a_ponta ≥ Σᵢ (timeout_i × tentativas_i + espera_i) + processamento_local + folga (≈20%)</div>
+
+<p>O <em>bulkhead</em> resolve o segundo problema: impedir que uma dependência lenta consuma todos os recursos partilhados. Com <em>threads</em> de plataforma, isso significa limitar chamadas concorrentes por dependência — 25 chamadas concorrentes para o adquirente, 50 para o serviço de fraude — de modo a que o esgotamento fique confinado. Com <em>virtual threads</em> em Java 21+, o <em>pool</em> de <em>threads</em> deixa de ser o recurso escasso, mas o limite continua a ser necessário: o que se esgota passa a ser o <em>pool</em> de ligações HTTP, as ligações à base de dados ou a memória das respostas em curso. Trocar <em>threads</em> por <em>virtual threads</em> sem manter um limite de concorrência por dependência substitui um esgotamento visível por um esgotamento mais tardio e mais difícil de diagnosticar.</p>
+
+<p>O disjuntor resolve o terceiro: parar de bater numa porta fechada. Quando a taxa de falha ultrapassa um limiar numa janela deslizante, o circuito abre e as chamadas falham imediatamente, poupando a latência do <em>timeout</em> e dando folga à dependência para recuperar. O parâmetro que quase todos ignoram é o <code>slowCallRateThreshold</code>: numa degradação real, os pedidos não falham, ficam lentos — e um disjuntor que só conta excepções nunca abre.</p>
+
+<figure class="listing yaml" id="lst-14-6"><div class="lhead"><span class="lnum">Listagem 14.6</span>
+<span class="lcap">Resilience4j: disjuntor sensível a chamadas lentas, limitador de tempo, repetição com aleatorização e <em>bulkhead</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>resilience4j:
+  circuitbreaker:
+    instances:
+      adquirente:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 100          # decide sobre as ultimas 100 chamadas
+        minimumNumberOfCalls: 20        # nao abre com amostra pequena
+        failureRateThreshold: 50        # 50% de falhas -> aberto
+        slowCallRateThreshold: 60       # 60% de chamadas lentas -> aberto tambem
+        slowCallDurationThreshold: 400ms
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 5
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        recordExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignoreExceptions:               # erros de negocio NAO abrem o circuito
+          - pt.acme.pagamentos.SaldoInsuficienteException
+
+  timelimiter:
+    instances:
+      adquirente:
+        timeoutDuration: 800ms
+        cancelRunningFuture: true
+
+  retry:
+    instances:
+      adquirente:
+        maxAttempts: 3                  # 1 original + 2 repeticoes
+        waitDuration: 100ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        enableRandomizedWait: true
+        randomizedWaitFactor: 0.5       # jitter: evita o efeito de rebanho
+        retryExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignoreExceptions:
+          - pt.acme.pagamentos.SaldoInsuficienteException
+
+  bulkhead:
+    instances:
+      adquirente:
+        maxConcurrentCalls: 25          # isolamento: nunca mais de 25 em voo
+        maxWaitDuration: 0              # rejeita de imediato em vez de acumular fila</code></pre></figure>
+
+<figure class="listing java" id="lst-14-7"><div class="lhead"><span class="lnum">Listagem 14.7</span>
+<span class="lcap">Ordem das camadas e degradação explícita; <code>RestClient</code> com <em>timeouts</em> finitos.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Configuration
+class ClientesHttp {
+
+    @Bean
+    RestClient adquirenteClient(RestClient.Builder builder) {
+        ClientHttpRequestFactorySettings def = ClientHttpRequestFactorySettings.defaults()
+                .withConnectTimeout(Duration.ofMillis(200))   // TCP + TLS
+                .withReadTimeout(Duration.ofMillis(800));     // resposta completa
+        return builder
+                .baseUrl("https://adquirente.interno")
+                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(def))
+                .build();
+    }
+}
+
+@Service
+class AdquirenteGateway {
+
+    private final RestClient http;
+
+    AdquirenteGateway(RestClient http) { this.http = http; }
+
+    // Ordem efectiva das anotacoes: Bulkhead -&gt; CircuitBreaker -&gt; Retry -&gt; TimeLimiter.
+    // O Retry por DENTRO do disjuntor faz cada repeticao contar para a janela deslizante,
+    // que e o que permite ao circuito abrir durante uma degradacao prolongada.
+    @Bulkhead(name = "adquirente", type = Bulkhead.Type.SEMAPHORE)
+    @CircuitBreaker(name = "adquirente", fallbackMethod = "degradar")
+    @Retry(name = "adquirente")
+    @TimeLimiter(name = "adquirente")
+    CompletableFuture&lt;Autorizacao&gt; autorizar(PedidoPagamento pedido) {
+        return CompletableFuture.supplyAsync(() -&gt; http.post()
+                .uri("/autorizacoes")
+                .header("Idempotency-Key", pedido.chaveIdempotencia())
+                .body(pedido)
+                .retrieve()
+                .body(Autorizacao.class));
+    }
+
+    // A degradacao e uma decisao de produto, nao um catch vazio:
+    // abaixo de 50 euros aceita-se offline e reconcilia-se depois; acima, recusa-se.
+    CompletableFuture&lt;Autorizacao&gt; degradar(PedidoPagamento pedido, Throwable causa) {
+        if (pedido.montanteEmCentimos() &lt;= 5000) {
+            return CompletableFuture.completedFuture(Autorizacao.diferida(pedido, causa));
+        }
+        return CompletableFuture.failedFuture(new AdquirenteIndisponivelException("visa", causa));
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-14-10" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Compilámos o serviço para <em>native image</em> e em produção rebenta com <code>ClassNotFoundException</code> num tipo que existe claramente no código. Como é que isso é possível e como se resolve?</div>
+  <div class="qprompt">O SLO da nossa API é p99 de 500 ms. Ela chama três serviços a jusante. Como reparte os <em>timeouts</em> e o que acontece quando um deles fica lento em vez de falhar?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque o GraalVM compila sob a hipótese do mundo fechado e elimina tudo o que a análise estática não consegue alcançar. Se a única referência ao tipo é reflexiva — <code>Class.forName</code> com um nome construído, desserialização por nome, um <em>proxy</em> dinâmico criado a partir de uma lista lida de configuração — o analisador não vê aresta nenhuma para essa classe e ela não entra no executável. O erro em tempo de execução é honesto: a classe realmente não existe no binário.</p>
-      <p>A resolução tem três passos, por ordem de custo. Primeiro, declarar os metadados: <code>@RegisterForReflection</code> em Quarkus, <code>RuntimeHintsRegistrar</code> ou <code>@RegisterReflectionForBinding</code> em Spring. Segundo, se a origem é uma biblioteca de terceiros, verificar se tem metadados no <em>reachability metadata repository</em> do GraalVM, que o plugin Maven consegue consumir automaticamente — evita escrever configuração à mão para bibliotecas conhecidas. Terceiro, quando não se sabe o que falta, correr a suite de testes com o <em>tracing agent</em> do GraalVM, que grava os acessos reflexivos observados e gera os ficheiros de configuração. O agente é rede de segurança, não solução: só cobre os caminhos executados, portanto um caminho de erro raro continua a faltar.</p>
-      <p>O que separa uma resposta sénior de uma resposta correcta mas incompleta é a prevenção. A causa raiz não é o GraalVM, é o <em>pipeline</em>: testou-se o artefacto JVM e enviou-se o artefacto nativo. A correcção estrutural é correr os testes de integração contra o binário nativo — <code>@QuarkusIntegrationTest</code> em Quarkus, um perfil de CI com o executável em Spring — e aceitar que isso acrescenta 5 a 12 minutos por <em>build</em>. Em equipas que fazem 30 <em>merges</em> por dia, a prática usual é correr a <em>build</em> nativa apenas no ramo principal e antes de cada <em>release</em>, mantendo os PR em JVM, o que reduz o custo diário mas aceita descobrir o problema algumas horas mais tarde.</p>
-      <p>Onde a escolha contrária ganha: se a aplicação depende de bibliotecas com muita magia reflexiva ou de agentes de APM que instrumentam bytecode, o custo de manter os metadados é recorrente e não vale os 100 MB de RSS poupados. Nesse caso a alternativa razoável é ficar em JVM com CDS/AppCDS e ajustar as <em>flags</em> de heap.</p></div>
+      <p>Reparto de fora para dentro, a partir do orçamento externo, e conto as repetições. Com 500 ms de orçamento: reservo 20% de folga para GC, agendamento e serialização, o que deixa 400 ms para o trabalho. Se as três chamadas forem sequenciais e o serviço A tiver p99 de 60 ms, B de 100 ms e C de 40 ms, os <em>timeouts</em> ficam em 150 ms, 200 ms e 120 ms — cerca de 2 vezes o p99 de cada — e a soma no pior caso ultrapassa o orçamento, o que obriga a paralelizar as duas chamadas independentes ou a cortar uma tentativa. Se A e C forem independentes, executam-se em paralelo e o custo passa a ser <code>max(150, 120) + 200 = 350 ms</code>, que cabe.</p>
+      <p>A regra que evita erros: o <em>timeout</em> é sempre derivado de percentis observados, nunca de números redondos escolhidos por conforto. Um <em>timeout</em> de 2 vezes o p99 falha cerca de 0,1% a 0,5% das chamadas em regime normal — proporção que tem de ser absorvida pela repetição ou pela degradação. Um <em>timeout</em> de 10 vezes o p99 nunca dispara em regime normal e também nunca protege durante o incidente.</p>
+      <p>A parte da pergunta que é a verdadeira armadilha é a segunda: lentidão não é falha. Se B degrada de 100 ms para 700 ms sem devolver erros, um disjuntor configurado apenas por <code>failureRateThreshold</code> permanece fechado, cada pedido consome uma <em>thread</em> durante 700 ms, o <em>pool</em> satura e o p99 do serviço inteiro sobe — incluindo o dos pedidos que não passam por B. Por isso três mecanismos têm de estar activos: <code>slowCallDurationThreshold</code> com <code>slowCallRateThreshold</code> para que o disjuntor abra com lentidão; <em>bulkhead</em> por dependência para confinar a saturação; e propagação de prazo, para o serviço não continuar a trabalhar num pedido cujo chamador já desistiu.</p>
+      <p>A propagação de prazo é o que separa staff: enviar o tempo restante a cada salto (um cabeçalho de <em>deadline</em>, à maneira do gRPC) permite que o serviço a jusante rejeite imediatamente o que não consegue concluir a tempo. Sem isso, durante um incidente, uma fracção significativa da capacidade é gasta a produzir respostas que ninguém vai ler.</p>
+      <p>Quando a escolha inversa ganha: em trabalho assíncrono aceite com <code>202</code> e consultado depois, o orçamento apertado deixa de fazer sentido — o correcto é um <em>timeout</em> generoso por tarefa e um limite de concorrência. A pergunta que decide é se há um humano à espera do outro lado.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Sugere adicionar a dependência outra vez ou limpar a cache do Maven; não menciona reflexão.</td></tr>
-        <tr><td>Mid</td><td>Diz «é reflexão, falta a configuração» e nomeia uma anotação, sem falar de recursos, <em>proxies</em>, serialização ou de como descobrir o que falta.</td></tr>
-        <tr><td>Sénior</td><td>Explica o mundo fechado; enumera as quatro categorias de metadados; conhece o <em>tracing agent</em> e o repositório de <em>reachability metadata</em>; aponta o teste de integração nativo como a correcção estrutural, com o custo em minutos.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a política de <em>pipeline</em> (nativo no ramo principal, JVM nos PR), quantifica o custo, e sabe dizer quando a decisão certa é desistir do nativo.</td></tr>
+        <tr><td>Insuficiente</td><td>Não sabe que <em>timeouts</em> existem no cliente HTTP ou usa o valor por omissão sem o conhecer.</td></tr>
+        <tr><td>Mid</td><td>Define um <em>timeout</em> igual para todas as chamadas, sem relação com percentis nem com o orçamento total.</td></tr>
+        <tr><td>Sénior</td><td>Reparte o orçamento com folga, deriva de percentis, conta as repetições, paraleliza o que é independente, e distingue lentidão de falha.</td></tr>
+        <tr><td>Staff</td><td>Propagação de prazo entre saltos, cancelamento do trabalho abandonado, e o efeito do <em>timeout</em> mal repartido na capacidade durante um incidente.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o que falta for um ficheiro de <em>template</em> em vez de uma classe?»</li>
-      <li>«O que muda para <em>proxies</em> dinâmicos JDK?»</li>
-      <li>«Como é que o <em>tracing agent</em> pode dar falsa confiança?»</li>
-      <li>«Que memória e tempo é preciso reservar no <em>runner</em> de CI?»</li></ul></div>
+      <li>«O que acontece à ligação e ao trabalho a jusante quando o <em>timeout</em> dispara?»</li>
+      <li>«Como propaga o prazo restante em HTTP?»</li>
+      <li>«Com <em>virtual threads</em>, o problema do <em>pool</em> esgotado desaparece?»</li>
+      <li>«Que alerta lhe diz que os <em>timeouts</em> estão mal calibrados?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não distinguir erro de <em>build</em> de erro de execução no contexto nativo.</li>
-      <li>Prometer nativo em produção sem qualquer teste contra o binário nativo.</li>
-      <li>Ignorar que agentes de instrumentação em tempo de execução deixam de funcionar.</li></ul></div>
+      <li><em>Timeouts</em> de 30 s «para não falhar em pedidos legítimos».</li>
+      <li>Não perceber que o <em>timeout</em> do cliente não cancela o trabalho no servidor.</li>
+      <li>Somar <em>timeouts</em> sem contar as repetições de cada nível.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-14-5" data-box="qa" data-area="devops" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+<div class="qa" id="q-14-11" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Configure um disjuntor com Resilience4j para o nosso adquirente de cartões. Justifique cada parâmetro e diga como combina disjuntor, repetição e limitador de tempo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Janela de contagem de 100 chamadas com mínimo de 20 antes de decidir, limiar de falha a 50%, limiar de chamadas lentas a 60% com fronteira de 400 ms, 10 s em estado aberto e 5 chamadas permitidas em meio-aberto. O mínimo de 20 evita que três falhas num serviço com pouco tráfego abram o circuito; o limiar de lentidão é o que faz o disjuntor funcionar em degradações reais, onde quase nada devolve erro.</p>
+      <p>A decisão que gera discussão é a ordem das camadas. Em Resilience4j, com anotações, a ordem efectiva é <em>bulkhead</em>, disjuntor, repetição, limitador de tempo — ou seja, a repetição fica <strong>dentro</strong> do disjuntor. É o que se quer: cada tentativa individual conta para a janela deslizante, portanto uma degradação prolongada abre o circuito. Se a repetição envolvesse o disjuntor, uma falha de três tentativas contaria como um único evento e o circuito precisaria de três vezes mais tráfego para abrir — e, pior, continuaria a repetir contra um circuito aberto.</p>
+      <p>O <code>ignoreExceptions</code> é obrigatório e quase sempre esquecido: erros de negócio — saldo insuficiente, cartão recusado — não são falhas da dependência. Se contarem para a taxa de falha, uma campanha de <em>marketing</em> que gere 60% de recusas legítimas abre o circuito e derruba os pagamentos que iam ser aprovados. Só entram na contagem excepções de infra-estrutura: <code>IOException</code>, <code>TimeoutException</code> e 5xx.</p>
+      <p>O disjuntor sem <em>fallback</em> apenas troca uma falha lenta por uma falha rápida — o que já é ganho, porque liberta capacidade. Mas o valor real está na degradação: abaixo de 50 euros, autorizar localmente e reconciliar depois; acima, recusar com <code>503</code> e <code>Retry-After</code>. Essa fronteira é uma decisão de risco do negócio, não do engenheiro, e dizê-lo em voz alta é um sinal forte.</p>
+      <p>Quando a escolha inversa ganha: para uma dependência não crítica cuja falha já é tratada por omissão de dados — um serviço de recomendações, por exemplo — um <em>timeout</em> agressivo de 50 ms com <em>fallback</em> vazio é mais simples e igualmente eficaz; o disjuntor acrescenta estado e configuração sem melhorar o resultado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Descreve o disjuntor como «tenta outra vez mais tarde»; confunde-o com repetição.</td></tr>
+        <tr><td>Mid</td><td>Enuncia os três estados e um limiar de falha; não trata chamadas lentas nem exclui erros de negócio.</td></tr>
+        <tr><td>Sénior</td><td>Parâmetros justificados com números, limiar de lentidão, <code>ignoreExceptions</code>, ordem correcta de repetição dentro do disjuntor, e <em>fallback</em> com significado.</td></tr>
+        <tr><td>Staff</td><td>Liga o comportamento ao SLO e ao orçamento de erro, define a métrica de transição de estado a alertar, e reconhece quando o disjuntor não vale o estado que introduz.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Em meio-aberto, quantas chamadas deixa passar e porquê esse número?»</li>
+      <li>«O circuito está aberto em três das dez instâncias. Isso é problema?»</li>
+      <li>«Que métricas exporta e qual delas alerta?»</li>
+      <li>«Um <em>fallback</em> que devolve <em>cache</em> antiga é aceitável em pagamentos?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Contar erros de negócio 4xx para a taxa de falha do circuito.</li>
+      <li>Repetição por fora do disjuntor, martelando um circuito aberto.</li>
+      <li>Configurar disjuntores sem exportar métricas de transição de estado.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-12" data-box="qa" data-area="sd" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Quer meter compilação nativa no nosso CI. Descreva-me o impacto no <em>pipeline</em> e como o justificaria ao responsável pela plataforma.</div>
+  <div class="qprompt">Migrámos para <em>virtual threads</em> em Java 21. Ainda precisamos de <em>bulkheads</em> e de limitação de débito, ou o problema do <em>pool</em> esgotado desapareceu?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O impacto é em três eixos — tempo, recursos e superfície de teste — e a justificação tem de ser feita com o custo da plataforma, não com a elegância do binário.</p>
-      <p>Tempo: a <em>build</em> nativa acrescenta 5 a 12 minutos ao que hoje demora 2 a 3 minutos, para um serviço médio. Se o <em>pipeline</em> corre em cada <em>push</em>, com 30 <em>merges</em> diários isso são 3 a 6 horas de <em>runner</em> por dia por serviço. A mitigação padrão é diferenciada: PR em JVM (rápido), <em>build</em> nativa no ramo principal e em <em>tags</em> de <em>release</em>, com um teste nocturno completo contra o binário.</p>
-      <p>Recursos: o compilador precisa de 8 a 16 GB de RAM e vários núcleos; <em>runners</em> partilhados com 2 vCPU e 4 GB não servem, e a falha manifesta-se como um processo morto, não como um erro claro. Há custo directo de <em>runners</em> maiores a comparar com a poupança em produção.</p>
-      <p>Superfície de teste: a suite de integração passa a ter de existir em duas variantes ou a correr contra o executável. Isso não é gratuito em manutenção — <em>fixtures</em> que dependem de <em>mocks</em> de bytecode não sobrevivem.</p>
-      <p>A justificação quantitativa é do lado da produção. Se o serviço corre 40 réplicas com pedido de 512 MB e o nativo permite descer para 192 MB com margem, poupam-se cerca de 12,8 GB de memória reservada; a 30 GB alocáveis por nó, é aproximadamente meio nó. Multiplicado por 12 serviços, chega para desligar cinco a seis nós. Este é o número que convence — e é também o teste à honestidade da proposta: se o parque tem 4 réplicas de 2 serviços, o ganho não paga a complexidade e a resposta correcta é não fazer.</p>
-      <p>O contra-argumento a antecipar é a alternativa mais barata: em muitos casos, ajustar <code>-XX:MaxRAMPercentage</code>, activar AppCDS e reduzir o pedido de memória com base em observação real captura metade do ganho com zero alterações ao <em>pipeline</em>. Um staff apresenta essa opção primeiro e só depois defende o nativo, se os números o justificarem.</p></div>
+      <p>O problema não desapareceu, mudou de sítio — e ficou mais difícil de ver. Com <em>threads</em> de plataforma, o <em>pool</em> de 200 <em>threads</em> era simultaneamente o gargalo e o mecanismo de protecção: ao esgotar-se, produzia rejeição rápida e um sintoma óbvio. Com <em>virtual threads</em>, criam-se centenas de milhares sem custo e o serviço aceita alegremente 50 000 pedidos concorrentes — que passam a competir por recursos que não escalaram: as 20 ligações do <em>pool</em> HikariCP, as ligações do cliente HTTP, e a memória das respostas em curso.</p>
+      <p>O modo de falha típico é o <code>OutOfMemoryError</code> ou uma fila invisível: 50 000 <em>virtual threads</em> à espera de 20 ligações à base de dados formam uma fila que não aparece em nenhuma métrica de <em>pool</em>, com latência a subir linearmente com a profundidade da fila. O sintoma é p99 catastrófico sem qualquer saturação de CPU e sem <em>threads</em> bloqueadas visíveis nos painéis clássicos.</p>
+      <p>Por isso o limite de concorrência continua a ser obrigatório, só que passa a ser explícito em vez de acidental: <em>bulkhead</em> por semáforo com um valor por dependência (25 chamadas ao adquirente, 40 à base de dados), limitação de débito à entrada, e uma fila com rejeição rápida em vez de espera ilimitada. A regra é dimensionar pela lei de Little: com uma taxa alvo de 500 pedidos por segundo e 40 ms de serviço médio, a concorrência necessária é 500 × 0,04 = 20 — e conceder muito mais do que isso apenas converte capacidade em fila e latência.</p>
+      <p>Há ainda dois detalhes específicos das <em>virtual threads</em> que valem pontos: fixação (<em>pinning</em>) em blocos <code>synchronized</code> com E/S dentro, resolvida em versões mais recentes mas ainda presente em bibliotecas antigas, e o facto de <code>ThreadLocal</code> deixar de ser uma optimização quando há milhões de <em>threads</em> — o padrão passa a ser passar contexto explicitamente ou usar valores com âmbito.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Compila-se com um perfil Maven e está feito»; não menciona tempo nem memória de <em>build</em>.</td></tr>
-        <tr><td>Mid</td><td>Sabe que demora mais e que é preciso GraalVM, mas não propõe estratégia diferenciada de <em>pipeline</em> nem quantifica.</td></tr>
-        <tr><td>Sénior</td><td>Quantifica minutos e GB, propõe JVM nos PR e nativo no ramo principal, exige testes contra o binário, e traduz a poupança de RSS em nós.</td></tr>
-        <tr><td>Staff</td><td>Apresenta primeiro a alternativa barata (afinação de heap, AppCDS, pedidos realistas), define o limiar de escala a partir do qual o nativo compensa, e assume o custo de manutenção recorrente dos metadados.</td></tr>
+        <tr><td>Insuficiente</td><td>«Com <em>virtual threads</em> deixa de haver limites de concorrência.»</td></tr>
+        <tr><td>Mid</td><td>Sabe que as <em>virtual threads</em> são baratas e que a base de dados continua limitada, sem quantificar nem propor mecanismo.</td></tr>
+        <tr><td>Sénior</td><td>Identifica o deslocamento do gargalo, mantém <em>bulkhead</em> e limitação explícitos, dimensiona pela lei de Little.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a fila invisível como problema de observabilidade, a rejeição rápida como política, fixação e o impacto em <code>ThreadLocal</code>.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como é que faz <em>rollback</em> se o binário nativo falhar em produção?»</li>
-      <li>«Que observabilidade perde ao deixar de ter agente JVM?»</li>
-      <li>«Qual é o limiar de réplicas a partir do qual isto compensa?»</li></ul></div>
+      <li>«Como mede a profundidade da fila invisível?»</li>
+      <li>«Que dimensão dá ao <em>pool</em> HikariCP com <em>virtual threads</em>?»</li>
+      <li>«Rejeitar cedo ou enfileirar? Qual o critério?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor migrar todo o parque de uma vez.</li>
-      <li>Ignorar o custo de <em>runners</em> e apresentar apenas o benefício.</li></ul></div>
+      <li>Remover limites de concorrência ao migrar para <em>virtual threads</em>.</li>
+      <li>Aumentar o <em>pool</em> de ligações à base de dados para «acompanhar» as <em>threads</em>.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-14-3" class="h2"><span class="secnum">14.3</span> Consumo de memória, arranque e custo em Kubernetes<a class="anchor" href="#sec-14-3" aria-label="ligação">#</a></h2>
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um <em>timeout</em> no cliente HTTP não cancela o trabalho no servidor. Quando o cliente desiste aos 800 ms, a transacção a jusante continua, escreve na base de dados e consome capacidade. Durante um incidente com repetições activas, é comum 40% a 60% do trabalho do serviço degradado ser trabalho fantasma — respostas que ninguém vai ler. Só a propagação de prazo com verificação no receptor, ou o cancelamento explícito, elimina esse desperdício.</p></aside>
 
-<p>Numa entrevista, os números de memória são uma armadilha de precisão: quem cita valores exactos de um <em>benchmark</em> de marketing perde credibilidade ao primeiro follow-up. A resposta forte dá ordens de grandeza, diz sobre que aplicação foram medidas, e distingue três quantidades que os candidatos misturam — <em>heap</em> usado, memória total da JVM (heap + metaspace + <em>code cache</em> + pilhas de <em>thread</em> + buffers directos) e RSS do processo, que é o que o <em>cgroup</em> do contentor conta e o que provoca o <code>OOMKilled</code>.</p>
+<h2 id="sec-14-6" class="h2"><span class="secnum">14.6</span> Paginação, filtros e payloads grandes<a class="anchor" href="#sec-14-6" aria-label="ligação">#</a></h2>
 
-<p>O erro operacional mais comum não tem nada a ver com o framework: é dar ao contentor um <em>limit</em> de 512 MB e à JVM um <code>-Xmx</code> igual ou próximo desse valor. O <em>heap</em> é apenas uma parte do RSS; o resto — facilmente 80 a 200 MB numa aplicação com muitas classes e várias dezenas de <em>threads</em> — vive fora dele. A regra defensável é <code>-XX:MaxRAMPercentage</code> entre 50% e 75% do limite, calibrada com observação, e nunca <code>-Xmx</code> fixo escrito à mão num contentor cujo tamanho muda.</p>
+<p>Paginação por <em>offset</em> é a que toda a gente escreve primeiro e a que falha de duas maneiras. A primeira é de desempenho: <code>OFFSET 100000 LIMIT 20</code> obriga o PostgreSQL a produzir e descartar 100 000 linhas; o custo cresce linearmente com a profundidade e a página 5 000 pode demorar 200 vezes mais do que a página 1. A segunda é de correcção: entre a página 1 e a página 2, uma inserção desloca todas as linhas e o cliente vê um registo duas vezes ou nenhuma — num processo de exportação que percorre 500 páginas, isso significa dados errados sem qualquer erro visível.</p>
 
-<p>Dito isso, a diferença estrutural existe e explica-se: o executável nativo não tem metaspace com milhares de classes carregadas, não tem <em>code cache</em> JIT a crescer durante o aquecimento e não tem estruturas de <em>profiling</em>. O que fica é <em>heap</em> mais o binário mapeado. Daí virem os valores típicos de 30 a 60 MB de RSS para um serviço REST simples nativo, contra 110 a 160 MB em Quarkus JVM e 180 a 280 MB em Spring Boot JVM na mesma aplicação. Em contrapartida, o nativo não beneficia do JIT: em regime estacionário e sob carga sustentada, o débito máximo é tipicamente 10 a 30% inferior ao da JVM aquecida, porque o C2 optimiza com informação de perfil que o compilador estático não tem.</p>
+<p>A paginação por cursor — ou paginação por chave — resolve as duas. Em vez de saltar N linhas, filtra-se por uma chave de ordenação estável e única: <code>WHERE (criado_em, id) &lt; (?, ?) ORDER BY criado_em DESC, id DESC LIMIT 20</code>. Com um índice composto em <code>(criado_em DESC, id DESC)</code>, o custo é O(log n) para localizar mais O(k) para ler a página, independentemente da profundidade: a página 5 000 custa o mesmo que a página 1. O par <code>(criado_em, id)</code> é indispensável porque <code>criado_em</code> sozinho não é único e linhas com o mesmo instante seriam saltadas ou repetidas.</p>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.1</span> Ordens de grandeza para o mesmo serviço REST + Hibernate + PostgreSQL. Valores indicativos, para raciocinar em entrevista, não para citar como medição.</div>
-<div class="tscroll"><table><thead><tr><th>Configuração</th><th>Arranque até <em>ready</em></th><th>RSS em repouso</th><th>Débito em regime</th><th>Tempo de <em>build</em></th></tr></thead><tbody>
-<tr><td>Spring Boot 3.x, JVM</td><td>2–4 s</td><td>180–280 MB</td><td>Referência (100%)</td><td>1–3 min</td></tr>
-<tr><td>Spring Boot 3.x, AOT + native</td><td>50–150 ms</td><td>90–140 MB</td><td>70–90%</td><td>6–15 min</td></tr>
-<tr><td>Quarkus, JVM</td><td>0,8–1,5 s</td><td>110–160 MB</td><td>95–110%</td><td>1–2 min</td></tr>
-<tr><td>Quarkus, native</td><td>20–50 ms</td><td>30–60 MB</td><td>70–90%</td><td>4–10 min</td></tr>
+<p>O cursor deve ser opaco — <em>base64</em> do par ordenado, idealmente assinado — por duas razões: impedir que o cliente o construa à mão e fique acoplado ao esquema, e permitir mudar a chave de ordenação sem quebrar ninguém. O preço do cursor é real: não há salto para uma página arbitrária, não há contagem total sem uma consulta separada (que em tabelas grandes é cara e muitas vezes se substitui por uma estimativa do planeador), e a ordenação fica limitada às colunas cobertas pelo índice.</p>
+
+<figure class="listing text" id="lst-14-8"><div class="lhead"><span class="lnum">Listagem 14.8</span>
+<span class="lcap">Resposta paginada por cursor, com ligações opacas e sem contagem total.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>GET /v1/pagamentos?limite=20&amp;estado=CAPTURADO&amp;desde=2026-08-01 HTTP/1.1
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: private, max-age=10
+
+{
+  "dados": [
+    {"id": "9f1c2e6a-3b7d-7c11-9a4e-0f2b8d6a1c33",
+     "estado": "CAPTURADO",
+     "montanteEmCentimos": 4990,
+     "criadoEm": "2026-08-30T14:22:07.412Z"}
+  ],
+  "pagina": {
+    "limite": 20,
+    "temMais": true,
+    "proximo": "eyJjcmlhZG9FbSI6IjIwMjYtMDgtMzBUMTQ6MjI6MDcuNDEyWiIsImlkIjoiOWYxYzJlNmEifQ",
+    "totalAproximado": 184000
+  },
+  "_ligacoes": {
+    "proximo": "/v1/pagamentos?limite=20&amp;estado=CAPTURADO&amp;cursor=eyJjcmlhZG9FbSI6..."
+  }
+}</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.2</span> Custo e garantias das três estratégias de paginação numa tabela de 50 milhões de linhas.</div>
+<div class="tscroll"><table><thead><tr><th>Estratégia</th><th>Custo da página K</th><th>Estável sob escrita</th><th>Salto arbitrário</th><th>Quando usar</th></tr></thead><tbody>
+<tr><td><em>Offset</em></td><td>O(K × limite) — página 5 000 na ordem de centenas de ms</td><td>Não</td><td>Sim</td><td>Interfaces internas com menos de 20 páginas e dados quase estáticos.</td></tr>
+<tr><td>Cursor / chave</td><td>O(log n + limite) — constante, tipicamente 1 a 5 ms</td><td>Sim, para a frente</td><td>Não</td><td>APIs públicas, exportações, listas infinitas.</td></tr>
+<tr><td>Instantâneo materializado</td><td>O(limite) após custo inicial da consulta</td><td>Sim, totalmente</td><td>Sim</td><td>Relatórios que exigem consistência absoluta e contagem exacta.</td></tr>
 </tbody></table></div></div>
 
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Nativo troca débito de pico e observabilidade por arranque e densidade. Ganha-se um factor de 3 a 5 em RSS e de 50 a 100 em tempo de arranque; perde-se 10 a 30% de débito sob carga sustentada, perdem-se agentes de APM baseados em instrumentação de bytecode, e perde-se a possibilidade de tirar um <em>heap dump</em> ou anexar um <em>profiler</em> JFR com as ferramentas habituais. Para um serviço de tráfego constante 24×7 com 8 réplicas, o nativo é quase sempre a escolha errada. Para 200 réplicas com escala elástica agressiva ou para funções que arrancam a cada invocação, é quase sempre a certa.</p></aside>
-
-<div class="qa" id="q-14-6" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+<div class="qa" id="q-14-13" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Em que situações é que o tempo de arranque de um serviço é uma métrica de negócio e não uma curiosidade? Dê-me casos concretos.</div>
+  <div class="qprompt">Um parceiro exporta o histórico de 2 milhões de transacções pela nossa API paginada e queixa-se de lentidão e de registos em falta. Qual é o diagnóstico e a correcção?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O arranque passa a ser métrica de negócio sempre que um utilizador espera por ele ou que dinheiro depende dele. São quatro cenários.</p>
-      <p>Primeiro, <em>serverless</em> com arranque a frio no caminho do pedido. Numa função invocada esporadicamente, um arranque de 4 s é latência que o utilizador sente; 40 ms desaparece no ruído. É aqui que o nativo dá o maior retorno. A alternativa sem nativo existe e deve ser mencionada: instantâneos de <em>snapshot</em> do tipo AWS Lambda SnapStart, ou CRaC, que restauram um processo já inicializado e cortam o arranque para a ordem das centenas de milissegundos sem sair da JVM.</p>
-      <p>Segundo, <em>scale-to-zero</em> em Kubernetes (Knative, KEDA). Um serviço com tráfego intermitente — <em>webhooks</em>, tarefas internas, ambientes de pré-produção — pode ficar a zero réplicas. O arranque entra no p99 do primeiro pedido de cada janela de actividade. Com 3 s de arranque, escalar a zero é inaceitável e paga-se uma réplica permanente; com 50 ms, escalar a zero é trivial e o custo aproxima-se de zero fora do horário.</p>
-      <p>Terceiro, elasticidade sob picos rápidos. Se o tráfego duplica em 60 segundos — abertura de vendas, campanha, evento desportivo — a diferença entre uma réplica útil em 3 s e em 0,05 s determina se o HPA consegue acompanhar. Aqui é preciso ser honesto: o factor limitante costuma ser o tempo de <em>pull</em> da imagem e o agendamento do <em>pod</em>, na ordem das dezenas de segundos, e a imagem nativa também é menor (tipicamente 60–110 MB contra 250–400 MB com JRE), o que ajuda nesse eixo.</p>
-      <p>Quarto, rapidez de recuperação e velocidade de <em>deploy</em>. Um <em>rolling update</em> de 200 réplicas com <em>readiness</em> de 4 s e janelas de estabilização demora dezenas de minutos; a 100 ms, minutos. Isso muda a frequência de <em>deploy</em> que a equipa tolera e encurta a janela de exposição durante um <em>rollback</em>.</p>
-      <p>Onde não importa: serviço interno com número fixo de réplicas, tráfego estável e <em>deploys</em> semanais. Aí, optimizar o arranque de 3 s para 50 ms não altera nenhum indicador. Dizer isto explicitamente é o que marca a resposta como sénior.</p></div>
+      <p>Os dois sintomas têm a mesma causa: paginação por <em>offset</em> sobre uma tabela que continua a receber escritas. A lentidão vem de o <code>OFFSET</code> obrigar a base de dados a percorrer e descartar todas as linhas anteriores — na página 50 000 com limite 40, são 2 milhões de linhas produzidas para devolver 40. Os registos em falta vêm de a janela deslizar: cada nova transacção inserida antes do ponto de leitura empurra uma linha para a página seguinte, que o cliente já passou.</p>
+      <p>A correcção é paginação por chave com ordenação estável e única, com o cursor a codificar <code>(criado_em, id)</code> e o índice composto correspondente. Isso torna o custo por página constante — tipicamente 1 a 5 ms em vez de centenas — e elimina o salto de registos para a frente, porque o predicado é sobre valores e não sobre posições. Para exportações que só percorrem para a frente, é a solução completa.</p>
+      <p>Se o parceiro exigir consistência absoluta — o histórico exactamente como estava às 00:00 — a paginação por cursor não chega, porque continua a ver escritas posteriores ao início. Aí a resposta correcta é mudar o padrão: um <em>endpoint</em> de exportação assíncrona que aceita o pedido com <code>202</code>, produz um ficheiro a partir de um instante consistente (uma transacção de leitura repetível ou uma cópia analítica), guarda-o em S3 e devolve uma URL pré-assinada com validade de 24 horas. Dois milhões de linhas em CSV comprimido são dezenas de MB e transferem-se numa ligação, em vez de 50 000 pedidos HTTP.</p>
+      <p>Números que sustentam a mudança de padrão: 50 000 pedidos a 40 ms cada são cerca de 33 minutos de relógio e 50 000 travessias completas de autenticação, autorização e serialização; uma exportação assíncrona faz o mesmo trabalho numa única leitura sequencial em poucos minutos, com uma fracção do custo de CPU. O <em>trade-off</em> é latência até ao primeiro byte e complexidade operacional (armazenamento, expiração, autorização da URL).</p>
+      <p>Quando a escolha inversa ganha: para listas interactivas em que o utilizador salta para a página 7, o <em>offset</em> continua a ser o mais simples, desde que se limite a profundidade máxima — por exemplo, recusar <code>offset</code> acima de 10 000 com <code>400</code> e exigir um filtro mais estreito.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Arrancar depressa é sempre melhor.»</td></tr>
-        <tr><td>Mid</td><td>Refere <em>serverless</em> e mais nada; não conhece <em>scale-to-zero</em> nem o efeito no <em>rolling update</em>.</td></tr>
-        <tr><td>Sénior</td><td>Dá três ou mais cenários com números, conhece SnapStart/CRaC como alternativa dentro da JVM, e nomeia explicitamente os casos em que não importa.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta que o <em>pull</em> da imagem e o agendamento dominam a latência de escala, liga a decisão ao custo por réplica e à política de <em>deploy</em>, e propõe medir antes de decidir.</td></tr>
+        <tr><td>Insuficiente</td><td>«Aumentamos o limite por página» ou «acrescentamos um índice» sem identificar o custo do <code>OFFSET</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que <em>offset</em> é lento em profundidade; não liga os registos em falta à instabilidade da janela.</td></tr>
+        <tr><td>Sénior</td><td>Diagnostica ambos os sintomas, propõe cursor <code>(criado_em, id)</code> com índice composto e cursor opaco, e quantifica o ganho.</td></tr>
+        <tr><td>Staff</td><td>Questiona o padrão: exportação em massa não é caso de uso de API paginada; propõe assíncrono com instantâneo consistente e URL pré-assinada.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Com <em>scale-to-zero</em>, o que faz às ligações de base de dados no arranque?»</li>
-      <li>«Que parte do tempo até <em>ready</em> é do framework e que parte é do Flyway e do <em>pool</em>?»</li>
-      <li>«SnapStart resolve tudo? O que fica de fora?»</li></ul></div>
+      <li>«O cursor deve ser opaco ou legível? Porquê?»</li>
+      <li>«O parceiro quer ordenar por montante. Como suporta isso com cursor?»</li>
+      <li>«Como devolve o total sem uma contagem completa?»</li>
+      <li>«E se o parceiro quiser paginar para trás?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confundir tempo de arranque do processo com tempo até <em>readiness</em>.</li>
-      <li>Não conhecer nenhuma alternativa ao nativo para reduzir arranque frio.</li></ul></div>
+      <li>Cursor baseado apenas num <em>timestamp</em> não único.</li>
+      <li>Expor <code>offset</code> ilimitado numa API pública.</li>
+      <li>Devolver <code>COUNT(*)</code> exacto em cada página de uma tabela de 50 milhões de linhas.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-14-7" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Dizem-me que passar para Quarkus nativo corta a memória para um terço. Que números é que consegue defender, e o que é que exactamente desaparece?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um factor de 3 a 5 em RSS é defensável para um serviço REST simples; para um serviço com <em>caches</em> grandes em <em>heap</em> o factor cai para perto de 1, porque o que domina é o <em>heap</em> e o <em>heap</em> não muda. A pergunta certa é sempre: que fracção do RSS actual é <em>heap</em>?</p>
-      <p>O que desaparece no nativo é a memória fora do <em>heap</em> que existe para suportar execução dinâmica. Metaspace com os metadados de milhares de classes carregadas — numa aplicação Spring típica são facilmente 60 a 120 MB. <em>Code cache</em> do JIT, que cresce durante o aquecimento e estabiliza em algumas dezenas de MB. Estruturas de perfil do C1/C2 e as próprias <em>threads</em> do compilador. O que fica é <em>heap</em> vivo, pilhas de <em>thread</em> (1 MB por <em>thread</em> de plataforma por omissão) e o binário mapeado.</p>
-      <p>Como se mede sem acreditar em ninguém: <code>Native Memory Tracking</code> na JVM (<code>-XX:NativeMemoryTracking=summary</code> e <code>jcmd VM.native_memory</code>) dá a repartição por categoria; do lado do contentor, <code>container_memory_working_set_bytes</code> é a métrica que o <em>kubelet</em> usa para decidir o <code>OOMKilled</code>. Comparar essas duas fontes durante uma semana de tráfego real é o que permite dizer um número em vez de repetir um <em>benchmark</em>.</p>
-      <p>O trade-off que fecha a resposta: a poupança em memória compra-se com débito. Sem JIT com informação de perfil, o pico sustentado é tipicamente 10 a 30% inferior, o que significa mais réplicas para o mesmo tráfego — e mais réplicas de 50 MB podem custar menos do que menos réplicas de 250 MB, ou não, consoante o serviço seja limitado por CPU ou por memória. Se o serviço é limitado por CPU, o nativo pode aumentar o custo total. Esse cálculo faz-se antes da migração, não depois.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Repete «um terço» sem saber o que compõe o RSS; confunde <em>heap</em> com memória do processo.</td></tr>
-        <tr><td>Mid</td><td>Distingue <em>heap</em> de não-<em>heap</em>, mas não sabe o que o nativo elimina nem como medir.</td></tr>
-        <tr><td>Sénior</td><td>Reparte o RSS por metaspace, <em>code cache</em>, pilhas e <em>heap</em>; condiciona o ganho à fracção de <em>heap</em>; nomeia NMT e <em>working set</em>; refere a perda de débito.</td></tr>
-        <tr><td>Staff</td><td>Transforma a poupança em decisão de custo (CPU-bound vs memory-bound), define o critério de medição prévia e recusa dar um número sem medir.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que acontece se puser <code>-Xmx</code> igual ao limite do contentor?»</li>
-      <li>«Como é que <em>virtual threads</em> mudam a conta das pilhas?»</li>
-      <li>«Que ganho consegue sem sair da JVM?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Citar números de <em>benchmark</em> de marketing como medições próprias.</li>
-      <li>Ignorar que serviços dominados por <em>cache</em> em <em>heap</em> não ganham quase nada.</li></ul></div>
-  </div>
-</div>
+<h2 id="sec-14-7" class="h2"><span class="secnum">14.7</span> REST vs gRPC vs GraphQL na entrevista<a class="anchor" href="#sec-14-7" aria-label="ligação">#</a></h2>
 
-<h2 id="sec-14-4" class="h2"><span class="secnum">14.4</span> Reactive com Mutiny e Vert.x<a class="anchor" href="#sec-14-4" aria-label="ligação">#</a></h2>
+<p>Esta pergunta não procura um vencedor, procura saber se o candidato escolhe por restrição ou por moda. As três tecnologias resolvem problemas diferentes: REST optimiza para alcance e para infra-estrutura que já existe; gRPC optimiza para latência, contrato forte e comunicação interna de alto débito; GraphQL optimiza para clientes heterogéneos que agregam dados de várias fontes e não querem depender do calendário da equipa de <em>backend</em>.</p>
 
-<p>Por baixo do Quarkus está o Vert.x, e por baixo do Spring WebFlux está o Reactor Netty. Ambos executam um modelo de <em>event loop</em>: um número pequeno de <em>threads</em> (tipicamente proporcional ao número de núcleos) processa todos os eventos de I/O sem bloquear. A regra de ouro é a mesma nos dois mundos e é a única coisa que interessa mesmo numa entrevista: bloquear uma <em>thread</em> de <em>event loop</em> paralisa todos os pedidos que estavam a ser servidos por ela. Uma chamada JDBC síncrona dentro de um método reactivo não é um detalhe de estilo, é um incidente à espera de tráfego.</p>
+<p>Os números que sustentam a escolha do gRPC internamente: Protobuf sobre HTTP/2 com multiplexação e cabeçalhos comprimidos corta tipicamente 30% a 60% dos bytes face a JSON e reduz o custo de serialização de forma mensurável em serviços com muitas chamadas pequenas; o <em>streaming</em> bidireccional resolve casos que em REST exigem <em>polling</em> ou WebSocket; e prazos são de primeira classe no protocolo, o que torna a propagação de <em>deadline</em> automática em vez de convenção. O que se perde: legibilidade sem ferramentas, suporte directo no <em>browser</em> (exige grpc-web e um <em>proxy</em>), <em>caching</em> HTTP, e uma barreira de entrada para integradores externos que sabem fazer <code>curl</code> e não sabem compilar <em>stubs</em>.</p>
 
-<p>A diferença de API entre Mutiny e Reactor é sobretudo ergonómica. O Reactor tem <code>Mono&lt;T&gt;</code> (0 ou 1) e <code>Flux&lt;T&gt;</code> (0..N), com uma superfície de centenas de operadores e nomes herdados da programação funcional (<code>flatMap</code>, <code>switchIfEmpty</code>, <code>zipWhen</code>). O Mutiny tem <code>Uni&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> e uma API de navegação explícita: começa-se por dizer sobre <em>o quê</em> se está a agir (<code>.onItem()</code>, <code>.onFailure()</code>, <code>.onCancellation()</code>) e só depois qual a acção (<code>.transform()</code>, <code>.transformToUni()</code>, <code>.retry()</code>). Isso torna o código mais longo e muito mais legível para quem não vive em Reactor, e faz a lista de sugestões do IDE ser navegável em vez de ter 300 entradas.</p>
+<p>O custo escondido do GraphQL é o que separa quem o pôs em produção de quem leu a documentação: uma única consulta pode gerar centenas de acessos à base de dados sem <em>dataloader</em>, o <em>caching</em> HTTP desaparece porque tudo é <code>POST</code> para um só <em>endpoint</em>, a autorização passa a ser por campo em vez de por recurso, e a limitação de débito por número de pedidos deixa de significar alguma coisa — passa a ser preciso analisar a complexidade da consulta antes de a executar. Nenhum destes problemas é impeditivo; todos são trabalho que não existe em REST.</p>
 
-<p>Do ponto de vista de decisão, há um ponto que não se pode ignorar em 2026: com Java 21 e <em>virtual threads</em>, o argumento de escalabilidade que justificava o estilo reactivo perdeu força. Uma <em>thread</em> virtual bloqueada em I/O não retém uma <em>thread</em> de plataforma, o que permite servir dezenas de milhares de pedidos concorrentes com código imperativo, testável com <em>stack traces</em> legíveis. Quarkus expõe <code>@RunOnVirtualThread</code> e Spring Boot activa-as com <code>spring.threads.virtual.enabled=true</code>. O estilo reactivo continua a ganhar em dois casos: <em>streaming</em> com <em>backpressure</em> ponta a ponta, e composição declarativa de muitas chamadas paralelas com política de erro e tempo limite. Fora disso, é complexidade a pagar.</p>
-
-<figure class="listing java" id="lst-14-4"><div class="lhead"><span class="lnum">Listagem 14.4</span>
-<span class="lcap">A mesma composição — duas chamadas em paralelo, tempo limite e recuperação — em Mutiny e em Reactor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// ---------- Quarkus / Mutiny ----------
-@GET @Path("/{id}")
-public Uni&lt;OrderView&gt; view(@RestPath Long id) {
-    Uni&lt;Order&gt;   order = orders.findById(id);
-    Uni&lt;Risk&gt;    risk  = riskClient.score(id)
-            .ifNoItem().after(Duration.ofMillis(200)).recoverWithItem(Risk.unknown())
-            .onFailure().recoverWithItem(Risk.unknown());
-
-    return Uni.combine().all().unis(order, risk)
-              .with(OrderView::of)
-              .onFailure(NotFoundException.class).transform(e -&gt; new WebApplicationException(404));
-}
-
-// Codigo bloqueante tem de sair do event loop:
-@GET @Path("/report") @Blocking            // ou @RunOnVirtualThread com Java 21
-public Report heavyReport() { return legacyJdbcReport(); }
-
-// ---------- Spring WebFlux / Reactor ----------
-@GetMapping("/{id}")
-public Mono&lt;OrderView&gt; view(@PathVariable Long id) {
-    Mono&lt;Order&gt; order = orders.findById(id)
-            .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND)));
-    Mono&lt;Risk&gt;  risk  = riskClient.score(id)
-            .timeout(Duration.ofMillis(200))
-            .onErrorReturn(Risk.unknown());
-
-    return Mono.zip(order, risk).map(t -&gt; OrderView.of(t.getT1(), t.getT2()));
-}
-
-// Codigo bloqueante em WebFlux:
-return Mono.fromCallable(this::legacyJdbcReport)
-           .subscribeOn(Schedulers.boundedElastic());
-</code></pre></figure>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O Quarkus deixa escolher por método: <code>@Blocking</code> desvia para o <em>pool</em> de <em>worker</em>, <code>@NonBlocking</code> mantém no <em>event loop</em>, <code>@RunOnVirtualThread</code> executa numa <em>thread</em> virtual. Em Spring, a fronteira é a do <em>stack</em>: WebFlux inteiro ou Web MVC inteiro, com <code>publishOn</code>/<code>subscribeOn</code> a mover trabalho para <code>boundedElastic</code>. Um serviço maioritariamente síncrono com dois <em>endpoints</em> de <em>streaming</em> é mais simples de exprimir em Quarkus; um serviço inteiramente reactivo é igualmente natural nos dois.</p></aside>
-
-<div class="qa" id="q-14-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Concorrência</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Vem de Reactor e vai escrever Mutiny. O que muda de facto, e como decide hoje entre reactivo e imperativo com <em>virtual threads</em>?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Muda a ergonomia, não o modelo. Mutiny e Reactor implementam ambos <em>Reactive Streams</em> com <em>backpressure</em>, são interoperáveis via <code>Publisher</code>, e o Mutiny até oferece conversores directos. <code>Uni&lt;T&gt;</code> corresponde a <code>Mono&lt;T&gt;</code> e <code>Multi&lt;T&gt;</code> a <code>Flux&lt;T&gt;</code>, com uma diferença de contrato relevante: <code>Uni</code> não tem <em>backpressure</em>, porque um único item não precisa dele.</p>
-      <p>A diferença prática é a API de navegação por evento. Em Reactor escolhe-se o operador entre centenas; em Mutiny escreve-se <code>.onItem().transformToUni(...)</code> ou <code>.onFailure(TimeoutException.class).retry().atMost(3)</code>. O código fica 20 a 40% mais longo em caracteres e substancialmente mais fácil de rever numa equipa que não é especialista — que é exactamente o argumento a usar numa entrevista, porque a manutenção é o custo dominante em código reactivo.</p>
-      <p>Sobre a decisão de hoje: com Java 21 em produção, o critério mudou. A justificação clássica do reactivo era não gastar uma <em>thread</em> de plataforma por pedido bloqueado; as <em>threads</em> virtuais resolvem isso mantendo código imperativo com <em>stack traces</em> legíveis, <code>try/finally</code> que funciona e depuração normal. Por isso o meu critério é: imperativo com <em>threads</em> virtuais por omissão; reactivo quando existe <em>streaming</em> real com <em>backpressure</em> ponta a ponta (SSE, Kafka a alimentar um consumidor lento, ficheiros grandes), ou quando a lógica é composição paralela de muitas chamadas com políticas de erro e tempo limite, onde o estilo declarativo é genuinamente mais claro.</p>
-      <p>As duas armadilhas a mencionar: bloquear o <em>event loop</em> continua a ser fatal e não é resolvido por <em>threads</em> virtuais se o código estiver no <em>event loop</em> — em Quarkus marca-se <code>@Blocking</code>; e <code>ThreadLocal</code> usado como contexto (segurança, <em>tenant</em>, MDC de <em>logging</em>) não sobrevive à travessia de operadores reactivos, o que obriga a propagação explícita de contexto e é a origem mais frequente de <em>logs</em> sem <em>trace id</em>. Com <em>threads</em> virtuais, <code>ScopedValue</code> ou o próprio <code>ThreadLocal</code> voltam a funcionar de forma previsível.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«São a mesma coisa com outros nomes», ou defende reactivo por ser «mais rápido».</td></tr>
-        <tr><td>Mid</td><td>Mapeia <code>Uni</code>/<code>Mono</code> correctamente, mas não fala de <em>backpressure</em>, de contexto nem do impacto das <em>threads</em> virtuais.</td></tr>
-        <tr><td>Sénior</td><td>Explica a API de navegação, a ausência de <em>backpressure</em> em <code>Uni</code>, o perigo de bloquear o <em>event loop</em> e um critério explícito para escolher entre reactivo e imperativo em Java 21.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta propagação de contexto e observabilidade, o custo de formação da equipa em código reactivo, e uma estratégia de coexistência (reactivo só nos <em>endpoints</em> que o justificam).</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como propaga o <em>trace id</em> através de uma cadeia Mutiny?»</li>
-      <li>«O que acontece se chamar JDBC dentro de um <code>Uni</code> sem <code>@Blocking</code>?»</li>
-      <li>«Quando é que <em>virtual threads</em> ainda não chegam?»</li>
-      <li>«Como testa <em>backpressure</em>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Achar que <em>virtual threads</em> tornam seguro bloquear no <em>event loop</em>.</li>
-      <li>Usar <code>ThreadLocal</code> como contexto em código reactivo sem propagação explícita.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-14-5" class="h2"><span class="secnum">14.5</span> Quando recomendar cada stack numa entrevista<a class="anchor" href="#sec-14-5" aria-label="ligação">#</a></h2>
-
-<p>Esta é a pergunta em que mais candidatos sénior falham, e falham por excesso de convicção. O entrevistador não quer saber qual o framework preferido; quer ver se a recomendação tem critérios, se o custo humano entra na conta e se existe um cenário em que o candidato mudaria de ideias. A estrutura de resposta que funciona tem três partes: as perguntas que faria antes de decidir, a decisão por omissão dado o contexto mais provável, e a condição que inverteria essa decisão.</p>
-
-<p>As perguntas que valem a pena são poucas e concretas: quantos serviços existem e qual o perfil de tráfego (constante ou intermitente); quantas réplicas por serviço e se o custo é dominado por CPU ou por memória; qual a experiência da equipa e a taxa de rotação; que bibliotecas internas e agentes de observabilidade existem e se têm suporte nativo; e qual o prazo — porque uma migração de <em>framework</em> compete directamente com o <em>roadmap</em> de produto.</p>
-
-<p>A decisão por omissão numa scale-up europeia com 15 a 60 serviços em Spring Boot, equipa de 20 a 60 engenheiros e tráfego razoavelmente constante é manter o Spring e não migrar nada. O ganho técnico existe mas é pequeno em relação ao custo: revalidar bibliotecas, reescrever testes, formar toda a gente, e perder velocidade de entrega durante meses. Aquilo que se faz é abrir uma excepção deliberada: novos serviços com perfil claramente intermitente ou <em>serverless</em> nascem em Quarkus (ou em Spring nativo), como piloto controlado, com um dono e com métricas de saída definidas à partida.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.2</span> Critérios de decisão, com o sinal que os torna decisivos.</div>
-<div class="tscroll"><table><thead><tr><th>Critério</th><th>Favorece Spring Boot</th><th>Favorece Quarkus</th></tr></thead><tbody>
-<tr><td>Perfil de tráfego</td><td>Constante, 24×7, réplicas fixas</td><td>Intermitente, <em>scale-to-zero</em>, picos rápidos</td></tr>
-<tr><td>Restrição de custo</td><td>Limitado por CPU</td><td>Limitado por memória, centenas de réplicas</td></tr>
-<tr><td>Ecossistema</td><td>Bibliotecas internas, SDKs invulgares, agentes de APM</td><td>Stack alinhado com extensões existentes</td></tr>
-<tr><td>Equipa</td><td>Experiência profunda em Spring, rotação alta</td><td>Equipa pequena, disposta a investir 2–4 semanas</td></tr>
-<tr><td>Contratação</td><td>Mercado muito maior de candidatos</td><td>Menos relevante em equipas estáveis</td></tr>
-<tr><td>Destino de execução</td><td>Kubernetes clássico, VM</td><td><em>Functions</em>, <em>edge</em>, Knative, dispositivos com pouca RAM</td></tr>
-</tbody></table></div></div>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Uma migração de <em>framework</em> num serviço médio (50 a 120 classes, Hibernate, Kafka, OIDC) custa tipicamente 3 a 8 semanas-pessoa, mais 2 a 4 semanas de curva de aprendizagem por engenheiro que nunca usou CDI. Contra isso, a poupança de infra-estrutura de um serviço com 10 réplicas é da ordem de 1,5 GB de memória reservada — irrelevante. A conta só fecha quando a migração é repetível ao longo de dezenas de serviços ou quando o arranque desbloqueia uma arquitectura nova (escala a zero, <em>functions</em>). É por isso que a resposta honesta a «devíamos migrar?» começa quase sempre por «para quantos serviços?».</p></aside>
-
-<div class="qa" id="q-14-9" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos 30 serviços em Spring Boot 3 e o CTO quer avaliar migrar para Quarkus para cortar custos de cloud. Como conduziria essa avaliação e o que espera concluir?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Começaria por separar o objectivo declarado — cortar custos de cloud — da solução proposta, porque na maioria dos parques a migração de <em>framework</em> não é a alavanca mais barata para esse objectivo.</p>
-      <p>Primeiro, medir onde está o custo. Se a factura é dominada por bases de dados geridas, tráfego entre zonas ou armazenamento, mudar de <em>framework</em> não move nada. Se é dominada por computação, é preciso saber se os <em>pods</em> estão limitados por CPU ou por memória, e comparar o pedido de recursos com o uso real: em muitos parques os pedidos estão sobredimensionados por hábito, e ajustá-los com base em observação de duas semanas dá 20 a 40% de redução sem tocar numa linha de código.</p>
-      <p>Segundo, esgotar as alavancas dentro da stack actual: <code>-XX:MaxRAMPercentage</code> calibrado, AppCDS para arranque, remoção de dependências não usadas, consolidação de serviços com 2 réplicas ociosas, e escala automática a sério em vez de réplicas fixas. Isto costuma capturar metade do ganho teórico da migração, em dias.</p>
-      <p>Terceiro, se ainda restar caso, fazer um piloto medido: escolher dois serviços representativos — um do caminho crítico, um intermitente —, migrar, e medir RSS, débito por <em>core</em>, arranque até <em>readiness</em>, tempo de <em>build</em> e horas gastas. Só com esses números se extrapola para 30 serviços. Definir à partida o critério de paragem: se a poupança projectada for inferior a, digamos, dois meses de trabalho de equipa por ano, não se avança.</p>
-      <p>A conclusão que espero é a mais frequente na realidade: manter o Spring Boot no parque existente, adoptar Spring Boot AOT/native apenas onde o arranque tem valor, e usar Quarkus em serviços novos com perfil <em>serverless</em> ou intermitente. E há um ponto que um staff diz em voz alta: recomendar «não migrar» é uma recomendação legítima, e é a que exige mais coragem numa conversa com um CTO entusiasmado.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Responde com preferência pessoal por um dos frameworks; não pergunta nada sobre o parque nem sobre a factura.</td></tr>
-        <tr><td>Mid</td><td>Propõe um piloto, mas não questiona se o custo é sequer de computação nem considera alternativas mais baratas.</td></tr>
-        <tr><td>Sénior</td><td>Mede primeiro, esgota alavancas dentro da stack, faz piloto com dois serviços e métricas definidas, extrapola com números e assume o custo humano.</td></tr>
-        <tr><td>Staff</td><td>Separa objectivo de solução, define critério de paragem quantitativo antes de começar, propõe estratégia mista por perfil de serviço, e está disposto a recomendar não migrar.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que dois serviços escolheria para o piloto e porquê?»</li>
-      <li>«Como convence a equipa que gosta de Spring?»</li>
-      <li>«E se metade da poupança vier de reduzir pedidos de recursos? Ainda migra?»</li>
-      <li>«Quanto tempo dá ao piloto antes de decidir?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Aceitar a premissa da pergunta sem a questionar.</li>
-      <li>Prometer percentagens de poupança antes de qualquer medição.</li>
-      <li>Não mencionar o custo de formação nem o impacto no <em>roadmap</em>.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-14-10" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+<div class="qa" id="q-14-14" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Que riscos de ecossistema é que assume ao escolher Quarkus para um serviço que vai viver cinco anos, e como os mitigaria desde o primeiro <em>commit</em>?</div>
+  <div class="qprompt">Estamos a partir um monólito em serviços. Um colega propõe gRPC para tudo, outro propõe manter REST. Que critério usa e qual é a sua decisão?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Quatro riscos, todos mitigáveis com desenho, e nenhum deles é «o projecto vai desaparecer» — o Quarkus tem patrocínio empresarial estável e ciclo de <em>releases</em> previsível com versões de suporte alargado.</p>
-      <p>Primeiro, cobertura de extensões. Uma biblioteca sem extensão pode funcionar em JVM e falhar em nativo, ou exigir metadados mantidos à mão. Mitigação: inventariar as dependências antes de começar e, para as que não têm extensão, isolá-las atrás de uma interface de domínio, de modo a que substituí-las seja um adaptador e não uma reescrita.</p>
-      <p>Segundo, observabilidade. Se a organização depende de um agente de APM comercial que instrumenta bytecode, o nativo pode não o suportar. Mitigação: normalizar em OpenTelemetry por instrumentação suportada pelo <em>framework</em> desde o primeiro dia, e validar <em>traces</em>, métricas e <em>logs</em> correlacionados no piloto, não depois.</p>
-      <p>Terceiro, mercado de contratação e rotação. Há muito mais engenheiros com Spring no currículo. Mitigação real: manter a arquitectura interna independente do <em>framework</em> — domínio em Java puro, sem anotações do <em>framework</em> nas entidades de negócio, adaptadores nas fronteiras. Assim, quem chega aprende CDI em dias porque a maior parte do código é Java comum, e uma eventual reversão fica confinada às camadas de fronteira.</p>
-      <p>Quarto, divergência operacional. Ter duas stacks significa dois modelos de configuração, duas imagens base, dois manuais de <em>troubleshooting</em> e duas versões de <em>chart</em>. Mitigação: bibliotecas partilhadas de <em>logging</em> e configuração alinhadas entre as duas, e um limite explícito — por exemplo, no máximo dois serviços na segunda stack até haver decisão formal de a alargar.</p>
-      <p>O trade-off honesto: estas mitigações custam tempo e algumas (domínio sem anotações) são boas práticas independentemente do <em>framework</em>. Se a equipa não estiver disposta a mantê-las, o risco de heterogeneidade supera o ganho e a recomendação passa a ser stack única.</p></div>
+      <p>Decido pela fronteira: gRPC para comunicação interna serviço-a-serviço de alto débito e baixa latência, REST com OpenAPI para tudo o que atravessa a fronteira da organização ou é consumido por <em>browsers</em> e aplicações móveis. Não é um compromisso, é reconhecer que o critério dominante muda de lado da fronteira: dentro, o custo é latência e serialização; fora, é o custo de integração de quem não controlamos.</p>
+      <p>Os critérios explícitos, por ordem de peso. Primeiro, quem é o consumidor: se houver um <em>browser</em> na cadeia, gRPC exige grpc-web e um <em>proxy</em> de tradução, o que introduz uma peça de infra-estrutura por um ganho que raramente se justifica no perfil de tráfego de uma interface. Segundo, o perfil de tráfego: com chamadas internas na ordem de milhares por segundo e cargas pequenas, a poupança de 30% a 60% de bytes e o custo de serialização mais baixo têm efeito visível em CPU e em p99; com dezenas de chamadas por segundo, é irrelevante e o critério passa a ser a ergonomia. Terceiro, o valor do contrato forte: o <code>.proto</code> compilado dá geração de código e evolução com regras claras (números de campo reservados, nunca reutilizados), o que reduz erros de integração face a JSON não tipado. Quarto, o ecossistema já instalado: se o <em>gateway</em>, a autenticação, o WAF, o registo de acessos e os painéis estão todos construídos para HTTP/JSON, introduzir gRPC obriga a duplicá-los.</p>
+      <p>A decisão prática numa migração de monólito é ainda mais simples do que o debate sugere: nos primeiros meses, o gargalo não é a serialização, são as fronteiras de domínio mal traçadas. Escolher gRPC no início adiciona uma variável nova ao problema mais difícil. A ordem que defendo é REST com OpenAPI e testes de contrato desde o primeiro dia, medir, e migrar para gRPC os caminhos internos que a medição mostrar serem quentes — tipicamente 2 ou 3 pares de serviços, não vinte.</p>
+      <p>GraphQL não entra nesta discussão como transporte entre serviços. Entra, se entrar, como camada de agregação para clientes — uma fachada sobre os serviços, não o protocolo entre eles. Usar GraphQL serviço-a-serviço acumula os custos dos dois modelos sem os benefícios de nenhum.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Não há riscos, é Java na mesma.»</td></tr>
-        <tr><td>Mid</td><td>Menciona só o risco de a comunidade ser menor, sem mitigações concretas.</td></tr>
-        <tr><td>Sénior</td><td>Enumera extensões, observabilidade, contratação e custo operacional de duas stacks, com uma mitigação accionável por risco.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o limite explícito de proliferação de stacks, a estratégia de domínio independente do <em>framework</em> como seguro de reversão, e a condição em que recomendaria stack única.</td></tr>
+        <tr><td>Insuficiente</td><td>Escolhe por preferência pessoal ou por «é mais moderno», sem critério.</td></tr>
+        <tr><td>Mid</td><td>Sabe que gRPC é binário e mais rápido; não quantifica nem considera <em>browser</em>, <em>gateway</em> ou ferramentas.</td></tr>
+        <tr><td>Sénior</td><td>Separa fronteira interna de externa, quantifica o ganho, pesa o ecossistema instalado, e coloca GraphQL como fachada e não como transporte.</td></tr>
+        <tr><td>Staff</td><td>Sequencia a decisão no tempo (medir antes de optimizar), reconhece que as fronteiras de domínio são o risco dominante, e define o gatilho objectivo para migrar um caminho para gRPC.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como isola uma biblioteca sem extensão?»</li>
-      <li>«O que muda no manual de plantão com um binário nativo?»</li>
-      <li>«Quantas stacks é demasiado para uma equipa de 40 pessoas?»</li></ul></div>
+      <li>«Como evolui um <code>.proto</code> sem quebrar consumidores?»</li>
+      <li>«Como faz observabilidade e <em>tracing</em> em gRPC?»</li>
+      <li>«Que gatilho concreto o faria migrar um caminho de REST para gRPC?»</li>
+      <li>«E os eventos assíncronos? Onde entram nesta decisão?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar heterogeneidade de stacks como custo zero.</li>
-      <li>Não ter plano de reversão para uma decisão com horizonte de cinco anos.</li></ul></div>
+      <li>Adoptar gRPC para APIs públicas consumidas por parceiros externos.</li>
+      <li>Afirmar ganhos de desempenho sem qualquer medição no contexto próprio.</li>
+      <li>Propor GraphQL como protocolo entre microserviços.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-14-6" class="h2"><span class="secnum">14.6</span> Resumo e checklist<a class="anchor" href="#sec-14-6" aria-label="ligação">#</a></h2>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Cada chamada síncrona entre serviços multiplica as probabilidades de falha: quatro dependências com 99,9% de disponibilidade cada dão 99,6% ao conjunto — cerca de 3 horas de indisponibilidade por mês em vez de 43 minutos. Substituir uma chamada síncrona por um evento assíncrono elimina esse acoplamento de disponibilidade, mas troca-o por consistência eventual, desduplicação no consumidor e uma janela em que o sistema está visivelmente desalinhado. A pergunta que decide é se há um humano à espera da resposta.</p></aside>
 
-<p>O que reter deste capítulo, na forma em que é útil dizê-lo em voz alta numa ronda:</p>
+<h2 id="sec-14-8" class="h2"><span class="secnum">14.8</span> Resumo e checklist<a class="anchor" href="#sec-14-8" aria-label="ligação">#</a></h2>
 
 <ul class="lst">
-  <li>A diferença estrutural é <em>quando</em> se resolve o grafo de <em>beans</em>: <em>augmentation</em> no <em>build</em> em Quarkus, construção do contexto no arranque em Spring — e o Spring Boot 3.x tem AOT que converge para o mesmo modelo no caminho nativo.</li>
-  <li>Em JVM, o arranque típico é 0,8–1,5 s em Quarkus contra 2–4 s em Spring Boot; em nativo, dezenas de milissegundos contra 50–150 ms. O que interessa em produção é o tempo até <em>readiness</em>, que inclui Flyway e <em>pool</em> de ligações.</li>
-  <li>O <em>native image</em> compila sob mundo fechado: reflexão dinâmica, <em>proxies</em> JDK, recursos do <em>classpath</em>, serialização, JNI e agentes de bytecode exigem metadados ou deixam de funcionar.</li>
-  <li>A <em>build</em> nativa custa 4 a 15 minutos e 8 a 16 GB de RAM no <em>runner</em>; enviar nativo sem testes de integração contra o binário é como enviar sem testes.</li>
-  <li>O ganho de RSS é de um factor 3 a 5 num serviço REST simples e aproxima-se de 1 num serviço dominado por <em>cache</em> em <em>heap</em>; em contrapartida perdem-se 10 a 30% de débito em regime estacionário.</li>
-  <li>O arranque só é métrica de negócio em <em>serverless</em>, <em>scale-to-zero</em>, picos rápidos e <em>rolling updates</em> de centenas de réplicas; SnapStart e CRaC são alternativas dentro da JVM.</li>
-  <li>Mutiny e Reactor implementam o mesmo modelo com ergonomia diferente; com Java 21, o critério por omissão passou a ser imperativo com <em>threads</em> virtuais, e reactivo só para <em>streaming</em> com <em>backpressure</em> ou composição paralela complexa.</li>
-  <li>Uma migração de serviço médio custa 3 a 8 semanas-pessoa mais formação; só compensa se for repetível em dezenas de serviços ou se desbloquear uma arquitectura nova.</li>
-  <li>Recomendar «não migrar» com números é uma resposta forte; recomendar migrar tudo sem medir é a falha mais comum nesta pergunta.</li>
+  <li>Segurança e idempotência dos métodos não são teoria: <em>proxies</em>, <em>meshes</em> e clientes automáticos repetem pedidos com base nelas. Marcar mal um método é contratar duplicação silenciosa.</li>
+  <li>O critério para 4xx versus 5xx é a retentabilidade sem alteração, e a consequência é operacional: só os 5xx alimentam o SLO e disparam alertas. <code>200</code> com erro no corpo faz a taxa de erro mentir.</li>
+  <li>Versionar é a última defesa. Expandir, medir por cliente, descontinuar com <code>Deprecation</code>/<code>Sunset</code>, contrair — e nunca reutilizar o nome de um campo com outra unidade ou outro tipo.</li>
+  <li>Em RFC 9457, o <code>type</code> e o código de domínio são contrato e nunca mudam; o <code>detail</code> é texto e pode mudar. <em>Stack traces</em> e nomes internos nunca vão no corpo; o <code>traceId</code> vai sempre.</li>
+  <li>Não existe <em>exactly-once</em> na entrega. Existe <em>at-least-once</em> mais desduplicação no receptor: chave de idempotência gravada na mesma transacção do efeito, impressão digital do pedido, e restrição de unicidade de negócio como segunda linha.</li>
+  <li>Repetir sem <em>jitter</em> cria efeito de rebanho; repetir em todos os níveis multiplica as tentativas (3<sup>4</sup> = 81 numa cadeia de quatro). Repetir num único nível, com orçamento de repetições sobre o débito.</li>
+  <li>Lentidão não é falha: um disjuntor sem <code>slowCallRateThreshold</code> nunca abre numa degradação real, e erros de negócio em <code>ignoreExceptions</code> impedem que uma campanha comercial derrube o serviço.</li>
+  <li>Paginação por <em>offset</em> é O(K × limite) e instável sob escrita; por cursor <code>(criado_em, id)</code> é constante e estável. Exportação em massa não é caso de uso de API paginada.</li>
+  <li><em>Virtual threads</em> deslocam o gargalo do <em>pool</em> de <em>threads</em> para as ligações e a memória, e tornam a fila invisível. O limite de concorrência passa a ser explícito, dimensionado pela lei de Little.</li>
 </ul>
 
-<p>Checklist accionável antes de uma ronda em que este tema possa aparecer:</p>
+<p><strong>Checklist antes da ronda de APIs:</strong></p>
 
 <ul class="lst">
-  <li>Saber descrever, em 60 segundos e sem notas, os quatro custos do arranque do Spring: varrimento, condições de auto-configuração, instanciação reflexiva e geração de <em>proxies</em>.</li>
-  <li>Ter na ponta da língua um par de números de arranque e de RSS para cada uma das quatro combinações da Tabela 14.1, sempre apresentados como ordens de grandeza.</li>
-  <li>Conseguir listar as quatro categorias de metadados nativos e a anotação ou API correspondente em cada <em>framework</em>.</li>
-  <li>Saber explicar a diferença entre <em>heap</em>, memória total da JVM e RSS, e dizer como se mede cada uma (NMT, <code>container_memory_working_set_bytes</code>).</li>
-  <li>Ter um critério pessoal, formulado numa frase, para escolher entre reactivo e <em>threads</em> virtuais.</li>
-  <li>Preparar uma resposta de «não migrar» com o cálculo de semanas-pessoa contra GB poupados, para o caso de a pergunta vir na forma de proposta do entrevistador.</li>
-  <li>Confirmar que consegue nomear pelo menos três armadilhas de CDI que mordem quem vem de Spring: <code>@Dependent</code> por omissão, remoção de <em>beans</em> e auto-invocação de métodos interceptados.</li>
+  <li>Saber dizer, em duas frases, porque <code>PATCH</code> não é idempotente em geral mas um <em>merge patch</em> de valores finais o é na prática.</li>
+  <li>Ter a grelha de códigos pronta: <code>400</code>, <code>401</code>/<code>403</code>, <code>404</code>, <code>409</code>, <code>422</code>, <code>429</code>, <code>503</code>, <code>504</code> — e a consequência operacional de cada um.</li>
+  <li>Conseguir desenhar, no quadro, a tabela de idempotência com a restrição de unicidade, o estado <code>EM_CURSO</code>, a impressão digital e o prazo de expiração.</li>
+  <li>Ter números decorados: <em>timeout</em> entre 2 e 3 vezes o p99, folga de 20% no orçamento, <em>jitter</em> de 50%, retenção de chaves de 24 h a 7 dias.</li>
+  <li>Saber a ordem das camadas de Resilience4j e justificar porque a repetição fica dentro do disjuntor.</li>
+  <li>Ter um exemplo próprio de degradação com significado de negócio, não um <em>catch</em> que devolve lista vazia.</li>
+  <li>Conseguir escrever a consulta de paginação por chave com o índice composto correcto, à mão.</li>
+  <li>Preparar uma resposta de 90 segundos para «REST, gRPC ou GraphQL?» que comece pela fronteira e termine com um gatilho de medição.</li>
+  <li>Ter uma história real de incidente causado por <em>timeout</em>, repetição ou duplicação — com o número antes e o número depois.</li>
 </ul>

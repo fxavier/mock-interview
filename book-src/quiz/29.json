@@ -1,60 +1,26 @@
-{
-  "chapter": 29,
-  "questions": [
-    {
-      "q": "Um serviço grava o pedido em PostgreSQL e, no mesmo método `@Transactional`, chama `kafkaTemplate.send(...)`. A equipa move o `send` para um `TransactionSynchronization` executado em `afterCommit`. O que muda?",
-      "options": [
-        "Passa a haver atomicidade entre a base de dados e o Kafka, porque o envio já só ocorre depois do commit.",
-        "Deixa de haver eventos para pedidos inexistentes, mas continua a poder perder-se o evento de um pedido gravado.",
-        "Nada muda: `afterCommit` corre dentro da mesma transacção da base de dados.",
-        "Passa a ser necessário activar transacções no produtor Kafka para que o `afterCommit` funcione."
-      ],
-      "answer": 1,
-      "explain": "Publicar em `afterCommit` elimina o caso do evento fantasma (evento sem estado gravado), mas se o processo morrer entre o commit e o envio, o pedido existe e ninguém a jusante o sabe. Só o outbox torna a mensagem tão durável quanto o estado, porque a escreve na mesma transacção local. Não há atomicidade entre PostgreSQL e Kafka, e as transacções do produtor Kafka não abrangem a base de dados."
-    },
-    {
-      "q": "Um consumidor Kafka desduplica assim: `if (repo.existsByEventId(id)) return;` numa transacção, e aplica o efeito noutra transacção a seguir. Duas réplicas recebem o mesmo evento após um rebalance. Qual é o problema?",
-      "options": [
-        "Nenhum: `existsByEventId` é suficiente porque o Kafka garante ordem dentro da partição.",
-        "O problema é só de desempenho, por causa da consulta extra antes de cada efeito.",
-        "Há uma janela de corrida entre a verificação e a escrita: ambas podem ver «não existe» e aplicar o efeito duas vezes.",
-        "O problema resolve-se confirmando o deslocamento antes de aplicar o efeito."
-      ],
-      "answer": 2,
-      "explain": "Verificar-e-depois-escrever em transacções separadas é uma condição de corrida clássica: duas réplicas leem «não existe» e ambas aplicam. A idempotência tem de vir da base de dados, com `INSERT` numa chave primária `(consumidor, event_id)` na mesma transacção do efeito, deixando a violação de chave anular o duplicado. Confirmar o deslocamento antes do efeito piora tudo, porque passa a perder mensagens."
-    },
-    {
-      "q": "Um ecrã de detalhe compõe dados de quatro serviços em paralelo, cada um com 99,9% de disponibilidade e p99 de 40 ms. Que afirmação descreve correctamente o resultado?",
-      "options": [
-        "A disponibilidade do ecrã é 99,9%, porque as chamadas são paralelas e não sequenciais.",
-        "A disponibilidade cai para cerca de 99,6% e o p99 aproxima-se do ramo mais lento, não da soma.",
-        "A disponibilidade cai para cerca de 99,6% e o p99 é a soma dos quatro, cerca de 160 ms.",
-        "A disponibilidade sobe, porque o paralelismo permite que uma falha seja compensada pelas outras chamadas."
-      ],
-      "answer": 1,
-      "explain": "O paralelismo afecta a latência, não a disponibilidade: se qualquer dos quatro ramos for obrigatório, a disponibilidade composta é 0,999⁴ ≈ 99,6%. A latência, essa, é a do ramo mais lento (mais a junção), porque as chamadas ocorrem ao mesmo tempo. Recuperar disponibilidade exige degradação por ramo com timeout, ou substituir a composição por uma projecção materializada."
-    },
-    {
-      "q": "Numa saga orquestrada de pedido, o serviço de pagamentos responde `504` ao comando de autorização. Qual é a acção correcta do orquestrador?",
-      "options": [
-        "Iniciar imediatamente as compensações, porque `504` indica que a autorização falhou.",
-        "Repetir o comando de autorização até obter uma resposta com `200`.",
-        "Consultar o pagamento pela chave de idempotência para descobrir o estado real e só depois decidir entre repetir e compensar.",
-        "Marcar a saga como `FAILED` e deixar a resolução para intervenção manual."
-      ],
-      "answer": 2,
-      "explain": "Um `504` é ignorância, não falha: a cobrança pode ter sido feita. Compensar às cegas arrisca estornar o que não existe; repetir às cegas arrisca cobrar duas vezes. A consulta pela chave de idempotência resolve a ambiguidade antes da decisão. Marcar `FAILED` de imediato transforma um caso rotineiro num incidente humano."
-    },
-    {
-      "q": "Uma equipa acrescenta o campo opcional `promoCode` ao evento `OrderPlaced` e implanta o produtor. Dois dos cinco consumidores começam a falhar na desserialização. Qual é a causa mais provável e a correcção?",
-      "options": [
-        "Os consumidores não são tolerantes a campos desconhecidos; a correcção é desserializar ignorando campos não mapeados.",
-        "A alteração é incompatível por natureza; a correcção é criar um tópico `v2` para todas as alterações de esquema.",
-        "Falta um registo de esquemas; sem ele nenhuma alteração de evento é possível.",
-        "O produtor implantou antes dos consumidores; a correcção é implantar sempre os consumidores primeiro."
-      ],
-      "answer": 0,
-      "explain": "Acrescentar um campo opcional é compatível por definição — quebra apenas consumidores configurados para rejeitar campos desconhecidos, e a correcção é o leitor tolerante. Criar um tópico novo por cada campo adicionado multiplica manutenção sem necessidade; o registo de esquemas ajuda a verificar compatibilidade mas não é a causa aqui; e em eventos o produtor implanta primeiro por natureza, o que é precisamente porque se exige compatibilidade progressiva."
-    }
-  ]
-}
+{"chapter": 29, "questions": [
+  {"q": "Uma cache distribuída escolhe o nó com `hash(chave) % N`. O cluster passa de 6 para 7 nós. Que fracção aproximada das chaves deixa de mapear para o nó onde estava?",
+   "options": ["≈ 14%, porque só entra um nó em sete", "≈ 33%, proporcional ao aumento de capacidade", "≈ 50%, metade das chaves muda sempre", "≈ 86%, porque o resto da divisão muda para quase todas as chaves"],
+   "answer": 3,
+   "explain": "Com módulo, mudar N reatribui aproximadamente N/(N+1) das chaves, ou seja 6/7 ≈ 86%: a cache fica praticamente vazia e todo o tráfego cai na origem. Os ≈ 14% são o valor de um anel de consistent hashing (K/N), que é precisamente a razão para o usar. As opções de 33% e 50% não correspondem a nenhum mecanismo: o resto da divisão não preserva localidade nenhuma quando o divisor muda."},
+
+  {"q": "Um pedido de utilizador atravessa três camadas de serviços e cada uma está configurada com `maxAttempts=3` (uma tentativa mais duas repetições). Quantas chamadas pode o serviço do fundo receber, no pior caso, por cada pedido de utilizador?",
+   "options": ["3", "9", "27", "81"],
+   "answer": 2,
+   "explain": "As repetições multiplicam-se entre camadas: 3 × 3 × 3 = 27 chamadas no serviço do fundo. É a razão para repetir apenas numa camada (a mais próxima do utilizador) e para impor um orçamento de repetições — as repetições só disparam quando o serviço já está em dificuldade, pelo que a amplificação impede a recuperação. As respostas 3 e 9 correspondem a uma e a duas camadas; 81 corresponderia a quatro."},
+
+  {"q": "Um produto novo tem 5 milhões de utilizadores activos por dia, cada um faz 20 chamadas à API por dia e o pico é 3× a média. Que ordem de grandeza de QPS de pico deve o candidato anunciar?",
+   "options": ["≈ 350 QPS", "≈ 1 200 QPS", "≈ 3 500 QPS", "≈ 12 000 QPS"],
+   "answer": 2,
+   "explain": "5e6 × 20 = 100e6 pedidos por dia; a dividir por 86 400 s dá ≈ 1 160 QPS médios, e com o factor de pico de 3× fica ≈ 3 500 QPS. Os ≈ 1 200 QPS são a média, não o pico — o erro mais comum. Os ≈ 350 QPS resultam de esquecer um zero nas acções por utilizador e os 12 000 de aplicar um factor de pico de 10× que ninguém declarou."},
+
+  {"q": "Uma chave de configuração servida a 6 000 pedidos por segundo expira e a origem demora 40 ms a responder. Qual é a combinação de mitigações correcta?",
+   "options": ["Aumentar o TTL para 24 horas e recarregar manualmente após cada alteração", "`Single-flight` por chave mais TTL com jitter e expiração probabilística antecipada", "Reduzir o TTL para 5 segundos, para que cada miss traga menos pedidos de cada vez", "Acrescentar réplicas de leitura à base de dados para absorver os misses"],
+   "answer": 1,
+   "explain": "Sem coordenação, entram ~240 consultas idênticas na origem antes de a primeira repovoar a chave; single-flight reduz isso a uma, o jitter dessincroniza as expirações em massa e a expiração probabilística renova a chave antes de expirar, com um único pedido. TTL de 24 h troca o incidente por dados desactualizados permanentes; TTL de 5 s multiplica a frequência da avalanche por 120; réplicas de leitura tratam o sintoma na origem e nada fazem quanto à avalanche de misses idênticos."},
+
+  {"q": "Um cluster PostgreSQL está configurado com replicação síncrona para uma réplica noutra região, com `synchronous_commit = remote_apply`. Como se classifica em PACELC?",
+   "options": ["PA/EL", "PC/EC", "PA/EC", "PC/EL"],
+   "answer": 1,
+   "explain": "Durante uma partição (P) o primário recusa confirmar escritas sem a réplica, ou seja escolhe consistência sobre disponibilidade (PC); fora da partição (E) continua a pagar o round-trip inter-regional em cada commit — dezenas de milissegundos — logo escolhe consistência sobre latência (EC). PA/EL descreve um Cassandra ou DynamoDB com quóruns baixos; as combinações mistas exigiriam replicação assíncrona num dos dois regimes, o que `remote_apply` exclui."}
+]}

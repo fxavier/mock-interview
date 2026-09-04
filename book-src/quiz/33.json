@@ -1,46 +1,46 @@
 {"chapter": 33, "questions": [
-  {"q": "Um serviço em ECS é implantado com canário a 5% durante 5 minutos. O serviço recebe 8 pedidos por segundo. O <em>workflow</em> promove para 100% porque nenhum alarme disparou. Qual é o problema?",
+  {"q": "Um pod tem `limits.memory: 2Gi` e a imagem não define nenhuma flag de memória da JVM. O serviço faz GC quase contínuo enquanto o `working set` do contentor fica em 700 MB. Qual é a explicação directa?",
    "options": [
-     "O canário devia observar 5% do tráfego durante pelo menos 60 minutos para o alarme ser válido.",
-     "A janela só expõe cerca de 120 pedidos, o que não dá sinal estatístico para distinguir uma taxa de erro de 0,1% de uma de 2%.",
-     "O ECS não suporta encaminhamento por peso no ALB, pelo que os 5% não são reais.",
-     "O canário só funciona se a versão nova e a antiga usarem esquemas de base de dados diferentes."],
+     "A JVM lê a memória do nó e não a do cgroup, por isso dimensiona a heap para o valor errado.",
+     "Sem `-Xmx`, `MaxRAMPercentage` vale 25% por omissão: a heap máxima é ~512 MB e o resto do limite fica por usar.",
+     "O `working set` inclui a page cache, por isso o valor de 700 MB não tem relação com a heap.",
+     "O G1 só usa metade da heap disponível quando o contentor tem menos de 4 vCPU."],
    "answer": 1,
-   "explain": "5% de 8 pedidos por segundo durante 5 minutos são cerca de 120 pedidos: com essa amostra, uma taxa de erro de 2% produz 2 ou 3 falhas, indistinguíveis do ruído. Alargar a janela para 60 minutos ajuda mas torna o <em>lead time</em> impraticável; em serviços de baixo tráfego a escolha correcta é blue-green com reposição rápida, ou sondas sintéticas que gerem carga determinística. O ALB suporta pesos por grupo-alvo, e o canário é ortogonal ao esquema da base de dados."},
+   "explain": "Com `UseContainerSupport` activo (omissão desde o JDK 10) a JVM lê o limite do cgroup, mas aplica-lhe `MaxRAMPercentage`, cujo valor por omissão é 25% — 512 MB de heap para 2Gi de limite. A opção 0 descreve o comportamento de JVMs antigas sem suporte a contentores; a page cache não explica GC contínuo; e o G1 não reduz a heap em função do número de CPUs."},
 
-  {"q": "Uma migração Flyway adiciona `NOT NULL` a uma coluna existente de uma tabela PostgreSQL com 80 milhões de linhas, e corre no arranque da aplicação com 6 réplicas. Qual é o efeito mais provável?",
+  {"q": "O `Deployment` tem `preStop` com espera de 10 s e a aplicação usa `server.shutdown: graceful` com `spring.lifecycle.timeout-per-shutdown-phase: 30s`. O `terminationGracePeriodSeconds` ficou no valor por omissão. Qual é a consequência?",
    "options": [
-     "Nada de especial: o PostgreSQL valida a restrição com um bloqueio partilhado que permite leituras e escritas.",
-     "As 6 réplicas corrompem a tabela de histórico do Flyway por escreverem em simultâneo.",
-     "A varredura completa mantém um bloqueio ACCESS EXCLUSIVE durante minutos e as réplicas em espera excedem a sonda de arranque, entrando em ciclo de reinícios.",
-     "O Flyway divide automaticamente a operação em lotes para evitar bloqueios longos."],
+     "Nenhuma: o grace period por omissão adapta-se ao preStop configurado.",
+     "O rollout fica bloqueado porque o kubelet espera pelo preStop antes de contar o pod como terminado.",
+     "Aos 30 s chega SIGKILL a meio da drenagem: pedidos perdidos e exit code 137 em vez de 143.",
+     "A readiness probe continua a correr durante o preStop e mantém o pod na lista de endpoints."],
    "answer": 2,
-   "explain": "Adicionar `NOT NULL` a uma coluna existente obriga a uma varredura completa sob ACCESS EXCLUSIVE, que bloqueia leituras e escritas durante minutos numa tabela desse tamanho. O Flyway serializa as réplicas com um bloqueio consultivo — não há corrupção — mas as cinco em espera podem exceder o limite da sonda de arranque e ser reiniciadas em ciclo. O caminho seguro é ADD CONSTRAINT ... CHECK ... NOT VALID seguido de VALIDATE CONSTRAINT, num passo do <em>pipeline</em> e não no arranque."},
+   "explain": "O valor por omissão de `terminationGracePeriodSeconds` é 30 s e conta a partir do início da paragem, incluindo o preStop: 10 s de espera mais até 30 s de drenagem não cabem, e o kubelet envia SIGKILL a meio. A aritmética tem de fechar em desigualdade estrita — grace period maior do que preStop mais o timeout de drenagem —, aqui 60 s. O grace period não se adapta sozinho e o problema não é o rollout ficar bloqueado."},
 
-  {"q": "O `backend \"s3\"` de uma raiz Terraform tem `bucket`, `key`, `region` e `encrypt = true`, mas nem `dynamodb_table` nem `use_lockfile`. Dois engenheiros correm `apply` ao mesmo tempo. O que acontece?",
+  {"q": "Um serviço com `requests.cpu: 500m` e `limits.cpu: 1` mostra p99 de 400 ms em picos, com utilização média de CPU em 45% e `rate(container_cpu_cfs_throttled_periods_total[5m])` acima de 12%. Qual é a leitura correcta?",
    "options": [
-     "O S3 serializa as escritas do objecto de estado, pelo que o segundo `apply` espera pelo primeiro.",
-     "Não há bloqueio: ambos leem o mesmo estado inicial e a última escrita vence, deixando um estado que não descreve nenhuma das duas intenções.",
-     "O Terraform detecta a concorrência pelo `lineage` do estado e aborta os dois `apply`.",
-     "O versionamento do <em>bucket</em> impede a segunda escrita e devolve um erro de conflito."],
+     "A CPU tem folga; a latência vem da base de dados e o throttling é um artefacto da métrica.",
+     "A quota do CFS é consumida em rajadas por GC e JIT e o processo fica suspenso até ao período seguinte; subir ou remover o limite de CPU é a acção certa.",
+     "É preciso baixar `requests.cpu` para 250m, porque o HPA calcula a utilização sobre o request.",
+     "Igualar `limits.cpu` a `requests.cpu` põe o pod em Guaranteed e elimina o throttling."],
    "answer": 1,
-   "explain": "Sem `dynamodb_table` (mecanismo clássico) ou `use_lockfile = true` (bloqueio nativo do S3 por escrita condicional, desde o Terraform 1.10) não existe qualquer serialização: os dois processos leem o mesmo estado e o último a escrever sobrepõe-se, ficando recursos criados que o estado não conhece. O versionamento do <em>bucket</em> permite recuperar a versão anterior mas não previne o conflito, e o `lineage` só identifica a origem do estado."},
+   "explain": "Um limite de 1 CPU dá 100 ms de quota por período de 100 ms; um pico paralelo consome-a em 25 ms e o processo fica 75 ms suspenso, o que destrói a cauda sem mexer na média. Baixar o request agrava o throttling relativo e faz o HPA escalar por um sinal enviesado; igualar limite a request reduz ainda mais a quota, e Guaranteed é uma classe de expulsão, não uma isenção do CFS."},
 
-  {"q": "Um serviço Java com Spring Boot serve 1 200 pedidos por segundo constantes com p99 de 120 ms, e a equipa quer reduzir custo passando para AWS Lambda. Qual é a objecção tecnicamente mais forte?",
+  {"q": "Uma equipa quer que uma alteração ao `ConfigMap` chegue aos pods de forma segura e reversível. Qual é a abordagem mais robusta?",
    "options": [
-     "O Lambda não permite ligações a bases de dados em sub-redes privadas.",
-     "A tráfego constante o Lambda é tipicamente mais caro que Fargate, e o arranque a frio da JVM (2-6 s) degrada o p99 sempre que a concorrência sobe.",
-     "O Lambda tem um limite de 100 invocações concorrentes por conta, insuficiente para essa carga.",
-     "O Spring Boot não pode ser empacotado como função Lambda."],
-   "answer": 1,
-   "explain": "O modelo do Lambda é vantajoso em cargas esporádicas e caro em tráfego constante — 1 200 pedidos por segundo dão cerca de 3 mil milhões de invocações mensais. Somando o arranque a frio da JVM, que só é mitigado com SnapStart ou imagem nativa, a proposta piora o p99 e a factura. O Lambda liga-se a sub-redes privadas, o Spring Boot pode ser empacotado como função, e o limite de concorrência por região é da ordem dos milhares e ajustável."},
-
-  {"q": "Depois de repor a versão anterior de um serviço, os pedidos continuam a falhar. A versão revertida lê a coluna `email`, que a migração da versão nova removeu com `DROP COLUMN`. Que regra foi violada?",
-   "options": [
-     "A migração devia ter corrido no arranque da aplicação em vez de num passo do <em>pipeline</em>.",
-     "Faltou um `terraform apply` para reconciliar o esquema com o estado declarado.",
-     "O esquema tem de ser compatível com a versão N-1 e a versão N em simultâneo; a contracção só ocorre quando nenhuma versão em execução lê o elemento antigo.",
-     "O <em>rollback</em> devia ter incluído a reposição de uma cópia de segurança da base de dados."],
+     "Montar o ConfigMap com `subPath` para o kubelet actualizar o ficheiro sem reiniciar o pod.",
+     "Injectar por `envFrom` e confiar que o kubelet propaga os novos valores ao processo.",
+     "Anotar o `spec.template` com o hash do ConfigMap (`checksum/config`), forçando um rolling update validado pela readiness probe.",
+     "Ligar `@RefreshScope` em todos os beans para recarregar a configuração nos 20 pods em simultâneo."],
    "answer": 2,
-   "explain": "Numa implantação progressiva convivem duas versões do código com um único esquema, pelo que qualquer alteração destrutiva tem de ficar para a fase de contracção, dias ou semanas depois, confirmada por métricas de leituras residuais. Onde a migração corre não muda a incompatibilidade, o Terraform não gere esquemas de tabelas, e repor uma cópia de segurança perderia todas as escritas entretanto confirmadas — a prevenção por expand/contract é a única resposta barata."}
+   "explain": "O hash no `spec.template` transforma uma mudança de configuração num deploy normal: rollout gradual, validação por readiness em cada pod, `progressDeadlineSeconds` a falhar o deploy e `rollout undo` disponível. Montagens com `subPath` nunca são actualizadas pelo kubelet, `envFrom` congela os valores na criação do pod, e o recarregamento a quente aplica uma configuração inválida a toda a frota ao mesmo tempo, sem barreira nenhuma."},
+
+  {"q": "Um consumidor de Kafka com 12 partições acumula lag às horas de ponta, com CPU em 30%. Que configuração de HPA é defensável?",
+   "options": [
+     "Escalar por lag do grupo de consumidores, com `maxReplicas: 12` e janela de estabilização longa na descida.",
+     "Escalar por CPU com alvo de 30%, para o HPA reagir antes de a CPU subir.",
+     "Escalar por lag com `maxReplicas: 40`, para absorver qualquer pico de produção.",
+     "Escalar por memória, já que o consumidor acumula mensagens em buffers antes de as processar."],
+   "answer": 0,
+   "explain": "O lag mede o trabalho por fazer, que é o recurso realmente saturado num consumidor ligado a I/O; o paralelismo de um grupo está limitado pelo número de partições, por isso réplicas acima de 12 ficam ociosas e só pagam rebalances. Baixar o alvo de CPU mantém o sinal errado, e a memória não descreve a saturação — além de que cada réplica que entra ou sai provoca um rebalance, daí a janela de estabilização longa na descida."}
 ]}

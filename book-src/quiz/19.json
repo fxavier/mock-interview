@@ -1,51 +1,46 @@
 {"chapter": 19, "questions": [
-  {"q": "Uma tabela de 300 milhões de linhas usa `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` e as inserções degradaram-se à medida que a tabela cresceu. Qual é a explicação mecânica correcta?",
+  {"q": "Num `@Service` singleton do Spring Boot 3.5, chamado em paralelo por um endpoint HTTP e por um job nocturno, existe um campo `private final Map<String, BigDecimal> rateCache = new HashMap<>()` preenchido com `get`/`put` dentro do método. Qual é a consequência mais grave e a correcção mínima?",
    "options": [
-     "O tipo `uuid` do PostgreSQL é guardado como texto de 36 bytes, o que torna as comparações lentas.",
-     "Os valores são aleatórios, cada inserção aterra numa folha imprevisível do B-tree, provocando divisões de página e leituras aleatórias quando o índice deixa de caber em `shared_buffers`.",
-     "O `gen_random_uuid()` bloqueia porque tem de consultar uma sequência partilhada para garantir unicidade.",
-     "O índice de chave primária deixa de ser usado acima de 100 milhões de linhas e o planeador passa a fazer varredura sequencial."
-   ],
+     "Nenhuma: o campo é `final`, logo o mapa é seguro para acesso concorrente.",
+     "Entradas perdidas e, em rehash simultâneo, uma thread a 100% de CPU sem stack de erro; corrige-se com `ConcurrentHashMap` e `computeIfAbsent`, ou com uma cache local à invocação.",
+     "Apenas consumo de memória; basta limpar o mapa no fim de cada invocação.",
+     "Marcar o método com `synchronized`, que resolve a corrida sem outro custo."],
    "answer": 1,
-   "explain": "O problema é localidade de escrita: UUIDv4 é aleatório em todos os bits úteis, por isso as inserções espalham-se por todo o índice, dividem páginas e deixam as folhas com 50-70% de ocupação. O tipo `uuid` ocupa 16 bytes binários, não 36 (esse é o erro de guardar em `varchar`); `gen_random_uuid()` não coordena nada, é local; e o planeador não abandona o índice por causa do tamanho da tabela."},
+   "explain": "`final` protege a referência, não o conteúdo: dois `put` concorrentes num `HashMap` podem perder entradas e corromper a estrutura interna, sintoma clássico de CPU a 100% sem excepção. `synchronized` no método serializa o job inteiro e mantém a cache sem expiração, pelo que resolve a corrida ao preço errado. Limpar o mapa no fim não elimina a escrita concorrente."},
 
-  {"q": "Numa tabela com `soft delete` por `deleted_at`, qual é a consequência que a maioria das equipas não antecipa?",
+  {"q": "Um método legado faz `jdbc.update(\"UPDATE payout SET amount = \" + total + \" WHERE merchant_id = '\" + merchantId + \"'\")` e um relatório vizinho concatena o nome da coluna num `ORDER BY`. Qual é a correcção correcta para cada caso?",
    "options": [
-     "As chaves estrangeiras deixam de impedir que uma linha viva referencie um pai já apagado, porque a linha do pai continua a existir.",
-     "O PostgreSQL passa a ignorar automaticamente as linhas com `deleted_at` preenchido nas junções.",
-     "O `autovacuum` remove as linhas marcadas ao fim de um ciclo, o que torna a reposição impossível.",
-     "Os índices deixam de poder ser usados porque `deleted_at` é uma coluna anulável."
-   ],
-   "answer": 0,
-   "explain": "O `soft delete` transfere para a aplicação um invariante que era da base: a chave estrangeira continua satisfeita por um pai marcado como apagado. O motor não conhece a convenção nem filtra nada, o `autovacuum` só recolhe tuplos mortos por MVCC (não linhas marcadas pela aplicação) e uma coluna anulável não impede o uso de índices — inclusive índices parciais, que são a correcção recomendada."},
-
-  {"q": "Numa tabela filha com 50 milhões de linhas, a coluna que referencia o pai não tem índice. O que acontece ao apagar uma linha do pai com `ON DELETE CASCADE`?",
-   "options": [
-     "Nada de especial: a cascata usa o índice da chave primária da tabela filha.",
-     "O PostgreSQL recusa o `DELETE` porque a integridade referencial exige um índice do lado filho.",
-     "A verificação da restrição obriga a uma varredura sequencial completa da tabela filha, com o bloqueio mantido durante todo o tempo.",
-     "A cascata é adiada para o próximo `autovacuum` e o `DELETE` regressa de imediato."
-   ],
+     "Parâmetros ligados (`?`) nos dois casos, porque o JDBC parametriza qualquer parte da instrução.",
+     "Escapar as plicas de `merchantId` e validar que o `ORDER BY` não contém espaços.",
+     "Parâmetros ligados para os valores e lista branca de colunas permitidas para o `ORDER BY`, que não é parametrizável.",
+     "Passar a usar um ORM: qualquer JPQL elimina o risco por construção."],
    "answer": 2,
-   "explain": "O PostgreSQL cria índice para a chave primária mas nunca para a coluna que referencia; sem ele, cada apagamento no pai varre toda a tabela filha, transformando uma operação sub-milissegundo em segundos com bloqueio activo. Não é recusado, não usa a PK da filha (a coluna de FK é outra) e a verificação é imediata, não diferida para o `autovacuum`."},
+   "explain": "Valores aceitam parâmetros ligados; identificadores como nomes de coluna em `ORDER BY` não, e a única defesa é validar contra uma lista fechada de colunas. Escapar plicas à mão falha com codificações e comentários SQL. Um ORM continua a permitir concatenação em queries nativas ou em ordenação dinâmica, logo não elimina o risco por construção."},
 
-  {"q": "Qual destas colunas está correctamente tipada num modelo PostgreSQL 17 para pagamentos?",
+  {"q": "Numa revisão, um ciclo `for (Order o : batch) { for (OrderLine l : o.getLines()) ... }` sobre uma associação `LAZY` gera 5 001 idas à base de dados para 5 000 encomendas. Qual é o comentário de revisão mais adequado?",
    "options": [
-     "`amount money NOT NULL`, porque o tipo é dedicado a valores monetários.",
-     "`captured_at timestamp NOT NULL`, porque a aplicação grava sempre em UTC.",
-     "`fx_rate double precision NOT NULL`, porque taxas de câmbio precisam de muitas casas decimais.",
-     "`amount numeric(18,4) NOT NULL` com `captured_at timestamptz NOT NULL`."
-   ],
-   "answer": 3,
-   "explain": "`numeric` dá aritmética decimal exacta com escala suficiente para montantes e `timestamptz` guarda um instante absoluto, imune à configuração de fuso de quem lê. O tipo `money` depende da configuração regional do servidor, `timestamp` sem fuso não fixa instante nenhum (a convenção UTC quebra-se no primeiro cliente com outra configuração) e `double precision` acumula erro de representação binária."},
-
-  {"q": "Num SaaS com 2 000 `tenants` e 40 tabelas, o argumento mais forte contra schema por tenant é:",
-   "options": [
-     "O PostgreSQL só suporta um número limitado de schemas por base de dados.",
-     "Cada migração passa a ser 2 000 operações orquestradas e o catálogo cresce para cerca de 80 000 relações, com impacto no `autovacuum` e nas cópias de segurança.",
-     "Não é possível garantir unicidade dentro de cada schema sem uma coluna `tenant_id`.",
-     "As ligações têm de ser abertas com um utilizador diferente por tenant, o que impede o uso de um pool."
-   ],
+     "Bloqueante: activar `FetchType.EAGER` na associação, que resolve o problema em todos os casos de uso.",
+     "Não-bloqueante se for anterior a este PR: descrever o custo (~2 s só de rede a 0,4 ms por ida) e propor `@EntityGraph`, `join fetch` ou `@BatchSize`, com issue separado.",
+     "Nit de estilo: sugerir substituir os ciclos aninhados por `stream().flatMap()`.",
+     "Bloqueante: aumentar o tamanho da pool de ligações para absorver as 5 001 queries."],
    "answer": 1,
-   "explain": "O custo dominante é operacional: uma alteração de esquema multiplica-se por 2 000, deixando o sistema em estado misto durante horas, e o catálogo com dezenas de milhares de relações penaliza planeamento, `autovacuum` e `pg_dump`. O PostgreSQL não impõe um limite prático de schemas, cada schema tem as suas próprias restrições de unicidade e o `search_path` por transacção permite reutilizar um único pool."}
+   "explain": "Um sénior separa regressão introduzida pelo PR de dívida pré-existente, e quantifica o custo antes de decidir a severidade. `EAGER` na associação resolve este caso e estraga todos os outros que carregam a entidade sem precisar das linhas. `flatMap` mantém exactamente as mesmas queries, e mais ligações apenas espalham o mesmo custo por mais recursos."},
+
+  {"q": "A equipa vai refactorizar um cálculo de portes sem testes. A bateria escrita tem 92% de cobertura de linhas, mas o PIT mata só 45% dos mutantes na região a alterar. Qual é a leitura correcta?",
+   "options": [
+     "A rede é suficiente: acima de 90% de cobertura o refactoring é seguro.",
+     "A rede é insuficiente: mais de metade das alterações de operadores e condições passa sem falhar um teste; faltam casos de fronteira antes de mexer no código.",
+     "O PIT está mal configurado, porque cobertura alta implica mutantes mortos.",
+     "Deve-se refactorizar primeiro e usar a taxa de mutantes depois, sobre o código novo."],
+   "answer": 1,
+   "explain": "Cobertura mede linhas executadas, não asserções que verificam resultado; 45% de mutantes mortos significa que trocar `>` por `>=` ou remover uma condição continua a dar bateria verde. A ordem é sempre rede primeiro: medir mutação sobre o código novo já não prova que o comportamento antigo foi preservado."},
+
+  {"q": "Um módulo com 12 alterações por mês custa em média 2 dias-pessoa extra por alteração; pô-lo sob testes e extrair os casos de uso está estimado em 20 dias-pessoa. Qual é a forma mais eficaz de levar isto ao gestor de produto?",
+   "options": [
+     "Pedir um sprint inteiro dedicado a dívida técnica, para concentrar o trabalho e evitar dispersão.",
+     "Inflacionar as estimativas das próximas funcionalidades e fazer a limpeza dentro delas, sem anunciar.",
+     "Apresentar 24 dias-pessoa perdidos por mês contra 20 de investimento, propor três fatias de uma semana intercaladas e verificar o resultado no tempo de lead do módulo.",
+     "Explicar os princípios SOLID violados e o risco de o código se tornar impossível de manter."],
+   "answer": 2,
+   "explain": "O argumento ganha quando é custo mensal contra custo de pagar, com fatias limitadas e um indicador que se verifica depois. Um sprint dedicado produz um PR gigante e nunca é aprovado uma segunda vez; inflacionar estimativas em segredo destrói a confiança quando for descoberto; e princípios de desenho não são unidades que um gestor de produto possa comparar com receita."}
 ]}

@@ -1,46 +1,46 @@
 {"chapter": 23, "questions": [
-  {"q": "Um método recebe `List<String> linhas` e constrói um relatório com `relatorio += l;` dentro de um ciclo `for` sobre 50 000 linhas de 60 caracteres. Qual é a complexidade temporal real?",
+  {"q": "Um serviço em PostgreSQL 17 executa, dentro de uma transacção em `READ COMMITTED`, dois `SELECT count(*) FROM lancamento WHERE conta_id = 7` separados por 300 ms de processamento em Java. Entretanto outra sessão faz `INSERT` de uma linha para a conta 7 e `COMMIT`. Qual é o resultado?",
    "options": [
-     "O(n), porque o compilador substitui a concatenação por um `StringBuilder`",
-     "O(n log n), porque `String` guarda os caracteres num `byte[]` compacto",
-     "O(n²) no comprimento total, porque cada `+=` copia tudo o que já foi acumulado",
-     "O(n), porque `String` é imutável e a JVM partilha o array interno entre instâncias"],
-   "answer": 2,
-   "explain": "Cada `+=` sobre uma `String` imutável aloca um `byte[]` novo e copia o conteúdo acumulado, dando uma soma quadrática (~7,5 × 10^10 bytes copiados neste caso). A optimização por `invokedynamic`/`StringConcatFactory` aplica-se a uma expressão de concatenação, não atravessa a fronteira do ciclo, porque cada iteração tem de produzir uma `String` observável. E desde a JDK 7u6 não há partilha do array interno entre instâncias."},
-
-  {"q": "Num array com valores positivos e negativos, procura-se o maior subarray contíguo com soma menor ou igual a K. Um candidato propõe janela deslizante com dois índices que nunca recuam. Qual é o problema?",
-   "options": [
-     "Nenhum: a janela deslizante é O(n) e correcta para qualquer conjunto de valores",
-     "A condição deixa de ser monótona com negativos — estender a janela pode baixar a soma — e o algoritmo devolve um resultado curto sem falhar",
-     "É correcta mas degenera para O(n²) porque o índice esquerdo tem de recuar",
-     "Só falha quando todos os valores são negativos; com pelo menos um positivo continua correcta"],
+     "Os dois `SELECT` devolvem o mesmo valor, porque a transacção fixa um `snapshot` no `BEGIN`.",
+     "O segundo `SELECT` devolve mais uma linha: é uma leitura fantasma, e desapareceria em `REPEATABLE READ`.",
+     "A segunda sessão fica bloqueada até o primeiro `SELECT` terminar, por causa dos `next-key locks`.",
+     "A primeira transacção aborta com SQLSTATE 40001 assim que a segunda faz `COMMIT`."],
    "answer": 1,
-   "explain": "A janela deslizante exige monotonia: estender nunca pode tornar válida uma condição inválida. Com negativos, acrescentar um elemento pode reduzir a soma, e o algoritmo termina com um resultado plausível mas subóptimo — falha em silêncio, não por excepção nem por lentidão. A abordagem correcta passa por somas de prefixo, com `deque` monótono ou árvore balanceada em O(n log n)."},
+   "explain": "Em `READ COMMITTED` o snapshot é tomado no início de cada instrução, não da transacção, por isso o segundo `SELECT` vê a linha inserida e commitada entretanto — o conjunto que satisfaz o predicado mudou, logo é leitura fantasma. Em `REPEATABLE READ` o snapshot fica fixado na primeira leitura e o fantasma não aparece. Leitores não bloqueiam escritores em MVCC, e o aborto 40001 só ocorre em conflitos de escrita ou em `SERIALIZABLE`."},
 
-  {"q": "Kadane implementado com `int melhor = 0; int corrente = 0;` e a regra `corrente = Math.max(0, corrente + a[i])`. O enunciado exige subarray não vazio e permite valores até 10⁹ com n até 10⁶. Que dois defeitos tem esta versão?",
+  {"q": "A regra é «uma sala não pode ter duas reservas sobrepostas». O código valida com um `SELECT` de sobreposição e depois insere, tudo em `REPEATABLE READ`. Duas reservas concorrentes ficaram ambas gravadas. Qual é a correcção mais robusta em PostgreSQL?",
    "options": [
-     "Devolve 0 para arrays só com negativos e transborda o acumulador `int`",
-     "É O(n²) e não devolve os índices do subarray",
-     "Falha em arrays com zeros e exige que o array esteja ordenado",
-     "Precisa de O(n) de espaço para o prefixo e não trata o array de um elemento"],
+     "Envolver o método num bloco `synchronized` no serviço Java.",
+     "Baixar o isolamento para `READ COMMITTED`, que relê a versão mais recente antes de inserir.",
+     "Criar uma restrição `EXCLUDE USING gist (sala_id WITH =, periodo WITH &&)` e tratar o erro 23P01.",
+     "Adicionar `SELECT ... FOR UPDATE` sobre as linhas de reserva devolvidas pela validação."],
+   "answer": 2,
+   "explain": "É write skew: as duas transacções lêem o mesmo estado e escrevem em linhas diferentes, pelo que nenhum nível abaixo de `SERIALIZABLE` o detecta. A restrição `EXCLUDE` move o invariante para o motor, onde nenhum caminho de escrita o pode contornar. `synchronized` não funciona com várias instâncias, baixar o isolamento agrava, e `FOR UPDATE` não bloqueia linhas que ainda não existem."},
+
+  {"q": "Um `endpoint` decrementa stock com `SELECT ... FOR UPDATE` seguido de `UPDATE`, e entre os dois chama o `gateway` de pagamentos por HTTP com `timeout` de 3 segundos. Qual é a consequência mais grave em produção?",
+   "options": [
+     "O `lock` da linha é mantido durante a chamada HTTP, limitando o produto a ~1 reserva a cada 3 s e esgotando a `pool` HikariCP.",
+     "O `FOR UPDATE` expira automaticamente ao fim de `deadlock_timeout` e o `UPDATE` falha com 40P01.",
+     "A chamada HTTP participa na transacção, pelo que um `ROLLBACK` desfaz a cobrança.",
+     "O PostgreSQL promove o `lock` de linha a `lock` de tabela, bloqueando também os `SELECT`."],
    "answer": 0,
-   "explain": "Inicializar a 0 e cortar em `Math.max(0, ...)` assume implicitamente o subarray vazio: com `[-3, -1, -2]` devolve 0 em vez de -1. Além disso, 10⁶ elementos de 10⁹ somam até 10¹⁵, muito acima dos 2,1 × 10⁹ do `int`, pelo que o acumulador tem de ser `long` — o transbordo é silencioso. A complexidade continua a ser O(n) e o algoritmo não exige ordenação."},
+   "explain": "Os `locks` de linha só são libertados no fim da transacção, por isso a latência do terceiro passa a ser o tempo de serialização daquele produto e as ligações ficam presas até esgotar a `pool`. Não há expiração automática de `FOR UPDATE` sem `lock_timeout` configurado, a chamada HTTP não é transaccional e não é desfeita por `ROLLBACK`, e o PostgreSQL não promove `locks` de linha a `locks` de tabela."},
 
-  {"q": "Consultas de soma sobre um intervalo `[i, j]` de um array de 10⁵ pontos, com 10⁵ consultas por minuto. Se 30% das operações passarem a ser actualizações pontuais de um único índice, o que muda?",
+  {"q": "Uma tabela de eventos com 2 mil milhões de linhas vai ser particionada por mês em `criado_em`, e existe hoje um índice `UNIQUE (id_externo)` usado para deduplicação. O que acontece?",
    "options": [
-     "Nada: a soma de prefixo actualiza-se em O(1) na posição alterada",
-     "Passa a valer a pena percorrer o intervalo a cada consulta, em O(n) por consulta",
-     "A soma de prefixo deixa de compensar, porque cada actualização invalida O(n) do prefixo; a escolha passa a ser uma árvore de Fenwick com O(log n) em ambas",
-     "Mantém-se a soma de prefixo, mas com `int` em vez de `long` para caber em cache"],
-   "answer": 2,
-   "explain": "A soma de prefixo só dá consultas O(1) enquanto o array for imutável: uma escrita no índice i obriga a recalcular todos os prefixos a partir de i, ou seja O(n). Com uma fracção significativa de escritas, a árvore de Fenwick equilibra as duas operações em O(log n) — cerca de 17 passos para n = 10⁵. Percorrer o intervalo por consulta daria 10¹⁰ operações por minuto."},
-
-  {"q": "Para agrupar anagramas de palavras com até 100 letras minúsculas, um candidato usa como chave do `HashMap` o valor `Arrays.hashCode(contagem)`, onde `contagem` é o `int[26]` de ocorrências. Porque é que o entrevistador rejeita?",
-   "options": [
-     "Porque `Arrays.hashCode` é O(26) e torna a solução O(N·k log k)",
-     "Porque o `hashCode` é um resumo de 32 bits que pode colidir, juntando no mesmo grupo palavras que não são anagramas",
-     "Porque `int[26]` não distingue palavras com letras repetidas",
-     "Porque a chave tem de ser imutável e um `int` é mutável dentro do `HashMap`"],
+     "O índice único global é mantido automaticamente pelo PostgreSQL sobre todas as partições.",
+     "O `UNIQUE` deixa de ser exprimível como está: a chave de partição tem de fazer parte de qualquer índice único da tabela particionada.",
+     "O índice passa a ser criado por partição, mas a unicidade global continua garantida pelo planeador.",
+     "A criação da tabela particionada falha, porque não é permitido ter índices únicos com partições por intervalo."],
    "answer": 1,
-   "explain": "Um `hashCode` de 32 bits não é uma chave canónica: duas contagens diferentes podem produzir o mesmo valor e o agrupamento fica errado, sem qualquer sintoma. A assinatura tem de ser injectiva — por exemplo a string \"a2b1\", em que cada contagem é delimitada pela letra seguinte. O `int[26]` distingue correctamente letras repetidas (é um multiconjunto) e o custo de 26 passos é constante."}
+   "explain": "No PostgreSQL, qualquer `PRIMARY KEY` ou `UNIQUE` numa tabela particionada tem de incluir a coluna de partição, porque cada índice é local à sua partição e não há forma de garantir unicidade entre ficheiros distintos. A deduplicação por `id_externo` passa a exigir outra solução — uma tabela auxiliar não particionada, ou incluir a data na chave. Nada nisto impede a criação da tabela particionada em si."},
+
+  {"q": "Um serviço grava uma encomenda em PostgreSQL e publica `EncomendaPaga` em Kafka. Quer eliminar tanto a perda de eventos como a leitura prematura pelo consumidor. Qual é a solução correcta e qual é a garantia obtida?",
+   "options": [
+     "Publicar em Kafka dentro do bloco `@Transactional`, obtendo atomicidade entre a base e o `broker`.",
+     "Usar `@TransactionalEventListener(AFTER_COMMIT)`, que garante durabilidade do evento mesmo se a JVM morrer.",
+     "Gravar o evento numa tabela `outbox` na mesma transacção e publicá-lo por um processo separado, com garantia «pelo menos uma vez».",
+     "Configurar `2PC` entre PostgreSQL e Kafka com um coordenador XA, obtendo «exactamente uma vez»."],
+   "answer": 2,
+   "explain": "O `outbox` transforma a dupla escrita numa única transacção local: ou há estado e evento, ou não há nenhum. O relay publica depois, com entrega «pelo menos uma vez», o que obriga o consumidor a ser idempotente por chave. Publicar dentro da transacção não é atómico e expõe o evento antes do `COMMIT`; o `AFTER_COMMIT` resolve a visibilidade mas perde o evento se o processo morrer; e `2PC` com um `broker` não dá «exactamente uma vez» de ponta a ponta."}
 ]}

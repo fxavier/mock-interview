@@ -1,46 +1,51 @@
 {"chapter": 21, "questions": [
-  {"q": "Numa tabela de 48 milhões de linhas, a consulta é `WHERE tenant_id = $1 AND created_at >= $2 AND status = $3` com `ORDER BY created_at DESC LIMIT 100`. Qual destes índices produz o varrimento mais estreito?",
+  {"q": "Uma tabela `avaliacao` tem 1000 linhas; a coluna `nota` está a NULL em 300 delas e as restantes 700 somam 3500. O que devolvem `count(*)`, `count(nota)` e `avg(nota)`?",
    "options": [
-     "`(created_at, tenant_id, status)`",
-     "`(tenant_id, status, created_at)`",
-     "`(created_at)` mais `(tenant_id)` mais `(status)`, deixando o planeador combiná-los",
-     "`(status, created_at, tenant_id)`"],
+     "1000, 1000 e 3,5",
+     "1000, 700 e 5,0",
+     "700, 700 e 5,0",
+     "1000, 700 e 3,5"
+   ],
    "answer": 1,
-   "explain": "As duas igualdades (`tenant_id`, `status`) fixam o prefixo lexicográfico e deixam as entradas já ordenadas por `created_at`, pelo que o `LIMIT 100` pára o varrimento à 100.ª folha. Pôr `created_at` à cabeça faz do intervalo o primeiro delimitador e transforma tudo o que vem depois em filtro. Três índices separados obrigam a `BitmapAnd` com dois bitmaps e a recolha na heap, quase sempre mais caro. A quarta opção desperdiça `status`, que tem 91% das linhas num só valor, como primeira coluna e volta a pôr o intervalo antes de `tenant_id`."},
+   "explain": "`count(*)` conta linhas (1000); `count(nota)` conta só valores não nulos (700); `avg` ignora NULL e divide 3500 por 700, dando 5,0. A opção com 3,5 assume que a média divide pelo total de linhas, que é o erro típico — para obter esse comportamento seria preciso `avg(coalesce(nota, 0))`."},
 
-  {"q": "Um plano mostra `Index Only Scan using idx_orders_cust on orders` com `Heap Fetches: 412883` e 900 ms de execução. Qual é a causa mais provável?",
+  {"q": "Numa tabela de transacções com várias linhas por dia, `sum(valor) OVER (ORDER BY dia)` produz um acumulado que salta em degraus e repete o mesmo valor em todas as linhas do mesmo dia. Porquê?",
    "options": [
-     "O índice não contém todas as colunas da projecção, por isso o motor vai à tabela buscar o resto",
-     "As estatísticas da coluna estão desactualizadas e o planeador escolheu o índice errado",
-     "O mapa de visibilidade não marca os blocos como todo-visíveis porque o `autovacuum` não acompanha a taxa de escrita",
-     "O índice está com bloat e precisa de `REINDEX CONCURRENTLY`"],
+     "O `ORDER BY` da janela é não determinístico e as linhas trocam de posição a cada execução.",
+     "Falta `PARTITION BY dia`, sem o qual a janela abrange a tabela inteira.",
+     "O frame por defeito é `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, e RANGE inclui todos os pares com o mesmo valor de `dia`.",
+     "`sum` sobre uma janela sem frame devolve sempre o total da partição."
+   ],
    "answer": 2,
-   "explain": "Se o índice não cobrisse a projecção, o nó seria `Index Scan` e não `Index Only Scan`, logo a primeira opção é impossível. `Heap Fetches` conta exactamente as idas à heap causadas por blocos sem a marca all-visible no visibility map, que o `VACUUM` é que coloca — daí a ligação directa ao `autovacuum` (ou a uma transacção longa que fixa o horizonte de xmin). Estatísticas erradas manifestam-se no desvio entre rows estimadas e reais, e bloat manifesta-se no tamanho do índice, não neste contador."},
+   "explain": "Com `ORDER BY` e sem frame escrito, o defeito é RANGE, que opera por valor: todas as linhas com o mesmo `dia` são pares e entram no cálculo umas das outras. A correcção é `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, ou pré-agregar por dia. Sem `ORDER BY` é que o frame seria a partição inteira."},
 
-  {"q": "A consulta `SELECT * FROM eventos WHERE date_trunc('day', ocorrido_em) = date '2026-08-30'` faz `Seq Scan` apesar de existir um B-tree em `ocorrido_em`. Qual é a correcção preferível?",
+  {"q": "`SELECT c.id FROM cliente c WHERE c.id NOT IN (SELECT e.cliente_id FROM encomenda e)` devolve zero linhas, embora existam clientes sem encomendas. Qual é a causa e a correcção mínima correcta?",
    "options": [
-     "Reescrever como `ocorrido_em >= '2026-08-30' AND ocorrido_em < '2026-08-31'`",
-     "Criar `CREATE INDEX ... USING gin (ocorrido_em)`",
-     "Definir `enable_seqscan = off` na sessão da aplicação",
-     "Criar `CREATE INDEX ... ON eventos (date_trunc('day', ocorrido_em))`"],
-   "answer": 0,
-   "explain": "O índice guarda `ocorrido_em`, não o resultado da função, por isso o predicado não é sargable; a reescrita como intervalo semi-aberto devolve exactamente o mesmo conjunto e usa o índice existente sem gastar espaço nem escrita. O índice de expressão funcionaria, mas `date_trunc` sobre `timestamptz` não é IMMUTABLE (depende de `TimeZone`) e o PostgreSQL recusa a criação sem fixar o fuso. GIN não serve predicados escalares de igualdade sobre timestamp, e desligar `enable_seqscan` é diagnóstico, nunca correcção."},
-
-  {"q": "Num plano, um `Nested Loop` mostra `loops=1188402` e o seu lado externo mostra `(cost=... rows=40 ...) (actual ... rows=1188402 ...)`. Qual é a primeira acção?",
-   "options": [
-     "Definir `enable_nestloop = off` para forçar um hash join",
-     "Investigar o erro de estimativa: `ANALYZE`, `SET STATISTICS` na coluna, e `CREATE STATISTICS` se houver colunas correlacionadas",
-     "Subir `work_mem` para que o nested loop caiba em memória",
-     "Criar um índice adicional no lado interno do join"],
+     "A subconsulta não está correlacionada; correlacioná-la com `WHERE e.cliente_id = c.id` resolve.",
+     "Há pelo menos um `cliente_id` a NULL, o que impede a expressão de ser TRUE; reescrever com `NOT EXISTS`.",
+     "Falta um índice em `encomenda(cliente_id)`, e sem ele o planeador devolve um conjunto vazio.",
+     "`NOT IN` só aceita listas literais; é preciso materializar a subconsulta numa tabela temporária."
+   ],
    "answer": 1,
-   "explain": "O planeador escolheu nested loop porque acreditou em 40 linhas do lado externo; com 1 188 402 reais, o algoritmo é uma consequência de uma premissa falsa e não a causa. Corrigir a estimativa costuma fazer o planeador trocar sozinho para hash join. Desligar `enable_nestloop` fixa o plano de hoje e cria um incidente quando a distribuição mudar; `work_mem` não afecta nested loops, que não materializam nada; e o lado interno já usa índice — é precisamente por isso que o nested loop parecia barato."},
+   "explain": "Com um NULL no conjunto, `x NOT IN (…)` avalia FALSE ou NULL, nunca TRUE, e o `WHERE` só deixa passar TRUE — daí o resultado vazio, sem erro. `NOT EXISTS` tem semântica correcta e converte em anti-join no plano. Um índice em falta afecta o desempenho, nunca o conjunto de resultados."},
 
-  {"q": "Um endpoint pagina com `ORDER BY created_at DESC OFFSET 100000 LIMIT 20` e demora 1,9 s. O que resolve o problema de forma estrutural?",
+  {"q": "Num departamento os salários são 500, 500, 420 e 300. A pergunta é «o segundo salário mais alto distinto». Que função de ranking devolve a resposta correcta (420) na posição 2?",
    "options": [
-     "Um índice `(created_at DESC)` e aumentar `work_mem` para 256 MB",
-     "Substituir por `WHERE created_at < $1 ORDER BY created_at DESC LIMIT 20`, usando o `created_at` da última linha da página anterior",
-     "Substituir por `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20` com índice em `(created_at DESC, id DESC)`",
-     "Manter o `OFFSET` e colocar as páginas mais pedidas em Redis"],
+     "`row_number()`, que dá 1, 2, 3, 4",
+     "`rank()`, que dá 1, 1, 3, 4",
+     "`dense_rank()`, que dá 1, 1, 2, 3",
+     "`ntile(2)`, que divide os salários em duas metades"
+   ],
    "answer": 2,
-   "explain": "O custo do `OFFSET` é linear na profundidade porque o motor produz e descarta as 100 000 linhas anteriores; nenhum índice nem memória alteram essa semântica, o que elimina a primeira opção. A paginação por chave torna o custo constante, mas só é correcta com uma chave total: com apenas `created_at`, linhas com o mesmo instante são perdidas ou repetidas na fronteira das páginas, o que invalida a segunda opção. A comparação de tuplos com `id` como desempate traduz-se directamente num limite de varrimento do índice composto. Uma cache não corrige a consulta e degrada-se assim que a distribuição de páginas pedidas se dispersa."}
+   "explain": "«Distinto» mapeia exactamente em `dense_rank`, que não salta posições após empates: 420 fica na posição 2. `rank()` colocaria 420 na posição 3 e o filtro `= 2` não devolveria nada; `row_number()` devolveria o segundo empatado com 500. `ntile` reparte a população em quantis e não responde à pergunta."},
+
+  {"q": "Em PostgreSQL 17, uma CTE não recursiva e sem efeitos secundários é referida duas vezes na consulta principal, que filtra o resultado por uma coluna indexada. Que comportamento se deve esperar?",
+   "options": [
+     "É integrada nas duas referências e o filtro exterior é empurrado para dentro em ambas.",
+     "É materializada num `CTE Scan` e o filtro exterior não é empurrado para dentro.",
+     "O motor rejeita a consulta e exige `MATERIALIZED` explícito.",
+     "É sempre uma barreira de optimização, tal como até ao PostgreSQL 11, independentemente do número de referências."
+   ],
+   "answer": 1,
+   "explain": "Desde o PostgreSQL 12, a integração automática só se aplica a CTEs não recursivas, sem efeitos secundários e referidas exactamente uma vez; com duas referências a CTE é materializada e deixa de aceitar predicados vindos de fora. Para forçar a integração usa-se `NOT MATERIALIZED`. A barreira incondicional era o comportamento até à versão 11."}
 ]}

@@ -1,46 +1,60 @@
-{"chapter": 35, "questions": [
-  {"q": "Um repositório Spring Data expõe `@Query(\"select f from Fatura f where f.estado = '\" + estado + \"'\")` montado com concatenação de strings em JPQL. Qual é a avaliação correcta?",
-   "options": [
-     "É seguro: o JPA traduz para prepared statement e escapa os valores automaticamente.",
-     "É vulnerável a injecção: a concatenação acontece antes de o JPQL ser analisado, e o valor passa a fazer parte da gramática da consulta.",
-     "É seguro desde que a entidade tenha validação Bean Validation nos campos.",
-     "É vulnerável apenas se o dialecto for PostgreSQL, porque outros motores escapam a plica."],
-   "answer": 1,
-   "explain": "O que protege é o parâmetro vinculado (`:estado`), não o facto de existir um ORM: o JPQL concatenado é analisado já com o valor lá dentro e produz a mesma classe de falha do SQL nativo. A validação de bean corre sobre a entidade depois da consulta e não impede nada, e o comportamento não depende do dialecto — nenhum motor escapa valores que já chegaram como texto da consulta."},
-
-  {"q": "Uma API `stateless` valida `Bearer` tokens e a equipa quer revogar o acesso de um utilizador em menos de 60 segundos após o despedimento. Qual é a solução coerente com o desenho actual?",
-   "options": [
-     "Aumentar a validade do access token para 24 horas e apagar a conta no fornecedor de identidade.",
-     "Manter o access token curto (5 a 15 minutos) e revogar o refresh token, aceitando a janela residual, ou consultar uma lista de revogação em Redis limitada aos tokens emitidos antes do corte.",
-     "Reemitir todas as chaves de assinatura do fornecedor, invalidando todos os tokens de todos os utilizadores.",
-     "Verificar a expiração no cliente antes de enviar o pedido."],
-   "answer": 1,
-   "explain": "Um token assinado é válido até `exp`, aconteça o que acontecer à conta, por isso a revogação só se obtém encurtando a validade e revogando o refresh, ou reintroduzindo um pequeno estado consultado apenas para os tokens ainda por expirar. Aumentar a validade agrava o problema; rodar as chaves derruba a autenticação de todos os utilizadores; e verificações do lado do cliente não são controlos de segurança, porque o atacante controla o cliente."},
-
-  {"q": "Numa API REST autenticada por cabeçalho `Authorization: Bearer`, um colega quer acrescentar `.csrf(c -> c.disable())` à cadeia de filtros. Quando é que isso é aceitável?",
-   "options": [
-     "Nunca: a protecção CSRF é sempre obrigatória em Spring Security.",
-     "Sempre que a resposta for JSON, porque o CSRF só afecta formulários HTML.",
-     "Quando essa cadeia não usa nenhuma credencial que o navegador anexe automaticamente — sem cookie de sessão e sem token guardado em cookie.",
-     "Quando existir `SameSite=None` no cookie de sessão, que já bloqueia pedidos entre sítios."],
-   "answer": 2,
-   "explain": "O CSRF depende de o navegador enviar a credencial sozinho; um cabeçalho `Authorization` tem de ser posto por código, logo não há vector. O formato da resposta é irrelevante — uma API JSON com cookie de sessão continua vulnerável — e `SameSite=None` é precisamente o valor mais permissivo, que autoriza o envio entre sítios em vez de o impedir."},
-
-  {"q": "Um `GET /api/contratos/{id}` verifica `@PreAuthorize(\"hasRole('GESTOR')\")` e depois faz `repo.findById(id)`. Um gestor consegue ler contratos de outra empresa. Qual é a correcção estrutural?",
-   "options": [
-     "Substituir os ids sequenciais por UUID, para que não sejam adivinháveis.",
-     "Devolver 403 em vez de 200 quando o contrato pertencer a outra empresa.",
-     "Acrescentar `if (contrato.empresaId() != principal.empresaId()) throw ...` a seguir à leitura.",
-     "Fazer da empresa parte da consulta — `findByIdAndEmpresaId` ou filtro obrigatório no repositório — e devolver 404 quando não houver correspondência."],
-   "answer": 3,
-   "explain": "O papel autoriza a operação, não o objecto; a falha só desaparece quando o caminho de leitura sem o principal deixa de existir, o que se consegue pondo a propriedade na assinatura da consulta ou num filtro obrigatório da camada de dados. Identificadores opacos apenas dificultam o varrimento, o `if` posterior corrige um método e não a classe de bugs, e responder 403 confirma que o recurso existe, o que ajuda a enumeração."},
-
-  {"q": "A equipa vai guardar palavras-passe de 3 milhões de utilizadores num serviço novo em Spring Boot 3.x. Qual é a configuração defensável?",
-   "options": [
-     "SHA-256 com salt aleatório por utilizador guardado noutra coluna, por ser rápido e não bloquear threads.",
-     "AES-256 com a chave no cofre, para permitir recuperar a palavra-passe em suporte ao cliente.",
-     "Argon2id (ou bcrypt) via `DelegatingPasswordEncoder`, com parâmetros calibrados para 100-500 ms no hardware de produção.",
-     "Base64 do SHA-512 com dez mil iterações feitas à mão num ciclo `for`."],
-   "answer": 2,
-   "explain": "Palavras-passe exigem uma função de derivação deliberadamente lenta e com salt por utilizador, calibrada por tempo medido no hardware real e não por um número copiado; o `DelegatingPasswordEncoder` guarda o identificador do algoritmo no valor, o que permite migrar sem reposições em massa. SHA-256 é rápido por desenho e testa milhares de milhões de candidatos por segundo em GPU, cifra reversível transforma a base de dados num ficheiro de palavras-passe em claro, e ciclos artesanais de hashing não têm nem a resistência a memória nem a comparação em tempo constante das bibliotecas."}
-]}
+{
+  "chapter": 35,
+  "questions": [
+    {
+      "q": "Um serviço corre em 6 réplicas. O painel calcula o p99 de latência fazendo `avg(http_server_requests_seconds{quantile=\"0.99\"})` sobre os percentis que cada instância exporta. Que problema tem este painel?",
+      "options": [
+        "Nenhum: a média dos p99 das réplicas é o p99 do serviço, desde que a carga esteja equilibrada.",
+        "Percentis não são agregáveis por média; o p99 real do serviço pode ser superior a todos os p99 individuais. É preciso exportar baldes de histograma e usar `histogram_quantile` sobre a soma dos baldes.",
+        "O problema é apenas de cardinalidade: a etiqueta `quantile` cria séries a mais.",
+        "É válido, mas devia usar-se `max` em vez de `avg` para ser conservador."
+      ],
+      "answer": 1,
+      "explain": "Um percentil é uma estatística de ordem, não um valor linear: a média (ou o máximo) dos p99 por instância não corresponde ao p99 da distribuição conjunta. A forma correcta é exportar baldes com `percentiles-histogram: true` e calcular `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))`, somando os baldes de todas as réplicas antes de estimar o quantil. `max` continua errado e é ainda mais ruidoso."
+    },
+    {
+      "q": "Um filtro coloca `tenant` no MDC no início de cada pedido, mas não chama `MDC.clear()`. O serviço corre num Tomcat com pool de 200 threads de plataforma. Qual é a consequência mais provável?",
+      "options": [
+        "Nenhuma: o MDC é limpo automaticamente quando o pedido termina.",
+        "Uma fuga de memória no heap, proporcional ao número de pedidos servidos.",
+        "Linhas de log de pedidos posteriores passam a trazer o `tenant` de um pedido anterior, porque a thread regressa ao pool com o contexto sujo.",
+        "O `trace_id` deixa de ser propagado para os serviços a jusante."
+      ],
+      "answer": 2,
+      "explain": "O MDC é um mapa associado à thread; quando a thread volta ao pool com valores por limpar, o pedido seguinte que a reutilizar herda-os e os logs atribuem eventos ao cliente errado — um problema de correcção e de privacidade, não apenas cosmético. Não há fuga significativa (o mapa é pequeno e limitado ao número de threads) e a propagação do `trace_id` entre serviços faz-se por cabeçalho `traceparent`, independente do MDC."
+    },
+    {
+      "q": "A equipa quer conseguir filtrar latência por cliente e tem 4000 clientes activos, além de 25 rotas, 6 estados HTTP e 12 baldes de histograma. Qual é a decisão correcta?",
+      "options": [
+        "Adicionar a etiqueta `tenant` ao histograma `http.server.requests`: são só mais 4000 valores.",
+        "Não adicionar a etiqueta à métrica (geraria na ordem de milhões de séries); pôr `tenant` como atributo do span e campo do log, e manter na métrica apenas os poucos clientes com SLO contratual.",
+        "Adicionar `tenant` e compensar aumentando o intervalo de recolha de 15 s para 60 s.",
+        "Adicionar `tenant` apenas ao contador de pedidos, que não tem baldes, e manter o histograma sem a etiqueta — assim a cardinalidade não cresce."
+      ],
+      "answer": 1,
+      "explain": "A cardinalidade é o produto cartesiano das etiquetas: 25 × 6 × 12 × 4000 dá cerca de 7,2 milhões de séries, o que a 1-3 KB de índice por série derruba o sistema de métricas. Alta cardinalidade é barata em traços e logs, que são amostrados e indexados por evento, e não em séries temporais. Aumentar o intervalo de recolha reduz pontos, não séries; e um contador com 4000 tenants continua a gerar 600 000 séries."
+    },
+    {
+      "q": "O SLO é 99,9% de disponibilidade em janela de 30 dias. Uma paragem parcial consumiu 20 minutos de indisponibilidade efectiva no dia 6 do mês. Que fracção do orçamento de erro foi gasta?",
+      "options": [
+        "Cerca de 0,05% — 20 minutos são insignificantes em 30 dias.",
+        "Cerca de 46% — o orçamento total é de 43,2 minutos.",
+        "Cerca de 4,6% — o orçamento total é de 7,2 horas.",
+        "Não é calculável sem saber quantos pedidos falharam."
+      ],
+      "answer": 1,
+      "explain": "0,1% de 30 dias (43 200 minutos) são 43,2 minutos de orçamento; 20 minutos representam cerca de 46% consumidos no dia 6, o que num modelo de error budget justifica congelar alterações arriscadas. As 7,2 horas correspondem a um SLO de 99%, não de 99,9%. A leitura em minutos é uma aproximação legítima quando a paragem é total no intervalo; com degradação parcial usa-se a fracção de pedidos maus, mas a ordem de grandeza da conclusão não muda."
+    },
+    {
+      "q": "Latência p99 alta, CPU dos pods a 20%. Três thread dumps espaçados mostram sempre cerca de 190 threads `TIMED_WAITING` em `com.zaxxer.hikari.pool.HikariPool.getConnection` e 12 `RUNNABLE` em `SocketInputStream.socketRead0`. Qual é a acção mais adequada como passo seguinte?",
+      "options": [
+        "Aumentar o pool HikariCP de 20 para 200 conexões, para eliminar a fila de espera.",
+        "Correr um perfilador de CPU: as 12 threads `RUNNABLE` indicam código a consumir ciclos.",
+        "Investigar a base de dados — `pg_stat_statements` por `total_exec_time`, `pg_stat_activity` para bloqueios e `idle in transaction` — porque a fila do pool é consequência de queries que deixaram de devolver conexões a tempo.",
+        "Reiniciar os pods em rolling update para libertar as conexões presas."
+      ],
+      "answer": 2,
+      "explain": "A assinatura (latência alta, CPU baixo, threads paradas à espera de conexão) é saturação por espera: o débito por conexão colapsou, e a causa está a jusante. Aumentar o pool desloca a fila para a base de dados, onde 200 sessões concorrentes agravam a contenção. `RUNNABLE` em `socketRead0` é espera de rede e não consumo de CPU, pelo que o perfilador de CPU apareceria vazio. Reiniciar destrói a prova e o problema regressa em minutos."
+    }
+  ]
+}

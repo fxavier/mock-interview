@@ -1,46 +1,46 @@
 {"chapter": 18, "questions": [
-  {"q": "Num `@Service` singleton do Spring Boot 3.5, chamado em paralelo por um endpoint HTTP e por um job nocturno, existe um campo `private final Map<String, BigDecimal> rateCache = new HashMap<>()` preenchido com `get`/`put` dentro do método. Qual é a consequência mais grave e a correcção mínima?",
+  {"q": "Num serviço Spring Boot 3.5 estruturado em hexagonal, a porta de saída do pagamento está declarada como `interface PaymentGateway { PaymentIntent charge(...) throws StripeException; }`, onde `PaymentIntent` e `StripeException` vêm do SDK do fornecedor. Qual é a consequência técnica?",
    "options": [
-     "Nenhuma: o campo é `final`, logo o mapa é seguro para acesso concorrente.",
-     "Entradas perdidas e, em rehash simultâneo, uma thread a 100% de CPU sem stack de erro; corrige-se com `ConcurrentHashMap` e `computeIfAbsent`, ou com uma cache local à invocação.",
-     "Apenas consumo de memória; basta limpar o mapa no fim de cada invocação.",
-     "Marcar o método com `synchronized`, que resolve a corrida sem outro custo."],
+     "Nenhuma relevante: a interface está no interior, logo a regra da dependência é respeitada.",
+     "O núcleo continua a depender do SDK — precisa do jar em compilação — e a inversão é apenas cosmética.",
+     "Impede o Spring de criar o bean do adaptador porque a interface expõe tipos de terceiros.",
+     "Obriga a marcar o serviço de aplicação com `@Transactional(noRollbackFor = StripeException.class)`."],
    "answer": 1,
-   "explain": "`final` protege a referência, não o conteúdo: dois `put` concorrentes num `HashMap` podem perder entradas e corromper a estrutura interna, sintoma clássico de CPU a 100% sem excepção. `synchronized` no método serializa o job inteiro e mantém a cache sem expiração, pelo que resolve a corrida ao preço errado. Limpar o mapa no fim não elimina a escrita concorrente."},
+   "explain": "O que define a regra da dependência não é onde a interface está declarada, mas que nomes atravessam a assinatura. Com tipos e excepções do SDK no contrato, o módulo do domínio deixa de compilar sem a dependência do fornecedor. A opção 0 confunde localização com acoplamento; a criação de beans é indiferente aos tipos usados; e o rollback de transacção nada tem a ver com a fronteira arquitectural."},
 
-  {"q": "Um método legado faz `jdbc.update(\"UPDATE payout SET amount = \" + total + \" WHERE merchant_id = '\" + merchantId + \"'\")` e um relatório vizinho concatena o nome da coluna num `ORDER BY`. Qual é a correcção correcta para cada caso?",
+  {"q": "A regra «um cliente não pode ter mais de cinco subscrições activas» foi implementada como `if (repo.countActive(customerId) < 5) repo.save(newSubscription);` dentro de um método `@Transactional` sobre PostgreSQL 17 com o isolamento por omissão. Dois pedidos concorrentes chegam ao mesmo tempo. O que acontece?",
    "options": [
-     "Parâmetros ligados (`?`) nos dois casos, porque o JDBC parametriza qualquer parte da instrução.",
-     "Escapar as plicas de `merchantId` e validar que o `ORDER BY` não contém espaços.",
-     "Parâmetros ligados para os valores e lista branca de colunas permitidas para o `ORDER BY`, que não é parametrizável.",
-     "Passar a usar um ORM: qualquer JPQL elimina o risco por construção."],
-   "answer": 2,
-   "explain": "Valores aceitam parâmetros ligados; identificadores como nomes de coluna em `ORDER BY` não, e a única defesa é validar contra uma lista fechada de colunas. Escapar plicas à mão falha com codificações e comentários SQL. Um ORM continua a permitir concatenação em queries nativas ou em ordenação dinâmica, logo não elimina o risco por construção."},
-
-  {"q": "Numa revisão, um ciclo `for (Order o : batch) { for (OrderLine l : o.getLines()) ... }` sobre uma associação `LAZY` gera 5 001 idas à base de dados para 5 000 encomendas. Qual é o comentário de revisão mais adequado?",
-   "options": [
-     "Bloqueante: activar `FetchType.EAGER` na associação, que resolve o problema em todos os casos de uso.",
-     "Não-bloqueante se for anterior a este PR: descrever o custo (~2 s só de rede a 0,4 ms por ida) e propor `@EntityGraph`, `join fetch` ou `@BatchSize`, com issue separado.",
-     "Nit de estilo: sugerir substituir os ciclos aninhados por `stream().flatMap()`.",
-     "Bloqueante: aumentar o tamanho da pool de ligações para absorver as 5 001 queries."],
+     "A segunda transacção bloqueia na contagem até a primeira fazer commit, e a regra é respeitada.",
+     "Ambas contam quatro, ambas inserem, e o cliente fica com seis subscrições activas.",
+     "A segunda transacção falha com `OptimisticLockException` porque a contagem participa no controlo de versão.",
+     "O PostgreSQL detecta a anomalia e aborta uma das transacções com erro de serialização."],
    "answer": 1,
-   "explain": "Um sénior separa regressão introduzida pelo PR de dívida pré-existente, e quantifica o custo antes de decidir a severidade. `EAGER` na associação resolve este caso e estraga todos os outros que carregam a entidade sem precisar das linhas. `flatMap` mantém exactamente as mesmas queries, e mais ligações apenas espalham o mesmo custo por mais recursos."},
+   "explain": "Em read committed, um SELECT de contagem não coloca qualquer bloqueio nem impede inserções concorrentes, por isso as duas transacções lêem o mesmo valor e ambas escrevem. A detecção de anomalias por erro de serialização só existe em serializable, e o bloqueio optimista com @Version protege linhas carregadas, não o resultado de uma agregação. A correcção passa por um constraint na base de dados, bloqueio explícito da linha do cliente, ou aceitar a violação transitória com compensação."},
 
-  {"q": "A equipa vai refactorizar um cálculo de portes sem testes. A bateria escrita tem 92% de cobertura de linhas, mas o PIT mata só 45% dos mutantes na região a alterar. Qual é a leitura correcta?",
+  {"q": "Uma equipa publica em Kafka dentro do método `@Transactional` que grava o agregado, argumentando que assim o evento e o estado ficam consistentes. Qual é o defeito concreto?",
    "options": [
-     "A rede é suficiente: acima de 90% de cobertura o refactoring é seguro.",
-     "A rede é insuficiente: mais de metade das alterações de operadores e condições passa sem falhar um teste; faltam casos de fronteira antes de mexer no código.",
-     "O PIT está mal configurado, porque cobertura alta implica mutantes mortos.",
-     "Deve-se refactorizar primeiro e usar a taxa de mutantes depois, sobre o código novo."],
+     "O produtor Kafka bloqueia a ligação JDBC e esgota o pool de ligações sob carga.",
+     "O broker pode confirmar a mensagem e a transacção reverter a seguir, publicando um facto que nunca existiu.",
+     "As mensagens perdem a ordenação por chave porque são enviadas antes do commit.",
+     "O Kafka rejeita mensagens produzidas dentro de transacções JDBC sem coordenador XA."],
    "answer": 1,
-   "explain": "Cobertura mede linhas executadas, não asserções que verificam resultado; 45% de mutantes mortos significa que trocar `>` por `>=` ou remover uma condição continua a dar bateria verde. A ordem é sempre rede primeiro: medir mutação sobre o código novo já não prova que o comportamento antigo foi preservado."},
+   "explain": "A base de dados e o broker são recursos transaccionais distintos: o envio é confirmado imediatamente e o rollback posterior do JDBC não o desfaz, deixando consumidores a reagir a um evento fantasma. O padrão outbox resolve isto ao gravar o evento na mesma transacção e deixar a publicação para um processo separado, com entrega pelo menos uma vez. As restantes opções descrevem efeitos que não decorrem desta combinação."},
 
-  {"q": "Um módulo com 12 alterações por mês custa em média 2 dias-pessoa extra por alteração; pô-lo sob testes e extrair os casos de uso está estimado em 20 dias-pessoa. Qual é a forma mais eficaz de levar isto ao gestor de produto?",
+  {"q": "Um ecrã de listagem está a 900 ms no p95 e a proposta na equipa é adoptar event sourcing. Qual é a objecção mais forte e tecnicamente correcta?",
    "options": [
-     "Pedir um sprint inteiro dedicado a dívida técnica, para concentrar o trabalho e evitar dispersão.",
-     "Inflacionar as estimativas das próximas funcionalidades e fazer a limpeza dentro delas, sem anunciar.",
-     "Apresentar 24 dias-pessoa perdidos por mês contra 20 de investimento, propor três fatias de uma semana intercaladas e verificar o resultado no tempo de lead do módulo.",
-     "Explicar os princípios SOLID violados e o risco de o código se tornar impossível de manter."],
-   "answer": 2,
-   "explain": "O argumento ganha quando é custo mensal contra custo de pagar, com fatias limitadas e um indicador que se verifica depois. Um sprint dedicado produz um PR gigante e nunca é aprovado uma segunda vez; inflacionar estimativas em segredo destrói a confiança quando for descoberto; e princípios de desenho não são unidades que um gestor de produto possa comparar com receita."}
+     "Event sourcing resolveria a latência mas exige Kafka, que a equipa ainda não usa.",
+     "A loja de eventos só procura eficientemente por identificador de agregado, por isso a listagem continuaria a precisar de uma projecção — e o custo real está no versionamento de eventos e no apagamento de dados pessoais.",
+     "Event sourcing impede consultas paginadas, porque os eventos não têm ordem total.",
+     "A latência só melhoraria depois de a loja de eventos ter snapshots de todos os agregados."],
+   "answer": 1,
+   "explain": "Event sourcing é uma decisão sobre o modelo de escrita e auditoria, não uma técnica de aceleração de leituras: qualquer consulta por atributo continua a exigir uma projecção, que é exactamente o que já se pode construir sem event sourcing. Os custos que raramente são ditos são o versionamento de eventos antigos com upcasters e o apagamento de dados pessoais num registo imutável. Os eventos têm ordem por fluxo, e os snapshots servem o carregamento do agregado, não a listagem."},
+
+  {"q": "Numa revisão de código aparece, dentro de `RenewSubscriptionService` (serviço de aplicação), a expressão `if (subscription.getStatus() == ACTIVE && subscription.getFailures() > 2) { ... }`. Qual é a leitura correcta e a correcção adequada?",
+   "options": [
+     "É orquestração legítima; o serviço de aplicação é o sítio das condições de negócio.",
+     "É lógica de domínio a escapar; a condição deve tornar-se um método com nome de negócio na raiz de agregado.",
+     "Deve mover-se para uma `@Query` no repositório para não carregar o agregado desnecessariamente.",
+     "Deve extrair-se para um serviço de domínio que injecte o repositório e recarregue a subscrição."],
+   "answer": 1,
+   "explain": "Um condicional sobre o estado interno de um único agregado é uma decisão de negócio e pertence à raiz desse agregado, onde o estado pode ficar privado e a regra ter um nome do negócio; deixá-lo no caso de uso garante que reaparece noutro fluxo com um limite ligeiramente diferente. O repositório serve para carregar e gravar, não para alojar regras; e um serviço de domínio só se justifica quando a decisão precisa de mais do que um agregado, e mesmo aí recebe-os como argumentos em vez de injectar repositórios."}
 ]}

@@ -1,46 +1,60 @@
-{"chapter": 17, "questions": [
-  {"q": "Num serviço Spring Boot 3.5 estruturado em hexagonal, a porta de saída do pagamento está declarada como `interface PaymentGateway { PaymentIntent charge(...) throws StripeException; }`, onde `PaymentIntent` e `StripeException` vêm do SDK do fornecedor. Qual é a consequência técnica?",
-   "options": [
-     "Nenhuma relevante: a interface está no interior, logo a regra da dependência é respeitada.",
-     "O núcleo continua a depender do SDK — precisa do jar em compilação — e a inversão é apenas cosmética.",
-     "Impede o Spring de criar o bean do adaptador porque a interface expõe tipos de terceiros.",
-     "Obriga a marcar o serviço de aplicação com `@Transactional(noRollbackFor = StripeException.class)`."],
-   "answer": 1,
-   "explain": "O que define a regra da dependência não é onde a interface está declarada, mas que nomes atravessam a assinatura. Com tipos e excepções do SDK no contrato, o módulo do domínio deixa de compilar sem a dependência do fornecedor. A opção 0 confunde localização com acoplamento; a criação de beans é indiferente aos tipos usados; e o rollback de transacção nada tem a ver com a fronteira arquitectural."},
-
-  {"q": "A regra «um cliente não pode ter mais de cinco subscrições activas» foi implementada como `if (repo.countActive(customerId) < 5) repo.save(newSubscription);` dentro de um método `@Transactional` sobre PostgreSQL 17 com o isolamento por omissão. Dois pedidos concorrentes chegam ao mesmo tempo. O que acontece?",
-   "options": [
-     "A segunda transacção bloqueia na contagem até a primeira fazer commit, e a regra é respeitada.",
-     "Ambas contam quatro, ambas inserem, e o cliente fica com seis subscrições activas.",
-     "A segunda transacção falha com `OptimisticLockException` porque a contagem participa no controlo de versão.",
-     "O PostgreSQL detecta a anomalia e aborta uma das transacções com erro de serialização."],
-   "answer": 1,
-   "explain": "Em read committed, um SELECT de contagem não coloca qualquer bloqueio nem impede inserções concorrentes, por isso as duas transacções lêem o mesmo valor e ambas escrevem. A detecção de anomalias por erro de serialização só existe em serializable, e o bloqueio optimista com @Version protege linhas carregadas, não o resultado de uma agregação. A correcção passa por um constraint na base de dados, bloqueio explícito da linha do cliente, ou aceitar a violação transitória com compensação."},
-
-  {"q": "Uma equipa publica em Kafka dentro do método `@Transactional` que grava o agregado, argumentando que assim o evento e o estado ficam consistentes. Qual é o defeito concreto?",
-   "options": [
-     "O produtor Kafka bloqueia a ligação JDBC e esgota o pool de ligações sob carga.",
-     "O broker pode confirmar a mensagem e a transacção reverter a seguir, publicando um facto que nunca existiu.",
-     "As mensagens perdem a ordenação por chave porque são enviadas antes do commit.",
-     "O Kafka rejeita mensagens produzidas dentro de transacções JDBC sem coordenador XA."],
-   "answer": 1,
-   "explain": "A base de dados e o broker são recursos transaccionais distintos: o envio é confirmado imediatamente e o rollback posterior do JDBC não o desfaz, deixando consumidores a reagir a um evento fantasma. O padrão outbox resolve isto ao gravar o evento na mesma transacção e deixar a publicação para um processo separado, com entrega pelo menos uma vez. As restantes opções descrevem efeitos que não decorrem desta combinação."},
-
-  {"q": "Um ecrã de listagem está a 900 ms no p95 e a proposta na equipa é adoptar event sourcing. Qual é a objecção mais forte e tecnicamente correcta?",
-   "options": [
-     "Event sourcing resolveria a latência mas exige Kafka, que a equipa ainda não usa.",
-     "A loja de eventos só procura eficientemente por identificador de agregado, por isso a listagem continuaria a precisar de uma projecção — e o custo real está no versionamento de eventos e no apagamento de dados pessoais.",
-     "Event sourcing impede consultas paginadas, porque os eventos não têm ordem total.",
-     "A latência só melhoraria depois de a loja de eventos ter snapshots de todos os agregados."],
-   "answer": 1,
-   "explain": "Event sourcing é uma decisão sobre o modelo de escrita e auditoria, não uma técnica de aceleração de leituras: qualquer consulta por atributo continua a exigir uma projecção, que é exactamente o que já se pode construir sem event sourcing. Os custos que raramente são ditos são o versionamento de eventos antigos com upcasters e o apagamento de dados pessoais num registo imutável. Os eventos têm ordem por fluxo, e os snapshots servem o carregamento do agregado, não a listagem."},
-
-  {"q": "Numa revisão de código aparece, dentro de `RenewSubscriptionService` (serviço de aplicação), a expressão `if (subscription.getStatus() == ACTIVE && subscription.getFailures() > 2) { ... }`. Qual é a leitura correcta e a correcção adequada?",
-   "options": [
-     "É orquestração legítima; o serviço de aplicação é o sítio das condições de negócio.",
-     "É lógica de domínio a escapar; a condição deve tornar-se um método com nome de negócio na raiz de agregado.",
-     "Deve mover-se para uma `@Query` no repositório para não carregar o agregado desnecessariamente.",
-     "Deve extrair-se para um serviço de domínio que injecte o repositório e recarregue a subscrição."],
-   "answer": 1,
-   "explain": "Um condicional sobre o estado interno de um único agregado é uma decisão de negócio e pertence à raiz desse agregado, onde o estado pode ficar privado e a regra ter um nome do negócio; deixá-lo no caso de uso garante que reaparece noutro fluxo com um limite ligeiramente diferente. O repositório serve para carregar e gravar, não para alojar regras; e um serviço de domínio só se justifica quando a decisão precisa de mais do que um agregado, e mesmo aí recebe-os como argumentos em vez de injectar repositórios."}
-]}
+{
+  "chapter": 17,
+  "questions": [
+    {
+      "q": "Um `@Service` do Spring Boot 3.5 tem `metodoA()` público e sem anotação, que chama `this.metodoB()`, anotado com `@Transactional`. O que acontece em produção?",
+      "options": [
+        "`metodoB()` corre numa transacção nova, porque a anotação é lida por reflexão em cada invocação.",
+        "`metodoB()` corre sem transacção nenhuma, porque a chamada interna não passa pelo proxy.",
+        "`metodoB()` corre na transacção de `metodoA()`, propagada pelo `TransactionSynchronizationManager`.",
+        "A aplicação não arranca: o Spring rejeita `@Transactional` em métodos chamados internamente."
+      ],
+      "answer": 1,
+      "explain": "O interceptor transaccional vive no proxy CGLIB que substitui o bean no contentor; `this.metodoB()` invoca o alvo directamente e nunca atravessa essa fronteira, pelo que nenhum interceptor corre. Não há transacção de `metodoA()` para propagar (opção 3) e o arranque não falha (opção 4) — o modo de falha é silencioso, o que o torna caro. A saída preferida é extrair `metodoB()` para outro bean e injectá-lo."
+    },
+    {
+      "q": "Uma equipa persiste o estado de encomendas e modela-o com `sealed interface OrderState` e um `switch` de padrões sem ramo `default`. Qual é o principal benefício face a uma interface aberta com uma classe por estado?",
+      "options": [
+        "O despacho passa a ser monomórfico, o que permite à JIT alinhar sempre a chamada.",
+        "Elimina a necessidade de persistir o estado, porque a hierarquia selada é serializável por omissão.",
+        "Acrescentar um estado novo passa a ser um erro de compilação em todos os `switch` que decidem sobre estados.",
+        "Garante que as transições ficam atómicas quando dois consumidores processam o mesmo evento."
+      ],
+      "answer": 2,
+      "explain": "A hierarquia fechada dá exaustividade verificada pelo compilador: sem `default`, um sétimo estado parte a compilação em cada local de decisão, que é exactamente o esquecimento que a versão aberta permite. O despacho continua polimórfico (opção 1), a serialização não vem de graça (opção 2) e a atomicidade entre consumidores concorrentes exige actualização condicional na base de dados, não tipos (opção 4)."
+    },
+    {
+      "q": "Um cliente HTTP é montado como `new TimedSource(new RetryingSource(new CachingSource(real, cache), 3), timer)`. Que problema tem esta ordem?",
+      "options": [
+        "Nenhum: os decoradores são comutativos desde que todos implementem a mesma interface.",
+        "O `retry` fica por fora da cache, pelo que uma falha transitória repete a consulta à cache em vez de repetir a chamada real.",
+        "As métricas passam a medir apenas os acertos de cache e ignoram as chamadas remotas.",
+        "A cache deixa de funcionar porque um decorador não pode envolver outro decorador."
+      ],
+      "answer": 1,
+      "explain": "Com `retry` por fora, cada tentativa volta a consultar a cache — que continuará a falhar da mesma maneira — em vez de repetir a chamada ao serviço remoto; a ordem defensável é métricas, cache, retry, cliente real. Decoradores não são comutativos (opção 1): a ordem muda o significado. As métricas ficam por fora e medem tudo (opção 3), e o encadeamento de decoradores é o próprio ponto do padrão (opção 4)."
+    },
+    {
+      "q": "Numa revisão de código aparece `Optional<Rate> r = ...; Integer a = 127, b = 127; Integer c = 1000, d = 1000;` e um teste que compara com `==`. Que padrão do JDK explica o resultado?",
+      "options": [
+        "Proxy: o autoboxing gera um proxy dinâmico que sobrepõe `equals`.",
+        "Singleton: `Integer` mantém uma única instância por valor durante a vida da JVM.",
+        "Flyweight: `Integer.valueOf` reutiliza instâncias em cache entre −128 e 127, pelo que `a == b` é verdadeiro e `c == d` é falso.",
+        "Adapter: o autoboxing adapta `int` a `Integer` criando sempre um objecto novo."
+      ],
+      "answer": 2,
+      "explain": "A cache de `Integer.valueOf` é flyweight: partilha instâncias para o intervalo −128 a 127, logo `a == b` dá verdadeiro por acidente e `c == d` dá falso. Não há proxy nem adaptador envolvidos, e não é singleton porque acima de 127 cada autoboxing aloca um objecto novo. A regra prática é comparar sempre com `equals` ou usar tipos primitivos."
+    },
+    {
+      "q": "Um serviço confirma o pagamento e publica um evento com `ApplicationEventPublisher`; três ouvintes tratam e-mail, inventário e facturação. Qual é a crítica mais forte a este desenho, assumindo que inventário e facturação vivem noutros processos?",
+      "options": [
+        "Os eventos do Spring são assíncronos por omissão, logo a ordem entre os três ouvintes é indeterminada.",
+        "Os eventos do Spring não atravessam a fronteira do processo nem sobrevivem a um reinício, pelo que inventário e facturação exigem mensageria com outbox.",
+        "`ApplicationEventPublisher` só suporta um ouvinte por tipo de evento, obrigando a um evento distinto por consumidor.",
+        "O padrão observer é incompatível com transacções, pelo que a confirmação do pagamento nunca poderia ser transaccional."
+      ],
+      "answer": 1,
+      "explain": "Eventos de aplicação são observer intraprocesso e sem durabilidade: se o processo morrer entre a confirmação e a execução do ouvinte, o evento perde-se e não há retentativa, e consumidores noutros processos nem sequer o recebem. São síncronos por omissão, não assíncronos (opção 1), suportam vários ouvintes por tipo (opção 3), e são transaccionais — o problema é serem-no demais, o que se atenua com `@TransactionalEventListener` (opção 4)."
+    }
+  ]
+}

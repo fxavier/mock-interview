@@ -1,720 +1,862 @@
-<p>Uma ronda de Kafka raramente mede se o candidato sabe o que é um tópico: mede se sabe onde é que uma arquitectura orientada a eventos perde dados, duplica dados ou perde ordem, e o que custa cada garantia extra. O entrevistador procura três coisas em sequência — o modelo mental (partição como unidade de ordem e de paralelismo), as configurações concretas que transformam esse modelo numa garantia (<code>acks</code>, <code>enable.idempotence</code>, <code>isolation.level</code>), e a operação (<em>lag</em>, retenção, <em>rebalance</em>, DLQ). Onde os candidatos caem é em três sítios previsíveis: dizem «Kafka garante ordem» sem qualificar «dentro da partição», dizem «usamos exactly-once» sem saber que a garantia só é válida quando o efeito final está dentro do Kafka ou é idempotente, e desenham um sistema com dupla escrita para a base de dados e para o tópico sem notar que acabaram de introduzir um estado impossível de reconciliar. Este capítulo cobre o mecanismo, os valores de produção que interessam, a comparação honesta com RabbitMQ e SQS/SNS, e um laboratório de produtor e consumidor idempotentes com <em>outbox</em> em Spring.</p>
+<p>Uma ronda de microsserviços não mede se o candidato sabe o que é um microsserviço: mede se sabe quanto custa ter um e se é capaz de dizer «aqui não vale a pena». O entrevistador procura três coisas — critérios de fronteira que não sejam «um serviço por entidade», uma resposta honesta sobre consistência sem transacções distribuídas, e consciência do custo operacional que a divisão transfere para a equipa. Onde os candidatos caem é no entusiasmo: descrevem doze serviços, uma <em>saga</em> coreografada e um <em>service mesh</em> para um sistema com 300 pedidos por segundo e cinco engenheiros, e não conseguem explicar como é que o pedido fica consistente quando o serviço de pagamentos responde <code>504</code> depois de ter cobrado. Este capítulo trata as fronteiras, os dois problemas que nunca desaparecem (escrita dupla e duplicação de mensagens) e os anti-padrões que transformam a divisão num monólito distribuído — que é pior do que o monólito de onde se partiu.</p>
 
-<h2 id="sec-30-1" class="h2"><span class="secnum">30.1</span> Modelo do Kafka: tópicos, partições, offsets e grupos<a class="anchor" href="#sec-30-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-30-1" class="h2"><span class="secnum">30.1</span> Quando dividir o monólito e quando não<a class="anchor" href="#sec-30-1" aria-label="ligação">#</a></h2>
 
-<p>Kafka não é uma fila: é um registo append-only particionado e replicado, com leitores que guardam a sua própria posição. Um tópico divide-se em N partições; cada partição é um ficheiro de <em>log</em> ordenado, e a posição de cada registo nesse <em>log</em> é o <em>offset</em>, um inteiro monotónico por partição. Consumir não destrói o registo — o consumidor avança um cursor. Daí decorre quase tudo: várias aplicações lêem o mesmo tópico sem se afectarem, é possível reprocessar meses de histórico retrocedendo <em>offsets</em>, e a leitura não compete com a escrita pelo mesmo estado mutável.</p>
+<p>A divisão em serviços compra três coisas concretas: implantação independente, isolamento de falha e liberdade de escala por componente. Paga-se com latência de rede em todas as chamadas que antes eram invocações de método, com perda de transacções ACID entre componentes, e com um imposto operacional fixo por serviço — <em>pipeline</em>, alarmes, painéis, plantão, gestão de segredos, actualização de dependências. Numa organização com processos maduros, esse imposto anda entre 3 e 8 dias de engenharia para pôr o primeiro serviço de pé e entre 2 e 5 dias por ano e por serviço só em manutenção de infra-estrutura. Multiplicado por trinta serviços, é meio engenheiro a tempo inteiro que nunca escreve lógica de negócio.</p>
 
-<p>A partição é simultaneamente a unidade de ordem e a unidade de paralelismo, e essas duas propriedades estão em tensão directa. Kafka garante ordem total dentro de uma partição e nenhuma ordem entre partições. O produtor escolhe a partição: com chave, por <code>murmur2(chave) % numPartitions</code> (o particionador por defeito); sem chave, por lotes distribuídos entre partições disponíveis. Logo, «eventos da mesma entidade em ordem» traduz-se em «mesma chave», e a chave certa é quase sempre o identificador da entidade cuja invariante importa — <code>accountId</code>, <code>orderId</code>, <code>tenantId</code> — nunca um UUID de evento.</p>
+<p>O critério que sobrevive à entrevista não é técnico, é de cadência: divide-se quando duas partes do sistema têm ritmos de mudança, perfis de risco ou requisitos de escala materialmente diferentes, e quando essa diferença está a bloquear equipas concretas. Se o módulo de catálogo é implantado três vezes por dia e o de facturação uma vez por trimestre com auditoria, partilhar o mesmo artefacto obriga a facturação a suportar o risco do catálogo. Se o cálculo de preços consome 70% da CPU em picos de 20 minutos e o resto do sistema é constante, escalar tudo junto significa pagar réplicas de tudo. Estes são argumentos com número. «Para escalar melhor» sem número não é argumento.</p>
 
-<p>Do lado do consumo, um <em>consumer group</em> é o mecanismo de partilha de trabalho: o <em>group coordinator</em> (um <em>broker</em>) atribui cada partição a exactamente um membro do grupo. O corolário duro é que o paralelismo máximo de um grupo é o número de partições: 12 partições e 20 instâncias significam 8 instâncias paradas. Aumentar partições é fácil; reduzir não é possível sem recriar o tópico, e aumentar quebra o mapeamento chave-partição para as chaves já escritas, porque o módulo muda. Por isso o dimensionamento de partições é uma decisão de arquitectura, não de <em>tuning</em>: parte-se do débito por consumidor (medido, não estimado) e da concorrência futura, com uma margem de 2 a 3 vezes.</p>
+<p>A honestidade sobre o caso contrário é o que distingue o sénior. Não se divide quando o problema é lentidão de <em>build</em> (resolve-se com módulos, cache de <em>build</em> e testes paralelos), quando o problema é código emaranhado (resolve-se com fronteiras internas, que são mais baratas de mover do que fronteiras de rede), quando a equipa tem menos engenheiros do que serviços propostos, ou quando não existe ainda observabilidade distribuída — dividir sem <em>tracing</em> é trocar um <em>stack trace</em> por um mistério. E, sobretudo, não se divide quando o domínio ainda não estabilizou: fronteiras erradas em rede custam uma migração de dados e um contrato entre equipas; fronteiras erradas dentro de um monólito modular custam um <em>refactor</em> de um dia.</p>
 
-<p>A replicação é por partição: cada partição tem um <em>leader</em> e F seguidores; o conjunto que está suficientemente actualizado chama-se ISR (<em>in-sync replicas</em>). Com <code>replication.factor=3</code> e <code>min.insync.replicas=2</code>, o <em>cluster</em> tolera a perda de um <em>broker</em> sem perder escritas confirmadas, e recusa escritas quando só resta uma réplica sincronizada — recusar é a decisão correcta, porque a alternativa é aceitar uma escrita que pode desaparecer.</p>
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Uma chamada intra-processo custa dezenas de nanossegundos. Uma chamada HTTP entre <em>pods</em> na mesma zona de disponibilidade custa tipicamente 0,3 a 1 ms de ida e volta em condições normais, e 1 a 3 ms com TLS mútuo e <em>sidecar</em> de <em>proxy</em> no caminho; entre zonas, some-se 0,5 a 2 ms. O que dói não é a média: é a cauda. Um p99 de 8 ms por salto em cinco saltos encadeados dá um p99 composto muito acima de 40 ms, porque a probabilidade de apanhar pelo menos uma cauda cresce com o número de saltos.</p></aside>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um <em>broker</em> moderno sustenta na ordem de milhares de partições sem degradar, mas o custo é real: cada partição é pelo menos um conjunto de segmentos abertos, memória de <em>page cache</em> e uma entrada em cada metadado replicado. Uma regra de trabalho: partições por tópico = pico de mensagens por segundo ÷ débito sustentado por consumidor (tipicamente 2 000 a 10 000 msg/s por instância para trabalho leve; 200 a 500 msg/s quando cada mensagem faz duas idas à base de dados), arredondado para cima e multiplicado por 2. Para 20 000 msg/s com consumidores a 1 000 msg/s dá 20 × 2 = 40 partições.</p></aside>
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 30.1</span> Sinais que justificam extrair um módulo — e os que não justificam.</div>
+<div class="tscroll"><table><thead><tr><th>Sinal observado</th><th>Extrair serviço?</th><th>Alternativa mais barata</th></tr></thead><tbody>
+<tr><td>Duas equipas bloqueiam-se mutuamente na janela de implantação</td><td>Sim, forte</td><td>Nenhuma, se o artefacto for único</td></tr>
+<tr><td>Um componente precisa de 8× a CPU do resto em picos curtos</td><td>Sim</td><td><em>Autoscaling</em> do monólito, se o custo for aceitável</td></tr>
+<tr><td>Requisitos de conformidade distintos (PCI, dados de saúde)</td><td>Sim, por isolamento</td><td>Esquema separado e cifra ao nível da coluna</td></tr>
+<tr><td><em>Build</em> de 25 minutos</td><td>Não</td><td>Módulos Gradle, cache remota, testes paralelos</td></tr>
+<tr><td>«O código está um caos»</td><td>Não</td><td>Monólito modular com fronteiras verificadas por ArchUnit</td></tr>
+<tr><td>Domínio novo, requisitos a mudar semanalmente</td><td>Não, ainda</td><td>Adiar a fronteira até ao terceiro <em>refactor</em></td></tr>
+</tbody></table></div></div>
 
 <div class="qa" id="q-30-1" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos um tópico <code>pagamentos</code> com 48 partições. O produto exige que as operações da mesma conta sejam processadas por ordem. Como escolhe a chave de partição e o que acontece se uma conta gerar 30% do tráfego?</div>
+  <div class="qprompt">Temos um monólito Spring Boot com cerca de 400 mil linhas, 25 engenheiros em quatro equipas e uma implantação por semana. Que critérios usaria para decidir o que extrair primeiro — e como justifica a escolha à direcção?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A chave é o <code>accountId</code>, porque a garantia de ordem do Kafka é por partição e a invariante de negócio é por conta. Com chave, o particionador por defeito calcula <code>murmur2(chave) % 48</code>, o que fixa a conta numa partição enquanto o número de partições não mudar; sem chave, dois eventos da mesma conta podem cair em partições diferentes e ser processados fora de ordem por consumidores distintos.</p>
-      <p>Uma conta com 30% do tráfego é uma <em>hot partition</em>: uma das 48 partições recebe 14 vezes mais carga do que a média, o consumidor dessa partição fica em <em>lag</em> permanente e nenhuma quantidade de instâncias adicionais ajuda, porque a partição só pode ser servida por um membro do grupo. Há três saídas, por ordem de preferência. Primeira: reduzir o âmbito da ordem. Se a invariante real for «operações do mesmo cartão» ou «do mesmo contrato», a chave mais fina distribui melhor e continua correcta. Segunda: chave composta com sufixo controlado, <code>accountId + ":" + (seq % 4)</code>, quando as operações dessa conta são comutativas entre si e só é preciso ordem por sub-fluxo; a ordem global da conta perde-se, e isso tem de ser aceite explicitamente pelo domínio. Terceira: um particionador personalizado que trata as poucas contas gigantes como caso especial e as isola em partições dedicadas, deixando o resto no <em>hashing</em> normal.</p>
-      <p>O que não é solução: aumentar as partições. Passar de 48 para 96 não divide a conta quente — ela continua numa única partição, e o remapeamento do módulo faz com que chaves existentes mudem de partição, o que quebra a ordem durante a transição para todas as chaves, não só para a quente. Se a mudança de contagem for inevitável, faz-se com um tópico novo, escrita dupla temporária e corte controlado.</p>
-      <p>O <em>trade-off</em> final é sempre o mesmo: ordem é serialização, e serialização é o inverso de paralelismo. A pergunta a devolver ao produto é «ordem entre que eventos, exactamente?» — na maioria dos domínios de pagamentos a resposta é «entre operações que tocam o mesmo saldo», o que é muito mais estreito do que «entre tudo o que a conta faz».</p></div>
+      <p>Extrai-se primeiro o módulo que maximiza a razão entre atrito removido e acoplamento residual. Na prática ordeno os candidatos por quatro medidas que já existem no repositório e no sistema de <em>tickets</em>: frequência de alteração por pacote (ficheiros tocados nos últimos 6 meses), sobreposição de autoria entre equipas nesse pacote, número de dependências de entrada e de saída ao resto do domínio, e diferença de perfil de carga ou de risco.</p>
+      <p>O melhor primeiro candidato tem alteração frequente, uma única equipa a tocar-lhe, poucas arestas para dentro do resto do domínio e uma razão operacional própria — tipicamente notificações, exportação de relatórios, <em>webhooks</em> de entrada ou processamento de ficheiros. O pior primeiro candidato é o núcleo transaccional partilhado por todos, exactamente o que os candidatos escolhem por ser «o mais importante»: é o que tem mais arestas e o que obriga a substituir transacções locais por saga logo no primeiro passo.</p>
+      <p>A justificação à direcção tem de estar em unidades de negócio, não de arquitectura. «A equipa de notificações fez 62 alterações no último trimestre e cada uma esperou em média 4 dias pela janela de implantação partilhada; extrair o módulo reduz esse tempo para menos de 1 hora e liberta cerca de 30 dias-pessoa por ano. O custo é um serviço novo: 5 dias para o pôr de pé e cerca de 3 dias por ano de manutenção.» Um número de entrada, um número de saída, um custo.</p>
+      <p>O <em>trade-off</em>: extrair pelo caminho mais fácil pode não tocar no verdadeiro estrangulamento. Se ao fim de dois serviços extraídos a cadência global não melhorou, a hipótese de partida estava errada e o problema era de processo — janela de implantação, aprovação manual, testes lentos — e não de arquitectura. Vale a pena dizer isto em voz alta, porque é o que o entrevistador está à espera de ouvir.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«O Kafka garante ordem», sem mencionar partição; ou propõe uma única partição para o tópico inteiro.</td></tr>
-        <tr><td>Mid</td><td>Escolhe correctamente a chave por conta, mas resolve a partição quente com «mais partições» ou «mais consumidores».</td></tr>
-        <tr><td>Sénior</td><td>Chave por invariante, explica o limite de um consumidor por partição, propõe chave mais fina ou sufixo e diz o que se perde em ordem.</td></tr>
-        <tr><td>Staff</td><td>Questiona o âmbito da ordem exigido pelo domínio, quantifica o desequilíbrio, planeia a migração de contagem de partições com tópico novo e discute isolamento das chaves gigantes.</td></tr>
+        <tr><td>Insuficiente</td><td>«Um serviço por entidade» ou «começava pelos utilizadores»; nenhuma medida, nenhum custo.</td></tr>
+        <tr><td>Mid</td><td>Fala de contextos delimitados e de baixo acoplamento em abstracto, mas não sabe dizer que dados olharia nem o que custa um serviço novo.</td></tr>
+        <tr><td>Sénior</td><td>Ordena candidatos por medidas observáveis, escolhe um módulo periférico primeiro, quantifica ganho e custo, e liga a decisão a equipas concretas.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério de falsificação («se ao fim de dois serviços a cadência não melhorar, a causa era outra») e trata a estrutura das equipas como variável, não como dado.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que muda no mapeamento quando passa de 48 para 96 partições?»</li>
-      <li>«Como detecta a partição quente antes de o cliente reclamar?»</li>
-      <li>«E se a chave nula for usada por engano em 1% das mensagens?»</li>
-      <li>«Consegue processar em paralelo dentro da partição sem perder ordem por conta?»</li></ul></div>
+      <li>«E se o módulo mais atrasado for o núcleo de facturação, com 40 dependências?»</li>
+      <li>«Como mede a sobreposição de autoria sem instrumentação nova?»</li>
+      <li>«Quantos serviços é demasiado para 25 engenheiros?»</li>
+      <li>«O que faz se a direcção quiser doze serviços em seis meses?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Afirmar ordem global no tópico.</li>
-      <li>Usar o UUID do evento como chave e ainda assim esperar ordem por entidade.</li>
-      <li>Ignorar que reduzir partições não é possível sem recriar o tópico.</li></ul></div>
+      <li>Decompor por camada técnica (serviço-de-controladores, serviço-de-repositórios) em vez de por capacidade de negócio.</li>
+      <li>Não mencionar um único custo da divisão.</li>
+      <li>Assumir que a divisão resolve problemas de qualidade de código.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-30-2" data-box="qa" data-area="sd" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos 12 partições e o serviço corre com 3 pods, cada um com <code>concurrency: 4</code>. A equipa quer escalar para 30 pods durante a campanha de Black Friday. O que espera que aconteça?</div>
+<div class="qa" id="q-30-2" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O CTO quer microsserviços porque «o deploy demora e ninguém consegue mexer no código». Se discordar, argumente. Em que situação diria explicitamente para não dividir?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Nada de bom: já existem 12 consumidores activos (3 pods × 4 <em>threads</em>) para 12 partições, portanto o grupo já está saturado. Subir para 30 pods cria 120 membros no grupo, dos quais 108 ficam sem partição atribuída — ociosos, mas a consumir memória, ligações ao <em>cluster</em> e, pior, a participar em cada <em>rebalance</em>. O débito não sobe; o tempo de <em>rebalance</em> e o risco de tempestade de reatribuições sobem.</p>
-      <p>O limite é estrutural: dentro de um <em>consumer group</em>, cada partição é atribuída a no máximo um membro. Para escalar consumo é preciso ou mais partições, ou mais trabalho por mensagem em paralelo dentro do consumidor, ou menos trabalho por mensagem.</p>
-      <p>A ordem de acções para a campanha é: primeiro medir onde está o tempo — se cada mensagem gasta 40 ms e 35 ms são espera de I/O na base de dados, o ganho está em lotes e em <em>pipelining</em>, não em pods. Segundo, se o débito por consumidor já está no tecto, aumentar partições antecipadamente (por exemplo de 12 para 48) fora de campanha, aceitando o remapeamento de chaves numa janela controlada. Terceiro, escalar pods até ao número de partições, nunca acima; com 48 partições, 12 pods a 4 <em>threads</em> esgotam a atribuição.</p>
-      <p>Uma alternativa que evita mexer em partições é desacoplar a leitura do trabalho: o consumidor lê em ordem e distribui por chave para um <em>pool</em> interno de <em>workers</em>, mantendo a ordem por chave e adiando o <em>commit</em> do <em>offset</em> até todas as mensagens até esse ponto estarem concluídas. Ganha-se paralelismo com 12 partições; paga-se em complexidade de <em>commit</em> e em risco de reprocessamento maior após falha.</p></div>
+      <p>Nenhum dos dois sintomas é resolvido pela divisão em serviços. «O <em>deploy</em> demora» é um problema de <em>pipeline</em>: <em>build</em> incremental com cache remota, testes paralelizados, contentor de base pré-construído, implantação progressiva automática. «Ninguém consegue mexer no código» é um problema de modularidade interna, e a divisão em rede não o resolve — apenas torna cada erro de fronteira 50 vezes mais caro de corrigir, porque passa a exigir migração de dados e coordenação entre equipas.</p>
+      <p>A proposta alternativa é o monólito modular: um artefacto, módulos com fronteiras explícitas, cada módulo com o seu esquema (ou pelo menos com o seu conjunto de tabelas e sem <em>joins</em> por cima da fronteira), comunicação entre módulos só através de interfaces publicadas e eventos internos, e as regras verificadas no <em>build</em> com ArchUnit ou com o sistema de módulos de Java. O ganho é que a fronteira fica testada e movível: quando um módulo tiver de sair, o custo é substituir a chamada de interface por um cliente HTTP ou por um produtor de eventos, não descobrir onde estão os laços.</p>
+      <p>Diria explicitamente para não dividir em quatro situações. Primeira: menos de um engenheiro por serviço proposto — sem dono, o serviço apodrece e ninguém sabe se ainda é usado. Segunda: sem <em>tracing</em> distribuído, métricas por serviço e registos correlacionados já em produção; a divisão sem observabilidade transforma um <em>stack trace</em> num inquérito de duas horas. Terceira: domínio instável, com requisitos a mudar de semana a semana. Quarta: quando o requisito real é consistência forte entre duas entidades que mudam sempre juntas — separá-las obriga a saga para conseguir o que uma transacção de PostgreSQL fazia em 2 ms.</p>
+      <p>O contra-argumento honesto: há um caso em que dividir cedo compensa mesmo com custo alto — quando existe fronteira de conformidade ou de segurança (dados de cartão, dados clínicos) e o isolamento do processo e da base reduz o âmbito de auditoria. Aí o serviço separado paga-se em semanas de auditoria poupadas, não em cadência.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Com 30 pods processamos 10 vezes mais.»</td></tr>
-        <tr><td>Mid</td><td>Identifica o limite de partições e propõe aumentar partições, sem falar do custo do remapeamento.</td></tr>
-        <tr><td>Sénior</td><td>Conta os consumidores reais (pods × concorrência), explica os membros ociosos e o custo em <em>rebalance</em>, e mede antes de escalar.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o paralelismo por chave dentro do consumidor com <em>commit</em> diferido, e planeia o aumento de partições fora do pico com corte controlado.</td></tr>
+        <tr><td>Insuficiente</td><td>Aceita a premissa e começa a desenhar serviços; ou rejeita microsserviços por princípio sem alternativa concreta.</td></tr>
+        <tr><td>Mid</td><td>Diz «monólito modular» mas não sabe como se impõe a fronteira nem o que se ganha por a impor no <em>build</em>.</td></tr>
+        <tr><td>Sénior</td><td>Separa os dois sintomas das suas causas reais, propõe a alternativa com mecanismo de verificação, e enuncia condições explícitas de «não dividir».</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o caso em que a divisão precoce compensa (conformidade), e trata a conversa como gestão de expectativas do CTO, com um plano faseado e critérios de reavaliação.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como é que o <em>commit</em> funciona se processar fora de ordem dentro da partição?»</li>
-      <li>«Que métrica olha para saber se o problema é débito ou latência por mensagem?»</li>
-      <li>«Faz sentido um segundo <em>consumer group</em> no mesmo tópico?»</li></ul></div>
+      <li>«Como impede, na prática, que um módulo faça <code>SELECT</code> nas tabelas de outro?»</li>
+      <li>«Quanto tempo dava ao monólito modular antes de reavaliar?»</li>
+      <li>«E se a razão real for retenção de talento — as pessoas querem microsserviços no currículo?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não saber que membros a mais ficam ociosos.</li>
-      <li>Propor aumentar partições durante o pico.</li>
-      <li>Confundir <em>consumer group</em> com tópico, achando que grupos diferentes partilham trabalho.</li></ul></div>
+      <li>Argumentar por moda ou por autoridade («toda a gente faz assim»).</li>
+      <li>Prometer que a divisão melhora a qualidade do código.</li>
+      <li>Não reconhecer nenhum cenário em que a divisão é a escolha certa.</li></ul></div>
   </div>
 </div>
-
-<h2 id="sec-30-2" class="h2"><span class="secnum">30.2</span> Garantias de entrega e ordenação<a class="anchor" href="#sec-30-2" aria-label="ligação">#</a></h2>
-
-<p>As três garantias clássicas — <em>at-most-once</em>, <em>at-least-once</em>, <em>exactly-once</em> — não são propriedades do <em>broker</em>: são propriedades do sistema completo, produtor, <em>broker</em> e consumidor, incluindo os efeitos externos que o consumidor produz. O Kafka fornece as peças; a garantia final depende de onde se coloca o <em>commit</em> do <em>offset</em> relativamente ao efeito.</p>
-
-<p>Se o <em>offset</em> for confirmado antes de processar, obtém-se <em>at-most-once</em>: uma queda entre o <em>commit</em> e o efeito perde a mensagem. Se for confirmado depois de processar, obtém-se <em>at-least-once</em>: uma queda entre o efeito e o <em>commit</em> faz repetir a mensagem no arranque seguinte. Praticamente todos os sistemas de produção escolhem a segunda e tornam o efeito idempotente, porque perder é irreversível e duplicar é tratável.</p>
-
-<p><em>Exactly-once</em> existe no Kafka, mas com fronteira definida: as transacções cobrem escritas em tópicos Kafka e o <em>commit</em> de <em>offsets</em> na mesma transacção — o padrão consumir-transformar-produzir. Se o consumidor escrever numa base de dados externa ou chamar uma API de terceiros, a transacção do Kafka não abrange esse efeito e a garantia útil volta a ser <em>at-least-once</em> com idempotência do lado do efeito. Dizer «temos exactly-once ponto-a-ponto até ao PostgreSQL» sem descrever um mecanismo de deduplicação é a resposta que mais rapidamente baixa o nível numa entrevista.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 30.1</span> O que cada garantia exige e o que custa.</div>
-<div class="tscroll"><table><thead><tr><th>Garantia</th><th>Configuração mínima</th><th>Falha típica</th><th>Custo</th></tr></thead><tbody>
-<tr><td>At-most-once</td><td><code>enable.auto.commit=true</code> com <em>commit</em> antes do trabalho</td><td>Perde mensagens em queda do processo</td><td>Nenhum débito perdido; inaceitável em pagamentos</td></tr>
-<tr><td>At-least-once</td><td><code>acks=all</code>, <code>min.insync.replicas=2</code>, <em>commit</em> manual depois do efeito</td><td>Duplicados após <em>rebalance</em> ou <em>crash</em></td><td>Exige chave de idempotência no consumidor</td></tr>
-<tr><td>Exactly-once (dentro do Kafka)</td><td><code>enable.idempotence=true</code>, <code>transactional.id</code>, <code>isolation.level=read_committed</code></td><td>Transacção pendente bloqueia leitores até ao <em>timeout</em></td><td>Latência p99 sobe tipicamente 10-40% e o débito cai; complexidade operacional real</td></tr>
-<tr><td>Efeito externo idempotente</td><td>At-least-once + tabela de deduplicação ou <code>UPSERT</code> por chave natural</td><td>Chave de deduplicação mal escolhida</td><td>Uma escrita extra por mensagem; retenção da tabela de deduplicação</td></tr>
-</tbody></table></div></div>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>As transacções do Kafka dão atomicidade entre escrita e <em>offset</em>, mas introduzem o <em>Last Stable Offset</em>: um consumidor com <code>isolation.level=read_committed</code> não lê além da transacção aberta mais antiga. Um produtor transaccional que fica pendurado bloqueia a leitura desse tópico até <code>transaction.timeout.ms</code> expirar (por defeito 60 s). Em fluxos onde a latência p99 é contratual, isto é motivo suficiente para preferir <em>at-least-once</em> com idempotência aplicacional.</p></aside>
 
 <div class="qa" id="q-30-3" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O consumidor de <code>pagamentos</code> credita a conta do comerciante no PostgreSQL. Depois de um <em>deploy</em>, apareceram créditos duplicados. Explique como isto acontece e como o consumidor passa a ser idempotente.</div>
+  <div class="qprompt">Decidiu extrair o módulo de pagamentos de um monólito que está em produção, com 900 pedidos por segundo, e não pode congelar funcionalidades durante seis meses. Descreva a estratégia passo a passo.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Acontece porque o sistema é <em>at-least-once</em> e o efeito não é idempotente. Durante um <em>deploy</em>, o pod recebe SIGTERM depois de já ter processado um lote de <code>max.poll.records</code> mensagens mas antes de confirmar o <em>offset</em>; o grupo faz <em>rebalance</em>, outro membro assume a partição a partir do último <em>offset</em> confirmado e volta a creditar. Não é um erro do Kafka — é a única semântica possível quando o efeito está fora da transacção que confirma o <em>offset</em>.</p>
-      <p>A correcção é dar ao efeito uma chave de deduplicação estável e deixar a base de dados decidir. O evento traz um identificador imutável — <code>paymentId</code>, ou um <code>eventId</code> gerado na origem, nunca gerado no consumidor — e a escrita torna-se condicional: uma tabela <code>processed_event(event_id PRIMARY KEY, consumer_group, processed_at)</code> com <code>INSERT ... ON CONFLICT DO NOTHING</code> na mesma transacção do crédito. Se o <code>INSERT</code> não afectar linhas, a mensagem já foi tratada e descarta-se. Quando o modelo permite, é ainda melhor eliminar a tabela auxiliar e tornar a própria escrita de domínio idempotente: <code>INSERT INTO ledger(...) ON CONFLICT (payment_id) DO NOTHING</code>, ou um <code>UPDATE ... WHERE version = :esperada</code> que falha na segunda tentativa.</p>
-      <p>Três detalhes que separam a resposta sénior. Primeiro, a chave de deduplicação tem de estar no âmbito certo: por consumidor lógico, não global, senão dois serviços diferentes que consomem o mesmo evento anulam-se mutuamente. Segundo, a tabela de deduplicação cresce sem limite e precisa de retenção — normalmente uma partição por dia com <code>DROP</code> ao fim de 7 a 30 dias, dimensionada acima do <em>lag</em> máximo plausível e da retenção do tópico. Terceiro, o encerramento limpo reduz muito a frequência do problema, mas não o elimina: um <code>SIGKILL</code>, uma pausa de GC longa ou um <em>rebalance</em> por <code>max.poll.interval.ms</code> excedido produzem a mesma repetição. Idempotência é obrigatória; encerramento limpo é higiene.</p>
-      <p>O custo é uma escrita adicional por mensagem — na ordem de 0,3 a 1 ms em PostgreSQL com o índice em memória — e uma tabela a manter. Em troca, o consumidor pode ser reiniciado, reposicionado ou reprocessado a partir de um <em>offset</em> antigo sem consequências financeiras, o que é o que torna o reprocessamento uma ferramenta utilizável em vez de um risco.</p></div>
+      <p>Usa-se o padrão da <em>strangler fig</em>: um ponto de intercepção à frente do monólito encaminha, funcionalidade a funcionalidade, uma fatia crescente do tráfego para o serviço novo, e o monólito só é desligado quando a última rota migrou. Nunca há um dia de corte, e há sempre caminho de regresso — a rota volta ao monólito com uma alteração de configuração, não com uma reversão de implantação.</p>
+      <p>Os passos por ordem. Primeiro, isolar o módulo dentro do monólito: uma fachada única, sem que o resto do código toque nas tabelas de pagamentos. Segundo, pôr o ponto de intercepção no caminho — um <em>API gateway</em>, um filtro à entrada do próprio monólito, ou uma regra no <em>ingress</em>; o mais barato costuma ser o filtro dentro do monólito, porque não exige infra-estrutura nova. Terceiro, implementar o serviço novo e correr em modo sombra (<em>shadow</em>): o monólito continua a decidir, mas o pedido é duplicado para o serviço novo e os resultados são comparados de forma assíncrona. Uma semana de sombra com 900 pedidos por segundo dá centenas de milhões de comparações — chega para encontrar as divergências de arredondamento e de fuso horário que os testes não apanham.</p>
+      <p>Quarto, migrar os dados. O padrão que funciona é escrita dupla temporária controlada pelo serviço novo, com o monólito a ler ainda do seu lado, seguido de uma reconciliação em lote e da inversão da fonte de verdade. Quinto, encaminhar tráfego real por escalões — 1%, 5%, 25%, 50%, 100% — com critério de reversão definido antes (taxa de erro acima de 0,1%, p99 acima do orçamento, divergência de reconciliação acima de 0,01%). Sexto, remover o código morto do monólito, que é o passo que quase toda a gente salta e que é o único que converte a migração em ganho real de manutenção.</p>
+      <p>O <em>trade-off</em>: durante a migração existem dois sistemas com a mesma lógica, e o custo de manutenção é temporariamente superior ao de qualquer das pontas. Por isso a janela tem de ter data: se a coexistência passar de dois trimestres, o padrão degenera em duplicação permanente. E há um caso em que a <em>strangler fig</em> não serve — quando o módulo a extrair partilha transacções com quase tudo o resto; aí primeiro corta-se a transacção (introduzindo estados intermédios no monólito), só depois se corta o processo.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Culpa o Kafka ou propõe confirmar o <em>offset</em> antes de processar.</td></tr>
-        <tr><td>Mid</td><td>Sabe que é <em>at-least-once</em> e sugere uma tabela de deduplicação, sem falar de âmbito nem de retenção.</td></tr>
-        <tr><td>Sénior</td><td>Explica a janela exacta da duplicação, usa chave da origem, mete a deduplicação na mesma transacção do efeito e trata a retenção da tabela.</td></tr>
-        <tr><td>Staff</td><td>Prefere idempotência natural no modelo de domínio, define o âmbito por consumidor, quantifica o custo por mensagem e liga isto à capacidade de reprocessar histórico com segurança.</td></tr>
+        <tr><td>Insuficiente</td><td>«Reescrevemos e trocamos num fim-de-semana»; ou nenhum plano de migração de dados.</td></tr>
+        <tr><td>Mid</td><td>Conhece o nome do padrão e o encaminhamento progressivo, mas não trata dos dados nem define critérios de reversão.</td></tr>
+        <tr><td>Sénior</td><td>Sequência completa com fachada, sombra, migração de dados, escalões de tráfego, critérios de reversão numéricos e remoção do código antigo.</td></tr>
+        <tr><td>Staff</td><td>Impõe prazo à coexistência, identifica o caso em que o padrão não serve (transacções partilhadas) e planeia a reconciliação como produto, com painel e dono.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o evento não trouxer identificador estável da origem?»</li>
-      <li>«Porque não confia no <code>offset</code> como chave de deduplicação?»</li>
-      <li>«Como limpa a tabela sem apagar registos ainda necessários?»</li>
-      <li>«Isto resolve reordenação, ou só repetição?»</li></ul></div>
+      <li>«Como compara resultados em modo sombra sem duplicar cobranças reais?»</li>
+      <li>«Onde põe o ponto de intercepção se não houver <em>gateway</em>?»</li>
+      <li>«Como reverte depois de a fonte de verdade ter mudado de lado?»</li>
+      <li>«Que métrica lhe diz que já pode apagar o código do monólito?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Gerar o identificador de deduplicação dentro do consumidor.</li>
-      <li>Deduplicar com uma cache em memória do pod.</li>
-      <li>Achar que <code>enable.idempotence=true</code> no produtor resolve duplicados no consumidor.</li></ul></div>
+      <li>Reescrita integral com corte único («big bang»).</li>
+      <li>Deixar o código antigo no monólito indefinidamente «por segurança».</li>
+      <li>Escrita dupla sem reconciliação nem métrica de divergência.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-30-4" data-box="qa" data-area="sd" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+<figure class="listing text" id="lst-30-1"><div class="lhead"><span class="lnum">Listagem 30.1</span>
+<span class="lcap">Strangler fig: o ponto de intercepção decide por rota e por percentagem.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>                    ┌──────────────────────────────────────────┐
+   cliente ────────▶│  ponto de intercepção (gateway ou filtro) │
+                    │                                          │
+                    │  /pagamentos/**   peso 1% → 25% → 100% ───┼──▶ serviço-pagamentos (novo)
+                    │                   sombra: 100% duplicado ─┼──▶ (comparação assíncrona)
+                    │  todo o resto ───────────────────────────┼──▶ monólito
+                    └──────────────────────────────────────────┘
+
+   fase 1  fachada interna no monólito .................. sem tráfego novo
+   fase 2  serviço novo em sombra ....................... divergência alvo &lt; 0,01%
+   fase 3  escalões 1% / 5% / 25% / 50% / 100% .......... reversão por configuração
+   fase 4  inversão da fonte de verdade + reconciliação .. janela máxima 2 trimestres
+   fase 5  remoção do código do monólito ................ o único passo que dá lucro</code></pre></figure>
+
+<h2 id="sec-30-2" class="h2"><span class="secnum">30.2</span> Fronteiras de serviço e propriedade de dados<a class="anchor" href="#sec-30-2" aria-label="ligação">#</a></h2>
+
+<p>A regra de ouro é uma só: cada dado tem exactamente um serviço que o escreve. Tudo o resto — quantos serviços, que protocolo, que linguagem — é secundário face a esta invariante, porque é ela que garante que existe um sítio onde as regras de negócio daquele dado são aplicadas. A base de dados por serviço não é dogma de pureza: é a única forma prática de impedir que outra equipa escreva na tabela sem passar pela validação, e de permitir alterar o esquema sem uma reunião de coordenação.</p>
+
+<p>Isto obriga a responder a uma pergunta desconfortável: como se faz um relatório que precisa de dados de quatro serviços? Há três respostas legítimas e uma ilegítima. Legítimas: composição na camada de leitura (o <em>BFF</em> ou o serviço de relatórios chama os quatro e junta, aceitando latência somada e disponibilidade composta); replicação de leitura por eventos, em que cada serviço publica alterações e o serviço de relatórios mantém uma projecção própria, eventualmente consistente com atraso típico de 100 ms a alguns segundos; ou uma cópia analítica em <em>data warehouse</em> alimentada por captura de alterações, para relatórios que toleram minutos de atraso. Ilegítima: ler directamente a base do outro serviço, que é o anti-padrão da base partilhada e que congela para sempre o esquema de quem é lido.</p>
+
+<p>O segundo critério de fronteira é o volume de dados de referência. Se o serviço de expedição precisa do nome e da morada do cliente em cada operação, uma chamada síncrona por pedido cria acoplamento temporal permanente. A alternativa é replicar o subconjunto necessário — não a entidade toda — por eventos, com o serviço de clientes como único escritor e com a réplica marcada explicitamente como derivada e não autoritativa. Replicar 4 campos é engenharia; replicar a entidade completa é uma base partilhada com passos extra.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um serviço por entidade do modelo relacional (<code>ClienteService</code>, <code>MoradaService</code>, <code>TelefoneService</code>) é o erro mais comum em entrevistas. Produz serviços anémicos sem regra de negócio própria, em que qualquer caso de uso toca em quatro serviços e exige saga para o que era um <code>INSERT</code>. A fronteira certa é a capacidade de negócio — «gestão de conta do cliente» — que pode conter dez tabelas e continua a ter uma transacção local.</p></aside>
+
+<div class="qa" id="q-30-4" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O ecrã de detalhe do pedido precisa de dados de pedidos, clientes, catálogo e expedição — quatro serviços, quatro bases. Antes tinha um <code>JOIN</code> de 4 tabelas em 6 ms. Como resolve agora?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A resposta directa: escolhe-se entre composição na leitura e projecção materializada, e a escolha decide-se pelo orçamento de latência e pela tolerância a dados desactualizados, não por preferência.</p>
+      <p>Composição na leitura significa que um serviço de leitura — tipicamente o <em>BFF</em> do ecrã — faz as quatro chamadas em paralelo e junta. Com quatro chamadas concorrentes, a latência é a do ramo mais lento (digamos p99 de 40 ms) mais a junção, portanto na ordem dos 45 a 60 ms em vez dos 6 ms iniciais. O custo escondido é a disponibilidade: quatro dependências a 99,9% dão 99,6% para o ecrã, e é por isso que a composição só é aceitável com <em>timeout</em> curto por ramo e degradação definida — o ecrã mostra o pedido sem a data prevista de entrega em vez de devolver <code>500</code>.</p>
+      <p>Projecção materializada significa que o serviço de leitura subscreve os eventos dos quatro e mantém a sua própria tabela desnormalizada, indexada para esta consulta. A leitura volta aos 5 ms e a disponibilidade volta a depender de um único serviço; paga-se com consistência eventual (atraso típico de 100 ms a 2 s, dependendo do <em>lag</em> do consumidor) e com o dever de reconstruir a projecção — o que exige que os eventos sejam reproduzíveis ou que exista um caminho de reconstituição a partir das fontes.</p>
+      <p>A regra prática que uso: ecrãs de detalhe com poucos pedidos por segundo e tolerância a 60 ms ficam com composição, porque não há projecção para manter; listagens, pesquisas e relatórios com filtros arbitrários ficam com projecção, porque compor não permite paginar nem ordenar por campos de serviços diferentes sem trazer tudo para memória. O que não faço em caso nenhum é ler a base do outro serviço: no dia em que ele mudar o esquema, o ecrã parte sem que ninguém tenha alterado o código do ecrã.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe ler directamente as tabelas dos outros serviços, ou uma base partilhada «só para leitura».</td></tr>
+        <tr><td>Mid</td><td>Sugere chamadas em série ao quatro serviços; não fala de paralelismo, de <em>timeouts</em>, nem de disponibilidade composta.</td></tr>
+        <tr><td>Sénior</td><td>Compara composição e projecção com números de latência e disponibilidade, define degradação por ramo e escolhe consoante o tipo de consulta.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a reconstrução da projecção, o custo de a manter correcta, e nota que paginação e ordenação cruzadas tornam a composição inviável.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o utilizador quiser ordenar por data prevista de entrega e paginar?»</li>
+      <li>«Como reconstrói a projecção depois de um <em>bug</em> que a corrompeu durante três dias?»</li>
+      <li>«Que <em>timeout</em> põe em cada ramo e porquê esse valor?»</li>
+      <li>«Como detecta que a projecção divergiu da fonte?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Quatro chamadas em série sem paralelismo.</li>
+      <li>Assumir consistência forte numa projecção alimentada por eventos.</li>
+      <li>Nenhuma estratégia para o caso de um dos quatro serviços estar em baixo.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-30-5" data-box="qa" data-area="comportamental" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Um colega propõe activar transacções Kafka para termos <em>exactly-once</em> em todo o <em>pipeline</em>. O que responde, e em que caso concreto concordaria?</div>
+  <div class="qprompt">Temos seis equipas e trinta serviços, e há três serviços que ninguém quer manter. Como é que a estrutura da organização entra no desenho de fronteiras?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Concordo se o <em>pipeline</em> for Kafka-para-Kafka; discordo se houver um efeito externo. As transacções do Kafka tornam atómico o conjunto «escrever em um ou mais tópicos + confirmar os <em>offsets</em> consumidos». O produtor recebe um <code>transactional.id</code> estável, o <em>broker</em> associa-lhe um <em>producer epoch</em> que exclui zombies de instâncias anteriores, e os consumidores com <code>isolation.level=read_committed</code> só vêem registos de transacções confirmadas. Para um serviço que lê <code>encomendas</code>, enriquece e escreve <code>encomendas-enriquecidas</code>, isto elimina genuinamente duplicados e resultados parciais.</p>
-      <p>O que a transacção não faz: não cobre um <code>INSERT</code> no PostgreSQL, nem uma chamada HTTP, nem um envio de email. Se o consumidor cair depois do <code>INSERT</code> e antes do <em>commit</em> da transacção Kafka, o <code>INSERT</code> fica feito e a mensagem será reprocessada. Ou seja, com efeito externo continua a ser preciso deduplicação aplicacional — e nesse caso as transacções acrescentam custo sem acrescentar garantia.</p>
-      <p>O custo é mensurável em três eixos. Latência: cada transacção envolve marcadores de <em>commit</em> escritos em todas as partições tocadas, e um lote de 100 ms de trabalho pode ganhar 5 a 20 ms; com transacções muito curtas a sobrecarga relativa é pior, por isso agrupa-se por lote de <em>poll</em>. Débito: cai tipicamente entre 10% e 30% face ao mesmo <em>pipeline</em> não transaccional, dependendo do tamanho do lote. Disponibilidade de leitura: com <code>read_committed</code>, os leitores ficam limitados pelo <em>Last Stable Offset</em>, portanto uma transacção pendurada num produtor bloqueia consumidores até <code>transaction.timeout.ms</code>. Em operação isto significa alertas novos e um modo de falha que a equipa nunca viu.</p>
-      <p>A posição defensável é: usar transacções em <em>pipelines</em> de transformação internos, incluindo Kafka Streams onde <code>processing.guarantee=exactly_once_v2</code> torna isto quase transparente; usar <em>at-least-once</em> com idempotência na fronteira com sistemas externos; e nunca vender «exactly-once» a um interlocutor de negócio sem explicar que a garantia termina onde termina o Kafka.</p></div>
+      <p>A observação de Conway diz que o desenho do sistema tende a espelhar a estrutura de comunicação da organização. A leitura útil é a inversa: se as fronteiras desejadas não corresponderem às equipas, o sistema regride para as fronteiras das equipas — por atrito, não por decisão. Portanto, ou se alinha a organização às fronteiras pretendidas, ou se aceitam as fronteiras que a organização já tem.</p>
+      <p>Três serviços órfãos são um sintoma de fronteiras sem dono, e o problema não é técnico. A regra que aplico é simples: nenhum serviço existe sem uma equipa nomeada, um canal de plantão e um orçamento de erro. Se ninguém o reclama, há três destinos possíveis — fundi-lo com o serviço da equipa que mais lhe chama, adoptá-lo formalmente numa equipa com ajuste de carga, ou desactivá-lo se o tráfego o permitir. Deixá-lo sem dono é escolher que a próxima falha nele tenha 4 horas de tempo até à recuperação em vez de 20 minutos.</p>
+      <p>Quanto ao número, uso uma heurística de carga cognitiva em vez de uma razão fixa: uma equipa de 5 a 8 pessoas mantém bem entre 2 e 5 serviços com plantão, dependendo de quão parecidos são. Trinta serviços para seis equipas dá cinco por equipa — está no limite, e é normal que os três menos usados sejam os abandonados. Reduzir o número de serviços é uma opção arquitectural legítima e raramente proposta em entrevista.</p>
+      <p>O <em>trade-off</em> de alinhar organização e arquitectura: reorganizar equipas é caro, lento e mexe com pessoas, e uma reorganização feita só para justificar um diagrama é pior do que a arquitectura errada. Por isso a sequência que defendo é primeiro tornar a propriedade explícita e medível (dono, plantão, orçamento de erro por serviço), depois consolidar o que não tem dono, e só então propor mudanças de equipa quando os dados mostrarem que a fronteira e a equipa continuam desalinhadas.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Exactly-once resolve tudo» ou «exactly-once é impossível», sem qualificar a fronteira.</td></tr>
-        <tr><td>Mid</td><td>Sabe que existem transacções e <code>read_committed</code>, mas não distingue efeito interno de externo.</td></tr>
-        <tr><td>Sénior</td><td>Define a fronteira consumir-transformar-produzir, cita <code>transactional.id</code> e <em>epoch</em>, quantifica o custo em débito e latência.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o <em>Last Stable Offset</em> como modo de falha operacional, escolhe por tipo de fluxo e explica a comunicação honesta da garantia ao negócio.</td></tr>
+        <tr><td>Insuficiente</td><td>Trata o problema como puramente técnico; propõe mais automatização para serviços sem dono.</td></tr>
+        <tr><td>Mid</td><td>Cita a lei de Conway como curiosidade, sem consequência operacional nem proposta.</td></tr>
+        <tr><td>Sénior</td><td>Liga propriedade a plantão e a orçamento de erro, propõe fusão ou desactivação, e dá uma heurística de serviços por equipa.</td></tr>
+        <tr><td>Staff</td><td>Trata a organização como variável de desenho, mas sequencia a intervenção (medir, consolidar, só depois reorganizar) e reconhece o custo humano.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Para que serve o <em>producer epoch</em>?»</li>
-      <li>«O que vê um consumidor com <code>read_uncommitted</code> durante uma transacção aberta?»</li>
-      <li>«Como é que o Kafka Streams consegue isto sem código extra?»</li>
-      <li>«Que alerta cria para transacções penduradas?»</li></ul></div>
+      <li>«Que métricas usaria para provar que uma fronteira está desalinhada?»</li>
+      <li>«Como desactiva um serviço que ainda tem 2 pedidos por segundo?»</li>
+      <li>«Uma equipa de plataforma que mantém serviços de outros é boa ideia?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Prometer atomicidade entre Kafka e base de dados externa.</li>
-      <li>Activar transacções sem mudar o <code>isolation.level</code> dos consumidores.</li>
-      <li>Usar um <code>transactional.id</code> aleatório por arranque, o que anula a protecção contra zombies.</li></ul></div>
+      <li>Propor reorganização de equipas como primeiro passo.</li>
+      <li>Aceitar serviços sem dono como estado normal.</li>
+      <li>Nunca considerar reduzir o número de serviços.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-30-3" class="h2"><span class="secnum">30.3</span> Produtores: acks, idempotência e transacções<a class="anchor" href="#sec-30-3" aria-label="ligação">#</a></h2>
+<h2 id="sec-30-3" class="h2"><span class="secnum">30.3</span> Síncrono vs assíncrono: escolher por acoplamento<a class="anchor" href="#sec-30-3" aria-label="ligação">#</a></h2>
 
-<p>Do lado do produtor há quatro decisões que definem se o sistema perde mensagens. <code>acks</code> determina quantas réplicas confirmam antes de o <em>broker</em> responder: <code>0</code> não espera nada (perde em qualquer falha), <code>1</code> espera o <em>leader</em> (perde se o <em>leader</em> cair antes de replicar), <code>all</code> espera todas as réplicas em ISR. Sozinho, <code>acks=all</code> não chega: se o ISR encolher para uma réplica, «todas as réplicas em ISR» passa a ser uma só. É por isso que <code>acks=all</code> anda sempre acompanhado de <code>min.insync.replicas=2</code> configurado no tópico, com <code>replication.factor=3</code>.</p>
+<p>A escolha entre chamada síncrona e mensagem não é uma questão de gosto nem de desempenho: é uma questão de saber se o emissor precisa da resposta para poder continuar. Se precisa — validar um saldo antes de aceitar o pedido — a chamada é síncrona e o emissor herda a disponibilidade do receptor. Se não precisa — notificar que o pedido foi criado — a mensagem quebra o acoplamento temporal: o receptor pode estar em baixo durante 10 minutos e o sistema continua correcto, só mais lento.</p>
 
-<p><code>enable.idempotence=true</code> — activo por defeito desde as versões 3.x do cliente — resolve o duplicado gerado pela retentativa do próprio produtor: cada produtor recebe um PID e numera as mensagens por partição, e o <em>broker</em> descarta sequências repetidas. Isto permite manter <code>max.in.flight.requests.per.connection</code> até 5 sem perder ordem, porque o <em>broker</em> reordena com base na sequência. Sem idempotência, qualquer valor acima de 1 admite reordenação numa retentativa: o pedido 2 pode chegar antes do 1 se o 1 for repetido.</p>
+<p>A consequência que os candidatos ignoram é a composição de disponibilidade. Numa cadeia síncrona, a disponibilidade do serviço de entrada é o produto das disponibilidades de todos os que estão no caminho crítico. Cinco dependências a 99,9% dão 99,5%, o que são cerca de 3,6 horas de indisponibilidade por mês — e nenhuma das cinco equipas falhou o seu objectivo.</p>
 
-<p>Depois há a dupla escrita, que é o erro de arquitectura mais comum em serviços orientados a eventos: gravar na base de dados e publicar no Kafka no mesmo método. Não existe transacção entre os dois, e qualquer falha entre as operações deixa o sistema inconsistente — pedido gravado sem evento, ou evento publicado sem pedido. O padrão <em>outbox</em> resolve isto escrevendo o evento na mesma transacção de base de dados que o estado, e publicando-o depois a partir da tabela, com <em>at-least-once</em> assumido.</p>
+<div class="formula">disponibilidade_da_cadeia = Π Aᵢ  →  0,999⁵ ≈ 0,995 ≈ 3,6 h de indisponibilidade por mês</div>
 
-<figure class="listing yaml" id="lst-30-1"><div class="lhead"><span class="lnum">Listagem 30.1</span>
-<span class="lcap">Configuração de produtor para não perder mensagens (Spring Boot 3.5).</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="yaml"><code>spring:
-  kafka:
-    bootstrap-servers: kafka-1:9092,kafka-2:9092,kafka-3:9092
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
-      acks: all                       # exige confirmacao de todas as replicas em ISR
-      properties:
-        enable.idempotence: true      # PID + numero de sequencia: sem duplicados por retentativa
-        max.in.flight.requests.per.connection: 5   # seguro so porque a idempotencia esta activa
-        retries: 2147483647           # limitado na pratica por delivery.timeout.ms
-        delivery.timeout.ms: 120000   # orcamento total: envio + retentativas
-        request.timeout.ms: 30000
-        max.block.ms: 60000           # bloqueio maximo em send() quando o buffer enche
-        linger.ms: 10                 # espera ate 10 ms para agrupar: +debito, +10 ms de latencia
-        batch.size: 65536
-        compression.type: zstd        # 3-5x menos rede e disco em JSON/Avro tipico
-        # transactional.id: pagamentos-tx-1   # so em pipelines Kafka-para-Kafka
+<p>Com a latência passa-se o mesmo, mas pior, porque as caudas não somam de forma simples: somar os p99 de cada salto dá um número optimista se as caudas forem correlacionadas (por exemplo, uma pausa de recolha de lixo ou uma saturação de rede que afecta vários serviços ao mesmo tempo) e pessimista se forem independentes. Em qualquer caso, o número que interessa é o p99 medido de ponta a ponta com <em>tracing</em>, não a soma de estimativas.</p>
 
-# No topico (nao no cliente): min.insync.replicas=2, replication.factor=3
-# Com ISR=1 o broker rejeita a escrita com NotEnoughReplicasException - e o comportamento correcto.</code></pre></figure>
+<figure class="listing text" id="lst-30-2"><div class="lhead"><span class="lnum">Listagem 30.2</span>
+<span class="lcap">Cadeia síncrona: a latência e a disponibilidade compõem-se contra nós.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>  salto                        p99 do salto   p99 acumulado   disponibilidade
+  ─────────────────────────────────────────────────────────────────────────────
+  gateway ──▶ pedidos                8 ms           8 ms         99,95%
+          ──▶ clientes              25 ms          33 ms         99,90%
+          ──▶ preços                30 ms          63 ms         99,90%
+          ──▶ stock                 40 ms         103 ms         99,50%
+          ──▶ fraude (externo)      60 ms         163 ms         99,00%
+  ─────────────────────────────────────────────────────────────────────────────
+  total no caminho crítico                        163 ms         98,26%
+                                                                (≈ 12,7 h/mês)
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>producer.send()</code> é assíncrono e devolve um <code>Future</code>. Chamar <code>send()</code> e ignorar o resultado converte <code>acks=all</code> em «esperança=all»: as falhas chegam ao <em>callback</em>, e sem <em>callback</em> desaparecem em silêncio. Ou se bloqueia no <code>get()</code> (perdendo débito), ou se trata o erro no <em>callback</em> e se mede a métrica <code>record-error-rate</code>. O mesmo se aplica ao <code>KafkaTemplate</code>: o <code>CompletableFuture</code> devolvido tem de ter um <code>whenComplete</code>.</p></aside>
+  mesma cadeia, fraude e preços fora do caminho crítico (evento + projecção):
+  total no caminho crítico                         73 ms         99,35%
+                                                                (≈ 4,7 h/mês)</code></pre></figure>
 
-<div class="qa" id="q-30-5" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+<div class="qa" id="q-30-6" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Ao criar um pedido é preciso reservar <em>stock</em>, calcular preço com promoções, avaliar fraude e enviar um e-mail de confirmação. Que passos são chamadas síncronas e quais são mensagens? Justifique cada um.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O critério é único: o passo entra no caminho crítico síncrono apenas se a sua resposta alterar a decisão que o utilizador vê agora. Aplicado aos quatro passos, dá dois síncronos e dois assíncronos.</p>
+      <p>Preço é síncrono, sem discussão: o valor apresentado ao utilizador é o valor cobrado, e não se pode confirmar um pedido com um total provisório. Reserva de <em>stock</em> é síncrona na maioria dos retalhos, porque a decisão «aceito ou recuso o pedido» depende dela — mas há uma variante legítima: em catálogos com disponibilidade quase infinita ou com sobrevenda tolerada, a reserva passa a assíncrona e o pedido nasce em estado <code>PENDENTE</code>, com cancelamento compensatório se faltar. Essa escolha é de negócio, não de engenharia, e vale a pena dizê-lo em voz alta.</p>
+      <p>Avaliação de fraude é o caso interessante. Um modelo de risco típico responde em 100 a 400 ms e é o componente com pior disponibilidade da cadeia, muitas vezes externo. A solução habitual é síncrona com <em>timeout</em> agressivo (por exemplo 200 ms) e política de recurso explícita: se o serviço não responder a tempo, o pedido segue em estado de revisão em vez de ser recusado, e a avaliação completa-se depois de forma assíncrona. Assim o pior caso é atrito operacional, não perda de receita.</p>
+      <p>O e-mail é assíncrono sempre. Publica-se <code>PedidoConfirmado</code> e o serviço de notificações trata; se o fornecedor de e-mail estiver em baixo 20 minutos, as mensagens ficam em fila. Pô-lo no caminho crítico é o erro clássico: acrescenta uma dependência externa de 99% a uma operação que gera receita, e o utilizador vê <code>500</code> num pedido que já foi cobrado. O <em>trade-off</em> global: cada passo movido para assíncrono compra disponibilidade e custa consistência imediata e complexidade de compensação — e cada compensação é código que só corre em falha, portanto é código mal testado por omissão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Tudo síncrono, ou tudo assíncrono «porque é mais escalável», sem critério.</td></tr>
+        <tr><td>Mid</td><td>Acerta no e-mail assíncrono mas põe fraude no caminho crítico sem <em>timeout</em> nem recurso.</td></tr>
+        <tr><td>Sénior</td><td>Enuncia o critério (a resposta altera a decisão visível?), aplica-o passo a passo, define <em>timeout</em> e degradação para o passo frágil.</td></tr>
+        <tr><td>Staff</td><td>Marca a reserva de <em>stock</em> como decisão de negócio, quantifica o efeito na disponibilidade composta, e nota que o código de compensação é o menos testado do sistema.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a avaliação de fraude tiver de ser bloqueante por exigência regulatória?»</li>
+      <li>«Que estado do pedido mostra ao utilizador enquanto a reserva é assíncrona?»</li>
+      <li>«Como testa o caminho de compensação em ambiente de pré-produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Enviar e-mail dentro da transacção do pedido.</li>
+      <li>Chamada síncrona a serviço externo sem <em>timeout</em> nem política de recurso.</li>
+      <li>Confundir assíncrono com «chamada síncrona numa <em>thread</em> separada».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-30-7" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um pedido atravessa cinco serviços em cadeia síncrona. O p99 de ponta a ponta subiu de 160 ms para 900 ms e nenhuma equipa reporta degradação nos seus painéis. O que se passa e como investiga?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A explicação mais provável é amplificação de retentativas. Cada serviço tem retentativas «inofensivas» — 3 tentativas com espera — e numa cadeia de cinco isso multiplica: uma degradação ligeira no último serviço gera 3 tentativas do quarto, cada uma das quais é uma tentativa do terceiro, e a carga no fundo da cadeia cresce como 3⁴ = 81 vezes no pior caso. Cada painel individual mostra uma taxa de erro baixa, porque as retentativas acabam por resultar; o que explodiu foi a latência acumulada e a carga no serviço mais fundo.</p>
+      <p>A investigação faz-se por <em>tracing</em> distribuído, e é a única forma. Filtro os traços de ponta a ponta acima do p99 e olho para o histograma de duração por <em>span</em>: se a soma dos <em>spans</em> for muito menor do que a duração total, o tempo está em espera — fila de <em>threads</em>, obtenção de ligação ao <em>pool</em>, ou espera de retentativa. Se um <em>span</em> aparecer repetido com o mesmo identificador lógico, confirma-se a retentativa. Se a soma bater certo mas um serviço no meio da cadeia estiver 5 vezes mais lento, o problema é local desse serviço.</p>
+      <p>As correcções são três, por ordem de eficácia. Primeira, retentativas só na borda mais próxima da causa e nunca em vários níveis para o mesmo erro — quem retenta é quem tem contexto para saber que a operação é idempotente. Segunda, orçamento de retentativas (por exemplo, no máximo 10% do tráfego pode ser retentativa) em vez de contagem fixa, com <em>jitter</em> na espera para evitar sincronização. Terceira, disjuntor por dependência, com <em>timeout</em> por salto derivado do orçamento total: se o orçamento de ponta a ponta é 300 ms e há cinco saltos, nenhum salto pode ter <em>timeout</em> de 2 segundos — a propagação de prazo (<em>deadline propagation</em>) resolve isto melhor do que valores fixos.</p>
+      <p>O que se ganha e o que se perde: reduzir retentativas aumenta a taxa de erro visível durante incidentes pequenos, e há equipas que resistem por isso. É o <em>trade-off</em> correcto — um erro rápido e visível é melhor do que um sistema que se auto-satura. E o sinal de alarme que faltava não era de latência: era a razão entre pedidos recebidos no serviço mais fundo e pedidos que entraram no <em>gateway</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentamos as réplicas» ou «é da base de dados», sem forma de o verificar.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há <em>tracing</em> mas descreve investigação por registos serviço a serviço; não identifica a amplificação.</td></tr>
+        <tr><td>Sénior</td><td>Identifica a multiplicação de retentativas, usa traços para separar espera de trabalho, e propõe retentativa numa só camada com <em>jitter</em> e disjuntor.</td></tr>
+        <tr><td>Staff</td><td>Introduz orçamento de retentativas e propagação de prazo, define a métrica de amplificação como alarme permanente, e aceita a subida da taxa de erro visível como custo consciente.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como propaga o prazo restante entre serviços em Spring Boot?»</li>
+      <li>«Que percentagem de amostragem de traços usaria a 5 000 pedidos por segundo?»</li>
+      <li>«Quando é que retentar é sempre errado?»</li>
+      <li>«Como distingue saturação de <em>pool</em> de lentidão a jusante num traço?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Retentativas em todos os níveis «por robustez».</li>
+      <li>Diagnosticar sistemas distribuídos sem identificador de correlação.</li>
+      <li><em>Timeout</em> por salto maior do que o orçamento de ponta a ponta.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-30-4" class="h2"><span class="secnum">30.4</span> Sagas, compensações e o outbox<a class="anchor" href="#sec-30-4" aria-label="ligação">#</a></h2>
+
+<p>Quando o pedido deixa de caber numa transacção da base de dados, perde-se atomicidade e isolamento. A saga recupera parte disso: a operação de negócio passa a ser uma sequência de transacções locais, cada uma com uma transacção de compensação que desfaz semanticamente o seu efeito. «Semanticamente» é a palavra que importa — não há <em>rollback</em>. Um pagamento autorizado compensa-se com anulação ou estorno, que deixa rasto; uma guia de expedição compensa-se com cancelamento, que pode já ter custo. O sistema fica com atomicidade (todos ou compensação de todos), consistência e durabilidade, mas sem isolamento: estados intermédios são visíveis, e o desenho tem de os assumir explicitamente.</p>
+
+<p>Antes da saga há um problema mais elementar e mais fatal: a escrita dupla. Guardar o pedido em PostgreSQL e a seguir publicar em Kafka são duas operações sem transacção comum. Se o processo morre entre as duas, ou a base tem o pedido e ninguém sabe, ou — pior, se a ordem for invertida — o evento existe para um pedido que não existe. Não há ordem correcta, não há bloco <code>try/catch</code> que resolva, e o <code>@Transactional</code> do Spring não abrange o <em>broker</em>. A solução é o padrão <em>transactional outbox</em>: numa única transacção local escreve-se o estado e a mensagem numa tabela de saída; um processo separado — sondagem da tabela ou captura de alterações (<em>change data capture</em>, com Debezium a ler o registo de escrita antecipada do PostgreSQL) — publica a partir daí.</p>
+
+<p>O outbox garante entrega pelo menos uma vez, nunca exactamente uma vez. Logo, todo o consumidor tem de ser idempotente, e a idempotência tem de ser feita com estado persistido, não com uma cache: uma tabela <code>processed_message</code> com chave primária <code>(consumidor, event_id)</code>, escrita na mesma transacção do efeito, transforma o duplicado num <em>no-op</em> por violação de chave. Verificar «se já existe» antes de escrever, em transacções separadas, não é idempotência — é uma condição de corrida com janela pequena.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 30.2</span> Saga coreografada e saga orquestrada.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th>Coreografada (eventos)</th><th>Orquestrada (coordenador)</th></tr></thead><tbody>
+<tr><td>Onde vive a sequência</td><td>Implícita, espalhada pelos serviços</td><td>Explícita, numa máquina de estados</td></tr>
+<tr><td>Acoplamento</td><td>Baixo entre serviços; alto ao esquema dos eventos</td><td>Serviços ignoram-se; acoplam ao orquestrador</td></tr>
+<tr><td>Depurar «onde parou o pedido»</td><td>Só com <em>tracing</em>; sem estado central</td><td>Consulta a uma tabela de estado</td></tr>
+<tr><td>Passos</td><td>Bom até 3-4; acima disso vira teia</td><td>Bom para 5 ou mais e ramificações</td></tr>
+<tr><td>Risco típico</td><td>Ciclos de eventos e sequência que ninguém sabe explicar</td><td>Orquestrador vira monólito com lógica de negócio dos outros</td></tr>
+<tr><td>Compensação</td><td>Cada serviço reage a evento de falha</td><td>O coordenador emite compensações por ordem inversa</td></tr>
+</tbody></table></div></div>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>A saga orquestrada centraliza a sequência e torna trivial responder a «em que passo está o pedido 4711?» — a consulta é uma linha numa tabela. Paga-se com um componente que conhece o fluxo de negócio de quatro equipas e que, sem disciplina, absorve regras que não lhe pertencem. A regra que mantém o orquestrador saudável: ele decide a ordem dos passos e as compensações, nunca as regras internas de cada passo (não sabe o que torna um pagamento válido, só se foi autorizado ou recusado).</p></aside>
+
+<div class="qa" id="q-30-8" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Configure-me um produtor que não pode perder mensagens e explique cada valor: <code>acks</code>, <code>min.insync.replicas</code>, <code>enable.idempotence</code> e <code>max.in.flight.requests.per.connection</code>.</div>
+  <div class="qprompt">Saga coreografada ou orquestrada para um fluxo de pedido com cinco passos e duas ramificações? Escolha e diga o que o faria mudar de ideias.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>acks=all</code> com <code>min.insync.replicas=2</code> e <code>replication.factor=3</code>, <code>enable.idempotence=true</code>, <code>max.in.flight.requests.per.connection=5</code>, <code>delivery.timeout.ms=120000</code> e tratamento explícito do resultado do <code>send()</code>.</p>
-      <p><code>acks=all</code> faz o <em>leader</em> só responder depois de todas as réplicas em ISR terem o registo. O par <code>min.insync.replicas=2</code> é o que dá significado a isso: define o mínimo de réplicas sincronizadas para a escrita ser aceite. Com 3 réplicas e mínimo 2, o sistema tolera a perda de um <em>broker</em> mantendo escritas; ao perder dois, recusa escritas em vez de aceitar dados que sobrevivem numa única cópia. É uma escolha deliberada de consistência sobre disponibilidade de escrita — a mesma família de decisão que se toma em qualquer sistema de quórum.</p>
-      <p><code>enable.idempotence=true</code> ataca outro problema: a retentativa. Se o <em>broker</em> gravou o registo mas a confirmação se perdeu na rede, o produtor reenvia e sem idempotência ficam dois registos. Com idempotência, o produtor identifica-se por PID e numera as mensagens por partição; o <em>broker</em> guarda a última sequência e descarta repetições. É também o que permite manter <code>max.in.flight</code> em 5: o <em>broker</em> aceita fora de ordem dentro da janela e reordena pela sequência. Sem idempotência, garantir ordem obriga a <code>max.in.flight=1</code>, o que corta o débito por partição em várias vezes por causa do custo de ida e volta.</p>
-      <p>O que fica de fora: nenhuma destas opções protege contra a perda no lado da aplicação antes do <code>send()</code>. Se o processo cair depois de gravar no PostgreSQL e antes de publicar, o evento nunca existiu — por isso a configuração correcta do produtor é condição necessária mas não suficiente, e a peça que falta é o <em>outbox</em>. O custo de <code>acks=all</code> é latência: espera-se pela replicação, tipicamente 2 a 10 ms adicionais dentro da mesma região, muito mais entre regiões. Em telemetria de baixo valor, <code>acks=1</code> continua a ser uma escolha razoável; em pagamentos, nunca.</p></div>
+      <p>Com cinco passos e ramificações, orquestrada. O ponto de viragem, na minha experiência, está por volta dos três ou quatro passos: abaixo disso a coreografia é mais simples e mais barata; acima, a sequência deixa de estar escrita em lado nenhum e a única forma de a reconstruir é ler o código de cinco serviços à procura de quem consome que evento.</p>
+      <p>O argumento decisivo não é elegância, é operação. Às três da manhã, com um cliente ao telefone, a pergunta é «onde está o pedido 4711 e porquê». Com orquestração, é <code>SELECT step, status, compensating FROM saga_state WHERE order_id = ?</code>. Com coreografia, é reconstruir a história a partir de traços e de tópicos, o que só funciona se o <em>tracing</em> estiver completo e a retenção do Kafka cobrir a janela. Ramificações agravam isto: «se o valor for superior a 1 000 EUR, passa por revisão manual» é uma condição que, coreografada, fica escondida num consumidor.</p>
+      <p>O que me faria mudar de ideias: se os cinco passos pertencerem a cinco equipas com autonomia forte e o fluxo mudar raramente, a coreografia evita o comité permanente à volta do orquestrador — que passa a exigir alteração coordenada sempre que qualquer equipa muda um passo. E se o fluxo for genuinamente de reacção («quando um pedido é pago, quem quiser que reaja»), a coreografia é a modelação correcta, porque não há sequência a impor: há um facto publicado.</p>
+      <p>Em ambos os casos há invariantes que não mudam: passos idempotentes, compensações idempotentes, prazo por passo com transição para estado de falha, e estado da saga persistido — mesmo na coreografia, mantenho uma projecção de estado só para leitura, alimentada pelos eventos, porque a alternativa é não ter resposta operacional. Não uso XA nem <em>two-phase commit</em>: o bloqueio de recursos durante a espera pelo coordenador é incompatível com os débitos deste tipo de fluxo, e o Kafka não participa em XA de forma útil.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Só <code>acks=all</code>, ou confunde <code>acks</code> com número de réplicas.</td></tr>
-        <tr><td>Mid</td><td>Enumera as opções certas mas não liga <code>acks=all</code> a <code>min.insync.replicas</code>.</td></tr>
-        <tr><td>Sénior</td><td>Explica o quórum, a relação idempotência ↔ <code>max.in.flight</code>, e o custo em latência.</td></tr>
-        <tr><td>Staff</td><td>Aponta o buraco antes do <code>send()</code> (dupla escrita), define orçamento de <code>delivery.timeout.ms</code> e diz qual é a métrica que prova que não se está a perder nada.</td></tr>
+        <tr><td>Insuficiente</td><td>Propõe transacção distribuída com <em>two-phase commit</em>, ou não distingue os dois estilos.</td></tr>
+        <tr><td>Mid</td><td>Descreve correctamente os dois estilos mas escolhe por preferência estética, sem critério de número de passos nem de operação.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe orquestração pelo argumento operacional, dá o ponto de viragem, e enuncia os invariantes comuns (idempotência, prazos, estado persistido).</td></tr>
+        <tr><td>Staff</td><td>Identifica o custo organizacional do orquestrador, o caso em que a coreografia é a modelação certa, e mantém projecção de estado mesmo na coreografia.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que acontece quando o ISR desce a 1?»</li>
-      <li>«Porque é que 5 é seguro para <code>max.in.flight</code> e 6 não?»</li>
-      <li>«<code>retries</code> muito alto pode ser mau? Porquê?»</li>
-      <li>«Como é que <code>linger.ms</code> interage com a latência p99?»</li></ul></div>
+      <li>«E se a compensação do passo 2 falhar repetidamente?»</li>
+      <li>«Como evita que o orquestrador acumule regras de negócio dos outros serviços?»</li>
+      <li>«Que prazo põe em cada passo e o que acontece quando expira?»</li>
+      <li>«Porque não XA?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><code>acks=all</code> com <code>min.insync.replicas=1</code>, achando que está protegido.</li>
-      <li>Ignorar o resultado assíncrono do <code>send()</code>.</li>
-      <li>Não saber que a idempotência do produtor é por sessão e por partição, não global.</li></ul></div>
+      <li>Achar que a saga dá isolamento e que estados intermédios não são visíveis.</li>
+      <li>Compensações sem idempotência.</li>
+      <li>Não ter forma de responder a «em que passo está este pedido».</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-30-6" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+<div class="qa" id="q-30-9" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O método <code>criarEncomenda</code> grava no PostgreSQL e a seguir faz <code>kafkaTemplate.send()</code>, tudo dentro de <code>@Transactional</code>. Que problemas vê e como o resolve?</div>
+  <div class="qprompt">Este código faz <code>orderRepository.save(order)</code> e a seguir <code>kafkaTemplate.send(&quot;orders&quot;, event)</code> dentro de um método <code>@Transactional</code>. Que problema tem e como o resolve?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>É uma dupla escrita: duas operações em sistemas diferentes sem transacção comum. O <code>@Transactional</code> não abrange o Kafka, portanto há dois modos de falha simétricos. Se o <code>send()</code> tiver sucesso e a transacção fizer <em>rollback</em>, o mundo recebe um evento de uma encomenda que não existe. Se a transacção fizer <em>commit</em> e o <code>send()</code> falhar — ou o processo cair no intervalo — a encomenda existe e ninguém a jusante sabe. Nenhuma retentativa dentro do método corrige isto, porque o processo pode desaparecer entre as duas linhas.</p>
-      <p>A solução padrão é o <em>outbox</em> transaccional. Na mesma transacção que grava a encomenda, insere-se uma linha numa tabela <code>outbox(id, aggregate_id, tipo, payload, created_at, published_at)</code>. Como está na mesma transacção da base de dados, ou existem ambos ou nenhum. Um publicador separado — um <em>scheduler</em> a ler lotes com <code>FOR UPDATE SKIP LOCKED</code>, ou <em>change data capture</em> com Debezium a ler o WAL — publica no Kafka e marca a linha. A garantia resultante é <em>at-least-once</em>: uma queda entre publicar e marcar repete o evento, e é por isso que o <code>id</code> da linha do <em>outbox</em> tem de ser a chave de deduplicação enviada no evento.</p>
-      <p>A escolha entre <em>polling</em> e CDC é operacional. O <em>polling</em> tem latência de metade a um intervalo (com 200 ms de período, p99 na ordem de 250 a 400 ms), custa uma consulta indexada por ciclo e não precisa de infraestrutura nova; escala bem até dezenas de milhares de eventos por minuto se a consulta usar um índice parcial em <code>published_at IS NULL</code>. O CDC dá latência de dezenas de milissegundos, não gera carga de leitura na tabela quente e sobrevive a picos, mas acrescenta Debezium e Kafka Connect ao inventário de coisas que a equipa tem de operar e monitorizar.</p>
-      <p>Há uma variante ligeira que resolve metade do problema com uma linha de código: publicar num <em>listener</em> de <code>AFTER_COMMIT</code>, com <code>@TransactionalEventListener</code>. Elimina o cenário «evento sem encomenda», que é o pior dos dois, mas mantém «encomenda sem evento» se o processo cair depois do <em>commit</em>. É aceitável em fluxos onde o consumidor pode reconciliar por consulta periódica; não é aceitável quando o evento é a única fonte de verdade a jusante.</p></div>
+      <p>Tem o problema da escrita dupla: duas escritas em sistemas diferentes sem transacção comum. O <code>@Transactional</code> cobre a base de dados e não cobre o Kafka. Se o processo morrer entre a publicação e o <em>commit</em>, há um evento para um pedido que nunca existiu; se o <em>commit</em> passar e a publicação falhar, o pedido existe e ninguém a jusante o sabe. A janela é pequena — talvez alguns milissegundos — mas a 500 pedidos por segundo, alguns milissegundos por dia dão dezenas de incidentes por ano.</p>
+      <p>A solução é o outbox transaccional. Na mesma transacção que grava o pedido, insere-se uma linha numa tabela <code>outbox</code> com o tipo de evento, o identificador do agregado, um <code>event_id</code> único e a carga em <code>jsonb</code>. Ou tudo é gravado, ou nada — é uma transacção local do PostgreSQL. Um publicador separado lê o outbox e envia para o Kafka.</p>
+      <p>Há duas variantes do publicador. Sondagem: um trabalho a cada 200 ms a fazer <code>SELECT ... WHERE published_at IS NULL ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED</code>, publicar e marcar. É simples, não exige infra-estrutura nova, e custa latência de publicação da ordem da metade do intervalo de sondagem, mais carga constante na base. Captura de alterações: o Debezium lê o registo de escrita antecipada através de uma <em>slot</em> de replicação lógica e publica sem tocar na tabela; a latência cai para dezenas de milissegundos e a carga de leitura desaparece, mas acrescenta Kafka Connect ao inventário operacional e a <em>slot</em> de replicação torna-se um risco — se o consumidor parar, o PostgreSQL retém segmentos do registo e o disco enche.</p>
+      <p>Nos dois casos a entrega é pelo menos uma vez: o publicador pode publicar e falhar antes de marcar. Por isso o <code>event_id</code> viaja no cabeçalho da mensagem e o consumidor desduplica com uma tabela de mensagens processadas, escrita na mesma transacção do efeito. A alternativa que costuma ser proposta — <code>TransactionSynchronization</code> a publicar depois do <em>commit</em> — é melhor do que publicar dentro da transacção, mas continua a perder eventos se o processo morrer imediatamente depois do <em>commit</em>. Só o outbox torna a mensagem tão durável quanto o estado.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não vê problema, ou propõe «try/catch com retry» dentro do método.</td></tr>
-        <tr><td>Mid</td><td>Identifica a dupla escrita e propõe publicar após o <em>commit</em>, sem ver o caso de queda do processo.</td></tr>
-        <tr><td>Sénior</td><td>Propõe <em>outbox</em> na mesma transacção, explica <em>at-least-once</em> e liga o identificador do <em>outbox</em> à deduplicação no consumidor.</td></tr>
-        <tr><td>Staff</td><td>Compara <em>polling</em> com <code>SKIP LOCKED</code> e CDC com números de latência e custo operacional, e discute ordem de publicação e limpeza da tabela.</td></tr>
+        <tr><td>Insuficiente</td><td>«Basta pôr o <code>send</code> antes do <code>save</code>» ou envolver tudo num <code>try/catch</code>.</td></tr>
+        <tr><td>Mid</td><td>Reconhece o risco e propõe publicar depois do <em>commit</em>, sem notar que a janela de perda continua a existir.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia a escrita dupla, propõe outbox, descreve a publicação com <code>SKIP LOCKED</code> e exige idempotência a jusante.</td></tr>
+        <tr><td>Staff</td><td>Compara sondagem e captura de alterações com latência e custo operacional, e identifica o risco da <em>slot</em> de replicação e da retenção do registo de escrita antecipada.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O <em>outbox</em> garante ordem entre eventos do mesmo agregado?»</li>
-      <li>«Porquê <code>SKIP LOCKED</code> e não um <code>SELECT</code> normal?»</li>
-      <li>«Como impede a tabela de crescer indefinidamente?»</li>
-      <li>«Que acontece se o publicador correr em três pods ao mesmo tempo?»</li></ul></div>
+      <li>«O outbox garante ordem por agregado? Como?»</li>
+      <li>«Como limpa a tabela de outbox sem afectar as escritas?»</li>
+      <li>«O que acontece se a <em>slot</em> de replicação ficar parada 6 horas?»</li>
+      <li>«E se o consumidor precisar de exactamente uma vez?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor XA ou <em>two-phase commit</em> entre PostgreSQL e Kafka como solução prática.</li>
-      <li>Achar que o <em>outbox</em> dá <em>exactly-once</em>.</li>
-      <li>Publicar dentro da transacção e depender do <em>rollback</em> para «desfazer» o envio.</li></ul></div>
+      <li>Acreditar que o <code>@Transactional</code> abrange o <em>broker</em>.</li>
+      <li>Prometer entrega exactamente uma vez de ponta a ponta sem desduplicação.</li>
+      <li>Outbox sem índice sobre as linhas por publicar, com varrimento sequencial a cada sondagem.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-30-10" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O consumidor de <code>payment.authorized</code> debita a conta do cliente. Depois de um reequilíbrio de partições, alguns clientes foram debitados duas vezes. Explique porquê e como o corrige.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o Kafka entrega pelo menos uma vez e o consumidor não é idempotente. Num reequilíbrio, as partições passam para outro consumidor a partir do último deslocamento confirmado; tudo o que foi processado depois dessa confirmação é reprocessado. Se o efeito for um <code>UPDATE contas SET saldo = saldo - 50</code>, o reprocessamento debita outra vez. O problema não é do Kafka: é do consumidor assumir entrega exactamente uma vez.</p>
+      <p>A correcção é desduplicação com estado persistido e atómico face ao efeito. Cada evento carrega um <code>event_id</code> estável, gerado pelo produtor e gravado no outbox — nunca derivado do deslocamento, porque o deslocamento muda se o tópico for reprocessado ou migrado. O consumidor abre uma transacção, tenta <code>INSERT INTO processed_message (consumer, event_id) VALUES (?, ?)</code>, e se apanhar violação de chave primária termina sem efeito; se passar, aplica o débito e confirma a transacção. Como o registo de desduplicação e o efeito estão na mesma transacção local, não há janela de falha entre eles.</p>
+      <p>A alternativa melhor, quando o domínio permite, é tornar o efeito naturalmente idempotente: em vez de decrementar, escrever um lançamento no livro-razão com chave única <code>(conta, event_id)</code> e derivar o saldo por soma ou por uma coluna materializada actualizada no mesmo <code>INSERT</code>. Isto tem a vantagem de dar auditoria de graça e de não precisar de tabela auxiliar. Onde não é possível — chamadas a sistemas externos — usa-se a chave de idempotência do fornecedor, que a maioria das gateways de pagamento aceita num cabeçalho.</p>
+      <p>Duas notas de custo. A tabela de desduplicação cresce com o débito: a 2 000 eventos por segundo são 173 milhões de linhas por dia, por isso precisa de retenção — apagar acima de 7 dias, valor que deve cobrir com folga a retenção do tópico, porque um evento reprocessado depois disso volta a passar. Há aqui uma tensão real: particionar por data tornaria a limpeza um <code>DROP</code> de partição em vez de um <code>DELETE</code> massivo, mas obrigaria a incluir a data na chave primária, e a unicidade deixaria de valer entre partições. A escolha honesta é manter a chave em <code>(consumidor, event_id)</code> e purgar por lotes com <code>DELETE ... WHERE processed_at &lt; ? LIMIT 10000</code>. E não confundir isto com as transacções do Kafka: o modo <em>exactly once</em> do Kafka cobre ler-processar-escrever dentro do Kafka, não o efeito na base de dados externa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Configuramos exactamente uma vez no Kafka» ou «confirmamos o deslocamento antes de processar».</td></tr>
+        <tr><td>Mid</td><td>Propõe verificar se já foi processado, mas em transacção separada do efeito, ou numa cache em memória.</td></tr>
+        <tr><td>Sénior</td><td>Identifica a entrega pelo menos uma vez, usa <code>event_id</code> do produtor e desduplicação na mesma transacção do efeito.</td></tr>
+        <tr><td>Staff</td><td>Prefere efeito naturalmente idempotente (livro-razão com chave única), trata retenção e partição da tabela de desduplicação, e delimita o alcance real do modo transaccional do Kafka.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque não usar o deslocamento como chave de desduplicação?»</li>
+      <li>«Como garante ordem por cliente durante o reequilíbrio?»</li>
+      <li>«E se o efeito for uma chamada HTTP a um sistema que não aceita chave de idempotência?»</li>
+      <li>«Quanto tempo guarda os registos de desduplicação e porquê esse valor?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Desduplicar com <code>Set</code> em memória ou cache sem persistência.</li>
+      <li>Confirmar o deslocamento antes de o efeito estar durável.</li>
+      <li>Tabela de desduplicação sem política de retenção.</li></ul></div>
   </div>
 </div>
 
 <div class="lab" id="lab-30-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 30.1 — Outbox transaccional com consumidor idempotente</span>
-    <div class="labpills"><span class="qpill">Spring Boot 3.5</span><span class="qpill">35 min</span></div></div>
+  <div class="labhead"><span class="labttl">Exercício 30.1 — Saga do pedido: compensações, pontos de falha e outbox</span>
+    <div class="labpills"><span class="qpill">Desenho + código</span><span class="qpill">35 min</span></div></div>
   <div class="labbody">
-    <p>Implemente o caminho completo de um evento <code>EncomendaCriada</code> sem dupla escrita e sem efeitos duplicados. Requisitos: (1) gravar a encomenda e o evento numa única transacção de base de dados; (2) um publicador que envia lotes para o tópico <code>encomendas.v1</code>, com chave igual ao <code>aggregateId</code>, tolerante a múltiplas instâncias em simultâneo; (3) um consumidor com <em>commit</em> manual que credita o comerciante exactamente uma vez, mesmo que a mesma mensagem chegue três vezes. Assuma PostgreSQL 17, <code>acks=all</code> e <em>at-least-once</em>. Entrada: uma chamada a <code>criar(...)</code>. Saída esperada: uma linha em <code>encomenda</code>, um registo no tópico, um crédito no razão — e, com três entregas da mesma mensagem, ainda um só crédito.</p>
+    <p>Um pedido de comércio electrónico envolve quatro serviços: <code>orders</code> (dono do pedido), <code>inventory</code> (reserva de <em>stock</em>), <code>payments</code> (autorização) e <code>shipping</code> (guia de expedição). Não há transacção distribuída. Pede-se: (1) desenhar a saga orquestrada com os passos e as compensações correspondentes; (2) enumerar os pontos de falha e o mecanismo que cobre cada um; (3) escrever o esquema da tabela de outbox e das tabelas de apoio; (4) escrever o orquestrador em Java 21 com Spring Boot 3.x, incluindo a escrita transaccional no outbox, o publicador e o consumidor idempotente. Restrições: PostgreSQL 17, Kafka, entrega pelo menos uma vez, prazo de 30 s por passo, e a resposta a «em que passo está o pedido X?» tem de ser uma consulta. Exemplo: pedido de 89,90 EUR, 3 unidades de SKU-42; o pagamento é recusado no passo 3 — o sistema tem de libertar a reserva e deixar o pedido em <code>CANCELLED</code>.</p>
     <h4>A sua solução</h4>
     <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
     <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-30-2"><div class="lhead"><span class="lnum">Listagem 30.2</span>
-        <span class="lcap">Outbox transaccional, publicador com SKIP LOCKED e consumidor idempotente.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>// ---------- 1. Escrita: estado e evento na MESMA transaccao ----------
+      <figure class="listing text" id="lst-30-3"><div class="lhead"><span class="lnum">Listagem 30.3</span>
+        <span class="lcap">Saga do pedido: caminho feliz, compensações por ordem inversa e pontos de falha.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>  CAMINHO FELIZ                                COMPENSAÇÃO (ordem inversa)
+  ───────────────────────────────────────      ─────────────────────────────────────
+  T1  orders     criar pedido PENDING          C1  orders     marcar CANCELLED
+  T2  inventory  reservar 3 un. SKU-42         C2  inventory  libertar reserva
+  T3  payments   autorizar 89,90 EUR           C3  payments   anular ou estornar
+  T4  shipping   criar guia de expedição       C4  shipping   cancelar guia
+  T5  orders     marcar CONFIRMED              —   (nada a compensar)
+
+  Falha em T3  ──▶  executar C2, depois C1  ──▶  pedido CANCELLED, stock livre
+
+  PONTOS DE FALHA E COBERTURA
+  ───────────────────────────────────────────────────────────────────────────────
+  F1  processo morre entre o commit local e a publicação no broker
+      ▶ outbox: estado + mensagem na MESMA transacção; publicador separado
+  F2  broker entrega a mesma mensagem duas vezes (rebalance, retentativa)
+      ▶ processed_message (consumer, event_id) na MESMA transacção do efeito
+  F3  payments responde 504: resposta desconhecida, pode ter cobrado
+      ▶ nunca compensar às cegas; consultar por chave de idempotência e só
+        depois decidir entre repetir e estornar
+  F4  a compensação falha (inventory em baixo durante C2)
+      ▶ saga fica em COMPENSATING com retentativa e backoff exponencial;
+        ao fim de N tentativas ▶ fila de mensagens mortas + alarme humano
+  F5  o passo nunca responde (mensagem perdida ou consumidor parado)
+      ▶ prazo de 30 s por passo; varredura periódica sobre saga_state
+        promove a saga para COMPENSATING
+  F6  estado intermédio visível: o cliente vê PENDING com stock reservado
+      ▶ a saga não dá isolamento; estados intermédios fazem parte do
+        contrato de UI e do relatório financeiro
+  F7  duas instâncias do orquestrador tratam a mesma saga em simultâneo
+      ▶ bloqueio optimista por coluna version em saga_state (+ chave de
+        partição do Kafka = order_id, para ordem por agregado)</code></pre></figure>
+      <figure class="listing sql" id="lst-30-4"><div class="lhead"><span class="lnum">Listagem 30.4</span>
+        <span class="lcap">Esquema: outbox, desduplicação e estado da saga (PostgreSQL 17).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="sql"><code>-- Mensagens a publicar. Escritas na MESMA transacção que muda o estado.
+CREATE TABLE outbox (
+  id             BIGINT        GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  aggregate_type TEXT          NOT NULL,          -- &quot;order&quot;
+  aggregate_id   UUID          NOT NULL,          -- chave de partição do Kafka
+  event_type     TEXT          NOT NULL,          -- &quot;payment.authorize.requested&quot;
+  event_id       UUID          NOT NULL UNIQUE,   -- viaja no cabeçalho; desdup a jusante
+  payload        JSONB         NOT NULL,
+  created_at     TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  published_at   TIMESTAMPTZ                       -- NULL enquanto não publicado
+);
+
+-- Índice parcial: só as linhas por publicar. Mantém-se pequeno mesmo com
+-- 100 M de linhas históricas, porque só indexa published_at IS NULL.
+CREATE INDEX outbox_pending_idx ON outbox (id) WHERE published_at IS NULL;
+
+-- Desduplicação do consumidor. Escrita na MESMA transacção do efeito.
+-- A chave primária é (consumer, event_id): é ela que torna o duplicado um no-op.
+CREATE TABLE processed_message (
+  consumer     TEXT        NOT NULL,
+  event_id     UUID        NOT NULL,
+  processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer, event_id)
+);
+
+-- Purga por lotes; particionar por data exigiria pôr processed_at na chave,
+-- o que deixaria de garantir unicidade entre partições. Ver notas abaixo.
+CREATE INDEX processed_message_age_idx ON processed_message (processed_at);
+
+-- Estado da saga: responde a &quot;em que passo está o pedido X?&quot; com uma consulta.
+CREATE TABLE saga_state (
+  saga_id      UUID        PRIMARY KEY,
+  order_id     UUID        NOT NULL UNIQUE,
+  step         TEXT        NOT NULL,   -- STOCK_RESERVED, PAYMENT_PENDING, ...
+  status       TEXT        NOT NULL,   -- RUNNING, COMPENSATING, DONE, FAILED
+  attempts     INT         NOT NULL DEFAULT 0,
+  deadline_at  TIMESTAMPTZ NOT NULL,   -- prazo do passo actual
+  last_error   TEXT,
+  version      INT         NOT NULL DEFAULT 0,    -- bloqueio optimista
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Varredura de prazos expirados: alimenta o compensador.
+CREATE INDEX saga_deadline_idx ON saga_state (deadline_at)
+  WHERE status IN ('RUNNING', 'COMPENSATING');</code></pre></figure>
+      <figure class="listing java" id="lst-30-5"><div class="lhead"><span class="lnum">Listagem 30.5</span>
+        <span class="lcap">Orquestrador, publicador do outbox e consumidor idempotente (Spring Boot 3.x).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// ---------- 1. Orquestrador: estado + mensagem na mesma transacção ----------
 @Service
-class ServicoEncomendas {
-    private final EncomendaRepo encomendas;
-    private final OutboxRepo outbox;
-    private final ObjectMapper json;
+public class OrderSaga {
 
-    @Transactional
-    public UUID criar(NovaEncomenda cmd) {
-        Encomenda e = encomendas.save(Encomenda.nova(cmd));
-        outbox.save(new OutboxEvento(
-                UUID.randomUUID(),          // eventId: chave de deduplicacao a jusante
-                e.getId().toString(),       // aggregateId: sera a chave da particao
-                "EncomendaCriada",
-                json.writeValueAsString(EncomendaCriada.de(e))));
-        return e.getId();                   // rollback aqui apaga encomenda E evento
+  private static final List&lt;String&gt; FORWARD =
+      List.of(&quot;RESERVE_STOCK&quot;, &quot;AUTHORIZE_PAYMENT&quot;, &quot;CREATE_SHIPMENT&quot;, &quot;CONFIRM&quot;);
+
+  private final OrderRepository orders;
+  private final SagaStateRepository sagas;
+  private final OutboxRepository outbox;
+  private final ObjectMapper json;
+
+  public OrderSaga(OrderRepository o, SagaStateRepository s,
+                   OutboxRepository ob, ObjectMapper j) {
+    this.orders = o; this.sagas = s; this.outbox = ob; this.json = j;
+  }
+
+  /** T1: cria o pedido e pede a reserva. Uma só transacção local. */
+  @Transactional
+  public UUID start(OrderRequest req) {
+    Order order = orders.save(Order.pending(req));
+    sagas.save(SagaState.running(order.id(), &quot;RESERVE_STOCK&quot;, Duration.ofSeconds(30)));
+    emit(order.id(), &quot;inventory.reserve.requested&quot;,
+         new ReserveStock(order.id(), req.sku(), req.quantity()));
+    return order.id();
+  }
+
+  /** Avança ou compensa consoante a resposta do passo. */
+  @Transactional
+  public void onStepResult(UUID orderId, String step, boolean ok, String error) {
+    SagaState saga = sagas.findByOrderIdForUpdate(orderId).orElseThrow();
+    if (saga.isTerminal() || !step.equals(saga.step())) return;  // fora de ordem: ignorar
+
+    if (!ok) { startCompensation(saga, error); return; }
+
+    int next = FORWARD.indexOf(step) + 1;
+    if (next == FORWARD.size()) {
+      orders.confirm(orderId);
+      saga.finish(&quot;DONE&quot;);
+      emit(orderId, &quot;order.confirmed&quot;, new OrderConfirmed(orderId));
+    } else {
+      String nextStep = FORWARD.get(next);
+      saga.advance(nextStep, Duration.ofSeconds(30));
+      emit(orderId, requestTopicFor(nextStep), commandFor(nextStep, orderId));
     }
+    sagas.save(saga);   // version++ ▶ ObjectOptimisticLockingFailureException se houver corrida
+  }
+
+  /** Compensações pela ordem inversa dos passos já concluídos. */
+  private void startCompensation(SagaState saga, String error) {
+    saga.startCompensating(error);
+    for (String done : saga.completedStepsReversed()) {
+      switch (done) {
+        case &quot;CREATE_SHIPMENT&quot;   -&gt; emit(saga.orderId(), &quot;shipping.cancel.requested&quot;,
+                                        new CancelShipment(saga.orderId()));
+        case &quot;AUTHORIZE_PAYMENT&quot; -&gt; emit(saga.orderId(), &quot;payment.void.requested&quot;,
+                                        new VoidPayment(saga.orderId()));
+        case &quot;RESERVE_STOCK&quot;     -&gt; emit(saga.orderId(), &quot;inventory.release.requested&quot;,
+                                        new ReleaseStock(saga.orderId()));
+        default -&gt; { }
+      }
+    }
+    orders.cancel(saga.orderId(), error);
+    sagas.save(saga);
+  }
+
+  /** Nunca chamar kafkaTemplate.send() aqui: só INSERT no outbox. */
+  private void emit(UUID aggregateId, String type, Object payload) {
+    outbox.save(new OutboxRecord(&quot;order&quot;, aggregateId, type,
+        UUID.randomUUID(), json.valueToTree(payload)));
+  }
 }
 
-// ---------- 2. Publicador: lotes, seguro com N instancias ----------
-public interface OutboxRepo extends JpaRepository&lt;OutboxEvento, UUID&gt; {
-    @Query(value = """
-        SELECT * FROM outbox
-        WHERE published_at IS NULL
-        ORDER BY created_at
-        FOR UPDATE SKIP LOCKED
-        LIMIT :lote
-        """, nativeQuery = true)
-    List&lt;OutboxEvento&gt; reservarLote(@Param("lote") int lote);
-}
-
+// ---------- 2. Publicador: lote com SKIP LOCKED, seguro com N instâncias ----------
 @Component
-class PublicadorOutbox {
-    private final OutboxRepo outbox;
-    private final KafkaTemplate&lt;String, String&gt; kafka;
+public class OutboxPublisher {
 
-    @Scheduled(fixedDelay = 200)
-    @Transactional                       // o lock de SKIP LOCKED dura ate ao commit
-    public void publicar() {
-        List&lt;OutboxEvento&gt; lote = outbox.reservarLote(200);
-        if (lote.isEmpty()) return;
-        List&lt;CompletableFuture&lt;?&gt;&gt; envios = new ArrayList&lt;&gt;(lote.size());
-        for (OutboxEvento ev : lote) {
-            ProducerRecord&lt;String, String&gt; r =
-                new ProducerRecord&lt;&gt;("encomendas.v1", ev.getAggregateId(), ev.getPayload());
-            r.headers().add("eventId", ev.getId().toString().getBytes(UTF_8));
-            r.headers().add("tipo", ev.getTipo().getBytes(UTF_8));
-            envios.add(kafka.send(r));   // NUNCA ignorar o futuro devolvido
-        }
-        CompletableFuture.allOf(envios.toArray(CompletableFuture[]::new))
-                         .join();        // falha aqui = rollback = lote reenviado depois
-        lote.forEach(ev -&gt; ev.setPublishedAt(Instant.now()));
-        outbox.saveAll(lote);            // at-least-once: pode repetir, nunca perde
+  private final JdbcClient db;
+  private final KafkaTemplate&lt;String, byte[]&gt; kafka;
+
+  @Scheduled(fixedDelay = 200)
+  @Transactional
+  public void publishBatch() {
+    List&lt;OutboxRow&gt; batch = db.sql(&quot;&quot;&quot;
+        SELECT id, aggregate_id, event_type, event_id, payload
+          FROM outbox
+         WHERE published_at IS NULL
+         ORDER BY id
+         LIMIT 500
+           FOR UPDATE SKIP LOCKED
+        &quot;&quot;&quot;).query(OutboxRow.class).list();
+
+    for (OutboxRow r : batch) {
+      var record = new ProducerRecord&lt;String, byte[]&gt;(
+          topicOf(r.eventType()), r.aggregateId().toString(), r.payload());
+      record.headers().add(&quot;event-id&quot;, r.eventId().toString().getBytes(UTF_8));
+      record.headers().add(&quot;event-type&quot;, r.eventType().getBytes(UTF_8));
+      kafka.send(record).join();          // falha ▶ rollback ▶ republica no próximo ciclo
+      db.sql(&quot;UPDATE outbox SET published_at = now() WHERE id = ?&quot;)
+        .param(r.id()).update();
     }
+  }
 }
 
-// ---------- 3. Consumidor: commit manual + efeito idempotente ----------
+// ---------- 3. Consumidor idempotente: desduplicação na transacção do efeito ----------
 @Component
-class ConsumidorEncomendas {
-    private final JdbcClient db;
+public class PaymentEventsConsumer {
 
-    @KafkaListener(topics = "encomendas.v1", groupId = "razao-v1")
-    @Transactional                        // transaccao APENAS da base de dados
-    public void tratar(ConsumerRecord&lt;String, String&gt; rec, Acknowledgment ack) {
-        String eventId = new String(rec.headers().lastHeader("eventId").value(), UTF_8);
+  private static final String CONSUMER = &quot;orders.payment-events&quot;;
 
-        int novo = db.sql("""
-                INSERT INTO evento_processado (event_id, consumer_group, processed_at)
-                VALUES (?, 'razao-v1', now())
-                ON CONFLICT (event_id, consumer_group) DO NOTHING
-                """).params(eventId).update();
+  private final JdbcClient db;
+  private final OrderSaga saga;
 
-        if (novo == 1) {                  // primeira vez: aplica o efeito
-            creditar(rec.value());        // mesma transaccao do INSERT acima
-        }                                 // repeticao: nada a fazer, so confirma
-        ack.acknowledge();                // commit do offset SO depois do efeito
-    }
+  @KafkaListener(topics = &quot;payment.events&quot;, groupId = CONSUMER)
+  @Transactional
+  public void onMessage(ConsumerRecord&lt;String, byte[]&gt; rec) {
+    UUID eventId = UUID.fromString(new String(
+        rec.headers().lastHeader(&quot;event-id&quot;).value(), UTF_8));
+
+    int inserted = db.sql(&quot;&quot;&quot;
+        INSERT INTO processed_message (consumer, event_id)
+        VALUES (?, ?) ON CONFLICT DO NOTHING
+        &quot;&quot;&quot;).params(CONSUMER, eventId).update();
+
+    if (inserted == 0) return;            // duplicado: no-op, confirma o deslocamento
+
+    PaymentEvent e = decode(rec.value());
+    saga.onStepResult(e.orderId(), &quot;AUTHORIZE_PAYMENT&quot;,
+                      e.status() == AUTHORIZED, e.reason());
+  }
 }</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>Custo por evento: uma escrita extra no <em>outbox</em> (mesma transacção, sem ida à rede) e um <code>INSERT</code> indexado no consumidor — na ordem de 0,3 a 1 ms cada em PostgreSQL com o índice quente.</li>
-        <li><code>FOR UPDATE SKIP LOCKED</code> é o que permite N publicadores sem coordenação nem duplicação dentro do lote; sem ele, três pods lêem as mesmas 200 linhas e publicam três vezes.</li>
-        <li>O <code>ack.acknowledge()</code> depois do efeito é o que fixa a semântica em <em>at-least-once</em>; antes do efeito seria <em>at-most-once</em> e perderia créditos.</li>
-        <li>Ordem: a chave é o <code>aggregateId</code>, logo eventos da mesma encomenda caem na mesma partição; o <code>ORDER BY created_at</code> preserva a ordem de publicação dentro do lote, mas lotes concorrentes podem intercalar entre agregados diferentes — o que é irrelevante, porque a ordem exigida é por agregado.</li>
-        <li>Retenção: <code>evento_processado</code> e as linhas publicadas do <em>outbox</em> precisam de limpeza periódica (partição diária com <code>DROP</code> ao fim de 7-30 dias); sem isso, o índice deixa de caber em memória e a latência do consumidor sobe.</li>
-        <li>Falha parcial: se o <code>join()</code> falhar a meio, parte do lote já está no tópico e a transacção reverte — as marcações não são gravadas, o lote inteiro é reenviado, e a deduplicação do consumidor absorve a repetição. É por isso que a chave de deduplicação tem de vir do <em>outbox</em> e não ser gerada no envio.</li>
+        <li>Custo por passo: 1 transacção local (2 a 5 ms em PostgreSQL com <em>commit</em> síncrono), mais latência de publicação — cerca de 100 ms de mediana com sondagem a 200 ms, ou 10 a 50 ms com captura de alterações. A saga completa de 4 passos fica na ordem dos 0,5 a 1 s de ponta a ponta, o que exige que a UI mostre <code>PENDING</code> e não espere pela conclusão.</li>
+        <li>O ponto que separa candidatos: <code>emit()</code> nunca chama o <em>broker</em>. Quem escreve <code>kafkaTemplate.send()</code> dentro do método transaccional reintroduziu a escrita dupla, mesmo tendo desenhado a tabela de outbox.</li>
+        <li>Resposta desconhecida (F3): o <code>504</code> do serviço de pagamentos não é falha — é ignorância. Compensar imediatamente pode estornar uma cobrança que não existiu, ou repetir uma que existiu. A consulta por chave de idempotência antes de decidir é o que evita ambos.</li>
+        <li>Ordem por agregado: a chave de partição do Kafka é o <code>aggregate_id</code>, portanto todos os eventos de um pedido caem na mesma partição e são entregues por ordem. Sem isto, uma compensação pode chegar antes do comando que a originou.</li>
+        <li>Concorrência entre instâncias: <code>FOR UPDATE</code> no <code>saga_state</code> mais a coluna <code>version</code>. Sem um dos dois, dois consumidores em réplicas diferentes fazem avançar a saga duas vezes.</li>
+        <li>Falha permanente da compensação (F4): tem de existir um estado terminal <code>FAILED</code> com alarme, e um procedimento humano documentado. Uma saga que retenta para sempre é uma fuga de recursos com aparência de robustez.</li>
+        <li>Testes: o caminho de compensação é o menos exercitado do sistema. Um teste com Testcontainers que arranca PostgreSQL e Kafka e força a recusa no passo 3 vale mais do que dez testes unitários do caminho feliz.</li>
+        <li>Limpeza: o <code>outbox</code> precisa de purga das linhas já publicadas (por exemplo acima de 7 dias) e o <code>processed_message</code> de purga por lotes acima da retenção do tópico; sem isso, ambos passam a dominar o volume da base em poucos meses. A chave de desduplicação não pode incluir a data só para permitir particionar — perder-se-ia a unicidade entre partições, que é exactamente a propriedade que se quer.</li>
       </ul>
     </div>
   </div>
 </div>
 
-<h2 id="sec-30-4" class="h2"><span class="secnum">30.4</span> Consumidores: rebalanceamento, lag e commits<a class="anchor" href="#sec-30-4" aria-label="ligação">#</a></h2>
+<h2 id="sec-30-5" class="h2"><span class="secnum">30.5</span> API gateway, BFF e service mesh<a class="anchor" href="#sec-30-5" aria-label="ligação">#</a></h2>
 
-<p>O consumidor é onde a maioria dos incidentes acontece, porque acumula três relógios independentes. <code>heartbeat.interval.ms</code> (por defeito 3 s) e <code>session.timeout.ms</code> (45 s nas versões recentes) governam a deteção de morte: uma <em>thread</em> de fundo envia batimentos e, se pararem durante o <em>timeout</em>, o coordenador expulsa o membro. <code>max.poll.interval.ms</code> (5 minutos) governa outra coisa: o tempo máximo entre chamadas consecutivas a <code>poll()</code>. Se o processamento de um lote demorar mais do que isso, o membro é expulso mesmo estando vivo e a enviar batimentos — é a causa clássica do consumidor que «entra em ciclo de <em>rebalance</em>» ao processar mensagens lentas.</p>
+<p>Três peças que os candidatos confundem porque todas estão «à frente» de alguma coisa. O <em>API gateway</em> está no tráfego norte-sul, entre o exterior e o sistema: termina TLS, autentica, limita débito, encaminha e agrega métricas de borda. O <em>backend for frontend</em> (BFF) é um serviço de aplicação por tipo de cliente — um para a aplicação móvel, outro para a <em>web</em> — que compõe chamadas e devolve exactamente a forma de que aquele ecrã precisa. O <em>service mesh</em> trata do tráfego este-oeste, entre serviços, e resolve com infra-estrutura o que antes se resolvia com bibliotecas: TLS mútuo, repetição, disjuntor, encaminhamento por percentagem e telemetria uniforme.</p>
 
-<p>O antídoto directo é dimensionar <code>max.poll.records</code> pelo tempo de processamento. Se cada mensagem custa 50 ms e <code>max.poll.records=500</code>, um lote leva 25 s — margem confortável nos 5 minutos; se cada mensagem chamar uma API externa com p99 de 2 s, 500 registos são 1 000 s e o consumidor é expulso a cada lote. Nesse caso baixa-se para 50 ou aumenta-se o intervalo, e nunca se resolve com <code>session.timeout.ms</code>, que trata de um problema diferente.</p>
+<p>A regra que evita o erro comum: no <em>gateway</em> não entra lógica de negócio. Um <em>gateway</em> que agrega três serviços, aplica uma regra de desconto e transforma o resultado deixou de ser infra-estrutura partilhada e passou a ser um serviço de aplicação sem dono claro — mantido pela equipa de plataforma, alterado pelas equipas de produto, testado por ninguém. Se é preciso agregar e transformar, isso é um BFF, com dono, repositório e implantação próprios.</p>
 
-<p>Quanto ao <em>commit</em>, <code>enable.auto.commit=true</code> confirma periodicamente (a cada 5 s) o <em>offset</em> do último lote devolvido pelo <code>poll()</code>, e não do último processado — ou seja, confirma trabalho ainda não feito. Em qualquer sistema com efeitos que importam, desliga-se e usa-se <em>commit</em> manual depois do efeito. No Spring Kafka isso é <code>ack-mode: manual_immediate</code> com <code>Acknowledgment</code> injectado, ou <code>batch</code> quando o débito importa mais do que a granularidade da repetição.</p>
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O modelo de <em>sidecar</em> acrescenta um contentor <em>proxy</em> por <em>pod</em>: tipicamente 50 a 150 MB de memória e alguns pontos percentuais de CPU por <em>pod</em>, e 0,5 a 2 ms de latência adicional por salto (ida e volta, contando as duas pontas). Com 200 <em>pods</em>, é infra-estrutura significativa. As implementações sem <em>sidecar</em>, com <em>proxy</em> por nó, reduzem esse custo mas trocam-no por menor isolamento entre cargas de trabalho.</p></aside>
 
-<figure class="listing yaml" id="lst-30-3"><div class="lhead"><span class="lnum">Listagem 30.3</span>
-<span class="lcap">Configuração de consumidor: commits manuais, cooperative sticky e leituras confirmadas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="yaml"><code>spring:
-  kafka:
-    consumer:
-      group-id: razao-v1              # muda-lo cria um grupo novo e reprocessa tudo
-      enable-auto-commit: false       # o offset e confirmado DEPOIS do efeito
-      auto-offset-reset: earliest     # so afecta grupo novo ou offset expirado
-      max-poll-records: 200           # 200 x 50 ms = 10 s por lote, dentro dos 5 min
-      isolation-level: read_committed # obrigatorio se o produtor for transaccional
-      properties:
-        max.poll.interval.ms: 300000  # tempo maximo entre poll(): dimensionar com o lote
-        session.timeout.ms: 45000     # deteccao de morte, via heartbeats
-        heartbeat.interval.ms: 3000   # regra pratica: 1/3 do session.timeout
-        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
-        fetch.min.bytes: 1
-        fetch.max.wait.ms: 500
-    listener:
-      ack-mode: manual_immediate      # Acknowledgment.acknowledge() explicito
-      concurrency: 4                  # 4 threads por pod; total nunca acima do n.o de particoes
-      missing-topics-fatal: true      # falha no arranque em vez de consumir do vazio</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>auto.offset.reset</code> não é uma política de arranque: só se aplica quando o grupo não tem <em>offset</em> guardado para a partição, ou quando o <em>offset</em> guardado já não existe no <em>log</em> por ter sido apagado pela retenção. Com <code>earliest</code>, um grupo cujo <em>lag</em> ultrapassou a retenção salta para o início e reprocessa meses de histórico; com <code>latest</code>, salta para o fim e perde silenciosamente tudo o que estava em atraso. Em ambos os casos o sintoma é o mesmo — um grupo esquecido — e a mitigação é alertar sobre <code>records-lag-max</code> muito antes de a retenção ser atingida.</p></aside>
-
-<div class="qa" id="q-30-7" data-box="qa" data-area="sd" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Quando é que faz sentido <code>enable.auto.commit=true</code> e o que muda exactamente ao passar para <em>commit</em> manual?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O <em>commit</em> automático faz sentido quando perder mensagens é aceitável e a simplicidade vale mais do que a garantia: telemetria, métricas agregadas, alimentação de um índice que é reconstruído periodicamente. Em tudo o resto, desliga-se.</p>
-      <p>O mecanismo é que o <em>commit</em> automático confirma, a cada <code>auto.commit.interval.ms</code> (5 s por defeito), o <em>offset</em> do último lote <em>devolvido</em> pelo <code>poll()</code> — não do último processado. Se o processo cair a meio de um lote, as mensagens já confirmadas mas não processadas desaparecem. Ou seja, o comportamento efectivo situa-se entre <em>at-most-once</em> e <em>at-least-once</em>, dependendo do timing, o que é o pior dos mundos: não se pode contar com nenhuma das duas.</p>
-      <p>Com <em>commit</em> manual, o programa decide o instante. O padrão correcto é confirmar depois de o efeito estar durável — no exemplo do razão, depois do <code>COMMIT</code> no PostgreSQL. Isso fixa a semântica em <em>at-least-once</em> de forma determinística, o que permite raciocinar sobre ela e cobrir a repetição com idempotência.</p>
-      <p>O <em>trade-off</em> é débito e granularidade. <code>manual_immediate</code> confirma mensagem a mensagem — cada <em>commit</em> é um pedido ao coordenador, cerca de 0,5 a 2 ms — o que a 5 000 msg/s por <em>thread</em> passa a ser significativo. O <em>commit</em> por lote amortiza o custo mas alarga a janela de reprocessamento: falhar no fim de um lote de 200 repete 200 mensagens. Escolhe-se pelo custo da repetição: se o efeito é um <code>UPSERT</code> barato, lote; se cada repetição dispara um email, granularidade fina.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Manual é sempre melhor» sem explicar o que o automático confirma.</td></tr>
-        <tr><td>Mid</td><td>Sabe que o automático pode perder mensagens; não menciona o intervalo nem o lote do <code>poll()</code>.</td></tr>
-        <tr><td>Sénior</td><td>Descreve exactamente o que é confirmado e quando, liga o <em>commit</em> ao instante em que o efeito fica durável, e quantifica o custo do <em>commit</em> por mensagem.</td></tr>
-        <tr><td>Staff</td><td>Escolhe a granularidade pelo custo da repetição, discute <em>commit</em> assíncrono com <em>callback</em> e o que fazer no <code>ConsumerRebalanceListener</code> antes de perder a partição.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Qual é o <em>offset</em> que se confirma: o processado ou o seguinte?»</li>
-      <li>«<code>commitSync</code> ou <code>commitAsync</code>? Porquê?»</li>
-      <li>«O que faz quando perde a partição a meio de um lote?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confirmar o <em>offset</em> antes de processar «para não bloquear».</li>
-      <li>Não saber que o automático confirma no <code>poll()</code> seguinte.</li>
-      <li>Guardar <em>offsets</em> numa base de dados própria sem razão para isso.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-30-8" data-box="qa" data-area="sd" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Durante um <em>rolling deploy</em> de 8 pods, o grupo passa 4 minutos praticamente sem consumir e o <em>lag</em> dispara. Diagnostique e proponha correcções concretas.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>É uma tempestade de <em>rebalances</em> com estratégia <em>eager</em>. Com a atribuição clássica (<code>RangeAssignor</code> ou <code>RoundRobinAssignor</code>), cada mudança de membros provoca um <em>stop-the-world</em>: todos os membros largam todas as partições, o coordenador reatribui e todos retomam. Num <em>rolling deploy</em> de 8 pods são 16 eventos de mudança — um por saída e um por entrada — e cada um pára o grupo inteiro. Se cada ciclo custar 10 a 15 s, chega-se facilmente aos 4 minutos observados.</p>
-      <p>A primeira correcção é <code>partition.assignment.strategy=CooperativeStickyAssignor</code>, que faz reatribuição incremental: os membros mantêm as partições que não mudam de dono e só as partições realmente movidas são revogadas, em duas rondas. O impacto típico é passar de «grupo parado» para «10-20% das partições momentaneamente paradas». A migração é a parte delicada: um grupo não pode ter membros com protocolos incompatíveis, por isso faz-se em dois <em>deploys</em> — primeiro anunciando as duas estratégias, depois só a cooperativa.</p>
-      <p>A segunda correcção é <code>group.instance.id</code> por pod (membros estáticos), com <code>session.timeout.ms</code> maior do que o tempo de reinício. Um pod que reinicia em 20 s com <code>session.timeout.ms=45000</code> recupera as mesmas partições sem qualquer reatribuição — o coordenador nem chega a considerá-lo morto. Em Kubernetes obtém-se com um <code>StatefulSet</code> ou injectando o nome do pod na configuração.</p>
-      <p>Terceira: encerramento limpo. O contentor tem de receber SIGTERM, parar o <em>listener</em>, terminar o lote em curso, confirmar o <em>offset</em> e só depois sair; isto exige que <code>terminationGracePeriodSeconds</code> seja maior do que o tempo do lote máximo. Sem isso, o pod é morto a meio, o grupo espera pelo <code>session.timeout</code> para o expulsar, e as mensagens do lote são reprocessadas. E quarto, verificar se não há um problema mascarado: se o <em>rebalance</em> também ocorre fora dos <em>deploys</em>, a causa provável é <code>max.poll.interval.ms</code> excedido por lotes lentos, e a correcção é baixar <code>max.poll.records</code>, não mexer na estratégia de atribuição.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«O Kafka às vezes faz isso»; propõe reiniciar tudo de uma vez.</td></tr>
-        <tr><td>Mid</td><td>Menciona <em>rebalance</em> e sugere a estratégia cooperativa, sem contar os eventos nem falar da migração de protocolo.</td></tr>
-        <tr><td>Sénior</td><td>Conta os 16 eventos, propõe cooperativa + membros estáticos + encerramento limpo, e distingue <em>rebalance</em> de <em>deploy</em> de <em>rebalance</em> por <code>max.poll.interval.ms</code>.</td></tr>
-        <tr><td>Staff</td><td>Planeia a migração de estratégia em dois <em>deploys</em>, alinha <code>terminationGracePeriodSeconds</code> com o lote, e define os alertas que provam a melhoria (tempo de <em>rebalance</em>, <em>lag</em> p99 durante <em>deploy</em>).</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque não pode mudar a estratégia num único <em>deploy</em>?»</li>
-      <li>«Que risco traz um <code>session.timeout.ms</code> muito alto?»</li>
-      <li>«Como distingue no painel um <em>rebalance</em> de <em>deploy</em> de um por lote lento?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Aumentar <code>session.timeout.ms</code> para «resolver» lotes lentos.</li>
-      <li>Não saber que a estratégia <em>eager</em> revoga todas as partições de todos os membros.</li>
-      <li>Ignorar o encerramento limpo e depois culpar duplicados no Kafka.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-30-9" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Que alertas define sobre um <em>consumer group</em> em produção? O <em>lag</em> em número de mensagens é bom indicador?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O <em>lag</em> absoluto é um mau alerta isolado, porque não tem unidade útil de negócio: 50 000 mensagens são 5 segundos num tópico a 10 000 msg/s e duas horas noutro a 7 msg/s. O alerta deve ser sobre <em>lag</em> convertido em tempo — <em>lag</em> ÷ débito de consumo actual, ou directamente a diferença entre o <em>timestamp</em> do registo em processamento e o instante presente, que é a métrica mais honesta porque inclui todas as causas de atraso.</p>
-      <p>O conjunto mínimo de alertas: (1) atraso temporal do grupo acima do orçamento do fluxo — por exemplo 2 minutos num fluxo de notificações, 30 segundos num de fraude; (2) derivada do <em>lag</em> positiva e sustentada durante 10 minutos, que apanha o caso em que o consumo é ligeiramente inferior à produção e o problema só rebentaria de madrugada; (3) taxa de <em>rebalance</em> acima de um por hora fora de janela de <em>deploy</em>; (4) grupo sem membros activos, que apanha o consumidor morto que o <em>lag</em> plano poderia esconder num tópico calmo; (5) crescimento do tópico de DLQ, com limiar absoluto baixo — uma única mensagem em DLQ merece pelo menos um aviso.</p>
-      <p>Há um caso de degradação silenciosa que só se apanha com a métrica temporal: uma partição quente. O <em>lag</em> somado do grupo pode parecer saudável enquanto uma partição acumula tudo, por isso o alerta deve ser sobre o máximo por partição — <code>records-lag-max</code> — e não sobre a soma. Do lado do produtor, os equivalentes são <code>record-error-rate</code> diferente de zero e <code>buffer-available-bytes</code> a aproximar-se de zero, que indica que o produtor vai começar a bloquear em <code>send()</code> até <code>max.block.ms</code>.</p>
-      <p>Finalmente, um alerta de vigilância: <em>lag</em> em tempo a aproximar-se de uma fracção da retenção do tópico (digamos 50%). Ultrapassada a retenção, o <em>offset</em> guardado deixa de existir, entra <code>auto.offset.reset</code> e o resultado é ou perda silenciosa (<code>latest</code>) ou uma tempestade de reprocessamento (<code>earliest</code>). Alertar a 50% dá horas para reagir.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Alertamos quando o <em>lag</em> passa de 10 000», sem justificação.</td></tr>
-        <tr><td>Mid</td><td>Sabe monitorizar <em>lag</em> e DLQ, mas usa valores absolutos e a soma do grupo.</td></tr>
-        <tr><td>Sénior</td><td>Converte <em>lag</em> em tempo, alerta no máximo por partição e na derivada, cobre <em>rebalance</em> e grupo sem membros.</td></tr>
-        <tr><td>Staff</td><td>Liga os limiares ao orçamento de latência de cada fluxo, acrescenta o alerta de aproximação à retenção e as métricas do produtor.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O <em>lag</em> está a zero e ninguém consome. Como detecta isso?»</li>
-      <li>«Que <em>timestamp</em> usa: o de criação ou o de gravação no <em>broker</em>?»</li>
-      <li>«Como distingue um pico legítimo de tráfego de um consumidor degradado?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Alertar apenas na soma do <em>lag</em> do grupo.</li>
-      <li>Não ter alerta nenhum na DLQ.</li>
-      <li>Considerar o <em>lag</em> um problema de capacidade quando é quase sempre um problema de latência por mensagem.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-30-5" class="h2"><span class="secnum">30.5</span> Desenho de eventos, esquemas e evolução<a class="anchor" href="#sec-30-5" aria-label="ligação">#</a></h2>
-
-<p>Um tópico é uma API pública com um número de consumidores desconhecido e sem forma de os obrigar a actualizar em conjunto. Isso muda duas coisas em relação a um DTO interno: o esquema tem de ser explícito e versionado, e a evolução tem de ser compatível numa direcção definida antes de o primeiro consumidor existir.</p>
-
-<p>Com um <em>schema registry</em> (Confluent ou compatível), Avro, Protobuf ou JSON Schema, o produtor regista o esquema e escreve nos registos um identificador de 4 bytes; o consumidor obtém o esquema por esse identificador e desserializa. As políticas que interessam são: <code>BACKWARD</code> — um consumidor com o esquema novo lê dados escritos com o esquema antigo, e é o defeito porque permite actualizar consumidores primeiro; <code>FORWARD</code> — um consumidor com o esquema antigo lê dados novos, útil quando não se controla o ritmo dos consumidores e é preciso publicar já; <code>FULL</code> — ambas, que é o que se exige em tópicos de domínio partilhados entre equipas. Em qualquer política compatível, as regras práticas são as mesmas: acrescentar campos com valor por defeito, nunca renomear, nunca mudar o tipo, e remover só campos que tinham valor por defeito.</p>
-
-<p>A outra decisão de desenho é o que vai dentro do evento. Uma <em>notificação</em> transporta o mínimo (<code>encomendaId</code>, tipo, instante) e obriga o consumidor a chamar de volta a origem — mantém os dados pequenos e a fonte de verdade única, mas cria acoplamento síncrono e amplifica carga na origem, com o risco de a leitura devolver um estado mais recente do que o evento. Um evento de <em>event-carried state transfer</em> transporta o estado necessário — o consumidor trabalha sem chamar ninguém, sobrevive a uma indisponibilidade da origem e pode reconstruir a sua vista a partir do tópico — mas o evento passa a ser um contrato largo, muda mais vezes e replica dados. A escolha honesta é por consumidor: eventos finos onde há um consumidor com acesso barato à origem; eventos gordos onde há muitos consumidores, ou onde a autonomia em caso de falha é um requisito.</p>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Versão no nome do tópico (<code>encomendas.v1</code>) e versão de esquema resolvem problemas diferentes. O esquema evolui compativelmente dentro de <code>v1</code>; um tópico <code>v2</code> só se cria para uma mudança que nenhuma política de compatibilidade cobre — mudar a semântica de um campo, mudar a chave de partição, dividir um evento em dois. A transição faz-se com dupla publicação em <code>v1</code> e <code>v2</code>, migração dos consumidores um a um, e desactivação de <code>v1</code> quando o <em>lag</em> for zero e nenhum grupo activo restar.</p></aside>
-
-<div class="qa" id="q-30-10" data-box="qa" data-area="api" data-level="senior" data-freq="media">
+<div class="qa" id="q-30-11" data-box="qa" data-area="api" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">APIs e integração</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Precisamos de acrescentar um campo obrigatório <code>moeda</code> ao evento <code>EncomendaCriada</code>, que tem sete consumidores em equipas diferentes. Como faz isto sem parar ninguém?</div>
+  <div class="qprompt">A aplicação móvel faz 11 chamadas para desenhar o ecrã inicial e a equipa quer resolver isso no <em>API gateway</em>. Concorda? Que alternativa propõe?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não se acrescenta um campo obrigatório sem valor por defeito — isso quebra compatibilidade em ambas as direcções. Acrescenta-se o campo com valor por defeito (por exemplo <code>"EUR"</code>), o que é uma alteração <code>FULL</code>-compatível em Avro, e a obrigatoriedade passa a ser garantida pelo produtor e por validação, não pelo esquema.</p>
-      <p>A sequência é: (1) registar o esquema novo com o campo opcional e valor por defeito, verificando a compatibilidade no registo antes de publicar — idealmente como passo de CI que falha o <em>build</em>; (2) actualizar o produtor para escrever sempre o campo preenchido; (3) esperar que a retenção do tópico só contenha eventos com o campo, ou aceitar que os consumidores tratam o valor por defeito ao reprocessar histórico; (4) migrar os sete consumidores ao seu ritmo, cada um a passar a ler o campo; (5) só quando todos leem e o histórico relevante já expirou, considerar tornar o campo realmente obrigatório num esquema seguinte — sabendo que essa alteração, sim, exige <code>v2</code> se houver leitores de histórico.</p>
-      <p>Com <code>BACKWARD</code>, o consumidor novo lê eventos antigos usando o valor por defeito; com <code>FORWARD</code>, o consumidor antigo ignora o campo novo. Um campo adicionado com defeito satisfaz as duas, e é por isso que a regra prática «só se acrescenta, com defeito, e nunca se renomeia» resolve 90% dos casos. Renomear é sempre uma remoção mais uma adição: se for mesmo necessário, publicam-se os dois campos durante um período de sobreposição maior do que a retenção, e remove-se o antigo depois.</p>
-      <p>O que evitar: publicar já com o campo obrigatório e pedir aos sete consumidores que actualizem primeiro «porque é rápido». Sete equipas com sete calendários significa que o tópico fica parado para a mais lenta, e o incidente aparece na equipa errada. A compatibilidade existe precisamente para tornar a ordem de <em>deploy</em> irrelevante.</p></div>
+      <p>Não no <em>gateway</em>. Onze chamadas para um ecrã é um problema real — em rede móvel com 120 ms de ida e volta e paralelismo limitado, são facilmente 400 a 600 ms só de rede — mas a solução é um BFF móvel, não lógica de agregação na borda partilhada.</p>
+      <p>A razão é de propriedade. O <em>gateway</em> é infra-estrutura horizontal usada por todas as equipas; a forma do ecrã inicial da aplicação móvel muda quando o produto muda, talvez de duas em duas semanas. Pôr essa lógica no <em>gateway</em> obriga a equipa de plataforma a implantar por causa de uma alteração de produto, e o teste dessa lógica fica sem casa. Um BFF móvel, mantido pela equipa que mantém a aplicação móvel, agrega as onze chamadas numa, aplica os <em>timeouts</em> e a degradação por secção do ecrã, e é implantado ao ritmo do produto.</p>
+      <p>Os números que justificam: com o BFF colocado junto dos serviços, as onze chamadas passam a ser internas e paralelas — a latência total aproxima-se do ramo mais lento, digamos 50 ms, mais uma travessia de rede móvel. O ecrã passa de perto de 600 ms para perto de 200 ms, e o consumo de dados e de bateria do dispositivo baixa. O custo é um serviço a mais por tipo de cliente, e o risco de o BFF acumular regras de negócio que pertencem aos serviços de domínio — a fronteira é que o BFF compõe, formata e degrada, mas não decide.</p>
+      <p>Quando a alternativa é melhor: se houver muitos clientes com necessidades divergentes, um BFF por cliente multiplica-se depressa, e aí GraphQL com uma camada de federação resolve o mesmo problema com um único ponto de composição — pagando com complexidade de limitação de custo de consulta e com cache muito mais difícil. E se as onze chamadas forem para o mesmo serviço, o problema não é de arquitectura: é uma API mal desenhada, e a correcção é um <em>endpoint</em> agregado nesse serviço.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Acrescento o campo e aviso as equipas.»</td></tr>
-        <tr><td>Mid</td><td>Sabe que precisa de valor por defeito, mas não distingue <code>BACKWARD</code> de <code>FORWARD</code> nem valida no CI.</td></tr>
-        <tr><td>Sénior</td><td>Descreve a política de compatibilidade, a ordem produtor-primeiro, e a validação de esquema como passo de <em>build</em>.</td></tr>
-        <tr><td>Staff</td><td>Trata a retenção e o reprocessamento de histórico, planeia o caminho até tornar o campo obrigatório, e explica porque não se coordena o <em>deploy</em> de sete equipas.</td></tr>
+        <tr><td>Insuficiente</td><td>Concorda e descreve como programar a agregação no <em>gateway</em>; ou culpa a aplicação móvel.</td></tr>
+        <tr><td>Mid</td><td>Sabe o que é um BFF mas não explica porque é que o <em>gateway</em> é o sítio errado.</td></tr>
+        <tr><td>Sénior</td><td>Separa por propriedade e cadência de alteração, quantifica o ganho de latência, define a fronteira do BFF (compõe, não decide).</td></tr>
+        <tr><td>Staff</td><td>Considera a proliferação de BFF, compara com federação de GraphQL com o custo respectivo, e nota o caso em que a causa é a API do próprio serviço.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como remove um campo que já não é usado?»</li>
-      <li>«Que política escolhe para um tópico interno de uma só equipa?»</li>
-      <li>«Onde é que a validação de compatibilidade corre no <em>pipeline</em>?»</li>
-      <li>«E se um consumidor reprocessar eventos de há seis meses?»</li></ul></div>
+      <li>«Quem mantém o BFF quando o ecrã junta dados de cinco equipas?»</li>
+      <li>«O que devolve se dois dos onze ramos falharem?»</li>
+      <li>«Como faz cache no BFF sem servir dados de outro utilizador?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar JSON sem esquema em tópicos partilhados entre equipas e chamar-lhe flexibilidade.</li>
-      <li>Renomear campos «porque o consumidor é nosso».</li>
-      <li>Assumir que se pode coordenar o <em>deploy</em> de produtor e consumidores.</li></ul></div>
+      <li>Lógica de negócio no <em>gateway</em>.</li>
+      <li>BFF que escreve directamente nas bases dos serviços de domínio.</li>
+      <li>Agregar sem <em>timeout</em> por ramo nem resposta degradada.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-30-11" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+<div class="qa" id="q-30-12" data-box="qa" data-area="devops" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O evento <code>EncomendaCriada</code> só leva o <code>encomendaId</code>, e os cinco consumidores chamam de volta a API de encomendas. O serviço de encomendas está a receber 6 000 pedidos por segundo só de consumidores. O que muda?</div>
+  <div class="qprompt">Temos 40 serviços em Kubernetes, quase todos em Java, e resiliência feita com Resilience4j em cada um. Vale a pena adoptar um <em>service mesh</em>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O padrão actual é notificação pura, e o sintoma é o esperado: cada evento gera cinco leituras síncronas, portanto 1 200 encomendas por segundo transformam-se em 6 000 pedidos, e a disponibilidade de cinco consumidores passa a depender da disponibilidade da origem. Pior: como a leitura acontece depois do evento, o consumidor recebe o estado no momento da consulta e não no momento do facto, o que produz resultados não determinísticos ao reprocessar.</p>
-      <p>A mudança é passar a <em>event-carried state transfer</em> para os campos que os consumidores realmente lêem. Auditam-se os cinco consumidores, faz-se a união dos campos usados, e o evento passa a transportar esse conjunto — tipicamente 10 a 20 campos, uns poucos KB por evento. Os cinco pedidos por evento desaparecem, os consumidores tornam-se autónomos face a uma indisponibilidade da origem, e o reprocessamento passa a ser determinístico porque o estado vai carimbado no evento.</p>
-      <p>O que se paga: o evento cresce (com <code>compression.type=zstd</code>, 2 KB de JSON ficam tipicamente em 400-700 bytes, portanto a rede não é o problema; o problema é o contrato), muda mais vezes, e replica dados que passam a existir em seis sítios. Além disso, o consumidor tem de tolerar reordenação: dois eventos da mesma encomenda transportam estados diferentes e, se chegarem fora de ordem, o mais antigo não pode sobrepor o mais recente. A defesa é um número de versão do agregado no evento e escrita condicional, <code>UPDATE ... WHERE versao &lt; :nova</code>.</p>
-      <p>Uma via intermédia frequentemente melhor: manter o evento fino e publicar em paralelo um tópico compactado com o estado por chave (<code>encomendas.estado</code>, <code>cleanup.policy=compact</code>, chave = <code>encomendaId</code>). Quem precisa do estado materializa uma vista local a partir do tópico compactado; quem só precisa do gatilho consome a notificação. Ganha-se autonomia sem inflacionar o evento de domínio, e o tópico compactado dá <em>bootstrap</em> completo a qualquer consumidor novo. O custo é mais um tópico e mais um <em>pipeline</em> a operar.</p></div>
+      <p>Depende de uma variável quase só: heterogeneidade. Com 40 serviços quase todos em Java e uma biblioteca partilhada já em uso, o ganho do <em>mesh</em> é marginal e o custo é real. Se o parque tiver Java, Go, Python e Node, o <em>mesh</em> ganha, porque implementar e manter a mesma política de repetição, disjuntor e TLS mútuo em quatro ecossistemas é trabalho permanente e nunca fica consistente.</p>
+      <p>O que o <em>mesh</em> dá que a biblioteca não dá, mesmo num parque homogéneo: TLS mútuo com rotação automática de certificados e identidade por serviço, que é caro de fazer à mão; política de autorização entre serviços declarada fora do código; encaminhamento por percentagem e espelhamento de tráfego sem alteração de aplicação; e telemetria de rede uniforme, incluindo dos serviços de terceiros que ninguém instrumentou. Se a razão para adoptar for conformidade — «todo o tráfego interno tem de ser cifrado e autenticado» — o <em>mesh</em> justifica-se sozinho.</p>
+      <p>O que custa: com <em>sidecar</em>, um contentor <em>proxy</em> por <em>pod</em> (na ordem dos 50 a 150 MB e alguns pontos de CPU), 0,5 a 2 ms por salto, e — o custo maior — um plano de controlo que passa a ser um sistema crítico com actualizações, depuração própria e um modo de falha novo. A pergunta de teste que faço às equipas: quem, hoje, sabe diagnosticar um <code>503</code> gerado pelo <em>proxy</em> e distingui-lo de um <code>503</code> da aplicação? Se a resposta for «ninguém», o <em>mesh</em> vai piorar o tempo de recuperação antes de o melhorar.</p>
+      <p>A recomendação concreta para este caso: manter o Resilience4j, e adoptar apenas a parte do <em>mesh</em> que a biblioteca não cobre — se a exigência for cifra e identidade, avaliar a alternativa sem <em>sidecar</em> (<em>proxy</em> por nó), que dá TLS mútuo com uma fracção do custo por <em>pod</em>. E reter que <em>mesh</em> e biblioteca não se somam bem: retentativa no <em>proxy</em> e retentativa no cliente Java multiplicam-se, e a configuração das duas tem de ser decidida em conjunto, com uma só camada a retentar.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Sugere cache na API sem tocar no desenho do evento.</td></tr>
-        <tr><td>Mid</td><td>Propõe pôr todos os dados no evento, sem ver o custo do contrato nem a reordenação.</td></tr>
-        <tr><td>Sénior</td><td>Audita os campos usados, quantifica a amplificação 5×, trata versão do agregado e escrita condicional.</td></tr>
-        <tr><td>Staff</td><td>Apresenta o tópico compactado como terceira via, discute quem passa a ser dono do contrato e o que acontece ao reprocessar histórico.</td></tr>
+        <tr><td>Insuficiente</td><td>«Sim, é a prática moderna» ou «não, é complexidade a mais», sem critério.</td></tr>
+        <tr><td>Mid</td><td>Lista funcionalidades do <em>mesh</em> sem as confrontar com o que a biblioteca já resolve.</td></tr>
+        <tr><td>Sénior</td><td>Usa a heterogeneidade como critério principal, identifica TLS mútuo e política declarativa como ganho real, quantifica o custo por <em>pod</em>.</td></tr>
+        <tr><td>Staff</td><td>Trata o plano de controlo como novo sistema crítico, testa a prontidão da equipa para o diagnosticar, e alerta para a duplicação de retentativas entre camadas.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como impede o consumidor de aplicar um estado antigo por cima de um recente?»</li>
-      <li>«Quem é o dono do esquema quando cinco equipas dependem dele?»</li>
-      <li>«Quanto ocupa esse tópico compactado ao fim de um ano?»</li></ul></div>
+      <li>«Como distingue um <code>503</code> do <em>proxy</em> de um da aplicação?»</li>
+      <li>«Com <em>mesh</em>, onde configura a retentativa: no <em>proxy</em> ou no cliente?»</li>
+      <li>«Qual é o modo de falha do plano de controlo e o que acontece aos <em>pods</em> existentes?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Meter o registo inteiro da base de dados no evento, incluindo colunas internas.</li>
-      <li>Não notar que a leitura de volta torna o reprocessamento não determinístico.</li>
-      <li>Ignorar dados pessoais a serem replicados por seis serviços.</li></ul></div>
+      <li>Adoptar por moda, sem requisito que a biblioteca não sirva.</li>
+      <li>Manter retentativas activas nas duas camadas.</li>
+      <li>Ignorar o custo de memória e CPU multiplicado pelo número de <em>pods</em>.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-30-6" class="h2"><span class="secnum">30.6</span> Kafka vs RabbitMQ vs SQS/SNS<a class="anchor" href="#sec-30-6" aria-label="ligação">#</a></h2>
+<h2 id="sec-30-6" class="h2"><span class="secnum">30.6</span> Versionamento de contratos entre equipas<a class="anchor" href="#sec-30-6" aria-label="ligação">#</a></h2>
 
-<p>A diferença estrutural é onde vive a inteligência do encaminhamento e quem guarda a posição de leitura. O Kafka é um <em>log</em> particionado com consumidores que guardam <em>offsets</em>: retém, reprocessa, ordena por partição e escala por partições. O RabbitMQ é um <em>broker</em> de filas com encaminhamento rico (<em>exchanges</em> directas, por tópico, <em>fanout</em>), confirmação por mensagem e remoção após consumo: é excelente para distribuição de trabalho com prioridades, TTL por mensagem e encaminhamento por padrão, e fraco em reprocessamento. O SQS é uma fila gerida sem operação nenhuma, com <em>visibility timeout</em>, DLQ nativa e escala automática; o SNS é o <em>fanout</em> que lhe falta, e a combinação SNS-para-SQS é o equivalente prático de um tópico com múltiplos consumidores na AWS.</p>
+<p>Num monólito, alterar uma assinatura de método é um erro de compilação. Entre serviços é um incidente em produção, dias depois, na equipa de outra pessoa. A disciplina que substitui o compilador tem três peças: regras de compatibilidade, testes de contrato executados nos <em>pipelines</em> das duas partes, e um processo de migração que nunca faz alterações incompatíveis num só passo.</p>
 
-<p>O erro típico em entrevista é reduzir a comparação a débito. Débito raramente decide: o SQS standard escala praticamente sem limite e o RabbitMQ sustenta dezenas de milhares de mensagens por segundo por fila com <em>hardware</em> modesto. O que decide é o conjunto retenção-e-reprocessamento, o modelo de ordem, a granularidade de retentativa e o custo operacional.</p>
+<p>As regras de compatibilidade dependem da direcção. Compatibilidade retroactiva significa que um consumidor novo lê dados antigos; compatibilidade progressiva significa que um consumidor antigo lê dados novos — que é o que interessa em eventos, porque o produtor implanta primeiro e os consumidores demoram semanas. Na prática, para eventos publicados: acrescentar campos opcionais com valor por omissão é seguro; remover ou renomear campos e apertar tipos não é. Em registos de esquema com Avro ou Protobuf isto é verificável automaticamente no <em>pipeline</em>; em JSON puro, verifica-se com um esquema versionado e um teste, ou não se verifica de todo.</p>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 30.2</span> Kafka, RabbitMQ e SQS/SNS nas dimensões que decidem a escolha.</div>
-<div class="tscroll"><table><thead><tr><th>Dimensão</th><th>Kafka</th><th>RabbitMQ</th><th>SQS + SNS</th></tr></thead><tbody>
-<tr><td>Modelo</td><td><em>Log</em> particionado, <em>offset</em> do consumidor</td><td>Filas com <em>exchanges</em>; mensagem sai ao ser confirmada</td><td>Fila gerida; SNS para <em>fanout</em></td></tr>
-<tr><td>Retenção e reprocessamento</td><td>Dias a infinito; retroceder <em>offsets</em> é rotina</td><td>Só até ser consumida; reprocessar exige republicar</td><td>Até 14 dias; não há releitura do consumido</td></tr>
-<tr><td>Ordem</td><td>Total por partição</td><td>Por fila com um consumidor; perde-se com concorrência</td><td>Standard: sem ordem. FIFO: por <em>message group</em></td></tr>
-<tr><td>Débito de referência</td><td>Centenas de milhares de msg/s por <em>cluster</em></td><td>Dezenas de milhares de msg/s por fila</td><td>Standard: praticamente ilimitado. FIFO: 3 000 msg/s com lotes</td></tr>
-<tr><td>Retentativa e DLQ</td><td>Manual: tópicos de retentativa e DLQ escritos pela aplicação</td><td>Nativa: TTL, <em>dead-letter exchange</em>, contagem de entregas</td><td>Nativa: <em>visibility timeout</em> + <code>maxReceiveCount</code></td></tr>
-<tr><td>Encaminhamento</td><td>Simples: tópico e partição</td><td>Rico: por padrão, cabeçalhos, prioridades</td><td>Filtros de atributos no SNS</td></tr>
-<tr><td>Custo operacional</td><td>Alto sem serviço gerido (ISR, partições, <em>rebalance</em>)</td><td>Médio (memória, filas espelhadas, <em>flow control</em>)</td><td>Quase nulo; paga-se por pedido</td></tr>
-<tr><td>Escolher quando</td><td>Vários consumidores, reprocessamento, ordem por chave, streaming</td><td>Trabalho com prioridades, encaminhamento complexo, retentativa por mensagem</td><td>Já em AWS, volume irregular, equipa pequena, sem necessidade de histórico</td></tr>
-</tbody></table></div></div>
+<p>Quando a alteração é mesmo incompatível, usa-se expandir e contrair: publicar os dois formatos em paralelo (campo novo a par do antigo, ou tópico <code>v2</code> a par do <code>v1</code>), migrar os consumidores um a um com métrica de quem ainda usa a versão antiga, e só depois remover. O passo que falha é sempre o último: sem métrica por versão e por consumidor, ninguém se atreve a remover, e o sistema acumula formatos para sempre.</p>
 
-<div class="qa" id="q-30-12" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Uma equipa de quatro pessoas, já em AWS, precisa de processar 200 mensagens por segundo de envio de emails e notificações. Propõem Kafka porque «é o padrão da casa». Concorda?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não, e a razão não é o volume — 200 msg/s é irrelevante para qualquer das três tecnologias. É que o caso de uso não usa nenhuma das propriedades pelas quais se paga o Kafka. Envio de notificações não precisa de reprocessar histórico, não precisa de ordem entre destinatários diferentes, tem um único consumidor lógico, e precisa muito de retentativa por mensagem com <em>backoff</em> e DLQ — que é exactamente o que o Kafka não dá nativamente e o SQS dá numa linha de configuração.</p>
-      <p>Com SQS: <code>visibilityTimeout</code> alinhado com o tempo de envio (por exemplo 60 s), <code>maxReceiveCount=5</code> com DLQ associada, e a fila reprocessa sozinha a mensagem falhada sem bloquear as outras. Com Kafka, a mesma funcionalidade exige tópicos de retentativa escalonados, um mecanismo de pausa por partição, e cuidado para que uma mensagem venenosa não bloqueie o resto da partição — várias centenas de linhas de código e um modo de falha novo. Para quatro pessoas, é custo mal aplicado.</p>
-      <p>Quando é que a resposta mudaria. Primeiro, se aparecessem consumidores adicionais do mesmo fluxo — analítica, antifraude, arquivo — o <em>fanout</em> passa a valer, embora SNS para várias filas SQS resolva isso sem Kafka. Segundo, se fosse preciso reprocessar dias de eventos para corrigir um erro de <em>template</em>, o <em>log</em> retido é uma vantagem que o SQS não tem. Terceiro, se surgisse ordem por destinatário com volume que obrigasse a paralelismo — SQS FIFO dá ordem por <em>message group</em> mas com um tecto de 3 000 msg/s com lotes. Quarto, se a organização já operasse Kafka com plataforma madura e o custo marginal de mais um tópico fosse quase zero, o argumento de homogeneidade torna-se legítimo.</p>
-      <p>A forma de dizer isto numa entrevista é explicitar o critério: escolhe-se Kafka quando se precisa de retenção, reprocessamento, múltiplos consumidores independentes ou ordem por chave a alto volume; escolhe-se fila gerida quando o padrão é trabalho com retentativa por mensagem e a equipa quer zero operação. «É o padrão da casa» é um argumento válido de custo total, mas tem de ser apresentado como tal, não como argumento técnico.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Escolhe pela moda ou compara só débito.</td></tr>
-        <tr><td>Mid</td><td>Prefere SQS, mas justifica só com «é mais simples».</td></tr>
-        <tr><td>Sénior</td><td>Liga a escolha às propriedades usadas (retentativa por mensagem, DLQ nativa, sem reprocessamento) e diz o que o Kafka obrigaria a construir.</td></tr>
-        <tr><td>Staff</td><td>Enumera as condições concretas que inverteriam a decisão e separa o argumento técnico do argumento de custo de plataforma.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se precisassem de ordem por destinatário?»</li>
-      <li>«Como faria retentativa com <em>backoff</em> em Kafka?»</li>
-      <li>«O que é o <em>visibility timeout</em> e o que corre mal se for curto demais?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Escolher Kafka por defeito para tudo o que é assíncrono.</li>
-      <li>Não conhecer os limites do SQS FIFO.</li>
-      <li>Ignorar o custo operacional de um <em>cluster</em> não gerido numa equipa de quatro.</li></ul></div>
-  </div>
-</div>
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Versionar por URL (<code>/v1/pedidos</code>, <code>/v2/pedidos</code>) parece disciplina, mas duplica o esforço de manutenção e, se a segunda versão for só um campo novo, é desnecessário. A regra prática: campos adicionais não justificam versão nova; alterações de semântica de um campo existente justificam sempre — e são as mais perigosas, porque não partem nada e produzem números errados em silêncio.</p></aside>
 
-<div class="qa" id="q-30-13" data-box="qa" data-area="sd" data-level="senior" data-freq="baixa">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Ocasional</span></div></div>
-  <div class="qprompt">Uma mensagem malformada faz o consumidor lançar excepção sempre. No RabbitMQ e no SQS isso resolve-se sozinho; no Kafka, o que acontece e o que faz?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>No Kafka, a mensagem venenosa bloqueia a partição inteira. Como o consumidor não pode saltar o <em>offset</em> sem o confirmar, e não o quer confirmar porque falhou, entra em ciclo: lê, falha, volta a ler. Todas as mensagens seguintes dessa partição ficam paradas atrás dela, e nas outras partições nada acontece — o sintoma é <em>lag</em> a crescer em exactamente uma partição. No RabbitMQ, a contagem de entregas mais a <em>dead-letter exchange</em> tiram a mensagem de circulação; no SQS, o <code>maxReceiveCount</code> move-a para a DLQ. Em ambos, as restantes mensagens continuam.</p>
-      <p>Em Kafka isto constrói-se. O <code>DefaultErrorHandler</code> do Spring Kafka aplica um <code>BackOff</code> local (por exemplo 3 tentativas com 1 s, 2 s, 4 s) e, esgotadas as tentativas, entrega a mensagem a um <code>DeadLetterPublishingRecoverer</code> que a publica em <code>encomendas.v1.DLT</code> com cabeçalhos de diagnóstico — excepção, mensagem original, partição e <em>offset</em> — e só então confirma o <em>offset</em>, libertando a partição. Para esperas longas usam-se tópicos de retentativa escalonados (<code>...retry.5s</code>, <code>...retry.1m</code>, <code>...retry.10m</code>), porque reter uma <em>thread</em> a dormir 10 minutos violaria <code>max.poll.interval.ms</code>.</p>
-      <p>A distinção que separa um sénior é entre erro transitório e erro permanente. Um <code>timeout</code> da base de dados merece retentativa e, se persistir, pausar o consumidor em vez de encher a DLQ com milhares de mensagens perfeitamente válidas — o Spring Kafka permite classificar excepções como não recuperáveis e o resto como recuperáveis. Um erro de desserialização é permanente: nenhuma retentativa o corrige, e a mensagem deve ir directamente para a DLQ (com <code>ErrorHandlingDeserializer</code>, que evita que a falha ocorra antes de o <em>listener</em> sequer correr).</p>
-      <p>Por fim, a DLQ só serve se alguém a operar: alerta a partir da primeira mensagem, cabeçalhos suficientes para reproduzir o caso, e um mecanismo documentado de reinjecção depois da correcção. Uma DLQ com 40 000 mensagens e nenhum <em>runbook</em> é apenas uma forma cara de apagar dados mais tarde.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Apanho a excepção e ignoro a mensagem», sem falar de DLQ nem de <em>offset</em>.</td></tr>
-        <tr><td>Mid</td><td>Sabe que existe DLQ no Spring Kafka, mas não explica o bloqueio da partição.</td></tr>
-        <tr><td>Sénior</td><td>Explica o bloqueio por partição, configura retentativa com <em>backoff</em>, DLQ com cabeçalhos e distingue erro transitório de permanente.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta tópicos de retentativa escalonados por causa do <code>max.poll.interval.ms</code>, pausa do consumidor em falhas sistémicas e o <em>runbook</em> de reinjecção.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque não pode simplesmente dormir 10 minutos no <em>listener</em>?»</li>
-      <li>«A DLQ deve ter quantas partições e que retenção?»</li>
-      <li>«Como reinjecta 5 000 mensagens sem repetir efeitos?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confirmar o <em>offset</em> em <code>catch (Exception e)</code> sem registar a mensagem em lado nenhum.</li>
-      <li>Mandar erros transitórios directamente para a DLQ.</li>
-      <li>Ter DLQ sem alerta nem processo de reprocessamento.</li></ul></div>
-  </div>
-</div>
+<figure class="listing java" id="lst-30-6"><div class="lhead"><span class="lnum">Listagem 30.6</span>
+<span class="lcap">Leitor tolerante no consumidor e teste de contrato dirigido pelo consumidor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Leitor tolerante: campos desconhecidos não fazem falhar a desserialização.
+// Sem isto, o produtor acrescentar um campo opcional derruba o consumidor.
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record OrderPlaced(
+    UUID eventId,
+    UUID orderId,
+    String customerId,
+    long totalMinor,          // sempre em unidades menores: evita Double
+    String currency,
+    Instant occurredAt,
+    Optional&lt;String&gt; promoCode) {   // campo da v2: ausente nas mensagens v1
 
-<h2 id="sec-30-7" class="h2"><span class="secnum">30.7</span> Operar: retenção, compactação e DLQ<a class="anchor" href="#sec-30-7" aria-label="ligação">#</a></h2>
+  public OrderPlaced {
+    Objects.requireNonNull(eventId, &quot;eventId&quot;);
+    Objects.requireNonNull(orderId, &quot;orderId&quot;);
+    promoCode = promoCode == null ? Optional.empty() : promoCode;
+  }
+}
 
-<p>A retenção é a primeira decisão operacional de cada tópico e depende do que o tópico é. Para eventos de domínio, a retenção tem de exceder confortavelmente o pior cenário de recuperação: se um consumidor pode estar em baixo um fim-de-semana longo, 7 dias é o mínimo defensável e 14 a 30 dias é comum. <code>retention.ms</code> apaga por idade, <code>retention.bytes</code> por tamanho por partição, e o que ocorrer primeiro ganha — configurar apenas <code>retention.ms</code> num tópico com picos de volume é a forma habitual de encher discos.</p>
+// Lado do consumidor: o teste corre contra o stub publicado pelo produtor.
+// Se o produtor quebrar o contrato, o pipeline DELE falha, não o incidente NOSSO.
+@SpringBootTest
+@AutoConfigureStubRunner(
+    ids = &quot;com.acme:orders-service:+:stubs:8090&quot;,
+    stubsMode = StubRunnerProperties.StubsMode.REMOTE)
+class ShippingReadsOrderPlacedTest {
 
-<p>A compactação (<code>cleanup.policy=compact</code>) é outra coisa: em vez de apagar por idade, o Kafka mantém pelo menos o último valor de cada chave. Um tópico compactado é uma tabela versionada — dá <em>bootstrap</em> completo a um consumidor novo e é a base das <code>KTable</code> do Kafka Streams e dos tópicos de configuração. Uma mensagem com valor nulo é um <em>tombstone</em>: marca a chave para eliminação, e é assim que se apaga um registo, o que interessa directamente para pedidos de eliminação de dados pessoais. A compactação não é imediata — actua sobre segmentos fechados, governada por <code>min.cleanable.dirty.ratio</code> (0,5 por defeito) e <code>segment.ms</code> — portanto um consumidor pode ver várias versões da mesma chave e tem de tolerar isso.</p>
+  @Autowired OrderPlacedHandler handler;
 
-<figure class="listing shell" id="lst-30-4"><div class="lhead"><span class="lnum">Listagem 30.4</span>
-<span class="lcap">Tópico de domínio, tópico compactado e diagnóstico de lag.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="shell"><code># Topico de eventos: 14 dias, tecto de 50 GiB por particao, segmentos diarios
-kafka-topics.sh --bootstrap-server kafka-1:9092 --create \
-  --topic encomendas.v1 --partitions 48 --replication-factor 3 \
-  --config min.insync.replicas=2 \
-  --config retention.ms=1209600000 \
-  --config retention.bytes=53687091200 \
-  --config segment.ms=86400000 \
-  --config compression.type=zstd
+  @Test
+  void aceita_mensagem_v1_sem_promoCode() {
+    var v1 = &quot;&quot;&quot;
+        {&quot;eventId&quot;:&quot;3f0c...&quot;,&quot;orderId&quot;:&quot;a91b...&quot;,&quot;customerId&quot;:&quot;C-77&quot;,
+         &quot;totalMinor&quot;:8990,&quot;currency&quot;:&quot;EUR&quot;,&quot;occurredAt&quot;:&quot;2026-03-04T10:00:00Z&quot;}
+        &quot;&quot;&quot;;
+    assertThatNoException().isThrownBy(() -&gt; handler.handle(v1));
+  }
+}</code></pre></figure>
 
-# Topico de estado: mantem o ultimo valor por chave, para sempre
-kafka-topics.sh --bootstrap-server kafka-1:9092 --create \
-  --topic encomendas.estado --partitions 48 --replication-factor 3 \
-  --config cleanup.policy=compact \
-  --config min.insync.replicas=2 \
-  --config min.cleanable.dirty.ratio=0.5 \
-  --config delete.retention.ms=86400000   # janela para os consumidores verem tombstones
-
-# Lag por particao: a coluna LAG por linha e o que interessa, nao a soma
-kafka-consumer-groups.sh --bootstrap-server kafka-1:9092 \
-  --describe --group razao-v1
-
-# Reprocessar as ultimas 6 horas (com o grupo PARADO, senao falha)
-kafka-consumer-groups.sh --bootstrap-server kafka-1:9092 \
-  --group razao-v1 --topic encomendas.v1 \
-  --reset-offsets --by-duration PT6H --execute</code></pre></figure>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Dimensionamento de disco por tópico: msg/s × tamanho médio comprimido × retenção em segundos × factor de replicação. A 1 200 msg/s, 600 bytes comprimidos, 14 dias e RF=3, dá 1 200 × 600 × 1 209 600 × 3 ≈ 2,6 TiB no <em>cluster</em>, cerca de 54 GiB por partição com 48 partições. Daí o <code>retention.bytes</code> de 50 GiB da listagem: é o tecto que impede que um pico de tráfego encha os discos antes de a retenção temporal actuar.</p></aside>
-
-<div class="qa" id="q-30-14" data-box="qa" data-area="sd" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+<div class="qa" id="q-30-13" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Quando usa <code>cleanup.policy=compact</code> em vez de <code>delete</code>, e o que muda para o consumidor? Inclua o que acontece a um pedido de eliminação de dados pessoais.</div>
+  <div class="qprompt">Seis equipas, 40 serviços. Como garante que a equipa A não parte o serviço da equipa B sem montar um ambiente de integração com os 40 serviços a correr?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Compactação quando o tópico representa <em>estado por chave</em>; eliminação por retenção quando representa <em>factos no tempo</em>. Um tópico de configuração de comerciantes, um cache distribuído de preços, a fonte de uma <code>KTable</code> ou uma vista materializada — tudo isso é compactado, porque o que interessa é o último valor de cada chave e um consumidor novo tem de conseguir reconstruir o mundo inteiro lendo o tópico do início. Um tópico de <code>PagamentoAutorizado</code> é o oposto: cada registo é um facto distinto e comprimir o histórico destruiria informação.</p>
-      <p>Para o consumidor mudam três coisas. Primeira, o tópico deixa de ser um histórico completo — ler do início dá o estado actual, não a sequência de mudanças, portanto lógica que dependa de transições («mudou de A para B») deixa de funcionar. Segunda, a compactação é assíncrona: entre a escrita nova e a limpeza do segmento, o consumidor vê valores antigos da mesma chave, e a lógica tem de ser convergente — aplicar sempre o valor mais recente é seguro, contar ocorrências não é. Terceira, aparecem registos com valor nulo, os <em>tombstones</em>, que o desserializador tem de tratar sem lançar excepção; ignorá-los é um erro comum e leva a estado que nunca é apagado na vista local.</p>
-      <p>Para eliminação de dados pessoais, o <em>tombstone</em> é o mecanismo: publica-se um registo com a chave da pessoa e valor nulo, e após <code>delete.retention.ms</code> (24 h por defeito) a chave desaparece do <em>log</em> compactado. Duas ressalvas honestas. Primeira, isto só funciona se a chave do tópico for o identificador da pessoa; se os dados pessoais estiverem no <em>payload</em> de eventos com outra chave, não há eliminação selectiva possível num <em>log</em> imutável, e a resposta correcta é ou retenção curta ou cifra por chave com destruição da chave criptográfica (<em>crypto-shredding</em>). Segunda, os consumidores têm de processar o <em>tombstone</em> para apagar as suas cópias — o Kafka apaga o <em>log</em>, não as vistas materializadas a jusante.</p>
-      <p>É possível combinar as políticas (<code>cleanup.policy=compact,delete</code>): mantém o último valor por chave mas apaga também tudo o que exceda a retenção. Serve para tópicos de estado com chaves que deixam de existir e que não se quer manter indefinidamente.</p></div>
+      <p>Com testes de contrato dirigidos pelo consumidor. O consumidor declara o que precisa da resposta do produtor — não a resposta completa, só os campos e as formas que usa — e esse contrato é publicado. O <em>pipeline</em> do produtor verifica todos os contratos dos seus consumidores antes de implantar; o <em>pipeline</em> do consumidor corre contra um <em>stub</em> gerado a partir do mesmo contrato. Nenhum dos dois precisa do outro a correr. Em Java, isto é Spring Cloud Contract ou Pact, com os artefactos de <em>stub</em> no mesmo repositório de artefactos onde já estão os JAR.</p>
+      <p>A propriedade importante é a direcção da falha: o contrato quebra no <em>pipeline</em> de quem provoca a quebra, minutos depois do <em>commit</em>, e não em produção da outra equipa três semanas depois. É essa inversão que substitui o ambiente de integração gigante — que, além de caro, é sempre instável, porque uma falha em qualquer um dos 40 serviços bloqueia toda a gente.</p>
+      <p>O contrato não substitui tudo. Cobre a forma e a semântica do protocolo, não o comportamento: um produtor pode respeitar o contrato e devolver o valor errado. Por isso a pirâmide fica assim: testes unitários no essencial, testes de componente com Testcontainers para o serviço com a sua base de dados e o seu Kafka, testes de contrato em todas as fronteiras, e um punhado pequeno — meia dúzia — de testes ponta a ponta apenas para os fluxos que geram receita. Ambiente completo com os 40 serviços é para exploração manual, não para o <em>pipeline</em>.</p>
+      <p>O custo real e pouco falado é organizacional: os contratos exigem que o produtor aceite ser bloqueado pelos consumidores. Sem essa combinação explícita, os contratos são ignorados ou desactivados na primeira urgência. Por isso costumo emparelhar a introdução dos contratos com uma métrica visível de consumidores por versão, para que a conversa «podemos remover a v1?» seja resolvida por dados.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Confunde compactação com compressão.</td></tr>
-        <tr><td>Mid</td><td>Distingue estado de facto, mas não menciona <em>tombstones</em> nem a natureza assíncrona da limpeza.</td></tr>
-        <tr><td>Sénior</td><td>Explica o <em>bootstrap</em> a partir do tópico compactado, os <em>tombstones</em>, e que o consumidor pode ver versões antigas.</td></tr>
-        <tr><td>Staff</td><td>Trata eliminação de dados pessoais com honestidade (chave certa ou <em>crypto-shredding</em>), inclui as vistas a jusante e a política combinada.</td></tr>
+        <tr><td>Insuficiente</td><td>Propõe um ambiente de integração com todos os serviços, ou testes ponta a ponta como rede de segurança principal.</td></tr>
+        <tr><td>Mid</td><td>Menciona testes de contrato mas não sabe em que <em>pipeline</em> correm nem quem gera o <em>stub</em>.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o contrato dirigido pelo consumidor, a verificação no <em>pipeline</em> do produtor, e situa-o numa pirâmide com testes de componente e poucos ponta a ponta.</td></tr>
+        <tr><td>Staff</td><td>Delimita o que o contrato não cobre (comportamento), trata o custo organizacional do bloqueio, e liga à métrica de consumidores por versão para permitir remover formatos antigos.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quanto tempo demora até o <em>tombstone</em> ter efeito?»</li>
-      <li>«O que faz se os dados pessoais estiverem no <em>payload</em> e não na chave?»</li>
-      <li>«Como garante que um consumidor novo não perde o <em>tombstone</em>?»</li></ul></div>
+      <li>«E quando o consumidor é externo e não corre <em>pipeline</em> vosso?»</li>
+      <li>«Como versiona o contrato quando o produtor tem 12 consumidores?»</li>
+      <li>«Que faz o produtor se um consumidor bloquear a implantação numa sexta-feira?»</li>
+      <li>«Como se testa o contrato de eventos assíncronos, e não só de REST?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Prometer «direito ao esquecimento» num tópico de eventos sem mecanismo concreto.</li>
-      <li>Compactar um tópico de auditoria.</li>
-      <li>Desserializador que lança excepção em valor nulo.</li></ul></div>
+      <li>Considerar que alterar um campo é seguro «porque ninguém o deve estar a usar».</li>
+      <li>Testes ponta a ponta como única rede de segurança entre equipas.</li>
+      <li>Não ter forma de saber quem consome qual versão.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-30-7" class="h2"><span class="secnum">30.7</span> Anti-padrões: monólito distribuído e base partilhada<a class="anchor" href="#sec-30-7" aria-label="ligação">#</a></h2>
+
+<p>O monólito distribuído é o resultado mais frequente de uma divisão mal feita: serviços separados em processos, mas acoplados de tal forma que têm de ser implantados juntos. Os sinais são concretos e mensuráveis. Alterar uma funcionalidade obriga a alterar três repositórios. Existe uma biblioteca partilhada com os modelos de domínio, e subir a versão obriga toda a gente a subir. Nenhum serviço tem testes que passem sem os outros a correr. A implantação de um serviço tem de ser sequenciada com a de outro. O tempo de recuperação piorou face ao monólito, porque agora uma falha atravessa quatro sistemas.</p>
+
+<p>A base partilhada é o irmão do mesmo problema, e é o mais difícil de desfazer. Enquanto dois serviços escreverem nas mesmas tabelas, não há fronteira: o esquema é um contrato público sem versão, sem testes e sem dono, e qualquer migração exige coordenação. O caminho de saída é sempre o mesmo — eleger um dono por tabela, transformar as escritas dos outros em chamadas ou eventos, e só depois separar fisicamente. Separar primeiro e resolver as escritas depois é como a maioria das tentativas falha.</p>
+
+<p>Estes dois anti-padrões partilham um requisito de saída: sem observabilidade distribuída, não se consegue nem diagnosticar nem provar melhoria. Contexto de traço propagado em todas as chamadas e em todos os cabeçalhos de mensagem, registos com identificador de correlação, e métricas de serviço com nome e versão. O padrão que hoje é o mínimo é OpenTelemetry para propagação e exportação, com amostragem baixa no caso normal (0,1 a 1% a alto débito) e amostragem garantida dos erros e das caudas.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Amostrar 100% dos traços a 5 000 pedidos por segundo, com 8 <em>spans</em> por pedido, gera 40 000 <em>spans</em> por segundo — volume e custo de armazenamento que poucas equipas querem pagar. A configuração habitual é amostragem de cabeça a 1% mais amostragem de cauda que retém todos os traços com erro ou acima do p99, o que costuma manter menos de 3% do volume e conserva quase toda a informação de diagnóstico.</p></aside>
+
+<div class="qa" id="q-30-14" data-box="qa" data-area="sd" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Herdou 18 serviços que têm de ser implantados na mesma ordem, partilham uma biblioteca de modelos de domínio e duas bases. Como diagnostica a situação e por onde começa a desfazê-la?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É um monólito distribuído: tem o custo operacional de 18 serviços e a rigidez de um. O primeiro passo não é arquitectural, é de medição — sem números, qualquer proposta é opinião contra opinião. Recolho quatro: percentagem de alterações que tocam em mais de um repositório (num sistema saudável fica abaixo de 20%, aqui costuma passar de 60%), número de serviços que conseguem implantar isoladamente, tempo médio de recuperação antes e depois da divisão, e quem escreve em cada tabela das duas bases partilhadas — esta última obtém-se com registo de instruções ou com uma auditoria de <em>grants</em>, não por conversa.</p>
+      <p>Antes de mexer em fronteiras, garanto observabilidade: propagação de contexto de traço em todas as chamadas e mensagens, e identificador de correlação nos registos. Sem isto não consigo provar que uma alteração melhorou nada, e é justamente o que permite ver que a alteração X percorre nove serviços.</p>
+      <p>Depois ataco por ordem de retorno. Primeiro, a biblioteca partilhada de modelos: divido-a em contratos (esquemas de eventos e DTO, versionados, com compatibilidade verificada) e utilitários genuinamente técnicos; o modelo de domínio deixa de ser partilhado — cada serviço passa a ter a sua representação e uma tradução na fronteira. É duplicação deliberada, e é o preço de poder implantar sozinho. Segundo, a ordem de implantação: exige compatibilidade em ambos os sentidos durante uma janela, o que se consegue com expandir e contrair em cada alteração de contrato. Terceiro, as bases partilhadas: dono por tabela, escritas dos outros convertidas em API ou eventos, separação física no fim.</p>
+      <p>A hipótese honesta que ponho em cima da mesa no início: se as 18 unidades não conseguirem tornar-se independentes, a opção certa pode ser consolidar — fundir grupos de serviços que mudam sempre juntos e ficar com cinco ou seis. Reduzir o número de serviços é uma decisão arquitectural legítima, muitas vezes a de maior retorno, e é a que quase nenhum candidato propõe porque parece um recuo. O critério de decisão é o mesmo do início do capítulo: os serviços que não têm cadência, risco ou escala distintos não têm razão para estar separados.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe reescrever tudo, ou não reconhece o anti-padrão.</td></tr>
+        <tr><td>Mid</td><td>Nomeia «monólito distribuído» e sugere desacoplar, sem medidas, sem sequência e sem tratar da biblioteca partilhada.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, garante observabilidade, e ataca por ordem: biblioteca de modelos, ordem de implantação com expandir e contrair, bases partilhadas com dono por tabela.</td></tr>
+        <tr><td>Staff</td><td>Aceita a duplicação deliberada de modelos como preço da independência e põe a consolidação (menos serviços) como resultado possível, com critério explícito de decisão.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como convence duas equipas a duplicar o modelo de domínio?»</li>
+      <li>«Que faz com uma tabela onde três serviços escrevem legitimamente?»</li>
+      <li>«Quanto tempo dá a este plano e que marcos define?»</li>
+      <li>«Que métrica usaria para decidir fundir dois serviços?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Considerar que fundir serviços é sempre um recuo.</li>
+      <li>Manter modelos de domínio numa biblioteca partilhada «para não duplicar».</li>
+      <li>Começar a separar bases antes de saber quem escreve em cada tabela.</li></ul></div>
   </div>
 </div>
 
 <h2 id="sec-30-8" class="h2"><span class="secnum">30.8</span> Resumo e checklist<a class="anchor" href="#sec-30-8" aria-label="ligação">#</a></h2>
 
-<p>O que reter para a ronda:</p>
+<p>O que reter deste capítulo, por ordem de utilidade numa ronda de <em>system design</em>:</p>
 
 <ul class="lst">
-  <li>A partição é a unidade de ordem <em>e</em> de paralelismo: ordem por chave custa serialização, e o paralelismo de um grupo nunca excede o número de partições.</li>
-  <li><code>acks=all</code> só significa alguma coisa com <code>min.insync.replicas=2</code> e <code>replication.factor=3</code>; sozinho é uma falsa segurança.</li>
-  <li><code>enable.idempotence=true</code> elimina duplicados da retentativa do produtor e permite <code>max.in.flight=5</code> sem perder ordem; não faz nada pelos duplicados do consumidor.</li>
-  <li><em>Exactly-once</em> existe entre tópicos Kafka, com <code>transactional.id</code> e <code>isolation.level=read_committed</code>, ao custo de 10-30% de débito e do <em>Last Stable Offset</em>. Fora do Kafka, a garantia real é <em>at-least-once</em> mais idempotência.</li>
-  <li>Dupla escrita para base de dados e tópico é sempre um defeito; resolve-se com <em>outbox</em> na mesma transacção, publicado por <em>polling</em> com <code>SKIP LOCKED</code> ou por CDC.</li>
-  <li><code>max.poll.records</code> dimensiona-se pelo tempo de processamento para não exceder <code>max.poll.interval.ms</code>; <code>session.timeout.ms</code> trata de um problema diferente.</li>
-  <li><code>CooperativeStickyAssignor</code> e <code>group.instance.id</code> transformam um <em>rolling deploy</em> de minutos parados em segundos de perturbação parcial.</li>
-  <li>O <em>lag</em> alerta-se em tempo e no máximo por partição, nunca na soma absoluta; e alerta-se antes de o atraso se aproximar da retenção.</li>
-  <li>Kafka ganha em retenção, reprocessamento, múltiplos consumidores e ordem por chave; SQS e RabbitMQ ganham em retentativa por mensagem, DLQ nativa e custo operacional quase nulo.</li>
+  <li>Divide-se por diferença de cadência, risco ou escala entre partes, e sempre com números. Sem essa diferença, o monólito modular é a resposta melhor — e dizê-lo em voz alta é sinal de senioridade, não de conservadorismo.</li>
+  <li>Cada dado tem exactamente um serviço escritor. Consultas que atravessam fronteiras resolvem-se por composição na leitura ou por projecção alimentada por eventos, nunca por leitura directa da base alheia.</li>
+  <li>Um passo entra no caminho crítico síncrono só se a sua resposta alterar a decisão que o utilizador vê agora. Tudo o resto é mensagem — e cada dependência síncrona multiplica-se na disponibilidade composta.</li>
+  <li>A escrita dupla não se resolve com ordem de instruções nem com <code>try/catch</code>: resolve-se com outbox transaccional, e a publicação daí resultante é sempre pelo menos uma vez.</li>
+  <li>Todo o consumidor é idempotente, com desduplicação persistida na mesma transacção do efeito, com <code>event_id</code> do produtor — nunca o deslocamento do Kafka, nunca uma cache em memória.</li>
+  <li>A saga dá atomicidade por compensação, mas não dá isolamento: estados intermédios são visíveis e fazem parte do contrato com o produto. Orquestração acima de três ou quatro passos, pela resposta a «em que passo está este pedido?».</li>
+  <li>O <em>gateway</em> não tem lógica de negócio; a agregação por ecrã é um BFF com dono. O <em>service mesh</em> compensa por heterogeneidade e por exigência de TLS mútuo, não por moda.</li>
+  <li>Contratos entre equipas verificam-se no <em>pipeline</em> de quem provoca a quebra, com contratos dirigidos pelo consumidor, alterações incompatíveis por expandir e contrair, e métrica de consumidores por versão.</li>
+  <li>Sem <em>tracing</em> distribuído não se divide: o custo é trocar um <em>stack trace</em> por um inquérito, e o tempo de recuperação sobe.</li>
 </ul>
 
-<p>Checklist accionável antes da entrevista:</p>
+<p>Checklist para usar na ronda, na ordem em que o entrevistador espera ouvi-la:</p>
 
 <ul class="lst">
-  <li>Saber dizer, sem hesitar, qual é a chave de partição de um tópico do sistema actual e que invariante ela protege.</li>
-  <li>Conseguir escrever de memória a configuração de produtor durável e a de consumidor com <em>commit</em> manual, e justificar cada valor.</li>
-  <li>Ter um número próprio para partições, débito por consumidor e <em>lag</em> típico do sistema em que se trabalhou.</li>
-  <li>Conseguir desenhar o <em>outbox</em> num quadro em dois minutos, incluindo onde entra a chave de deduplicação.</li>
-  <li>Saber explicar por palavras próprias porque é que <em>exactly-once</em> não se estende ao PostgreSQL.</li>
-  <li>Ter uma história de <em>rebalance</em> ou de partição quente com sintoma, diagnóstico e correcção medida.</li>
-  <li>Conhecer os limites do SQS FIFO e o modelo de DLQ do RabbitMQ, para não parecer que só se conhece uma ferramenta.</li>
-  <li>Preparar a resposta a «porque não uma fila gerida?» com critérios, não com preferência.</li>
+  <li>Perguntar carga, orçamento de latência, número de equipas e requisitos de conformidade antes de desenhar qualquer fronteira.</li>
+  <li>Dizer explicitamente o que <em>não</em> se divide nesta iteração e porquê.</li>
+  <li>Nomear o dono de cada dado no diagrama, tabela a tabela nas fronteiras críticas.</li>
+  <li>Marcar no desenho o que é síncrono e o que é mensagem, com o critério dito em voz alta.</li>
+  <li>Somar a disponibilidade composta do caminho crítico e comentar o resultado.</li>
+  <li>Introduzir o outbox no momento em que aparecer a primeira publicação de evento, sem esperar que perguntem.</li>
+  <li>Declarar as compensações de cada passo da saga e o comportamento em resposta desconhecida (<code>504</code>).</li>
+  <li>Definir prazo por passo, estado terminal de falha e alarme humano — não retentativa infinita.</li>
+  <li>Definir <em>timeout</em> por salto derivado do orçamento total e retentativa numa só camada, com <em>jitter</em>.</li>
+  <li>Fechar com observabilidade: propagação de contexto, amostragem, e as três métricas que provariam que a divisão valeu a pena.</li>
 </ul>

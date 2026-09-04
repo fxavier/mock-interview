@@ -1,51 +1,51 @@
 {"chapter": 20, "questions": [
-  {"q": "Uma tabela `avaliacao` tem 1000 linhas; a coluna `nota` está a NULL em 300 delas e as restantes 700 somam 3500. O que devolvem `count(*)`, `count(nota)` e `avg(nota)`?",
+  {"q": "Uma tabela de 300 milhões de linhas usa `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` e as inserções degradaram-se à medida que a tabela cresceu. Qual é a explicação mecânica correcta?",
    "options": [
-     "1000, 1000 e 3,5",
-     "1000, 700 e 5,0",
-     "700, 700 e 5,0",
-     "1000, 700 e 3,5"
+     "O tipo `uuid` do PostgreSQL é guardado como texto de 36 bytes, o que torna as comparações lentas.",
+     "Os valores são aleatórios, cada inserção aterra numa folha imprevisível do B-tree, provocando divisões de página e leituras aleatórias quando o índice deixa de caber em `shared_buffers`.",
+     "O `gen_random_uuid()` bloqueia porque tem de consultar uma sequência partilhada para garantir unicidade.",
+     "O índice de chave primária deixa de ser usado acima de 100 milhões de linhas e o planeador passa a fazer varredura sequencial."
    ],
    "answer": 1,
-   "explain": "`count(*)` conta linhas (1000); `count(nota)` conta só valores não nulos (700); `avg` ignora NULL e divide 3500 por 700, dando 5,0. A opção com 3,5 assume que a média divide pelo total de linhas, que é o erro típico — para obter esse comportamento seria preciso `avg(coalesce(nota, 0))`."},
+   "explain": "O problema é localidade de escrita: UUIDv4 é aleatório em todos os bits úteis, por isso as inserções espalham-se por todo o índice, dividem páginas e deixam as folhas com 50-70% de ocupação. O tipo `uuid` ocupa 16 bytes binários, não 36 (esse é o erro de guardar em `varchar`); `gen_random_uuid()` não coordena nada, é local; e o planeador não abandona o índice por causa do tamanho da tabela."},
 
-  {"q": "Numa tabela de transacções com várias linhas por dia, `sum(valor) OVER (ORDER BY dia)` produz um acumulado que salta em degraus e repete o mesmo valor em todas as linhas do mesmo dia. Porquê?",
+  {"q": "Numa tabela com `soft delete` por `deleted_at`, qual é a consequência que a maioria das equipas não antecipa?",
    "options": [
-     "O `ORDER BY` da janela é não determinístico e as linhas trocam de posição a cada execução.",
-     "Falta `PARTITION BY dia`, sem o qual a janela abrange a tabela inteira.",
-     "O frame por defeito é `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, e RANGE inclui todos os pares com o mesmo valor de `dia`.",
-     "`sum` sobre uma janela sem frame devolve sempre o total da partição."
+     "As chaves estrangeiras deixam de impedir que uma linha viva referencie um pai já apagado, porque a linha do pai continua a existir.",
+     "O PostgreSQL passa a ignorar automaticamente as linhas com `deleted_at` preenchido nas junções.",
+     "O `autovacuum` remove as linhas marcadas ao fim de um ciclo, o que torna a reposição impossível.",
+     "Os índices deixam de poder ser usados porque `deleted_at` é uma coluna anulável."
+   ],
+   "answer": 0,
+   "explain": "O `soft delete` transfere para a aplicação um invariante que era da base: a chave estrangeira continua satisfeita por um pai marcado como apagado. O motor não conhece a convenção nem filtra nada, o `autovacuum` só recolhe tuplos mortos por MVCC (não linhas marcadas pela aplicação) e uma coluna anulável não impede o uso de índices — inclusive índices parciais, que são a correcção recomendada."},
+
+  {"q": "Numa tabela filha com 50 milhões de linhas, a coluna que referencia o pai não tem índice. O que acontece ao apagar uma linha do pai com `ON DELETE CASCADE`?",
+   "options": [
+     "Nada de especial: a cascata usa o índice da chave primária da tabela filha.",
+     "O PostgreSQL recusa o `DELETE` porque a integridade referencial exige um índice do lado filho.",
+     "A verificação da restrição obriga a uma varredura sequencial completa da tabela filha, com o bloqueio mantido durante todo o tempo.",
+     "A cascata é adiada para o próximo `autovacuum` e o `DELETE` regressa de imediato."
    ],
    "answer": 2,
-   "explain": "Com `ORDER BY` e sem frame escrito, o defeito é RANGE, que opera por valor: todas as linhas com o mesmo `dia` são pares e entram no cálculo umas das outras. A correcção é `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, ou pré-agregar por dia. Sem `ORDER BY` é que o frame seria a partição inteira."},
+   "explain": "O PostgreSQL cria índice para a chave primária mas nunca para a coluna que referencia; sem ele, cada apagamento no pai varre toda a tabela filha, transformando uma operação sub-milissegundo em segundos com bloqueio activo. Não é recusado, não usa a PK da filha (a coluna de FK é outra) e a verificação é imediata, não diferida para o `autovacuum`."},
 
-  {"q": "`SELECT c.id FROM cliente c WHERE c.id NOT IN (SELECT e.cliente_id FROM encomenda e)` devolve zero linhas, embora existam clientes sem encomendas. Qual é a causa e a correcção mínima correcta?",
+  {"q": "Qual destas colunas está correctamente tipada num modelo PostgreSQL 17 para pagamentos?",
    "options": [
-     "A subconsulta não está correlacionada; correlacioná-la com `WHERE e.cliente_id = c.id` resolve.",
-     "Há pelo menos um `cliente_id` a NULL, o que impede a expressão de ser TRUE; reescrever com `NOT EXISTS`.",
-     "Falta um índice em `encomenda(cliente_id)`, e sem ele o planeador devolve um conjunto vazio.",
-     "`NOT IN` só aceita listas literais; é preciso materializar a subconsulta numa tabela temporária."
+     "`amount money NOT NULL`, porque o tipo é dedicado a valores monetários.",
+     "`captured_at timestamp NOT NULL`, porque a aplicação grava sempre em UTC.",
+     "`fx_rate double precision NOT NULL`, porque taxas de câmbio precisam de muitas casas decimais.",
+     "`amount numeric(18,4) NOT NULL` com `captured_at timestamptz NOT NULL`."
+   ],
+   "answer": 3,
+   "explain": "`numeric` dá aritmética decimal exacta com escala suficiente para montantes e `timestamptz` guarda um instante absoluto, imune à configuração de fuso de quem lê. O tipo `money` depende da configuração regional do servidor, `timestamp` sem fuso não fixa instante nenhum (a convenção UTC quebra-se no primeiro cliente com outra configuração) e `double precision` acumula erro de representação binária."},
+
+  {"q": "Num SaaS com 2 000 `tenants` e 40 tabelas, o argumento mais forte contra schema por tenant é:",
+   "options": [
+     "O PostgreSQL só suporta um número limitado de schemas por base de dados.",
+     "Cada migração passa a ser 2 000 operações orquestradas e o catálogo cresce para cerca de 80 000 relações, com impacto no `autovacuum` e nas cópias de segurança.",
+     "Não é possível garantir unicidade dentro de cada schema sem uma coluna `tenant_id`.",
+     "As ligações têm de ser abertas com um utilizador diferente por tenant, o que impede o uso de um pool."
    ],
    "answer": 1,
-   "explain": "Com um NULL no conjunto, `x NOT IN (…)` avalia FALSE ou NULL, nunca TRUE, e o `WHERE` só deixa passar TRUE — daí o resultado vazio, sem erro. `NOT EXISTS` tem semântica correcta e converte em anti-join no plano. Um índice em falta afecta o desempenho, nunca o conjunto de resultados."},
-
-  {"q": "Num departamento os salários são 500, 500, 420 e 300. A pergunta é «o segundo salário mais alto distinto». Que função de ranking devolve a resposta correcta (420) na posição 2?",
-   "options": [
-     "`row_number()`, que dá 1, 2, 3, 4",
-     "`rank()`, que dá 1, 1, 3, 4",
-     "`dense_rank()`, que dá 1, 1, 2, 3",
-     "`ntile(2)`, que divide os salários em duas metades"
-   ],
-   "answer": 2,
-   "explain": "«Distinto» mapeia exactamente em `dense_rank`, que não salta posições após empates: 420 fica na posição 2. `rank()` colocaria 420 na posição 3 e o filtro `= 2` não devolveria nada; `row_number()` devolveria o segundo empatado com 500. `ntile` reparte a população em quantis e não responde à pergunta."},
-
-  {"q": "Em PostgreSQL 17, uma CTE não recursiva e sem efeitos secundários é referida duas vezes na consulta principal, que filtra o resultado por uma coluna indexada. Que comportamento se deve esperar?",
-   "options": [
-     "É integrada nas duas referências e o filtro exterior é empurrado para dentro em ambas.",
-     "É materializada num `CTE Scan` e o filtro exterior não é empurrado para dentro.",
-     "O motor rejeita a consulta e exige `MATERIALIZED` explícito.",
-     "É sempre uma barreira de optimização, tal como até ao PostgreSQL 11, independentemente do número de referências."
-   ],
-   "answer": 1,
-   "explain": "Desde o PostgreSQL 12, a integração automática só se aplica a CTEs não recursivas, sem efeitos secundários e referidas exactamente uma vez; com duas referências a CTE é materializada e deixa de aceitar predicados vindos de fora. Para forçar a integração usa-se `NOT MATERIALIZED`. A barreira incondicional era o comportamento até à versão 11."}
+   "explain": "O custo dominante é operacional: uma alteração de esquema multiplica-se por 2 000, deixando o sistema em estado misto durante horas, e o catálogo com dezenas de milhares de relações penaliza planeamento, `autovacuum` e `pg_dump`. O PostgreSQL não impõe um limite prático de schemas, cada schema tem as suas próprias restrições de unicidade e o `search_path` por transacção permite reutilizar um único pool."}
 ]}
