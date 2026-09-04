@@ -759,7 +759,389 @@ module "servico" {
   </div>
 </div>
 
-<h2 id="sec-34-6" class="h2"><span class="secnum">34.6</span> Custo, quotas e o que perguntam sobre FinOps<a class="anchor" href="#sec-34-6" aria-label="ligação">#</a></h2>
+<h2 id="sec-34-6" class="h2"><span class="secnum">34.6</span> Terraform a fundo: grafo, ciclo de vida, refactor de estado e testes<a class="anchor" href="#sec-34-6" aria-label="ligação">#</a></h2>
+
+<p>Quem já viveu com Terraform em produção responde às perguntas difíceis com endereços de recursos, não com conceitos. A pergunta que abre esta secção — «como é que muda o nome de um recurso sem o destruir?» — parece trivial e elimina metade dos candidatos, porque o Terraform não identifica recursos pelo nome que lhes damos na nuvem: identifica-os pelo <em>endereço</em> no estado, no formato <code>module.servico.aws_ecs_service.api</code>. Mudar o nome do bloco é, para o Terraform, apagar um recurso e criar outro; e num <code>aws_db_instance</code> isso significa destruir a base de dados.</p>
+
+<p>Por baixo de cada <code>plan</code> está um grafo dirigido acíclico construído a partir das referências entre blocos. As dependências implícitas — <code>subnet_id = aws_subnet.privada.id</code> — são as boas, porque são exactas e mantêm-se sozinhas. O <code>depends_on</code> existe para o que o grafo não vê: uma política IAM que tem de existir antes de o serviço arrancar, ainda que o serviço não lhe faça referência. Usado por hábito, o <code>depends_on</code> serializa o grafo e transforma um <code>apply</code> de dois minutos em oito, porque o Terraform executa por omissão dez operações em paralelo (<code>-parallelism=10</code>) e cada aresta a mais é paralelismo perdido.</p>
+
+<p>O bloco <code>lifecycle</code> é o conjunto de excepções que se declaram a esse grafo, e cada uma resolve um problema concreto: <code>create_before_destroy</code> para recursos com nome único que causariam indisponibilidade se fossem destruídos primeiro (um <em>target group</em>, uma <em>launch template</em>); <code>prevent_destroy</code> como travão de emergência em bases de dados e <em>buckets</em> de estado, que faz o <code>plan</code> falhar em vez de destruir; <code>ignore_changes</code> para campos que outro sistema gere legitimamente, como o número de tarefas desejadas quando há <em>autoscaling</em>; e <code>replace_triggered_by</code> para forçar substituição quando muda algo que a nuvem não considera alteração. As pré e pós-condições no mesmo bloco, e os blocos <code>check</code>, passam a validação para dentro do <code>plan</code> em vez de a deixar para um teste posterior.</p>
+
+<p>A parte que separa mesmo sénior de mid é o refactor: mover recursos entre módulos, dividir um estado em dois, adoptar recursos criados à mão. O caminho moderno é declarativo e revisível — blocos <code>moved</code> para renomear e mover, blocos <code>import</code> para adoptar, blocos <code>removed</code> para largar sem destruir — em vez dos comandos imperativos <code>state mv</code>, <code>state rm</code> e <code>import</code>, que não deixam rasto no repositório e não passam por revisão. A diferença prática é que um bloco <code>moved</code> aparece no <em>pull request</em>, corre para toda a gente e para todos os ambientes, e pode ser removido do código passadas algumas semanas; um <code>state mv</code> corrido no portátil de uma pessoa tem de ser repetido, à mão e sem erros, em cada ambiente.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 34.3</span> Operações de estado e ciclo de vida: o que usar, e o que acontece se se usar a alternativa errada.</div>
+<div class="tscroll"><table><thead><tr><th>Objectivo</th><th>Ferramenta actual</th><th>Alternativa antiga</th><th>Se escolher mal</th></tr></thead><tbody>
+<tr><td>Renomear ou mover um recurso/módulo</td><td>Bloco <code>moved</code> (1.1+)</td><td><code>terraform state mv</code></td><td>Destruição e recriação do recurso, ou repetição manual por ambiente</td></tr>
+<tr><td>Adoptar um recurso criado à mão</td><td>Bloco <code>import</code> (1.5+), com <code>plan -generate-config-out</code></td><td><code>terraform import</code></td><td>Recurso duplicado na nuvem, ou conflito de nome no <code>apply</code></td></tr>
+<tr><td>Deixar de gerir sem destruir</td><td>Bloco <code>removed</code> (1.7+)</td><td><code>terraform state rm</code></td><td>Recurso órfão a facturar sem ninguém saber que existe</td></tr>
+<tr><td>Forçar a substituição de uma instância</td><td><code>apply -replace=ENDEREÇO</code></td><td><code>terraform taint</code></td><td>Estado marcado sem <em>plan</em> revisto por ninguém</td></tr>
+<tr><td>Colecção de recursos semelhantes</td><td><code>for_each</code> sobre mapa ou conjunto</td><td><code>count</code> sobre lista</td><td>Remover um elemento do meio destrói e recria todos os seguintes</td></tr>
+<tr><td>Evitar indisponibilidade na substituição</td><td><code>lifecycle { create_before_destroy = true }</code></td><td>Substituição por omissão</td><td>Janela de indisponibilidade entre destruir e criar</td></tr>
+<tr><td>Proteger recursos com dados</td><td><code>prevent_destroy</code> + política no <em>pipeline</em></td><td>Confiança na revisão do <em>plan</em></td><td>Um <code>apply</code> distraído apaga a base de dados</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing hcl" id="lst-34-5"><div class="lhead"><span class="lnum">Listagem 34.5</span>
+<span class="lcap">Módulo com <code>for_each</code>, variáveis validadas, tipos com atributos opcionais e ciclo de vida explícito.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="hcl"><code>variable "filas" {
+  description = "Filas SQS do servico, por nome logico"
+  type = map(object({
+    retencao_dias      = optional(number, 4)     # optional() exige Terraform 1.3+
+    visibilidade_segs  = optional(number, 30)
+    dlq                = optional(bool, true)
+  }))
+  nullable = false
+
+  validation {
+    condition     = alltrue([for k, v in var.filas : v.visibilidade_segs &gt;= 30])
+    error_message = "visibilidade_segs tem de ser &gt;= 30: abaixo disso o consumidor Java reprocessa mensagens ainda em curso."
+  }
+}
+
+resource "aws_sqs_queue" "dlq" {
+  # for_each com chaves estaveis: o endereco no estado e' aws_sqs_queue.dlq["pagamentos"],
+  # nao aws_sqs_queue.dlq[2] -- remover uma fila nao mexe nas outras.
+  for_each = { for k, v in var.filas : k =&gt; v if v.dlq }
+  name     = "${var.prefixo}-${each.key}-dlq"
+
+  message_retention_seconds = 1209600            # 14 dias: a DLQ retem sempre o maximo
+}
+
+resource "aws_sqs_queue" "principal" {
+  for_each = var.filas
+
+  name                       = "${var.prefixo}-${each.key}"
+  visibility_timeout_seconds = each.value.visibilidade_segs
+  message_retention_seconds  = each.value.retencao_dias * 86400
+
+  redrive_policy = each.value.dlq ? jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq[each.key].arn   # dependencia implicita: o grafo trata da ordem
+    maxReceiveCount     = 5
+  }) : null
+
+  lifecycle {
+    create_before_destroy = true    # o nome e' unico: destruir primeiro deixaria o produtor sem fila
+
+    precondition {
+      condition     = each.value.retencao_dias &lt;= 14
+      error_message = "SQS nao retem mais de 14 dias; corrija ${each.key}."
+    }
+  }
+}
+
+resource "aws_db_instance" "principal" {
+  identifier = "${var.prefixo}-bd"
+  # ... configuracao ...
+
+  lifecycle {
+    prevent_destroy = true                       # o plan falha em vez de destruir
+
+    ignore_changes = [
+      engine_version,                            # gerido pela janela de manutencao da AWS
+      final_snapshot_identifier,
+    ]
+  }
+}
+</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>count</code> sobre uma lista indexa por posição: <code>aws_instance.no[0]</code>, <code>[1]</code>, <code>[2]</code>. Remover o elemento do meio da lista faz o Terraform ver <code>no[1]</code> com outro conteúdo e <code>no[2]</code> a desaparecer — o <em>plan</em> mostra uma destruição e uma alteração destrutiva em cadeia, quando a intenção era remover um único recurso. Com <code>for_each</code> sobre um mapa, o endereço é a chave (<code>no["eu-west-1b"]</code>) e a remoção afecta exactamente um recurso. A regra prática: <code>count</code> só para «zero ou um» (<code>count = var.criar ? 1 : 0</code>); tudo o resto, <code>for_each</code>.</p></aside>
+
+
+<div class="qa" id="q-34-14" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Precisa de renomear um recurso e de mover metade dos recursos para um módulo novo. O que faz para que o <code>plan</code> não mostre destruições?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O Terraform identifica recursos pelo endereço no estado, não pelo nome que têm na nuvem. <code>aws_ecs_service.api</code> e <code>module.pagamentos.aws_ecs_service.api</code> são objectos diferentes, e mudar de um para o outro sem mais nada produz um <em>plan</em> com uma destruição e uma criação. Em recursos sem estado isso custa uma janela de indisponibilidade; num <code>aws_db_instance</code> ou num <em>bucket</em>, custa os dados.</p>
+      <p>A forma actual de o fazer é declarativa: blocos <code>moved</code>, disponíveis desde o Terraform 1.1, que declaram no próprio código que o endereço antigo passou a ser o novo. <code>moved { from = aws_ecs_service.api  to = module.pagamentos.aws_ecs_service.api }</code> faz o <em>plan</em> mostrar «moved» em vez de destruição, funciona para recursos e módulos inteiros, é revisto no <em>pull request</em> e aplica-se sozinho em todos os ambientes. Passadas algumas semanas, quando todos os estados já foram actualizados, o bloco pode ser apagado.</p>
+      <p>A alternativa antiga é <code>terraform state mv</code>, imperativa: corre no terminal de uma pessoa, não deixa rasto no repositório, tem de ser repetida em cada ambiente e é fácil de errar com endereços indexados (<code>[0]</code> contra <code>["chave"]</code>). Continua a ser a saída para casos que os blocos não cobrem — mover entre <em>backends</em> diferentes, por exemplo —, sempre com cópia do estado antes, que o versionamento do <em>bucket</em> já garante.</p>
+      <p>Há dois blocos irmãos que completam a resposta: <code>import</code>, desde a 1.5, para adoptar um recurso criado à mão sem o recriar — com <code>terraform plan -generate-config-out=gerado.tf</code> a escrever a configuração inicial —, e <code>removed</code>, desde a 1.7, para deixar de gerir um recurso sem o destruir, substituindo o <code>state rm</code>. Todos partilham a mesma vantagem: são código, passam por revisão, e o <em>pipeline</em> aplica-os de forma idêntica em todos os ambientes.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Mudo o nome e faço <code>apply</code>» — não sabe que o recurso é destruído.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>terraform state mv</code> e usa-o à mão, ambiente a ambiente.</td></tr>
+        <tr><td>Sénior</td><td>Usa blocos <code>moved</code>, explica a diferença entre endereço e identificador na nuvem, e valida no <em>plan</em> antes do <em>merge</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>import</code> e <code>removed</code>, descreve a limpeza dos blocos depois de propagados e como protege recursos com dados durante refactors grandes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva o bloco <code>moved</code> para um recurso dentro de um <code>for_each</code>.»</li>
+      <li>«Quando é que ainda usa <code>state mv</code> em vez do bloco?»</li>
+      <li>«Como adopta uma VPC criada há três anos pela consola?»</li>
+      <li>«O <em>plan</em> mostra destruição da base de dados. Que travões tem antes do <code>apply</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Editar o ficheiro de estado à mão.</li>
+      <li><code>state rm</code> para «resolver» o que devia ser um <code>moved</code>.</li>
+      <li>Fazer o refactor em produção primeiro, para «ver se corre bem».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-15" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Tem cinco filas criadas com <code>count</code> sobre uma lista e precisa de remover a segunda. O que mostra o <code>plan</code>, e como é que devia estar escrito?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com <code>count</code>, o endereço de cada recurso é a posição na lista: <code>aws_sqs_queue.fila[0]</code> a <code>[4]</code>. Ao remover o segundo elemento, a lista encolhe e tudo o que estava à direita desliza uma posição: o Terraform passa a ver <code>[1]</code> com o conteúdo do antigo <code>[2]</code>, <code>[2]</code> com o do antigo <code>[3]</code>, e <code>[4]</code> a desaparecer. O <em>plan</em> mostra uma destruição no fim e três recursos a serem alterados ou substituídos, conforme o campo que mudou seja actualizável no local — em SQS o nome não é, portanto são três substituições.</p>
+      <p>A consequência não é estética. Substituir uma fila SQS descarta as mensagens que lá estavam; em <code>aws_db_instance</code> ou <code>aws_ebs_volume</code>, a mesma mecânica destrói dados. É a razão pela qual o <em>plan</em> tem de ser lido linha a linha antes de qualquer <code>apply</code> — a intenção era remover um recurso e o efeito real são quatro.</p>
+      <p>A escrita correcta é <code>for_each</code> sobre um mapa ou conjunto, com chaves estáveis e significativas: o endereço passa a ser <code>aws_sqs_queue.fila["pagamentos"]</code> e remover uma entrada afecta exactamente esse recurso. A regra prática que uso é: <code>count</code> apenas para «zero ou um» (<code>count = var.criar_replica ? 1 : 0</code>); qualquer colecção com identidade própria usa <code>for_each</code>. E as chaves não podem depender de valores só conhecidos depois do <code>apply</code>, senão o Terraform recusa-se a planear.</p>
+      <p>Para migrar o que já existe sem destruir nada, usam-se blocos <code>moved</code> de índice para chave, um por recurso: <code>moved { from = aws_sqs_queue.fila[0]  to = aws_sqs_queue.fila["pagamentos"] }</code>. É um <em>pull request</em> aborrecido de escrever e o <em>plan</em> resultante deve mostrar apenas movimentos e zero alterações — se mostrar mais alguma coisa, o mapeamento está errado e é para corrigir antes do <em>merge</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Diz que só o recurso removido é afectado.</td></tr>
+        <tr><td>Mid</td><td>Sabe que «<code>count</code> tem problemas com índices»; não consegue descrever o <em>plan</em> concreto.</td></tr>
+        <tr><td>Sénior</td><td>Explica o deslizamento dos índices, prevê destruições e substituições, e reescreve com <code>for_each</code> e chaves estáveis.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a migração com blocos <code>moved</code>, a restrição das chaves conhecidas em <em>plan</em> e os travões para recursos com dados.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a chave do <code>for_each</code> vier de um recurso ainda por criar?»</li>
+      <li>«Quando é que <code>count</code> continua a ser a escolha certa?»</li>
+      <li>«Como escreve os <code>moved</code> para migrar cinco índices para chaves?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>count</code> com listas de recursos com identidade.</li>
+      <li>Aplicar sem ler o <em>plan</em> por ser «só uma remoção».</li>
+      <li>Chaves de <code>for_each</code> derivadas de identificadores gerados na nuvem.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-16" data-box="qa" data-area="devops" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Para que serve cada meta-argumento do bloco <code>lifecycle</code>, e qual deles é o mais perigoso?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>create_before_destroy</code> inverte a ordem da substituição: cria o recurso novo antes de destruir o antigo, o que elimina a janela de indisponibilidade. Exige que o recurso admita dois exemplares em simultâneo — se o nome for único, é preciso <code>name_prefix</code> em vez de <code>name</code> —, e propaga-se em cascata para as dependências, o que às vezes surpreende no tamanho do <em>plan</em>.</p>
+      <p><code>prevent_destroy</code> faz o <code>plan</code> falhar com erro se alguma alteração implicar destruir aquele recurso. É o travão que se põe em bases de dados, <em>buckets</em> de estado e chaves KMS. Não substitui permissões nem políticas — quem tiver acesso ao código pode remover a linha —, mas transforma um engano silencioso num erro barulhento, que é exactamente o objectivo.</p>
+      <p><code>ignore_changes</code> diz ao Terraform para não reagir a diferenças num campo. É legítimo quando outro sistema gere aquele valor: o número de tarefas desejadas quando existe <em>autoscaling</em>, ou uma etiqueta escrita por um agente. É também o mais perigoso da lista, porque cria divergência autorizada e silenciosa: com <code>ignore_changes = all</code>, o recurso deixa de ser gerido na prática e ninguém percebe que a infraestrutura já não corresponde ao código. Usa-se sempre com a lista de campos exacta, nunca <code>all</code>, e com um comentário a dizer quem gere aquele campo.</p>
+      <p><code>replace_triggered_by</code>, desde a 1.2, força a substituição quando outro recurso ou atributo muda — útil quando a dependência é real mas invisível para o fornecedor, por exemplo substituir uma tarefa quando muda uma versão de configuração. E dentro do mesmo bloco vivem <code>precondition</code> e <code>postcondition</code>, que passam as validações para o <code>plan</code>: falhar cedo, com uma mensagem escrita para quem lê, em vez de descobrir a incoerência depois de metade dos recursos criados.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não conhece o bloco <code>lifecycle</code>.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>prevent_destroy</code> e <code>ignore_changes</code>; usa <code>ignore_changes = all</code> sem ver o risco.</td></tr>
+        <tr><td>Sénior</td><td>Explica os quatro com um caso real, refere <code>name_prefix</code> com <code>create_before_destroy</code> e limita <code>ignore_changes</code> a campos concretos.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta pré e pós-condições e blocos <code>check</code>, e discute como detecta divergência autorizada que <code>ignore_changes</code> esconde.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que <code>create_before_destroy</code> obriga a <code>name_prefix</code>?»</li>
+      <li>«Com <code>ignore_changes</code> no número de tarefas, como sabe que o código está desactualizado?»</li>
+      <li>«Qual é a diferença entre uma <code>precondition</code> e um bloco <code>check</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>ignore_changes = all</code> em recursos importantes.</li>
+      <li><code>prevent_destroy</code> como única protecção da base de dados de produção.</li>
+      <li>Não saber que a substituição por omissão destrói antes de criar.</li></ul></div>
+  </div>
+</div>
+
+
+<div class="qa" id="q-34-17" data-box="qa" data-area="seguranca" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A palavra-passe da base de dados é gerada pelo Terraform. Onde é que ela acaba, e o que faz para que isso deixe de ser um problema?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Acaba no ficheiro de estado, em texto simples. Tudo o que passa por um recurso — palavras-passe, chaves privadas, <em>tokens</em> — é gravado no estado para que o Terraform possa comparar na execução seguinte. <code>sensitive = true</code> não muda nada disto: apenas oculta o valor na saída do <code>plan</code> e do <code>apply</code>, e continua a ser possível revelá-lo indirectamente. É a razão pela qual o <em>bucket</em> de estado é tratado como um segredo: cifra com KMS, acesso restrito a duas <em>roles</em>, sem acesso público, com versionamento e registo de acessos.</p>
+      <p>A partir do Terraform 1.10 existe mecanismo de linguagem para o evitar: valores e recursos <em>ephemeral</em>, que existem apenas durante a execução e nunca são escritos no estado nem no ficheiro de <em>plan</em>; e, desde a 1.11, argumentos <em>write-only</em> nos fornecedores — campos como <code>password_wo</code> que são enviados para a API mas não guardados. Combinados, permitem gerar ou ler um segredo, entregá-lo ao recurso e não deixar cópia nenhuma no estado.</p>
+      <p>O padrão que uso quando esses mecanismos não estão disponíveis é retirar o segredo do Terraform: o recurso cria a entrada no Secrets Manager com uma rotação gerida pela AWS, ou a palavra-passe é gerada fora e injectada, e a aplicação lê o segredo em execução. O Terraform gere a existência e as permissões do segredo, não o seu valor — e assim o estado passa a conter apenas o ARN, que não é sensível.</p>
+      <p>Fecho com o que faço mesmo assim, porque nenhuma destas medidas é completa: rotação obrigatória de tudo o que já tenha passado pelo estado antes destas práticas, já que as versões antigas do objecto continuam no <em>bucket</em>; auditoria de quem tem <code>s3:GetObject</code> nesse <em>bucket</em>, que é o mesmo que ter as palavras-passe de produção; e detecção de segredos no <em>pipeline</em>, para o caso mais banal de todos — alguém que grava um <code>terraform.tfvars</code> com credenciais no repositório.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que <code>sensitive = true</code> cifra ou omite o valor do estado.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o estado contém segredos e cifra o <em>bucket</em>; não tem alternativa para o valor.</td></tr>
+        <tr><td>Sénior</td><td>Trata o estado como segredo, tira o valor do Terraform (Secrets Manager, rotação gerida) e explica o que <code>sensitive</code> faz e não faz.</td></tr>
+        <tr><td>Staff</td><td>Refere valores <em>ephemeral</em> e argumentos <em>write-only</em>, exige rotação do que já passou pelo estado e audita quem lê o <em>bucket</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um <code>terraform output</code> marcado <code>sensitive</code> aparece nos <em>logs</em> do <em>pipeline</em>?»</li>
+      <li>«O <em>bucket</em> tem versionamento. Que consequência tem isso para a rotação?»</li>
+      <li>«Como passa o segredo para a aplicação sem o pôr numa variável de ambiente da tarefa?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Estado sem cifra, ou com acesso de leitura alargado à organização.</li>
+      <li><code>terraform.tfvars</code> com credenciais no repositório.</li>
+      <li>Assumir que o valor deixou de estar no estado depois de mudar o código.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-18" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como é que testa e valida infraestrutura como código? O que corre em cada <em>pull request</em> e o que corre só antes de produção?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Organizo em quatro camadas por custo crescente. A primeira é estática e corre em segundos em cada <em>pull request</em>: <code>terraform fmt -check</code>, <code>terraform validate</code> e <code>tflint</code> com as regras do fornecedor — apanham sintaxe, argumentos inválidos, tipos de instância que não existem naquela região. Não precisam de credenciais e não devem falhar por razões de rede.</p>
+      <p>A segunda é o <em>plan</em> como artefacto: <code>terraform plan -out=tfplan</code> com uma <em>role</em> de leitura assumida por OIDC, publicado como comentário no <em>pull request</em>, e depois <code>terraform show -json tfplan</code> a alimentar políticas — Conftest/OPA, Checkov ou Sentinel — que falham o <em>build</em> em regras não negociáveis: <em>bucket</em> público, grupo de segurança aberto a 0.0.0.0/0 na porta 22, volume sem cifra, base de dados a ser destruída. Analisar o <em>plan</em> em JSON é muito mais fiável do que analisar o HCL, porque avalia o resultado depois das variáveis e das condicionais.</p>
+      <p>A terceira é o <em>framework</em> nativo, <code>terraform test</code>, disponível desde a 1.6: ficheiros <code>.tftest.hcl</code> com blocos <code>run</code>, cada um a correr <code>plan</code> ou <code>apply</code> com variáveis próprias e a afirmar sobre os valores resultantes. Com <code>command = plan</code> e <code>mock_provider</code> (1.7+) os testes correm sem tocar na nuvem e servem para validar a lógica dos módulos — condicionais, <code>for_each</code>, valores calculados. É onde ponho os testes de regressão de um módulo partilhado.</p>
+      <p>A quarta é a que cria recursos a sério: <code>terraform test</code> com <code>command = apply</code> numa conta descartável, ou Terratest em Go quando é preciso verificar comportamento e não configuração — que o balanceador responde 200, que a base de dados não é alcançável da <em>subnet</em> pública. É lenta e cara, portanto corre por agendamento e na promoção de versões de módulos, não em cada <em>pull request</em>. E fecho com o que nenhuma destas camadas apanha: um <em>job</em> nocturno com <code>plan -detailed-exitcode</code> em todas as raízes, porque o código pode estar certo e a realidade ter divergido.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Corremos <code>plan</code> e olhamos» — sem verificação automática nenhuma.</td></tr>
+        <tr><td>Mid</td><td><code>fmt</code>, <code>validate</code> e revisão humana do <em>plan</em>; não conhece políticas nem testes de módulo.</td></tr>
+        <tr><td>Sénior</td><td>Camadas por custo, políticas sobre o <em>plan</em> em JSON, testes de módulo, e o que corre em cada momento do <em>pipeline</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta detecção periódica de divergência, promoção versionada de módulos com testes de aplicação real, e escolhe as regras de política pelo custo do incidente que evitam.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Escreva a regra que impede um grupo de segurança aberto na porta 22.»</li>
+      <li>«Porque é que analisa o <em>plan</em> em JSON e não os ficheiros HCL?»</li>
+      <li>«O que faz com <code>mock_provider</code> que não consegue fazer com <code>apply</code>?»</li>
+      <li>«Quanto tempo demora hoje o <em>feedback</em> de um PR de infraestrutura?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Aprovar <code>apply</code> sem <em>plan</em> guardado como artefacto — aplica-se algo diferente do que foi revisto.</li>
+      <li>Políticas que só avisam e nunca falham o <em>build</em>.</li>
+      <li>Testes de infraestrutura que correm contra a conta de produção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-34-19" data-box="qa" data-area="devops" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">O <code>plan</code> de produção demora 14 minutos e as pessoas começaram a usar <code>-target</code> para andar mais depressa. O que faz?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro trato o <code>-target</code> como sintoma, não como solução. O que ele faz é planear um subgrafo, ignorando o resto: o resultado é um estado que nunca foi validado como um todo, e a documentação da própria ferramenta o descreve como saída para situações excepcionais. Quando entra no hábito da equipa, acumula-se divergência que só aparece no dia em que alguém corre um <code>apply</code> completo — normalmente durante um incidente.</p>
+      <p>Depois meço onde vão os 14 minutos, porque há três causas com correcções diferentes. Se for o <em>refresh</em> — o Terraform a consultar centenas de recursos na API da AWS —, as respostas são reduzir o tamanho do estado e, em casos pontuais, <code>-refresh=false</code> com plena consciência de que o resultado deixa de ver divergência. Se for o número de recursos, é problema de granularidade. Se for o fornecedor a ser descarregado a cada execução, resolve-se com <code>TF_PLUGIN_CACHE_DIR</code> e com o <em>lock file</em> em repositório.</p>
+      <p>A correcção estrutural é dividir o estado por ciclo de vida: rede, dados, plataforma, serviços. Cada raiz passa a ter poucas dezenas de recursos e o <em>plan</em> volta a demorar um ou dois minutos; o raio de explosão de um erro reduz-se; e equipas diferentes deixam de esperar umas pelas outras. O preço é a ligação entre raízes, que faço com fontes de dados que consultam a AWS por etiqueta ou por nome, em vez de <code>terraform_remote_state</code>, para não acoplar uma raiz ao ficheiro de estado de outra.</p>
+      <p>Enquanto a divisão não está feita, mantenho duas medidas: <code>-parallelism</code> ajustado com cuidado — subir de 10 acelera, mas bate nas quotas de API da AWS e produz erros de limitação intermitentes — e <code>plan</code> automático em cada <em>pull request</em>, para que o tempo seja gasto por uma máquina e não por uma pessoa à espera. E deixo registado que <code>-target</code> passa a exigir justificação escrita, porque o que se está a comprar com ele é velocidade hoje em troca de um estado em que ninguém confia.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Normaliza o <code>-target</code> como forma de trabalhar.</td></tr>
+        <tr><td>Mid</td><td>Sugere <code>-refresh=false</code> sem perceber o que se deixa de ver.</td></tr>
+        <tr><td>Sénior</td><td>Diagnostica a causa do tempo, divide o estado por ciclo de vida e explica o custo do <code>-target</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o acoplamento entre raízes e como o evita, o efeito do paralelismo nas quotas de API, e trata o hábito da equipa como problema de processo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que critério usa para decidir a fronteira entre duas raízes?»</li>
+      <li>«<code>terraform_remote_state</code> ou fontes de dados? Porquê?»</li>
+      <li>«Subir o paralelismo para 50: o que espera ver?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>-target</code> em procedimentos escritos de <em>deploy</em>.</li>
+      <li>Um único estado para toda a infraestrutura da empresa.</li>
+      <li><code>-refresh=false</code> por omissão no <em>pipeline</em>.</li></ul></div>
+  </div>
+</div>
+
+
+<div class="lab" id="lab-34-2" data-box="lab" data-lang="hcl">
+  <div class="labhead"><span class="labttl">Exercício 34.2 — Ler o <em>plan</em> antes de o correr: o que este <em>pull request</em> destrói</span>
+    <div class="labpills"><span class="qpill">Prever o plan</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Um colega abre um <em>pull request</em> com duas alterações que descreve como «remover a fila de facturação, que já não se usa, e aumentar a instância da base de dados». O código antes e depois está na Listagem 34.6. Responda: (a) qual é a linha de resumo do <code>plan</code> — quantos recursos a criar, a alterar e a destruir; (b) o que acontece a cada uma das três filas e à base de dados, e porquê; (c) reescreva o ficheiro para que a intenção descrita seja o que realmente acontece, incluindo os blocos necessários para não destruir nada por engano e o travão que devia existir no recurso da base de dados.</p>
+    <figure class="listing hcl" id="lst-34-6"><div class="lhead"><span class="lnum">Listagem 34.6</span>
+      <span class="lcap">Antes e depois, tal como aparecem no <em>diff</em> do <em>pull request</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="hcl"><code># ---------- ANTES (em producao ha dois anos) ----------
+locals {
+  filas = ["pagamentos", "faturacao", "notificacoes"]
+}
+
+resource "aws_sqs_queue" "fila" {
+  count = length(local.filas)
+  name  = "prod-${local.filas[count.index]}"
+}
+
+resource "aws_db_instance" "principal" {
+  identifier        = "prod-pagamentos"
+  instance_class    = "db.r6g.large"
+  storage_encrypted = true
+}
+
+# ---------- DEPOIS (a proposta do pull request) ----------
+locals {
+  filas = ["pagamentos", "notificacoes"]      # removida a do meio
+}
+
+resource "aws_sqs_queue" "fila" {
+  count = length(local.filas)
+  name  = "prod-${local.filas[count.index]}"
+}
+
+resource "aws_db_instance" "bd" {             # bloco renomeado, "principal" era pouco claro
+  identifier        = "prod-pagamentos"
+  instance_class    = "db.r6g.xlarge"         # o aumento pedido
+  storage_encrypted = true
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-34-7"><div class="lhead"><span class="lnum">Listagem 34.7</span>
+        <span class="lcap">O <em>plan</em> que este <em>pull request</em> produz.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>  # aws_db_instance.bd will be created
+  # aws_db_instance.principal will be destroyed
+  # aws_sqs_queue.fila[1] must be replaced   (name: "prod-faturacao" -> "prod-notificacoes")
+  # aws_sqs_queue.fila[2] will be destroyed  ("prod-notificacoes")
+
+Plan: 2 to add, 0 to change, 3 to destroy.</code></pre></figure>
+      <p><strong>(a) e (b).</strong> Nenhuma das duas alterações faz o que a descrição diz. As filas estão indexadas por posição: <code>fila[0]</code> continua a ser <code>prod-pagamentos</code> e não muda; <code>fila[1]</code> passa de <code>prod-faturacao</code> para <code>prod-notificacoes</code>, e como o nome de uma fila SQS não é alterável no local, o Terraform substitui o recurso — destrói a fila com as mensagens que lá estivessem e cria outra com o mesmo nome da terceira; <code>fila[2]</code> deixa de existir na lista e é destruída. Resultado: a fila que o colega queria remover (<code>prod-faturacao</code>) desaparece, mas <code>prod-notificacoes</code> também é destruída e recriada, perdendo mensagens em voo.</p>
+      <p>A base de dados é pior. Renomear o bloco de <code>principal</code> para <code>bd</code> muda o endereço no estado, e para o Terraform isso é um recurso a destruir e outro a criar — o aumento de <code>instance_class</code> nem sequer chega a ser considerado, porque não há continuidade entre os dois. Como ambos declaram o mesmo <code>identifier</code>, a destruição acontece primeiro e leva os dados com ela; sem <code>skip_final_snapshot = false</code> e um identificador de <em>snapshot</em> definido, não há sequer cópia para repor. É exactamente o tipo de <em>plan</em> que se aprova por distracção quando ninguém lê para lá da linha de resumo.</p>
+      <figure class="listing hcl" id="lst-34-8"><div class="lhead"><span class="lnum">Listagem 34.8</span>
+        <span class="lcap">Versão corrigida: <code>for_each</code> com chaves estáveis, blocos <code>moved</code> e travão na base de dados.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="hcl"><code>locals {
+  # Conjunto com identidade propria: a chave passa a ser o endereco no estado.
+  filas = toset(["pagamentos", "notificacoes"])
+}
+
+resource "aws_sqs_queue" "fila" {
+  for_each = local.filas
+  name     = "prod-${each.key}"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Migracao de indice para chave: sem estes blocos, o plan destruiria e recriaria as duas.
+moved {
+  from = aws_sqs_queue.fila[0]
+  to   = aws_sqs_queue.fila["pagamentos"]
+}
+
+moved {
+  from = aws_sqs_queue.fila[2]
+  to   = aws_sqs_queue.fila["notificacoes"]
+}
+# aws_sqs_queue.fila[1] ("prod-faturacao") nao tem bloco moved: e' a unica remocao pretendida.
+
+resource "aws_db_instance" "bd" {
+  identifier        = "prod-pagamentos"
+  instance_class    = "db.r6g.xlarge"      # alteracao no local, sem substituir o recurso
+  storage_encrypted = true
+
+  lifecycle {
+    prevent_destroy = true                 # o plan falha em vez de destruir a base de dados
+  }
+}
+
+moved {
+  from = aws_db_instance.principal
+  to   = aws_db_instance.bd
+}</code></pre></figure>
+      <figure class="listing text" id="lst-34-9"><div class="lhead"><span class="lnum">Listagem 34.9</span>
+        <span class="lcap">O <em>plan</em> da versão corrigida — que é o que a descrição do <em>pull request</em> prometia.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>  # aws_sqs_queue.fila[0] has moved to aws_sqs_queue.fila["pagamentos"]
+  # aws_sqs_queue.fila[2] has moved to aws_sqs_queue.fila["notificacoes"]
+  # aws_db_instance.principal has moved to aws_db_instance.bd
+  # aws_sqs_queue.fila[1] will be destroyed   ("prod-faturacao")
+  # aws_db_instance.bd will be updated in-place  (instance_class: "db.r6g.large" -> "db.r6g.xlarge")
+
+Plan: 0 to add, 1 to change, 1 to destroy.</code></pre></figure>
+      <p><strong>(c).</strong> A correcção tem três partes. Os blocos <code>moved</code> preservam a identidade dos recursos que mudam de endereço — de índice para chave, e do nome antigo do bloco para o novo — e podem ser apagados algumas semanas depois, quando todos os ambientes já tiverem aplicado. O <code>for_each</code> sobre um conjunto elimina a classe de defeito para sempre: a partir daqui, remover uma fila afecta uma fila. E o <code>prevent_destroy</code> na base de dados transforma qualquer futuro <em>plan</em> que implique destruí-la num erro de execução, em vez de uma linha no meio de trinta.</p>
+      <p>O que o entrevistador procura, além do resultado correcto: que o candidato leia o <em>plan</em> recurso a recurso e não apenas a linha de resumo; que saiba distinguir alteração no local de substituição e de movimento; que note que o aumento de <code>instance_class</code>, feito correctamente, é uma alteração no local mas com reinício da instância — pelo que fica pendente da janela de manutenção ou de <code>apply_immediately</code>, e é uma decisão a tomar, não um detalhe; e que proponha, para além do código, o travão de processo — política no <em>pipeline</em> que falha o <em>build</em> quando o <em>plan</em> em JSON contém a destruição de um recurso com dados.</p>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-34-7" class="h2"><span class="secnum">34.7</span> Custo, quotas e o que perguntam sobre FinOps<a class="anchor" href="#sec-34-7" aria-label="ligação">#</a></h2>
 
 <p>Numa scale-up europeia, a factura da nuvem é frequentemente o segundo maior custo depois dos salários, e um sénior de backend é esperado saber o que o seu serviço custa. A pergunta raramente é «como poupar dinheiro»; é «qual é o custo por transacção do seu serviço e o que o domina». Quem responde com uma ordem de grandeza e uma decomposição em três parcelas — computação, dados, transferência — está acima da média, porque a maioria não sabe sequer se o seu serviço custa 200 ou 20 000 dólares por mês.</p>
 
@@ -769,7 +1151,7 @@ module "servico" {
 
 <aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Etiquetagem é a pré-condição de toda a conversa de custo. Sem <code>default_tags</code> no fornecedor Terraform a atribuir <em>Serviço</em>, <em>Equipa</em>, <em>Ambiente</em> e centro de custo a cada recurso, a factura é um número agregado sobre o qual não se pode agir. Com etiquetas, a mesma factura passa a ser uma lista ordenada de serviços com dono, e a conversa deixa de ser «temos de poupar 20%» e passa a ser «este serviço custa 3 400 USD por mês e processa 12 milhões de transacções».</p></aside>
 
-<div class="qa" id="q-34-14" data-box="qa" data-area="devops" data-level="staff" data-freq="baixa">
+<div class="qa" id="q-34-20" data-box="qa" data-area="devops" data-level="staff" data-freq="baixa">
   <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
   <div class="qprompt">A factura AWS da equipa subiu 40% em dois meses sem aumento de tráfego. Como investiga e que três medidas propõe primeiro?</div>
@@ -800,7 +1182,7 @@ module "servico" {
   </div>
 </div>
 
-<h2 id="sec-34-7" class="h2"><span class="secnum">34.7</span> Resumo e checklist<a class="anchor" href="#sec-34-7" aria-label="ligação">#</a></h2>
+<h2 id="sec-34-8" class="h2"><span class="secnum">34.8</span> Resumo e checklist<a class="anchor" href="#sec-34-8" aria-label="ligação">#</a></h2>
 
 <p>O fio condutor deste capítulo é um só: entregar depressa é uma consequência de conseguir desfazer depressa. Todas as práticas — artefacto imutável, canário com alarme, expand/contract, estado bloqueado — existem para tornar a reposição barata e previsível, e é isso que o entrevistador procura ouvir.</p>
 
@@ -814,6 +1196,11 @@ module "servico" {
   <li>ECS Fargate para a maioria dos serviços Java; EKS quando existe equipa de plataforma e dezenas de serviços; Lambda para eventos esporádicos, não para APIs sustentadas com JVM.</li>
   <li>Multi-AZ é disponibilidade, réplicas são leitura; e antes de comprar capacidade, olhar para os planos de execução.</li>
   <li>Estado do Terraform em S3 cifrado e versionado, com bloqueio (<code>use_lockfile</code>), raiz por ambiente e módulos com etiqueta fixa.</li>
+  <li>O Terraform identifica recursos pelo endereço no estado: renomear um bloco é destruir e criar. Refactor faz-se com blocos <code>moved</code>, adopção com <code>import</code> e desistência com <code>removed</code> — todos revistos no <em>pull request</em>, ao contrário de <code>state mv</code> e <code>state rm</code>.</li>
+  <li><code>count</code> indexa por posição e faz deslizar tudo o que está à direita; <code>for_each</code> indexa por chave. <code>count</code> só para «zero ou um».</li>
+  <li><code>lifecycle</code> é o conjunto de excepções ao grafo: <code>create_before_destroy</code> para não abrir janela, <code>prevent_destroy</code> em recursos com dados, <code>ignore_changes</code> com a lista exacta de campos — nunca <code>all</code>.</li>
+  <li>O estado guarda segredos em texto simples e <code>sensitive</code> só mascara a saída; valores <em>ephemeral</em> e argumentos <em>write-only</em> resolvem-no na linguagem, e o que já lá passou tem de ser rodado.</li>
+  <li>A verificação de IaC faz-se em camadas: <code>fmt</code>/<code>validate</code>/<code>tflint</code> por PR, políticas sobre o <em>plan</em> em JSON, <code>terraform test</code> nos módulos, e apenas na promoção é que se criam recursos a sério.</li>
 </ul>
 
 <p>Checklist accionável antes da entrevista:</p>
@@ -824,6 +1211,9 @@ module "servico" {
   <li>Ter uma história de migração expand/contract com números: linhas, lotes, dias entre fases.</li>
   <li>Preparar a justificação ECS/EKS/Lambda para o próprio sistema, com a condição que inverteria a escolha.</li>
   <li>Ser capaz de escrever de cor um <em>backend</em> S3 com <code>encrypt</code>, <code>key</code> por ambiente e bloqueio.</li>
+  <li>Escrever de cor um bloco <code>moved</code> de índice para chave, e saber dizer quando o apagar.</li>
+  <li>Fazer o Exercício 34.2 sem correr nada: prever a linha de resumo do <em>plan</em> e identificar as destruições silenciosas.</li>
+  <li>Ter uma regra de política concreta que o <em>pipeline</em> faz falhar, e o incidente que a motivou.</li>
   <li>Ter uma ordem de grandeza do custo mensal do serviço e do custo por transacção.</li>
   <li>Saber nomear três quotas AWS que já limitaram, ou podiam limitar, o sistema actual.</li>
   <li>Preparar um incidente de <em>pipeline</em> ou de infraestrutura em que a decisão foi do próprio candidato, com o que se mediu antes e depois.</li>
