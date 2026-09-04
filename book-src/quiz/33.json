@@ -1,46 +1,46 @@
 {"chapter": 33, "questions": [
-  {"q": "Um pod tem `limits.memory: 2Gi` e a imagem não define nenhuma flag de memória da JVM. O serviço faz GC quase contínuo enquanto o `working set` do contentor fica em 700 MB. Qual é a explicação directa?",
+  {"q": "Um tópico tem 24 partições e o produtor escreve com `enable.idempotence=true` e `max.in.flight.requests.per.connection=5`. Que garantia de ordenação existe?",
    "options": [
-     "A JVM lê a memória do nó e não a do cgroup, por isso dimensiona a heap para o valor errado.",
-     "Sem `-Xmx`, `MaxRAMPercentage` vale 25% por omissão: a heap máxima é ~512 MB e o resto do limite fica por usar.",
-     "O `working set` inclui a page cache, por isso o valor de 700 MB não tem relação com a heap.",
-     "O G1 só usa metade da heap disponível quando o contentor tem menos de 4 vCPU."],
+     "Ordem total no tópico, porque a idempotência numera todas as mensagens do produtor.",
+     "Ordem total dentro de cada partição, incluindo em caso de retentativa, porque o broker reordena pela sequência do produtor.",
+     "Nenhuma ordem garantida, porque com `max.in.flight` acima de 1 as mensagens podem ser reordenadas.",
+     "Ordem apenas entre mensagens enviadas no mesmo lote (`batch.size`)."],
    "answer": 1,
-   "explain": "Com `UseContainerSupport` activo (omissão desde o JDK 10) a JVM lê o limite do cgroup, mas aplica-lhe `MaxRAMPercentage`, cujo valor por omissão é 25% — 512 MB de heap para 2Gi de limite. A opção 0 descreve o comportamento de JVMs antigas sem suporte a contentores; a page cache não explica GC contínuo; e o G1 não reduz a heap em função do número de CPUs."},
+   "explain": "A idempotência atribui um PID e um número de sequência por partição; o broker rejeita ou reordena pedidos fora de sequência, o que torna seguro manter até 5 pedidos em voo sem perder ordem dentro da partição. Ordem total no tópico nunca existe, porque partições diferentes são logs independentes. Sem idempotência é que `max.in.flight` acima de 1 admitiria reordenação numa retentativa; o `batch.size` só afecta agrupamento, não garantias."},
 
-  {"q": "O `Deployment` tem `preStop` com espera de 10 s e a aplicação usa `server.shutdown: graceful` com `spring.lifecycle.timeout-per-shutdown-phase: 30s`. O `terminationGracePeriodSeconds` ficou no valor por omissão. Qual é a consequência?",
+  {"q": "O consumidor tem `enable.auto.commit=true`, `auto.commit.interval.ms=5000` e cada mensagem demora 300 ms a processar. O pod é morto com SIGKILL a meio de um lote. Qual é o resultado mais provável?",
    "options": [
-     "Nenhuma: o grace period por omissão adapta-se ao preStop configurado.",
-     "O rollout fica bloqueado porque o kubelet espera pelo preStop antes de contar o pod como terminado.",
-     "Aos 30 s chega SIGKILL a meio da drenagem: pedidos perdidos e exit code 137 em vez de 143.",
-     "A readiness probe continua a correr durante o preStop e mantém o pod na lista de endpoints."],
-   "answer": 2,
-   "explain": "O valor por omissão de `terminationGracePeriodSeconds` é 30 s e conta a partir do início da paragem, incluindo o preStop: 10 s de espera mais até 30 s de drenagem não cabem, e o kubelet envia SIGKILL a meio. A aritmética tem de fechar em desigualdade estrita — grace period maior do que preStop mais o timeout de drenagem —, aqui 60 s. O grace period não se adapta sozinho e o problema não é o rollout ficar bloqueado."},
-
-  {"q": "Um serviço com `requests.cpu: 500m` e `limits.cpu: 1` mostra p99 de 400 ms em picos, com utilização média de CPU em 45% e `rate(container_cpu_cfs_throttled_periods_total[5m])` acima de 12%. Qual é a leitura correcta?",
-   "options": [
-     "A CPU tem folga; a latência vem da base de dados e o throttling é um artefacto da métrica.",
-     "A quota do CFS é consumida em rajadas por GC e JIT e o processo fica suspenso até ao período seguinte; subir ou remover o limite de CPU é a acção certa.",
-     "É preciso baixar `requests.cpu` para 250m, porque o HPA calcula a utilização sobre o request.",
-     "Igualar `limits.cpu` a `requests.cpu` põe o pod em Guaranteed e elimina o throttling."],
+     "Todas as mensagens do lote serão reprocessadas, porque nada foi confirmado.",
+     "Mensagens já confirmadas mas ainda não processadas são perdidas, porque o commit automático confirma o lote devolvido pelo `poll()`.",
+     "Nada se perde nem se repete: o commit automático é transaccional com o processamento.",
+     "O grupo bloqueia até `session.timeout.ms` e depois reprocessa a partir do início do tópico."],
    "answer": 1,
-   "explain": "Um limite de 1 CPU dá 100 ms de quota por período de 100 ms; um pico paralelo consome-a em 25 ms e o processo fica 75 ms suspenso, o que destrói a cauda sem mexer na média. Baixar o request agrava o throttling relativo e faz o HPA escalar por um sinal enviesado; igualar limite a request reduz ainda mais a quota, e Guaranteed é uma classe de expulsão, não uma isenção do CFS."},
+   "explain": "O commit automático confirma periodicamente o offset do último lote devolvido pelo `poll()`, não do último efectivamente processado, pelo que a queda pode deixar trabalho confirmado por fazer — perda silenciosa. Reprocessar tudo seria o comportamento de commit manual após o efeito. Não há transacção entre commit e processamento, e `auto.offset.reset` só entraria se não houvesse offset guardado."},
 
-  {"q": "Uma equipa quer que uma alteração ao `ConfigMap` chegue aos pods de forma segura e reversível. Qual é a abordagem mais robusta?",
+  {"q": "Um serviço lê `pedidos`, escreve em `pedidos-validados` e faz um `INSERT` no PostgreSQL. A equipa activa transacções Kafka com `transactional.id` fixo e `isolation.level=read_committed` nos consumidores. Que garantia passa a existir de ponta a ponta?",
    "options": [
-     "Montar o ConfigMap com `subPath` para o kubelet actualizar o ficheiro sem reiniciar o pod.",
-     "Injectar por `envFrom` e confiar que o kubelet propaga os novos valores ao processo.",
-     "Anotar o `spec.template` com o hash do ConfigMap (`checksum/config`), forçando um rolling update validado pela readiness probe.",
-     "Ligar `@RefreshScope` em todos os beans para recarregar a configuração nos 20 pods em simultâneo."],
+     "Exactly-once entre Kafka e PostgreSQL, porque o offset e o INSERT ficam na mesma transacção.",
+     "At-most-once, porque a transacção Kafka reverte o INSERT em caso de falha.",
+     "Exactly-once entre os tópicos Kafka, mas at-least-once para o INSERT, que continua a precisar de deduplicação.",
+     "Nenhuma garantia adicional, porque `read_committed` só afecta a latência de leitura."],
    "answer": 2,
-   "explain": "O hash no `spec.template` transforma uma mudança de configuração num deploy normal: rollout gradual, validação por readiness em cada pod, `progressDeadlineSeconds` a falhar o deploy e `rollout undo` disponível. Montagens com `subPath` nunca são actualizadas pelo kubelet, `envFrom` congela os valores na criação do pod, e o recarregamento a quente aplica uma configuração inválida a toda a frota ao mesmo tempo, sem barreira nenhuma."},
+   "explain": "A transacção do Kafka é atómica sobre escritas em tópicos Kafka e sobre o commit dos offsets consumidos, e nada mais. Um `INSERT` no PostgreSQL fica fora dessa fronteira: se o processo cair entre o INSERT e o commit da transacção Kafka, a mensagem é reprocessada e o INSERT repete-se, pelo que é preciso uma chave de deduplicação. `read_committed` tem efeito real — esconde registos de transacções não confirmadas e limita a leitura ao Last Stable Offset."},
 
-  {"q": "Um consumidor de Kafka com 12 partições acumula lag às horas de ponta, com CPU em 30%. Que configuração de HPA é defensável?",
+  {"q": "Um consumidor entra em ciclo de rebalance: processa cerca de 4 minutos por lote e é expulso do grupo, mesmo com a rede saudável. Qual é a correcção certa?",
    "options": [
-     "Escalar por lag do grupo de consumidores, com `maxReplicas: 12` e janela de estabilização longa na descida.",
-     "Escalar por CPU com alvo de 30%, para o HPA reagir antes de a CPU subir.",
-     "Escalar por lag com `maxReplicas: 40`, para absorver qualquer pico de produção.",
-     "Escalar por memória, já que o consumidor acumula mensagens em buffers antes de as processar."],
-   "answer": 0,
-   "explain": "O lag mede o trabalho por fazer, que é o recurso realmente saturado num consumidor ligado a I/O; o paralelismo de um grupo está limitado pelo número de partições, por isso réplicas acima de 12 ficam ociosas e só pagam rebalances. Baixar o alvo de CPU mantém o sinal errado, e a memória não descreve a saturação — além de que cada réplica que entra ou sai provoca um rebalance, daí a janela de estabilização longa na descida."}
+     "Aumentar `session.timeout.ms` para 600000, porque é o timeout que expulsa o membro.",
+     "Baixar `max.poll.records` (ou subir `max.poll.interval.ms`), porque o membro é expulso por demorar demasiado entre chamadas a `poll()`.",
+     "Baixar `heartbeat.interval.ms` para 500 ms para o coordenador saber que o membro está vivo.",
+     "Mudar `auto.offset.reset` para `latest` para saltar o lote lento."],
+   "answer": 1,
+   "explain": "Os batimentos são enviados por uma thread de fundo e continuam durante o processamento, por isso `session.timeout.ms` e `heartbeat.interval.ms` não são a causa: o membro é expulso por exceder `max.poll.interval.ms` entre chamadas consecutivas a `poll()`. A correcção é reduzir o trabalho por lote com `max.poll.records` ou alargar o intervalo máximo. `auto.offset.reset` só se aplica quando não há offset guardado ou ele expirou."},
+
+  {"q": "Um tópico `precos` com `cleanup.policy=compact` alimenta uma vista local em cada serviço. Que afirmação está correcta?",
+   "options": [
+     "Um consumidor que leia do início obtém o histórico completo de alterações de cada preço.",
+     "Um registo com valor nulo é um tombstone: marca a chave para eliminação e desaparece após `delete.retention.ms`.",
+     "A compactação é síncrona com a escrita, pelo que nunca se vêem duas versões da mesma chave.",
+     "Compactação e `retention.ms` são mutuamente exclusivas, pelo que o tópico cresce sem limite."],
+   "answer": 1,
+   "explain": "O tombstone (valor nulo) é o mecanismo de eliminação por chave num log compactado, e `delete.retention.ms` define a janela em que os consumidores ainda o conseguem ver antes de a chave desaparecer. A compactação mantém pelo menos o último valor por chave, logo o histórico de transições não é recuperável; actua de forma assíncrona sobre segmentos fechados, pelo que se podem ler versões antigas; e as políticas combinam-se com `cleanup.policy=compact,delete`."}
 ]}

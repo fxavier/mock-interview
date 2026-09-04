@@ -1,880 +1,685 @@
-<p>Nenhuma outra área discrimina tão depressa entre um sénior e um mid como a leitura de um plano de execução. A pergunta raramente é «o que é um índice»; é «esta consulta demora 4,8 s em produção, aqui está o <code>EXPLAIN (ANALYZE, BUFFERS)</code>, o que fazia a seguir». O que o entrevistador mede é se o candidato lê o plano de baixo para cima, compara estimativa com realidade, olha para os <em>buffers</em> antes de olhar para os milissegundos, e propõe uma alteração cujo efeito consegue prever com um número. Onde os candidatos caem: recitam «cria-se um índice na coluna do <code>WHERE</code>» sem falar de selectividade, ignoram o custo de escrita do índice que acabaram de propor, confundem <em>cost</em> com tempo, e nunca reparam que o nó mais caro do plano é um <em>sort</em> que verteu 73 MB para disco. Este capítulo trabalha o PostgreSQL 17 como referência, mas o raciocínio transfere-se para qualquer planeador baseado em custos.</p>
+<p>Uma ronda de modelação relacional mede se o candidato consegue escrever, ao vivo, um esquema que sobrevive a três anos de produção — e depois defender cada decisão contra um requisito novo que o entrevistador acrescenta a meio. O que se avalia não é saber recitar as formas normais: é saber onde é que o modelo guarda cada invariante, quanto custa em bytes e em páginas de índice cada escolha de tipo, e o que se parte quando o requisito muda. Onde os candidatos caem é em três sítios previsíveis: usam <code>uuid</code> aleatório como chave primária de uma tabela de 200 milhões de linhas sem saber o que isso faz ao B-tree, resolvem histórico com um <code>deleted_at</code> e ficam sem resposta quando se pergunta pela unicidade do email, e guardam dinheiro em <code>double precision</code>. Este capítulo trata o modelo como aquilo que é — a última linha de defesa da correcção, porque a aplicação será reescrita duas vezes e os dados ficam.</p>
 
-<h2 id="sec-22-1" class="h2"><span class="secnum">22.1</span> B-tree por dentro: selectividade, cardinalidade e ordem das colunas<a class="anchor" href="#sec-22-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-22-1" class="h2"><span class="secnum">22.1</span> Normalização até 3FN e desnormalização deliberada<a class="anchor" href="#sec-22-1" aria-label="ligação">#</a></h2>
 
-<p>Um índice B-tree do PostgreSQL é uma árvore equilibrada de páginas de 8 kB. Cada entrada de folha guarda a chave mais um <em>tuple identifier</em> (<code>ctid</code>) de 6 bytes que aponta para o par (bloco, posição) na <em>heap</em>. Com uma chave <code>bigint</code>, a entrada custa cerca de 24 bytes com alinhamento e cabeçalho, o que dá aproximadamente 300 entradas por página interna. Daí a propriedade que interessa numa entrevista: uma tabela de 48 milhões de linhas produz uma árvore de altura 4 (300<sup>3</sup> ≈ 27 M, 300<sup>4</sup> ≈ 8,1 G), logo localizar uma chave custa 3 a 4 leituras de página, quase sempre em <em>cache</em>, mais 1 leitura aleatória na <em>heap</em> por cada linha devolvida. É esse último termo — uma leitura aleatória por linha — que domina tudo o resto e explica quase todas as decisões do planeador.</p>
+<p>As três primeiras formas normais resolvem um problema só: eliminar a possibilidade de o mesmo facto existir em dois sítios com valores diferentes. A 1FN exige valores atómicos e ausência de grupos repetidos — nada de <code>tags</code> em texto separado por vírgulas, nada de <code>phone1</code>, <code>phone2</code>, <code>phone3</code>. A 2FN elimina dependências parciais de parte de uma chave composta: numa tabela com chave <code>(order_id, product_id)</code>, a coluna <code>product_name</code> depende só de metade da chave e tem de sair. A 3FN elimina dependências transitivas entre atributos não-chave: se <code>city</code> se deduz de <code>postcode</code>, a cidade pertence a uma tabela de códigos postais. A BCNF aperta o caso raro em que existe uma dependência funcional sobre um determinante que não é chave candidata; em entrevista basta reconhecer o caso, não o recitar.</p>
 
-<p>Duas grandezas separam um índice útil de um índice decorativo. <em>Cardinalidade</em> é o número de valores distintos da coluna; <em>selectividade</em> é a fracção de linhas que o predicado deixa passar. Só a segunda decide. Uma coluna <code>status</code> com 6 valores distintos tem cardinalidade ridícula, mas se <code>'PENDING'</code> representa 0,3% das 48 milhões de linhas, o predicado é altamente selectivo e o índice compensa. A mesma coluna com <code>status = 'DELIVERED'</code> a cobrir 91% das linhas torna o índice inútil: o planeador prefere ler os 390 000 blocos da tabela sequencialmente do que fazer 43 milhões de saltos aleatórios. O ponto de viragem, com os custos por omissão (<code>seq_page_cost = 1.0</code>, <code>random_page_cost = 4.0</code>), fica tipicamente entre 5% e 12% das linhas; num volume NVMe onde <code>random_page_cost</code> foi ajustado para 1.1, sobe para 20% a 30%. Quem responde «acima de X% o índice não é usado» sem mencionar <code>random_page_cost</code> e o factor de correlação está a decorar um número sem o mecanismo.</p>
+<p>O erro simétrico é normalizar factos históricos. A morada de entrega de uma encomenda de 2023 não é uma referência à morada actual do cliente: é um valor congelado no momento da compra. Copiá-la para a tabela <code>sales_order</code> não viola a 3FN, porque não existe dependência funcional entre a encomenda e a morada corrente — são atributos distintos que por acaso tiveram o mesmo valor um dia. O mesmo vale para o preço unitário na linha de encomenda. Um candidato que apresenta <code>order_line.unit_price</code> como redundância a eliminar está a dizer ao entrevistador que nunca reconciliou uma factura.</p>
 
-<p>A ordem das colunas num índice composto obedece a uma regra com três degraus, por esta ordem: primeiro as colunas com predicado de <strong>igualdade</strong>, depois a coluna com predicado de <strong>intervalo</strong>, depois as colunas usadas apenas para <strong>ordenação</strong> ou para cobrir a projecção. A razão é estrutural: um B-tree é uma ordenação lexicográfica das tuplas de chave, logo o varrimento só consegue delimitar um intervalo contíguo de folhas enquanto os prefixos forem fixos. Assim que aparece um predicado de intervalo, tudo o que vem depois deixa de restringir os limites do varrimento e passa a ser apenas um filtro aplicado a cada entrada percorrida.</p>
+<p>A desnormalização deliberada entra depois de existir um número. A regra prática que resiste à pergunta seguinte é: só se desnormaliza um agregado quando o plano de execução do <em>join</em> equivalente já foi medido, quando o rácio de leituras para escritas justifica pagar amplificação de escrita, e quando existe um processo de reconciliação que detecta divergência. Um contador <code>order_count</code> na tabela do cliente poupa uma agregação de 40 ms por pedido no p99, mas cria um ponto de contenção: cada encomenda nova passa a fazer <code>UPDATE</code> da mesma linha do cliente, e num cliente empresarial com 300 encomendas por minuto isso é uma fila de escritores no mesmo <em>tuple</em>.</p>
 
 <figure class="listing sql" id="lst-22-1"><div class="lhead"><span class="lnum">Listagem 22.1</span>
-  <span class="lcap">O esquema de referência usado no resto do capítulo (PostgreSQL 17).</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="sql"><code>-- customers: 2 100 000 linhas, 11 034 blocos (~86 MB)
--- orders:   48 000 000 linhas, 391 204 blocos (~3,0 GB)
-CREATE TABLE orders (
-    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id    int         NOT NULL,
-    customer_id  bigint      NOT NULL REFERENCES customers(id),
-    status       text        NOT NULL,   -- 6 valores; PENDING = 0,3%, DELIVERED = 91%
-    channel      text        NOT NULL,   -- WEB 62%, APP 33%, CALLCENTER 5%
-    created_at   timestamptz NOT NULL,
-    total_cents  bigint      NOT NULL,
-    payload      jsonb
+<span class="lcap">Núcleo em 3FN com valores históricos copiados de propósito (PostgreSQL 17).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE customer (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       citext      NOT NULL,
+    vat_number  text,
+    tier        text        NOT NULL DEFAULT 'STANDARD',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    deleted_at  timestamptz,
+    CONSTRAINT customer_tier_ck CHECK (tier IN ('STANDARD','GOLD','PARTNER'))
+);
+CREATE UNIQUE INDEX customer_email_live_uq ON customer (email) WHERE deleted_at IS NULL;
+
+CREATE TABLE product (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku        text          NOT NULL,
+    name       text          NOT NULL,
+    list_price numeric(12,4) NOT NULL CHECK (list_price &gt;= 0),
+    currency   char(3)       NOT NULL,
+    CONSTRAINT product_sku_uq UNIQUE (sku)
 );
 
--- Errado para o predicado (status = ?, created_at &gt;= ?): o intervalo vem primeiro
-CREATE INDEX idx_orders_created_status ON orders (created_at, status);
+CREATE TABLE sales_order (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id   bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    placed_at     timestamptz NOT NULL DEFAULT now(),
+    paid_at       timestamptz,
+    status        text        NOT NULL,
+    -- cópia deliberada: o que valia no momento da compra, não a morada actual
+    ship_line1    text        NOT NULL,
+    ship_city     text        NOT NULL,
+    ship_postcode text        NOT NULL,
+    CONSTRAINT sales_order_status_ck CHECK (status IN ('NEW','PAID','SHIPPED','CANCELLED')),
+    CONSTRAINT sales_order_paid_ck   CHECK (status &lt;&gt; 'PAID' OR paid_at IS NOT NULL)
+);
+CREATE INDEX sales_order_customer_ix ON sales_order (customer_id, placed_at DESC);
 
--- Certo: igualdade primeiro, intervalo depois
-CREATE INDEX idx_orders_status_created ON orders (status, created_at);</code></pre></figure>
-
-<p>A diferença não é académica. A Listagem 22.2 mostra os dois planos para a mesma consulta, na mesma máquina, com a <em>cache</em> quente nos dois casos.</p>
-
-<figure class="listing text" id="lst-22-2"><div class="lhead"><span class="lnum">Listagem 22.2</span>
-  <span class="lcap">A mesma consulta com as duas ordens de colunas: 288 ms contra 2,1 ms.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="text"><code>=# EXPLAIN (ANALYZE, BUFFERS) SELECT id, total_cents FROM orders
--#  WHERE status = 'PENDING' AND created_at &gt;= now() - interval '1 hour';
-
--- (a) com idx_orders_created_status (created_at, status)
- Index Scan using idx_orders_created_status on orders
-        (cost=0.57..73412.90 rows=812 width=16)
-        (actual time=2.104..288.377 rows=796 loops=1)
-   Index Cond: ((created_at &gt;= (now() - '01:00:00'::interval)) AND (status = 'PENDING'::text))
-   Buffers: shared hit=1204 read=8831
- Planning Time: 0.212 ms
- Execution Time: 288.641 ms
-
--- (b) com idx_orders_status_created (status, created_at)
- Index Scan using idx_orders_status_created on orders
-        (cost=0.57..1103.44 rows=812 width=16)
-        (actual time=0.038..1.902 rows=796 loops=1)
-   Index Cond: ((status = 'PENDING'::text) AND (created_at &gt;= (now() - '01:00:00'::interval)))
-   Buffers: shared hit=812 read=9
- Planning Time: 0.196 ms
- Execution Time: 2.071 ms</code></pre></figure>
-
-<p>Os dois planos têm o mesmo nome de nó e a mesma linha <code>Index Cond</code> com os mesmos dois predicados — é por isso que este erro sobrevive tanto tempo em produção. A denúncia está nos <em>buffers</em>: 10 035 páginas contra 821. Em (a) o varrimento delimita-se pela última hora (cerca de 42 000 entradas) e testa <code>status</code> em cada uma; em (b) delimita-se pelo par (<code>PENDING</code>, última hora) e toca em 796. O tempo cai 137 vezes sem que uma única linha de SQL mude.</p>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Regra de bolso para orçamentar um índice B-tree no PostgreSQL 17: cerca de 24 bytes por linha para uma chave <code>bigint</code>, 32 a 40 bytes para um par (<code>int</code>, <code>timestamptz</code>), mais 30% de folga por causa do <em>fillfactor</em> de 90 das folhas. Para <code>orders</code> (48 M linhas), um índice de duas colunas ocupa 1,6 a 1,9 GB e demora 90 a 150 s a construir com <code>maintenance_work_mem = 1GB</code> e <code>max_parallel_maintenance_workers = 4</code>. Com <code>CREATE INDEX CONCURRENTLY</code>, dois varrimentos completos em vez de um: contar com 2,5 a 3× esse tempo.</p></aside>
+CREATE TABLE order_line (
+    order_id   bigint        NOT NULL REFERENCES sales_order(id) ON DELETE CASCADE,
+    line_no    smallint      NOT NULL,
+    product_id bigint        NOT NULL REFERENCES product(id) ON DELETE RESTRICT,
+    qty        integer       NOT NULL CHECK (qty &gt; 0),
+    unit_price numeric(12,4) NOT NULL CHECK (unit_price &gt;= 0),
+    PRIMARY KEY (order_id, line_no)
+);
+CREATE INDEX order_line_product_ix ON order_line (product_id);</code></pre></figure>
 
 <div class="qa" id="q-22-1" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Tenho uma consulta com <code>WHERE tenant_id = ? AND status = ? AND created_at &gt;= ?</code> e <code>ORDER BY created_at DESC LIMIT 100</code>. Que índice cria e por que ordem põe as colunas?</div>
+  <div class="qprompt">Recebo esta tabela de um colega: <code>invoice(id, customer_email, customer_name, customer_postcode, customer_city, line_items_csv, total)</code>. Leve-a até à 3FN em voz alta e diga o que ganhou e o que perdeu em cada passo.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um índice em <code>(tenant_id, status, created_at DESC)</code>. A regra é igualdades primeiro, intervalo a seguir, e a coluna do intervalo escolhida de modo a coincidir com a coluna da ordenação — assim o mesmo índice resolve o filtro <em>e</em> o <code>ORDER BY</code>, e o <code>LIMIT 100</code> pára o varrimento nas primeiras 100 folhas em vez de materializar e ordenar o conjunto todo.</p>
-      <p>O mecanismo: o B-tree é uma ordenação lexicográfica das chaves. Com <code>tenant_id</code> e <code>status</code> fixos por igualdade, todas as entradas desse par vivem num intervalo contíguo de folhas, já ordenadas por <code>created_at</code>. O planeador escolhe <code>Index Scan Backward</code>, lê 100 entradas e devolve. Se a ordem fosse <code>(created_at, tenant_id, status)</code>, o varrimento teria de cobrir toda a janela temporal de todos os inquilinos e filtrar — em 48 milhões de linhas com 400 inquilinos, isso são centenas de milhares de entradas percorridas para devolver 100.</p>
-      <p>Duas subtilezas de nível sénior. Primeira: o <code>DESC</code> no índice é quase sempre desnecessário, porque o PostgreSQL percorre qualquer B-tree nos dois sentidos com o mesmo custo; só passa a ser preciso quando a ordenação mistura sentidos, por exemplo <code>ORDER BY status ASC, created_at DESC</code>. Segunda: entre <code>(tenant_id, status, created_at)</code> e <code>(status, tenant_id, created_at)</code> a escolha decide-se pela reutilização, não pela selectividade — quando as duas colunas são de igualdade, o varrimento delimitado é idêntico; o que muda é que só o prefixo à esquerda serve outras consultas. Num sistema multi-inquilino, <code>tenant_id</code> à cabeça porque quase todas as consultas o têm.</p>
-      <p>O <em>trade-off</em>: este índice de três colunas custa cerca de 2,2 GB e acrescenta uma escrita de índice por cada <code>INSERT</code> em <code>orders</code>. Se <code>status</code> tiver 91% das linhas num único valor, um índice parcial <code>WHERE status = 'PENDING'</code> sobre <code>(tenant_id, created_at)</code> resolve o mesmo caso ocupando 0,3% do espaço. A escolha contrária — não criar o índice — passa a ser a certa se a consulta correr uma vez por hora num relatório e a tabela receber 3 000 <code>INSERT</code>/s.</p></div>
+      <p>Três passos, um por forma normal, e um quarto passo que reverte parte do trabalho de propósito.</p>
+      <p>1FN: <code>line_items_csv</code> viola a atomicidade. Sai para <code>invoice_line(invoice_id, line_no, product_id, qty, unit_price)</code> com chave <code>(invoice_id, line_no)</code>. Ganho: as linhas passam a ser indexáveis, agregáveis e validáveis por <em>constraint</em>; deixa de ser possível gravar uma linha com quantidade negativa. Perda: ler uma factura completa passa de uma leitura de uma linha para um <em>join</em>, tipicamente um <code>Nested Loop</code> com <em>index scan</em> de 3 a 6 páginas.</p>
+      <p>2FN e 3FN: <code>customer_name</code> e <code>customer_email</code> dependem do cliente, não da factura, e <code>customer_city</code> depende transitivamente de <code>customer_postcode</code>. Saem para <code>customer</code> e, se o negócio for pan-europeu, <code>postcode</code> fica como tabela de referência. Ganho: uma alteração de email é uma escrita, não um <code>UPDATE</code> sobre 400 mil facturas. Perda: perde-se o dado histórico, que é exactamente o que a facturação precisa.</p>
+      <p>Passo quatro, a desnormalização deliberada: o nome e a morada fiscais impressos na factura voltam para <code>invoice</code>, agora como colunas <code>billing_*</code>, e o <code>total</code> fica materializado com uma verificação nocturna contra a soma das linhas. Não é violação de 3FN — é um facto diferente, o valor no momento da emissão. Uma factura emitida é um documento legal imutável; se o modelo permite que a morada da factura mude por um <code>UPDATE</code> noutra tabela, o modelo está errado, por mais normalizado que esteja.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe três índices de coluna única, um por predicado, e espera que a base de dados os combine.</td></tr>
-        <tr><td>Mid</td><td>Acerta no índice composto mas põe <code>created_at</code> à cabeça, ou não liga a ordem do índice ao <code>ORDER BY</code>.</td></tr>
-        <tr><td>Sénior</td><td>Igualdade → intervalo → ordenação, explica o varrimento contíguo de folhas, nota que o <code>LIMIT</code> evita o <em>sort</em>, quantifica o custo de espaço e escrita.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o índice parcial como alternativa, discute o prefixo à esquerda como activo partilhado entre consultas, e diz que valida com <code>EXPLAIN</code> em cópia de produção antes de propor.</td></tr>
+        <tr><td>Insuficiente</td><td>Recita as definições das formas normais sem as aplicar às colunas dadas, ou parte tudo em tabelas sem justificar nenhuma.</td></tr>
+        <tr><td>Mid</td><td>Normaliza correctamente até 3FN, extrai o cliente e as linhas, mas não vê o problema do documento fiscal histórico.</td></tr>
+        <tr><td>Sénior</td><td>Normaliza, identifica a dependência transitiva do código postal e depois reverte deliberadamente os campos de facturação, explicando que são factos distintos.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais o custo de leitura do modelo final, a estratégia de reconciliação do total materializado e o que muda se a empresa passar a emitir notas de crédito.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o <code>ORDER BY</code> passar a ser <code>total_cents DESC</code>?»</li>
-      <li>«O <code>DESC</code> na definição do índice faz alguma diferença aqui?»</li>
-      <li>«Se eu já tiver <code>(tenant_id, created_at)</code>, vale a pena criar este?»</li>
-      <li>«Como confirma que o índice novo está a ser usado e o antigo já não?»</li></ul></div>
+      <li>«E se um produto for eliminado do catálogo — a factura antiga ainda tem de imprimir o nome?»</li>
+      <li>«Onde é que valida que o total bate certo com as linhas, e com que frequência?»</li>
+      <li>«O que é a BCNF e este esquema está nela?»</li>
+      <li>«Quantos <em>joins</em> custa agora o ecrã de detalhe da factura?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Ordenar as colunas por cardinalidade («a mais selectiva primeiro») sem distinguir igualdade de intervalo.</li>
-      <li>Não mencionar que o índice também serve a ordenação.</li>
-      <li>Propor o índice sem uma palavra sobre custo de escrita ou espaço.</li></ul></div>
+      <li>Deixar <code>line_items_csv</code> «porque a aplicação já sabe fazer o <em>parse</em>».</li>
+      <li>Apontar <code>unit_price</code> na linha como redundância a eliminar.</li>
+      <li>Não distinguir referência corrente de valor histórico em nenhum momento.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-22-2" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O índice existe, a coluna está no <code>WHERE</code>, e mesmo assim o plano mostra <code>Seq Scan</code>. Quando é que o planeador está certo em fazer isso?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Está certo sempre que o número estimado de linhas devolvidas multiplicado pelo custo de um acesso aleatório à <em>heap</em> ultrapassa o custo de ler a tabela inteira em sequência. Um <code>Seq Scan</code> lê 391 204 blocos a <code>seq_page_cost = 1.0</code>; um <code>Index Scan</code> que devolva 5 milhões de linhas paga até 5 milhões de acessos aleatórios a <code>random_page_cost = 4.0</code>. O ponto de indiferença fica perto de 8% das linhas nos parâmetros por omissão. Acima disso o varrimento sequencial ganha, e ganha mesmo — em disco rotativo por um factor de 10, em NVMe por um factor de 2 a 3.</p>
-      <p>Há três atenuantes que um sénior nomeia. O primeiro é a <em>correlação física</em>: <code>pg_stats.correlation</code> mede quanto a ordem lógica da coluna acompanha a ordem física dos blocos. Numa coluna <code>created_at</code> de tabela <em>append-only</em>, a correlação é ≈ 1,0, os «acessos aleatórios» caem em blocos consecutivos e o planeador desconta o custo em conformidade; numa coluna <code>customer_id</code> a correlação anda perto de 0 e não há desconto. O segundo é o <code>Bitmap Heap Scan</code>, o meio-termo: ordena os <code>ctid</code> por bloco antes de ir à <em>heap</em>, o que converte acessos aleatórios em quase sequenciais e torna o índice viável entre 8% e 25% de selectividade. O terceiro é o <em>index-only scan</em>, que elimina o acesso à <em>heap</em> por completo quando o índice cobre a projecção e o mapa de visibilidade está actualizado.</p>
-      <p>O erro típico é ler o <code>Seq Scan</code> como um defeito. Na maioria dos casos em que aparece indevidamente, o problema não é a escolha, é a estimativa: <code>rows=812</code> no plano contra <code>rows=4118902</code> reais. Corrigem-se as estatísticas (<code>ANALYZE</code>, <code>default_statistics_target</code>, <code>CREATE STATISTICS</code> para colunas correlacionadas) antes de mexer no plano. Desligar <code>enable_seqscan</code> serve para diagnosticar — comparar os dois custos e ver de quanto o planeador se enganou — e nunca para produção.</p>
-      <p>Onde a escolha contrária é a certa: numa tabela de 400 linhas, o <code>Seq Scan</code> é sempre melhor, e é normal e saudável que o índice nunca seja usado. Uma tabela cabe num punhado de blocos e o índice acrescenta indirecção sem devolver nada.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«O PostgreSQL está a ignorar o índice»; propõe hints ou <code>enable_seqscan = off</code> como solução.</td></tr>
-        <tr><td>Mid</td><td>Sabe que há um limiar de selectividade mas não nomeia <code>random_page_cost</code> nem o <code>Bitmap Heap Scan</code>.</td></tr>
-        <tr><td>Sénior</td><td>Modelo de custo explícito, limiar quantificado, correlação física, bitmap como meio-termo, e verifica a estimativa antes de culpar o planeador.</td></tr>
-        <tr><td>Staff</td><td>Liga o limiar à configuração real do armazenamento, discute <code>effective_cache_size</code> e paralelismo, e sabe que a decisão muda com a fracção da tabela em <em>cache</em>.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que valor de <code>random_page_cost</code> usa em NVMe e porquê?»</li>
-      <li>«Como distingue um erro de estimativa de uma escolha correcta do planeador?»</li>
-      <li>«O que faz um <code>Bitmap Heap Scan</code> com <code>Heap Blocks: lossy</code>?»</li>
-      <li>«E se o <code>Seq Scan</code> for paralelo com 4 <em>workers</em>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar <code>Seq Scan</code> como sinónimo de bug.</li>
-      <li>Alterar parâmetros do planeador na sessão de produção como correcção definitiva.</li>
-      <li>Não olhar para a diferença entre <code>rows</code> estimadas e reais.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-22-2" class="h2"><span class="secnum">22.2</span> Índices compostos, covering e index-only scans<a class="anchor" href="#sec-22-2" aria-label="ligação">#</a></h2>
-
-<p>Um índice composto de <em>k</em> colunas serve qualquer consulta cujo prefixo à esquerda coincida com as colunas de igualdade — <code>(a, b, c)</code> serve <code>a</code>, serve <code>(a, b)</code> e serve <code>(a, b, c)</code>, mas não serve <code>b</code> sozinho. Esta propriedade do prefixo é a razão pela qual três índices bem escolhidos costumam bater sete índices de coluna única: cada composto amortiza-se por várias consultas. O PostgreSQL 17 sabe combinar dois índices via <code>BitmapAnd</code>, mas o resultado é quase sempre mais caro do que um composto adequado, porque paga a construção de dois <em>bitmaps</em> e depois a recolha na <em>heap</em>.</p>
-
-<p>Um índice diz-se <em>covering</em> quando contém todas as colunas de que a consulta precisa — as do <code>WHERE</code>, as do <code>ORDER BY</code> e as da lista de projecção. Nesse caso o PostgreSQL pode escolher um <code>Index Only Scan</code> e nunca tocar na <em>heap</em>. A cláusula <code>INCLUDE</code>, disponível desde a versão 11, acrescenta colunas apenas às páginas-folha, sem entrarem na chave de ordenação: não aumentam a altura da árvore, não podem ser usadas como condição de varrimento, e permitem colunas de tipos sem operador de ordenação. É a ferramenta certa para transportar um <code>total_cents</code> ou um <code>email</code> sem inflacionar a chave.</p>
-
-<p>A armadilha do <em>index-only scan</em> é a visibilidade. O índice não guarda informação de transacção, por isso o motor tem de confirmar que a linha é visível para a transacção corrente — consulta o <em>visibility map</em>, um bit por bloco da <em>heap</em>, e só evita a ida à <em>heap</em> se o bloco estiver marcado como todo-visível. Se o <code>autovacuum</code> não passou desde as últimas escritas, o campo <code>Heap Fetches</code> do plano dispara e o <em>index-only scan</em> degrada-se para o custo de um <code>Index Scan</code> normal, ou pior.</p>
-
-<figure class="listing text" id="lst-22-3"><div class="lhead"><span class="lnum">Listagem 22.3</span>
-  <span class="lcap">Index-only scan sobre um índice com <code>INCLUDE</code>: <code>Heap Fetches: 0</code> e 6 páginas tocadas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="text"><code>=# CREATE INDEX idx_orders_cust_created_inc ON orders (customer_id, created_at)
--#     INCLUDE (total_cents, status);
-
-=# EXPLAIN (ANALYZE, BUFFERS)
--#  SELECT created_at, total_cents, status FROM orders
--#  WHERE customer_id = 84120 AND created_at &gt;= date '2026-01-01'
--#  ORDER BY created_at DESC LIMIT 20;
-
- Limit  (cost=0.57..35.02 rows=20 width=24) (actual time=0.042..0.061 rows=20 loops=1)
-   Buffers: shared hit=6
-   -&gt;  Index Only Scan Backward using idx_orders_cust_created_inc on orders
-              (cost=0.57..268.44 rows=156 width=24)
-              (actual time=0.040..0.056 rows=20 loops=1)
-         Index Cond: ((customer_id = 84120) AND (created_at &gt;= '2026-01-01'::date))
-         Heap Fetches: 0
-         Buffers: shared hit=6
- Planning Time: 0.184 ms
- Execution Time: 0.081 ms
-
--- a mesma consulta 30 s depois de 400 000 UPDATE, antes do autovacuum passar:
-         Heap Fetches: 18
-         Buffers: shared hit=24
- Execution Time: 0.298 ms</code></pre></figure>
-
-<p>Um índice parcial restringe as linhas indexadas com um <code>WHERE</code> na própria definição. É a técnica de maior retorno em tabelas com distribuição enviesada: uma fila de trabalho com 48 milhões de linhas históricas e 140 000 pendentes indexa-se em 4 MB em vez de 1,8 GB, e cada linha que sai do estado pendente sai também do índice, o que mantém o índice pequeno e quente em <em>cache</em>. A condição é que o planeador consiga provar, a partir do predicado da consulta, que a consulta está contida no predicado do índice — provas só sintácticas e simples, o que obriga a que a constante do índice apareça literalmente na consulta.</p>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><code>INCLUDE</code> contra pôr a coluna na chave: com a coluna na chave, ela pode delimitar o varrimento e ordenar, mas entra em todos os níveis internos e engorda a árvore. Com <code>INCLUDE</code>, só ocupa espaço nas folhas — para uma tabela de 48 M linhas e uma coluna de 8 bytes, a diferença de tamanho ronda 3% mas a diferença de altura da árvore é zero em ambos os casos. Decide a semântica: se a coluna nunca aparece em <code>WHERE</code> nem em <code>ORDER BY</code>, <code>INCLUDE</code>; se aparece, chave.</p></aside>
-
-<div class="qa" id="q-22-3" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+<div class="qa" id="q-22-2" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O plano mostra <code>Index Only Scan</code> mas com <code>Heap Fetches: 412883</code> e a consulta demora 900 ms. Explique o que está a acontecer e como o corrige.</div>
+  <div class="qprompt">O ecrã de listagem de clientes faz uma agregação sobre 40 milhões de encomendas e está a 900 ms no p95. A equipa quer uma coluna <code>order_count</code> no cliente. Qual é a sua posição?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O índice cobre a consulta, mas o mapa de visibilidade não. Como o índice não guarda cabeçalhos de transacção, o motor só pode responder a partir do índice se o bloco da <em>heap</em> correspondente estiver marcado como <em>all-visible</em>. Cada bloco não marcado obriga a uma ida à <em>heap</em> — é isso que <code>Heap Fetches</code> conta. Com 412 883 idas, o <em>index-only scan</em> perdeu a vantagem e ficou mais caro do que um <code>Index Scan</code> comum, porque paga o teste do mapa por cima.</p>
-      <p>A causa quase sempre é o <code>autovacuum</code> a não acompanhar a taxa de escrita. Os parâmetros por omissão disparam a limpeza aos 20% de linhas mortas (<code>autovacuum_vacuum_scale_factor = 0.2</code>), o que numa tabela de 48 milhões de linhas significa esperar por 9,6 milhões de <code>UPDATE</code> ou <code>DELETE</code>. Numa tabela quente, isso são horas de trabalho acumulado, e é durante essas horas que os blocos ficam sem a marca. A correcção é por tabela: <code>ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_insert_scale_factor = 0.02, autovacuum_vacuum_cost_delay = 2ms)</code>, e subir <code>autovacuum_max_workers</code> se houver várias tabelas grandes.</p>
-      <p>Há uma segunda causa, mais subtil: transacções longas. Uma transacção aberta há 40 minutos, ou um <em>replication slot</em> parado, fixa o horizonte de <code>xmin</code> e impede o <code>VACUUM</code> de marcar seja o que for como todo-visível, por muito que corra. Diagnostica-se com <code>SELECT max(age(backend_xmin)) FROM pg_stat_activity</code> e com <code>pg_replication_slots</code>. Nesse caso ajustar o <code>autovacuum</code> não produz efeito nenhum; é preciso matar a transacção ou libertar o <em>slot</em>.</p>
-      <p>Medição antes e depois: correr <code>VACUUM (VERBOSE) orders</code> manualmente e repetir o <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Se <code>Heap Fetches</code> cair para perto de zero e o tempo passar de 900 ms para dezenas de milissegundos, a hipótese confirma-se. Se não cair, é o horizonte de <code>xmin</code>.</p></div>
+      <p>A posição é: ainda não. Uma agregação de 900 ms sobre 40 milhões de linhas quase sempre significa índice em falta ou plano errado, não falta de desnormalização. Com um índice em <code>(customer_id, placed_at DESC)</code> e um <code>count</code> restrito à janela que o ecrã mostra, o mesmo trabalho cai tipicamente para 5-20 ms por cliente. Desnormalizar antes de esgotar isto é comprar dívida permanente para resolver um problema temporário.</p>
+      <p>Se o número persistir depois de o plano estar correcto — porque o ecrã agrega sobre todo o histórico de todos os clientes visíveis —, há três instrumentos por ordem de custo crescente. Primeiro, vista materializada com <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code>: a divergência é limitada pelo intervalo de <em>refresh</em>, ninguém escreve no caminho crítico, e o custo é uma tabela extra a manter. Segundo, coluna mantida por <em>trigger</em>: consistente na mesma transacção, mas serializa escritas na linha do cliente. Terceiro, contador incremental fora da base, em Redis, com reconciliação periódica: rápido, mas passa a existir uma segunda fonte de verdade e um modo de falha que ninguém vê até divergir.</p>
+      <p>O <em>trade-off</em> decisivo é a contenção. Com <em>trigger</em>, 300 encomendas por minuto de um cliente empresarial tornam-se 300 <code>UPDATE</code> na mesma linha; em <em>MVCC</em> isso são 300 versões da linha, mais trabalho de <em>autovacuum</em> e escritores em fila no bloqueio da linha. Se o rácio for de 200 leituras por escrita e a tolerância a atraso for de um minuto, a vista materializada ganha; se o valor tiver de ser exacto no mesmo pedido — um limite de crédito, por exemplo — não há alternativa à coluna transaccional, e aí aceita-se a contenção e mede-se.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não sabe o que é <code>Heap Fetches</code>; sugere criar mais um índice.</td></tr>
-        <tr><td>Mid</td><td>Diz «falta fazer VACUUM» sem explicar o mapa de visibilidade nem propor parâmetros por tabela.</td></tr>
-        <tr><td>Sénior</td><td>Explica o mapa de visibilidade, liga ao <code>autovacuum</code>, propõe <code>scale_factor</code> por tabela com números, e valida com uma medição antes/depois.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o horizonte de <code>xmin</code> (transacções longas, <em>slots</em> de replicação, <em>standby</em> com <code>hot_standby_feedback</code>) como causa que nenhum ajuste de <code>autovacuum</code> resolve.</td></tr>
+        <tr><td>Insuficiente</td><td>Aceita a coluna imediatamente, ou recusa-a por «viola a normalização» sem nenhum número.</td></tr>
+        <tr><td>Mid</td><td>Sugere índice ou cache, mas não distingue consistência transaccional de eventual nem menciona custo de escrita.</td></tr>
+        <tr><td>Sénior</td><td>Exige o plano primeiro, apresenta as três opções com o critério de escolha e nomeia a contenção na linha do cliente.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o mecanismo de detecção de divergência, o que acontece no <em>backfill</em> das 40 milhões de linhas e como se reverte a decisão se falhar.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque é que o índice não guarda a informação de visibilidade?»</li>
-      <li>«Que impacto tem <code>hot_standby_feedback = on</code> nisto?»</li>
-      <li>«Como monitoriza isto continuamente?»</li>
-      <li>«O <code>INCLUDE</code> ajudaria aqui?»</li></ul></div>
+      <li>«Como faz o <em>backfill</em> inicial sem bloquear a tabela?»</li>
+      <li>«Que consulta corre para detectar que o contador divergiu, e com que custo?»</li>
+      <li>«E se a encomenda for cancelada — quem decrementa?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confundir <em>index-only scan</em> com «o índice tem todas as colunas, logo nunca vai à tabela».</li>
-      <li>Propor <code>VACUUM FULL</code> numa tabela de 3 GB em produção sem mencionar o bloqueio exclusivo.</li>
-      <li>Ignorar completamente as transacções longas.</li></ul></div>
+      <li>Propor <em>trigger</em> sem mencionar a contenção nem o <em>autovacuum</em>.</li>
+      <li>Assumir que a cache em Redis é gratuita em correcção.</li>
+      <li>Nunca pedir o plano de execução antes de mudar o modelo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-22-2" class="h2"><span class="secnum">22.2</span> Chaves primárias: sequencial, UUID e ULID<a class="anchor" href="#sec-22-2" aria-label="ligação">#</a></h2>
+
+<p>A chave primária é a decisão de modelação com maior alcance, porque se propaga a todas as chaves estrangeiras, a todos os índices que as cobrem, a todas as caches e a todos os contratos de API. Em PostgreSQL 17, <code>bigint GENERATED ALWAYS AS IDENTITY</code> ocupa 8 bytes, é a forma normalizada do antigo <code>bigserial</code> e produz inserções estritamente crescentes; <code>uuid</code> ocupa 16 bytes e, na versão 4, é aleatório em todos os 122 bits úteis. A diferença de 8 bytes por coluna parece irrelevante até se contar quantas vezes a chave aparece.</p>
+
+<p>A aritmética do B-tree é o número que separa quem já mediu de quem repete slogans. Uma página de índice tem 8 kB, com cerca de 8 160 bytes utilizáveis. Uma entrada de folha para <code>bigint</code> custa 8 bytes de cabeçalho de tuplo mais 8 de valor mais 4 do ponteiro de linha, à volta de 20 bytes, dando por volta de 400 entradas por página; para <code>uuid</code> são 8 mais 16 mais 4, à volta de 28 bytes, cerca de 290 entradas. São 100 milhões de linhas em aproximadamente 2,1 GB de índice contra 2,9 GB. Mas o custo maior não é esse: com valores aleatórios, cada inserção vai para uma folha imprevisível, o que provoca divisões de página constantes e deixa as folhas com 50-70% de ocupação — o índice real cresce para 4 GB e o conjunto de páginas tocadas por inserção deixa de caber em <code>shared_buffers</code>. Numa tabela com escrita intensa, é comum ver a taxa de inserção cair para metade ou menos quando o índice ultrapassa a memória disponível, com <em>random I/O</em> onde antes havia acrescento sequencial.</p>
+
+<p>UUIDv7, definido no RFC 9562, resolve exactamente isto: 48 bits iniciais de timestamp em milissegundos seguidos de aleatoriedade, ordenável no tempo. O ULID tem a mesma propriedade com outra codificação textual. Em PostgreSQL 17 não existe gerador de UUIDv7 no núcleo — <code>gen_random_uuid()</code> produz v4 —, portanto gera-se na aplicação (Java 21, com uma biblioteca ou 20 linhas sobre <code>SecureRandom</code>) ou numa função SQL própria. Guardar UUID como <code>varchar(36)</code> é o erro de custo mais alto e mais silencioso: 37 bytes em vez de 16, comparações por texto em vez de por 128 bits, e um índice mais de duas vezes maior.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 22.1</span> Estratégias de chave primária, para uma tabela de 100 milhões de linhas com três chaves estrangeiras a apontar-lhe.</div>
+<div class="tscroll"><table><thead><tr><th>Estratégia</th><th>Bytes por linha (PK + 3 FK)</th><th>Localidade de escrita</th><th>Índice PK aproximado</th><th>Quando é a escolha certa</th></tr></thead><tbody>
+<tr><td><code>bigint</code> identity</td><td>32</td><td>Acrescento no fim; folhas cheias</td><td>≈ 2,1 GB</td><td>Uma só base a gerar ids; ids nunca expostos ao exterior ou expostos sem risco de enumeração.</td></tr>
+<tr><td><code>uuid</code> v4</td><td>64</td><td>Aleatória; divisões de página, folhas a 50-70%</td><td>≈ 3,5-4 GB</td><td>Ids gerados por vários produtores sem coordenação e sem qualquer ordenação temporal desejável.</td></tr>
+<tr><td><code>uuid</code> v7 / ULID</td><td>64</td><td>Quase sequencial por milissegundo</td><td>≈ 2,9 GB</td><td>Ids gerados no cliente ou em vários serviços, com escrita intensa; o defeito razoável hoje.</td></tr>
+<tr><td><code>varchar(36)</code> com UUID</td><td>148</td><td>Aleatória, com comparação textual</td><td>≈ 7 GB</td><td>Nunca; só existe por migração descuidada de um ORM.</td></tr>
+<tr><td>Chave natural composta</td><td>variável, tipicamente 40-120</td><td>Depende do primeiro atributo</td><td>Muito variável</td><td>Tabelas de associação puras e tabelas de referência estáveis (código ISO, código de moeda).</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Trocar <code>bigint</code> por <code>uuid</code> numa tabela de 100 milhões de linhas referenciada por três tabelas filhas acrescenta cerca de 32 bytes por linha em dados e mais 0,8 GB por cada índice de chave estrangeira. Com quatro índices envolvidos, o custo total ronda 6-8 GB de armazenamento adicional e a mesma proporção de páginas extra a competir por <code>shared_buffers</code>. Passar de v4 para v7 não devolve os bytes, mas devolve a localidade: as divisões de página desaparecem e a densidade das folhas volta a 85-90%.</p></aside>
+
+<figure class="listing sql" id="lst-22-2"><div class="lhead"><span class="lnum">Listagem 22.2</span>
+<span class="lcap">Medir o efeito real da chave: densidade e fragmentação das folhas do B-tree.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS pgcrypto;     -- gen_random_uuid() = UUIDv4
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+CREATE TABLE event_v4 (
+    id         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- UUIDv7 (RFC 9562): 48 bits de tempo + aleatoriedade. PostgreSQL 17 não o gera
+-- em core; o id chega já preenchido pela aplicação.
+CREATE TABLE event_v7 (
+    id         uuid        PRIMARY KEY,
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE event_seq (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload    jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- depois da carga: o que interessa é avg_leaf_density e leaf_fragmentation
+SELECT 'v4'  AS k, * FROM pgstatindex('event_v4_pkey')
+UNION ALL
+SELECT 'v7',       * FROM pgstatindex('event_v7_pkey')
+UNION ALL
+SELECT 'seq',      * FROM pgstatindex('event_seq_pkey');
+
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS heap
+FROM pg_class WHERE relname LIKE 'event\_%' AND relkind = 'r';</code></pre></figure>
+
+<div class="qa" id="q-22-3" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A tabela de eventos vai receber 30 mil inserções por segundo e crescer para mil milhões de linhas. A equipa propõe <code>uuid</code> gerado com <code>gen_random_uuid()</code> como chave primária. O que responde?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Respondo que a decisão de gerar o id fora da base é boa e a versão do UUID é má. <code>gen_random_uuid()</code> produz v4, aleatório em todos os bits úteis; a mudança é para UUIDv7, gerado na aplicação, que mantém as garantias de unicidade sem coordenação e acrescenta ordenação temporal.</p>
+      <p>O mecanismo é a localidade de escrita no B-tree. Com v4, cada inserção aterra numa folha aleatória do índice. Com mil milhões de linhas, o índice da chave primária tem 3 a 4 GB; se <code>shared_buffers</code> forem 8 GB numa máquina com outros índices a competir, a folha alvo raramente está em memória e cada inserção paga uma leitura aleatória, mais a escrita da página suja, mais divisões de página quando a folha enche. As folhas estabilizam com 50-70% de ocupação. Com v7, as inserções concentram-se nas últimas folhas: praticamente sem divisões, densidade a 85-90%, e o conjunto de trabalho de escrita reduz-se a algumas dezenas de páginas quentes independentemente do tamanho da tabela.</p>
+      <p>Aos 30 mil por segundo, isto é a diferença entre caber e não caber. Vale a pena acrescentar duas coisas na mesma resposta. Primeira: a 30 mil eventos por segundo, uma tabela única não chega; particiona-se por intervalo em <code>created_at</code>, o que também torna a remoção por retenção um <code>DETACH PARTITION</code> em vez de um <code>DELETE</code> de mil milhões de linhas. Segunda: o custo do v7 é revelar o instante de criação a quem vir o id — se o id for público e o tempo de criação for informação sensível, ou se o requisito for id opaco e não enumerável, então v4 é a escolha certa e paga-se a fragmentação, ou usa-se v7 interno com um identificador público separado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«UUID é sempre melhor porque evita colisões» ou «sequencial é sempre melhor», sem falar de índices.</td></tr>
+        <tr><td>Mid</td><td>Sabe que UUID aleatório fragmenta o índice, mas não explica divisões de página nem relaciona com a memória disponível.</td></tr>
+        <tr><td>Sénior</td><td>Explica a localidade de escrita no B-tree com números, propõe v7 e nomeia o custo de expor o tempo de criação.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta particionamento e retenção, o impacto nas chaves estrangeiras e na replicação, e como migraria uma tabela já em produção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como migra uma tabela de 400 milhões de linhas de v4 para v7 sem parar o serviço?»</li>
+      <li>«Qual é o efeito no volume de WAL e na replicação?»</li>
+      <li>«Porque não usar <code>bigint</code> com uma sequência com <code>CACHE</code> alto?»</li>
+      <li>«O que muda se o id for a chave de particionamento?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Guardar o UUID em <code>varchar(36)</code> ou <code>text</code>.</li>
+      <li>Não saber que <code>gen_random_uuid()</code> é v4.</li>
+      <li>Afirmar que o problema se resolve com <code>REINDEX</code> periódico.</li></ul></div>
   </div>
 </div>
 
 <div class="qa" id="q-22-4" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Temos uma tabela de 48 milhões de encomendas em que a fila de trabalho procura sempre as 0,3% com <code>status = 'PENDING'</code>. Que índice propõe e que cuidados é preciso ter?</div>
+  <div class="qprompt">O domínio já tem identificadores únicos naturais: IBAN para a conta, ISIN para o instrumento, número de contribuinte para a entidade. Porque não usá-los directamente como chaves primárias?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um índice parcial: <code>CREATE INDEX CONCURRENTLY idx_orders_pending ON orders (tenant_id, created_at) WHERE status = 'PENDING'</code>. Indexa 144 000 linhas em vez de 48 milhões — cerca de 5 MB em vez de 1,8 GB — e o índice inteiro fica residente em <em>cache</em>. O ganho não é só de espaço: quando uma encomenda transita de <code>PENDING</code> para <code>PAID</code>, a entrada sai do índice, portanto o índice acompanha o tamanho da fila e não o tamanho do histórico.</p>
-      <p>O primeiro cuidado é a prova de contenção. O planeador só usa o índice parcial se conseguir demonstrar que o predicado da consulta implica o predicado do índice, e essa prova é sintáctica e limitada. <code>WHERE status = 'PENDING'</code> funciona; <code>WHERE status = $1</code> com um parâmetro só funciona depois de o <em>plan cache</em> gerar um plano específico com o valor, o que num <code>PreparedStatement</code> JDBC com <code>prepareThreshold</code> a 5 pode significar que as primeiras execuções usam o índice e a sexta, genérica, não usa. Na prática, o predicado tem de aparecer como literal ou o código tem de ter uma consulta dedicada.</p>
-      <p>O segundo cuidado é a manutenção. Índices parciais em filas de trabalho são o caso clássico de <em>bloat</em>: as entradas entram e saem depressa, e o índice pode crescer para 200 MB com 5 MB de dados vivos se o <code>autovacuum</code> não acompanhar. Fixa-se <code>autovacuum_vacuum_scale_factor = 0.01</code> na tabela e monitoriza-se o rácio entre <code>pg_relation_size</code> do índice e a contagem de linhas pendentes; <code>REINDEX INDEX CONCURRENTLY</code> quando passar de 5×.</p>
-      <p>Quando a escolha contrária é a certa: se os estados consultados forem muitos e mudarem com o produto, uma dúzia de índices parciais torna-se um passivo de manutenção. Aí prefere-se um índice composto <code>(status, tenant_id, created_at)</code> único, aceitando 1,8 GB, ou parte-se a tabela por <em>partitioning</em> em quente/frio.</p></div>
+      <p>Porque nenhuma das três propriedades que uma chave primária precisa está garantida por uma chave natural: imutabilidade, estreiteza e disponibilidade no momento da inserção. O padrão é chave <em>surrogate</em> interna como primária e a chave natural como <code>UNIQUE NOT NULL</code>.</p>
+      <p>Imutabilidade: os identificadores naturais mudam. Um IBAN muda quando o banco é adquirido e migra os códigos; um número de contribuinte muda numa fusão de sociedades; um SKU é reatribuído quando o catálogo é reestruturado. Se essa coluna for a chave primária, cada alteração propaga-se por <code>ON UPDATE CASCADE</code> a todas as tabelas filhas — uma escrita de negócio trivial torna-se um <code>UPDATE</code> de milhões de linhas com bloqueios em cadeia.</p>
+      <p>Estreiteza: um IBAN tem até 34 caracteres. Como chave primária propagada a cinco tabelas filhas, são cerca de 35 bytes por linha em cada uma, contra 8 de um <code>bigint</code>. Numa tabela de movimentos com 500 milhões de linhas, são mais de 13 GB só na coluna e outro tanto em cada índice que a inclua, além de comparações de texto com colação em vez de comparação de inteiros.</p>
+      <p>Disponibilidade: a entidade tem de existir no modelo antes de o identificador natural ser conhecido — um cliente em <em>onboarding</em> cria-se antes de o número de contribuinte ser validado. Com chave natural, ou se inventa um valor de sentinela, ou se atrasa a criação da linha.</p>
+      <p>A escolha contrária é legítima em dois casos: tabelas de referência estáveis, onde o código ISO da moeda ou do país é a chave primária e a legibilidade das consultas compensa; e tabelas de associação puras, onde a chave é o par de chaves estrangeiras e não há nada mais a identificar.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Índice simples em <code>status</code>; não repara que 91% das linhas têm o mesmo valor.</td></tr>
-        <tr><td>Mid</td><td>Propõe o índice parcial e o ganho de espaço, mas não sabe que o planeador tem de provar a contenção do predicado.</td></tr>
-        <tr><td>Sénior</td><td>Índice parcial com números, prova de contenção e o problema dos planos genéricos, <code>CONCURRENTLY</code>, e a manutenção contra <em>bloat</em>.</td></tr>
-        <tr><td>Staff</td><td>Compara com particionamento e com uma tabela de fila dedicada, e define o critério de quando migrar de uma solução para a outra.</td></tr>
+        <tr><td>Insuficiente</td><td>«Usa-se sempre um id auto-incremento», sem justificação, ou aceita a chave natural sem ver o problema da mutação.</td></tr>
+        <tr><td>Mid</td><td>Menciona que a chave natural pode mudar, mas não quantifica a propagação nem fala de largura.</td></tr>
+        <tr><td>Sénior</td><td>Dá as três propriedades com exemplos do domínio e mantém a chave natural como <code>UNIQUE</code>, com números de custo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta os casos em que a chave natural ganha e discute a estabilidade da chave de negócio nos contratos de integração externos.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que acontece se a aplicação passar <code>status</code> como parâmetro <em>bind</em>?»</li>
-      <li>«Como sabe que o índice parcial está mesmo a ser usado?»</li>
-      <li>«E se precisar de <code>SELECT … FOR UPDATE SKIP LOCKED</code> sobre esta fila?»</li>
-      <li>«Quando é que passa isto para uma tabela separada ou para Kafka?»</li></ul></div>
+      <li>«Se o cliente externo integra pelo ISIN, que id expõe na API?»</li>
+      <li>«O que faz quando o mesmo IBAN reaparece com outra entidade?»</li>
+      <li>«Onde põe a validação de formato do IBAN — <code>CHECK</code>, domínio ou aplicação?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Criar o índice sem <code>CONCURRENTLY</code> numa tabela de produção com 3 GB.</li>
-      <li>Assumir que o índice parcial é escolhido sempre que a coluna aparece no <code>WHERE</code>.</li>
-      <li>Não falar de <em>bloat</em> num índice de fila de alta rotação.</li></ul></div>
+      <li>Deixar cair a <code>UNIQUE</code> sobre a chave natural depois de criar a <em>surrogate</em>.</li>
+      <li>Usar <code>ON UPDATE CASCADE</code> como resposta ao problema da mutabilidade.</li>
+      <li>Expor a chave sequencial interna numa API pública sem pensar em enumeração.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-22-3" class="h2"><span class="secnum">22.3</span> Além do B-tree: hash, GIN, GiST e BRIN<a class="anchor" href="#sec-22-3" aria-label="ligação">#</a></h2>
+<h2 id="sec-22-3" class="h2"><span class="secnum">22.3</span> Constraints, integridade referencial e a defesa em profundidade<a class="anchor" href="#sec-22-3" aria-label="ligação">#</a></h2>
 
-<p>O B-tree resolve igualdade, intervalo, ordenação e unicidade sobre tipos escalares — cobre 90% dos casos, e é por isso que é o índice por omissão. Os restantes 10% são exactamente onde a entrevista aperta, porque exigem que o candidato saiba mapear a forma do predicado ao tipo de índice em vez de decorar uma lista.</p>
+<p>O argumento contra <em>constraints</em> na base — «a validação está na aplicação» — falha por uma razão empírica: a aplicação não é o único escritor. Ao longo da vida de um sistema escrevem na base o serviço principal, um segundo serviço criado dois anos depois, os <em>scripts</em> de migração, as correcções manuais em incidente, a ferramenta de importação de dados e o pipeline de reprocessamento. A <em>constraint</em> é a única regra que todos esses caminhos atravessam. O custo é conhecido e pequeno: uma chave estrangeira acrescenta uma verificação por índice na inserção do filho e um bloqueio <code>FOR KEY SHARE</code> na linha do pai, tipicamente unidades de microssegundos quando o índice está em memória.</p>
 
-<p>O <em>hash</em> só serve igualdade, deixou de ser inseguro na versão 10 (passou a ser registado no WAL) e ocupa menos espaço do que um B-tree quando a chave é longa — um <code>text</code> de 200 caracteres reduz-se a 4 bytes de <em>hash</em>. Em contrapartida, não ordena, não suporta unicidade nem chaves compostas e não pode ser <em>index-only</em>. O caso em que ganha é estreito: igualdade sobre uma chave grande, sem ordenação. O GIN (<em>Generalized Inverted Index</em>) é um índice invertido: mapeia cada elemento contido no valor para a lista de linhas que o contêm, o que serve <code>jsonb</code> com <code>@&gt;</code>, <em>arrays</em> com <code>&amp;&amp;</code>, pesquisa de texto com <code>tsvector</code>, e — com a extensão <code>pg_trgm</code> — <code>LIKE '%texto%'</code>. O GiST é uma árvore de contenção para tipos com sobreposição: intervalos (<code>tstzrange</code>), geometria (PostGIS), e restrições de exclusão. O BRIN (<em>Block Range Index</em>) guarda apenas o mínimo e o máximo por grupo de blocos: minúsculo, quase gratuito de manter, e útil só quando os dados estão fisicamente ordenados pela coluna.</p>
+<p>O erro operacional mais frequente com chaves estrangeiras é não indexar a coluna do lado filho. O PostgreSQL cria automaticamente o índice da chave primária, nunca o do lado que referencia. Sem ele, cada <code>DELETE</code> ou <code>UPDATE</code> da chave no pai obriga a uma varredura sequencial completa da tabela filha para verificar a restrição: numa filha de 50 milhões de linhas, um apagamento de uma linha do pai passa de sub-milissegundo para vários segundos, com o bloqueio a ser mantido durante todo esse tempo.</p>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 22.1</span> Tipos de índice do PostgreSQL 17 sobre a tabela <code>orders</code>/<code>events</code> do exemplo.</div>
-<div class="tscroll"><table><thead><tr><th>Tipo</th><th>Predicados que acelera</th><th>Tamanho típico (48 M linhas)</th><th>Escolhe-se quando</th></tr></thead><tbody>
-<tr><td>B-tree</td><td><code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>BETWEEN</code>, <code>IN</code>, <code>ORDER BY</code>, <code>LIKE 'x%'</code></td><td>1,1–1,9 GB</td><td>Sempre que houver dúvida; único que garante unicidade e ordenação.</td></tr>
-<tr><td>Hash</td><td>Só <code>=</code></td><td>0,9–1,3 GB</td><td>Igualdade sobre chave longa (URL, <em>token</em>), sem ordenação nem unicidade.</td></tr>
-<tr><td>GIN</td><td><code>jsonb @&gt;</code>, <em>arrays</em>, <code>tsvector @@</code>, <code>LIKE '%x%'</code> com <code>pg_trgm</code></td><td>2–6 GB</td><td>Um valor contém muitos elementos pesquisáveis; leitura muito mais frequente que escrita.</td></tr>
-<tr><td>GiST</td><td>Sobreposição de intervalos e geometria, <code>EXCLUDE</code>, vizinho mais próximo</td><td>1,5–3 GB</td><td>Intervalos temporais, PostGIS, restrições de não-sobreposição.</td></tr>
-<tr><td>BRIN</td><td>Intervalos sobre coluna fisicamente correlacionada</td><td>150–400 kB</td><td>Tabela <em>append-only</em> por tempo, muito grande, consultas por janela larga.</td></tr>
-</tbody></table></div></div>
+<p><code>ON DELETE CASCADE</code> merece a mesma desconfiança. É correcto quando o filho não tem existência independente do pai — linhas de encomenda, endereços de um perfil — e perigoso quando a cardinalidade é grande ou desconhecida: apagar um <em>tenant</em> com 12 milhões de linhas em cascata é uma única transacção que gera gigabytes de WAL, mantém bloqueios em todas as tabelas envolvidas e não tem ponto de retoma se falhar a meio. Para essas relações usa-se <code>ON DELETE RESTRICT</code> e um processo de eliminação por lotes com transacções curtas, ou apagamento por partição.</p>
 
-<figure class="listing text" id="lst-22-4"><div class="lhead"><span class="lnum">Listagem 22.4</span>
-  <span class="lcap">BRIN sobre uma tabela de eventos <em>append-only</em>: 184 kB de índice, 118 ms para 402 883 linhas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="text"><code>=# CREATE INDEX idx_events_ts_brin ON events USING brin (occurred_at)
--#     WITH (pages_per_range = 32);
-=# SELECT pg_size_pretty(pg_relation_size('idx_events_ts_brin'));
- 184 kB
--- o equivalente em B-tree sobre a mesma coluna: 4118 MB
+<figure class="listing sql" id="lst-22-3"><div class="lhead"><span class="lnum">Listagem 22.3</span>
+<span class="lcap">Invariantes que o modelo garante e a aplicação não consegue: unicidade condicional, não-sobreposição e adição sem bloqueio longo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS btree_gist;
 
-=# EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM events
--#  WHERE occurred_at &gt;= '2026-08-30' AND occurred_at &lt; '2026-08-31';
+-- Adicionar FK a uma tabela grande sem manter bloqueio durante a validação:
+-- NOT VALID só verifica as linhas novas; VALIDATE varre com bloqueio fraco.
+ALTER TABLE sales_order
+    ADD CONSTRAINT sales_order_customer_fk FOREIGN KEY (customer_id)
+    REFERENCES customer(id) ON DELETE RESTRICT NOT VALID;
+ALTER TABLE sales_order VALIDATE CONSTRAINT sales_order_customer_fk;
 
- Aggregate  (cost=41208.77..41208.78 rows=1 width=8)
-            (actual time=118.442..118.443 rows=1 loops=1)
-   Buffers: shared hit=93 read=11934
-   -&gt;  Bitmap Heap Scan on events  (cost=196.44..40191.02 rows=407100 width=0)
-                                   (actual time=1.902..96.118 rows=402883 loops=1)
-         Recheck Cond: ((occurred_at &gt;= '2026-08-30 00:00:00+01'::timestamptz)
-                    AND (occurred_at &lt; '2026-08-31 00:00:00+01'::timestamptz))
-         Rows Removed by Index Recheck: 24117
-         Heap Blocks: lossy=12032
-         Buffers: shared hit=93 read=11934
-         -&gt;  Bitmap Index Scan on idx_events_ts_brin  (cost=0.00..94.66 rows=407100 width=0)
-                                   (actual time=1.884..1.886 rows=120320 loops=1)
-               Index Cond: ((occurred_at &gt;= '2026-08-30 00:00:00+01'::timestamptz)
-                        AND (occurred_at &lt; '2026-08-31 00:00:00+01'::timestamptz))
-               Buffers: shared hit=27
- Planning Time: 0.121 ms
- Execution Time: 118.502 ms</code></pre></figure>
+-- Um único contrato activo por cliente: unicidade parcial, impossível com UNIQUE
+CREATE TABLE contract (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    started_at  timestamptz NOT NULL,
+    ended_at    timestamptz,
+    CONSTRAINT contract_period_ck CHECK (ended_at IS NULL OR ended_at &gt; started_at)
+);
+CREATE UNIQUE INDEX contract_one_active_uq
+    ON contract (customer_id) WHERE ended_at IS NULL;
 
-<p><code>Heap Blocks: lossy=12032</code> é a assinatura do BRIN: o índice não sabe que linhas correspondem, só que blocos podem corresponder, por isso marca blocos inteiros e o motor volta a testar cada linha (<code>Rows Removed by Index Recheck: 24117</code>). O custo desse retrabalho é aceitável porque o índice eliminou 99,7% dos 391 204 blocos da tabela lendo 27 páginas. Se a tabela deixar de ser <em>append-only</em> — por exemplo se um processo de reconciliação actualizar linhas antigas e o <code>UPDATE</code> as reescrever no fim do ficheiro —, a correlação desaba e o mesmo BRIN passa a marcar metade da tabela.</p>
+-- Preços com períodos que não se podem sobrepor para o mesmo produto
+CREATE TABLE price_period (
+    product_id   bigint        NOT NULL REFERENCES product(id) ON DELETE CASCADE,
+    valid_during tstzrange     NOT NULL,
+    amount       numeric(12,4) NOT NULL CHECK (amount &gt;= 0),
+    EXCLUDE USING gist (product_id WITH =, valid_during WITH &amp;&amp;)
+);
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um GIN por omissão tem escrita diferida através da <code>pending list</code> (<code>fastupdate = on</code>), o que torna os <code>INSERT</code> baratos mas faz com que, de vez em quando, um <code>INSERT</code> azarado pague a fusão da lista inteira e demore 200× mais do que a mediana. Numa API com SLA de p99, isso aparece como picos inexplicáveis. Para carga sensível a cauda, <code>ALTER INDEX … SET (fastupdate = off)</code>: os <code>INSERT</code> ficam uniformemente mais lentos, mas o p99 estabiliza.</p></aside>
+-- Inserções circulares entre duas tabelas: adiar a verificação até ao COMMIT
+ALTER TABLE department
+    ADD CONSTRAINT department_head_fk FOREIGN KEY (head_employee_id)
+    REFERENCES employee(id) DEFERRABLE INITIALLY IMMEDIATE;
+-- na transacção:  SET CONSTRAINTS department_head_fk DEFERRED;</code></pre></figure>
 
-<div class="qa" id="q-22-5" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Preciso de três coisas nesta tabela: filtrar por chaves dentro de uma coluna <code>jsonb</code>, procurar texto livre na descrição, e contar eventos por janela de tempo em 900 milhões de linhas. Que índices usa em cada caso?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Três tipos diferentes, porque os três predicados têm formas diferentes. Para o <code>jsonb</code>, um GIN. Se as consultas usarem só o operador de contenção <code>@&gt;</code>, a classe de operadores <code>jsonb_path_ops</code> em vez da omissão: indexa <em>hashes</em> de caminhos completos em vez de cada chave e cada valor separadamente, ocupa 40% a 60% menos e é mais rápido a responder, ao custo de deixar de suportar <code>?</code>, <code>?|</code> e <code>?&amp;</code>. Se apenas uma ou duas chaves do documento forem realmente consultadas, um índice B-tree de expressão sobre <code>(payload -&gt;&gt; 'merchant_id')</code> é dez vezes mais pequeno e mais rápido do que qualquer GIN — a pergunta certa é «quantas chaves distintas é que a aplicação filtra».</p>
-      <p>Para texto livre, depende do requisito. Pesquisa linguística com <em>stemming</em> e <em>ranking</em>: <code>GIN</code> sobre uma coluna gerada <code>tsvector</code> (<code>GENERATED ALWAYS AS (to_tsvector('portuguese', descricao)) STORED</code>) e consultas com <code>@@ websearch_to_tsquery</code>. Correspondência de subcadeia, incluindo tolerância a erros de escrita: <code>pg_trgm</code> com <code>GIN (descricao gin_trgm_ops)</code>, que acelera <code>ILIKE '%texto%'</code> e <code>similarity()</code>. São coisas diferentes e o entrevistador está a ver se o candidato as distingue: <code>tsvector</code> não encontra subcadeias, trigramas não fazem <em>stemming</em>.</p>
-      <p>Para a contagem por janela em 900 milhões de linhas, BRIN sobre a coluna temporal, se a tabela for <em>append-only</em> e a janela consultada for larga. Um B-tree custaria 25 a 30 GB e a consulta acabaria em <code>Bitmap Heap Scan</code> na mesma; o BRIN custa algumas centenas de kB e elimina 99% dos blocos. Se a janela for estreita e muito selectiva — «os 20 eventos do último minuto deste utilizador» — o BRIN não serve e volta-se ao B-tree composto <code>(user_id, occurred_at)</code>.</p>
-      <p>Acima destes três, a decisão estrutural: em 900 milhões de linhas por tempo, o particionamento declarativo por mês elimina partições inteiras no planeamento (<em>partition pruning</em>) e resolve também a purga por <code>DROP TABLE</code> em vez de <code>DELETE</code>. Índices e particionamento compõem-se: BRIN local por partição continua a ser útil dentro de cada partição.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe B-tree para os três casos, ou não sabe que existe índice para <code>jsonb</code>.</td></tr>
-        <tr><td>Mid</td><td>Nomeia GIN e BRIN correctamente mas sem classes de operadores, sem tamanhos e sem distinguir <code>tsvector</code> de trigramas.</td></tr>
-        <tr><td>Sénior</td><td>Mapeia cada predicado ao índice, justifica <code>jsonb_path_ops</code>, separa pesquisa linguística de subcadeia, quantifica o BRIN e diz quando não serve.</td></tr>
-        <tr><td>Staff</td><td>Questiona se o <code>jsonb</code> devia sequer ser <code>jsonb</code>, propõe colunas geradas para as chaves quentes, e traz particionamento e política de retenção para a conversa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Qual é o custo de escrita de um GIN comparado com um B-tree?»</li>
-      <li>«O que é a <code>pending list</code> e que problema traz ao p99?»</li>
-      <li>«Como é que o BRIN se comporta depois de um <code>UPDATE</code> massivo?»</li>
-      <li>«E se a pesquisa tiver de ser <em>fuzzy</em> e ordenada por relevância?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar GIN «porque é o mais poderoso» sem falar do custo de escrita e do tamanho.</li>
-      <li>Propor BRIN numa tabela com actualizações espalhadas.</li>
-      <li>Achar que <code>tsvector</code> resolve <code>LIKE '%abc%'</code>.</li></ul></div>
-  </div>
-</div>
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Uma <code>UNIQUE</code> sobre <code>(email)</code> numa tabela com <em>soft delete</em> impede reutilizar o email de um registo apagado; substituí-la por índice único parcial <code>WHERE deleted_at IS NULL</code> resolve a unicidade mas deixa de proteger contra dois registos apagados idênticos — que é exactamente o que se quer. O erro simétrico, mais caro, é remover a <code>UNIQUE</code> e não criar o índice parcial: a partir daí a base aceita duplicados e a aplicação passa a ter de os tratar em cada leitura.</p></aside>
 
-<h2 id="sec-22-4" class="h2"><span class="secnum">22.4</span> Ler um EXPLAIN ANALYZE do PostgreSQL<a class="anchor" href="#sec-22-4" aria-label="ligação">#</a></h2>
-
-<p><code>EXPLAIN</code> sozinho mostra o plano estimado e não executa nada. <code>EXPLAIN ANALYZE</code> executa mesmo — o que implica que um <code>UPDATE</code> analisado altera dados, e por isso se corre dentro de <code>BEGIN … ROLLBACK</code>. <code>BUFFERS</code>, que na versão 17 passou a estar activo por omissão quando se usa <code>ANALYZE</code>, é a opção que transforma um plano num diagnóstico: mostra páginas encontradas em <em>cache</em> (<code>shared hit</code>), lidas do sistema de ficheiros (<code>shared read</code>), sujas e escritas, e — o campo que mais denuncia — <code>temp read/written</code>, que significa que um nó verteu para disco.</p>
-
-<p>A leitura faz-se de dentro para fora e de baixo para cima: o nó mais indentado executa primeiro, e cada nó pai recebe as linhas do filho. Cada nó traz dois pares de números. <code>(cost=início..total rows=N width=B)</code> é a estimativa do planeador, em unidades arbitrárias de custo, onde o primeiro valor é o custo até à primeira linha e o segundo até à última — a diferença explica porque um <code>LIMIT</code> pode escolher um plano com custo total pior. <code>(actual time=início..fim rows=N loops=L)</code> é a medição real, em milissegundos, <strong>por execução</strong>: com <code>loops=1188</code>, o tempo total gasto naquele nó é <code>fim × loops</code>, não <code>fim</code>. Ignorar o <code>loops</code> é o erro de leitura mais comum e o mais fácil de detectar numa entrevista.</p>
-
-<figure class="listing text" id="lst-22-5"><div class="lhead"><span class="lnum">Listagem 22.5</span>
-  <span class="lcap">Plano completo de um relatório de 4,8 s — três problemas distintos no mesmo plano.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="text"><code>=# EXPLAIN (ANALYZE, BUFFERS)
--#  SELECT c.id, c.email, sum(o.total_cents) AS total
--#  FROM customers c JOIN orders o ON o.customer_id = c.id
--#  WHERE c.country = 'PT' AND o.created_at &gt;= date '2026-07-01'
--#  GROUP BY c.id, c.email ORDER BY total DESC LIMIT 50;
-
- Limit  (cost=812443.19..812443.31 rows=50 width=48)
-        (actual time=4821.663..4821.671 rows=50 loops=1)
-   Buffers: shared hit=118442 read=402117, temp read=18244 written=18391
-   -&gt;  Sort  (cost=812443.19..813218.44 rows=310100 width=48)
-             (actual time=4821.661..4821.666 rows=50 loops=1)
-         Sort Key: (sum(o.total_cents)) DESC
-         Sort Method: top-N heapsort  Memory: 32kB
-         -&gt;  HashAggregate  (cost=798112.44..802113.72 rows=310100 width=48)
-                            (actual time=4602.118..4744.902 rows=298114 loops=1)
-               Group Key: c.id, c.email
-               Batches: 5  Memory Usage: 4145kB  Disk Usage: 118432kB
-               -&gt;  Hash Join  (cost=61204.88..712088.10 rows=1204188 width=44)
-                              (actual time=402.118..3918.442 rows=1188402 loops=1)
-                     Hash Cond: (o.customer_id = c.id)
-                     -&gt;  Seq Scan on orders o  (cost=0.00..602441.00 rows=4120400 width=16)
-                                    (actual time=0.028..2704.118 rows=4118902 loops=1)
-                           Filter: (created_at &gt;= '2026-07-01'::date)
-                           Rows Removed by Filter: 43881098
-                           Buffers: shared read=391204
-                     -&gt;  Hash  (cost=48112.00..48112.00 rows=310100 width=36)
-                               (actual time=401.204..401.205 rows=308914 loops=1)
-                           Buckets: 131072  Batches: 4  Memory Usage: 3488kB
-                           -&gt;  Seq Scan on customers c  (cost=0.00..48112.00 rows=310100 width=36)
-                                    (actual time=0.012..288.442 rows=308914 loops=1)
-                                 Filter: (country = 'PT'::text)
-                                 Rows Removed by Filter: 1791086
-                                 Buffers: shared hit=118 read=10886
- Planning Time: 0.412 ms
- Execution Time: 4838.204 ms</code></pre></figure>
-
-<p>Leitura linha a linha, de baixo para cima:</p>
-
-<ol class="lst">
-  <li><code>Seq Scan on customers c</code> — 288 ms, lê 11 004 blocos e descarta 1 791 086 linhas por filtro. A estimativa (310 100) bate com o real (308 914), logo as estatísticas de <code>country</code> estão boas. Um <code>Seq Scan</code> que devolve 15% da tabela é uma escolha defensável.</li>
-  <li><code>Hash</code> — constrói a tabela de dispersão com essas 308 914 linhas. <code>Batches: 4</code> é o primeiro sinal vermelho: o <em>hash</em> não coube em <code>work_mem</code> e foi partido em quatro lotes, o que obriga a escrever e reler os lotes em ficheiros temporários.</li>
-  <li><code>Seq Scan on orders o</code> — 2 704 ms e <code>Rows Removed by Filter: 43881098</code>. Leram-se 391 204 blocos para aproveitar 4,1 milhões de linhas em 48 milhões. É o nó mais caro e a origem óbvia de um índice em <code>created_at</code>.</li>
-  <li><code>Hash Join</code> — 3 918 ms acumulados, 1 188 402 linhas. Note-se que este tempo <em>inclui</em> os filhos; o custo próprio do <em>join</em> é 3918 − 2704 − 401 ≈ 813 ms, gasto em grande parte a lidar com os quatro lotes.</li>
-  <li><code>HashAggregate</code> — <code>Disk Usage: 118432kB</code>. Segundo sinal vermelho: a agregação verteu 116 MB para disco. Confirma-se em cima com <code>temp written=18391</code> páginas.</li>
-  <li><code>Sort</code> com <code>top-N heapsort Memory: 32kB</code> — este está bem. O <code>LIMIT 50</code> permitiu ao PostgreSQL manter só 50 elementos em memória em vez de ordenar 298 114.</li>
-  <li><code>Buffers</code> no topo — 520 559 páginas partilhadas (≈ 4,1 GB) e 18 391 páginas temporárias escritas. Para devolver 50 linhas.</li>
-</ol>
-
-<p>Três problemas, três correcções com efeito previsível: um índice parcial ou composto em <code>orders (created_at)</code> corta o nó de 2,7 s para dezenas de milissegundos; subir <code>work_mem</code> na sessão do relatório de 4 MB para 128 MB elimina os cinco lotes do <code>HashAggregate</code> e os quatro do <code>Hash</code>; e, se este relatório correr de minuto a minuto, uma vista materializada com actualização incremental é a resposta certa em vez de qualquer índice.</p>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p><code>cost</code> não é tempo. É uma grandeza sem unidade em que 1,0 equivale, por definição, à leitura sequencial de uma página. Serve para comparar planos alternativos da mesma consulta, nunca para comparar consultas diferentes nem para prever milissegundos. O candidato que diz «o custo é 812 443, logo demora 812 segundos» perdeu a ronda.</p></aside>
-
-<div class="qa" id="q-22-6" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+<div class="qa" id="q-22-5" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Dou-lhe um <code>EXPLAIN (ANALYZE, BUFFERS)</code> de uma consulta lenta que nunca viu. Por que ordem lê o plano e quais são os primeiros quatro números que procura?</div>
+  <div class="qprompt">O arquitecto quer o esquema sem chaves estrangeiras nem <code>CHECK</code>: «a validação é responsabilidade do domínio e as <em>constraints</em> custam desempenho». Argumente contra ou a favor.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Leio de baixo para cima e de dentro para fora, porque a execução é essa: o nó mais indentado produz linhas para o pai. Antes de olhar para nomes de nós, procuro quatro coisas, por esta ordem.</p>
-      <ul class="lst">
-        <li><strong>O nó com maior tempo próprio.</strong> O <code>actual time</code> de um nó inclui os filhos, por isso subtraio: tempo próprio = tempo do nó − soma dos tempos dos filhos, e multiplico por <code>loops</code> quando é maior que 1. É aqui que está o problema, não no nó de topo.</li>
-        <li><strong>A razão entre <code>rows</code> estimadas e reais.</strong> Um desvio superior a 10× num nó abaixo de um <em>join</em> significa que todo o plano acima está construído sobre uma premissa falsa. É problema de estatísticas ou de correlação entre colunas, não de índices.</li>
-        <li><strong><code>Buffers</code>.</strong> <code>shared read</code> alto diz que os dados não estavam em <em>cache</em>; <code>temp read/written</code> diferente de zero diz que um <em>sort</em>, um <em>hash</em> ou uma agregação verteu para disco, e isso resolve-se com <code>work_mem</code>, não com índices.</li>
-        <li><strong><code>Rows Removed by Filter</code>.</strong> Quantifica o trabalho desperdiçado. Descartar 43 milhões de linhas para devolver 4 milhões é a assinatura de um índice em falta.</li>
-      </ul>
-      <p>Depois disso olho para as assinaturas conhecidas: <code>Sort Method: external merge Disk: …</code> (falta memória), <code>Batches</code> maior que 1 num <code>Hash</code> (o mesmo), <code>Heap Fetches</code> alto num <code>Index Only Scan</code> (<em>autovacuum</em>), <code>Heap Blocks: lossy</code> (o <em>bitmap</em> excedeu <code>work_mem</code> e degradou para granularidade de bloco), <code>loops</code> de milhares num <code>Nested Loop</code> (estimativa de cardinalidade errada do lado externo). E leio o <code>Planning Time</code>: se for 40 ms para uma consulta de 12 ms, o problema é o número de partições ou de índices, não a execução.</p>
-      <p>Um detalhe operacional: <code>EXPLAIN ANALYZE</code> executa a consulta. Em <code>UPDATE</code> ou <code>DELETE</code>, corro dentro de <code>BEGIN; … ROLLBACK;</code>. E prefiro <code>EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT TEXT)</code> — <code>SETTINGS</code> mostra os parâmetros do planeador diferentes do valor por omissão, o que já explicou mais de um mistério em que alguém tinha deixado <code>enable_nestloop = off</code> numa sessão do <em>pooler</em>.</p></div>
+      <p>Argumento contra, com uma concessão. A validação de negócio pertence ao domínio; os invariantes estruturais pertencem à base, porque a base é o único ponto por onde passam todos os escritores. Ao fim de três anos, escrevem na tabela o serviço original, um segundo serviço, migrações, correcções manuais em incidente e um importador. A regra que só existe em Java não é aplicada por nenhum destes.</p>
+      <p>O argumento de desempenho é mensurável e pequeno. Uma chave estrangeira custa uma pesquisa por índice na tabela pai por linha inserida e um bloqueio <code>FOR KEY SHARE</code> na linha referenciada — microssegundos quando o índice está em <code>shared_buffers</code>. Um <code>CHECK</code> é uma avaliação de expressão sobre a linha em memória, ruído estatístico. Em inserções em massa, desactiva-se temporariamente com <code>ALTER TABLE ... DISABLE TRIGGER</code> ou carrega-se para uma partição sem restrições e valida-se depois — a solução é operacional, não é apagar a regra.</p>
+      <p>O custo real das <em>constraints</em> é outro e vale a pena nomeá-lo primeiro, porque é o que mostra experiência: rigidez em migrações. Adicionar uma coluna <code>NOT NULL</code> sem valor por omissão a uma tabela de 200 milhões de linhas, ou uma chave estrangeira validada de imediato, mantém um bloqueio longo. A resposta é <code>ADD CONSTRAINT ... NOT VALID</code> seguido de <code>VALIDATE CONSTRAINT</code>, que corre com um bloqueio muito mais fraco, e nunca é «não pôr a restrição».</p>
+      <p>A concessão: regras que dependem de estado externo ou que mudam a cada campanha — limites de desconto, elegibilidade, políticas de preço — não devem ser <code>CHECK</code>. Alterá-las exige migração e não devem ser bloqueadas por uma janela de manutenção. A linha divisória é: se a regra falhar, os dados ficam corrompidos ou apenas indesejados? Corrompidos vai para a base.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Lê de cima para baixo, confunde <code>cost</code> com milissegundos, procura só a palavra <code>Seq Scan</code>.</td></tr>
-        <tr><td>Mid</td><td>Lê na ordem certa e encontra o nó lento, mas ignora <code>loops</code>, <code>Buffers</code> e a diferença entre estimado e real.</td></tr>
-        <tr><td>Sénior</td><td>Método explícito e ordenado, tempo próprio contra tempo acumulado, <code>loops</code>, desvio de estimativa, <em>buffers</em> e derrame para disco, com as assinaturas nomeadas.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta <code>SETTINGS</code>, <code>Planning Time</code>, o cuidado do <code>ROLLBACK</code>, e distingue as correcções que são de índice das que são de memória ou de estatísticas.</td></tr>
+        <tr><td>Insuficiente</td><td>Concorda com o arquitecto, ou defende <em>constraints</em> por dogma sem nenhum custo mensurável.</td></tr>
+        <tr><td>Mid</td><td>Defende as <em>constraints</em> pela integridade, mas não sabe quantificar o custo nem lidar com migrações.</td></tr>
+        <tr><td>Sénior</td><td>Argumento dos múltiplos escritores, custo real quantificado, <code>NOT VALID</code>/<code>VALIDATE</code>, e a linha divisória entre invariante e política.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta como isto se aplica em vários serviços sobre a mesma base, o efeito em <em>schema evolution</em> e o processo de aprovação de migrações.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O <code>actual time</code> de um nó com <code>loops=1188</code> é o total ou por iteração?»</li>
-      <li>«O que significa <code>Heap Blocks: lossy</code>?»</li>
-      <li>«Porque é que o custo tem dois valores separados por dois pontos?»</li>
-      <li>«Como capta o plano de uma consulta que só é lenta em produção?»</li></ul></div>
+      <li>«Como adiciona uma coluna <code>NOT NULL</code> a 200 milhões de linhas sem indisponibilidade?»</li>
+      <li>«E se dois serviços diferentes escreverem na mesma tabela com regras diferentes?»</li>
+      <li>«Que <em>constraint</em> já teve de remover em produção e porquê?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Converter <code>cost</code> em tempo.</li>
-      <li>Somar os tempos dos nós como se fossem disjuntos.</li>
-      <li>Correr <code>EXPLAIN ANALYZE</code> num <code>DELETE</code> em produção sem transacção.</li></ul></div>
+      <li>«As <em>constraints</em> são lentas» sem nunca ter medido.</li>
+      <li>Não conhecer <code>NOT VALID</code> nem o efeito dos bloqueios em <code>ALTER TABLE</code>.</li>
+      <li>Propor validação só na aplicação num sistema com mais de um escritor.</li></ul></div>
   </div>
 </div>
+
+<div class="qa" id="q-22-6" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um pedido de esquecimento apaga um cliente com <code>ON DELETE CASCADE</code> em sete tabelas, uma delas com 12 milhões de linhas desse cliente. O que espera que aconteça e o que faria diferente?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Espero uma transacção única de longa duração, gigabytes de WAL, bloqueios exclusivos nas sete tabelas até ao <code>COMMIT</code>, replicação em atraso e nenhum ponto de retoma se falhar. Se alguma das tabelas filhas não tiver índice na coluna da chave estrangeira, acrescenta-se uma varredura sequencial completa por cada nível da cascata.</p>
+      <p>Há ainda dois efeitos menos óbvios. O <em>autovacuum</em> tem 12 milhões de tuplos mortos para recolher depois do <code>COMMIT</code>, e o espaço em disco não é devolvido ao sistema de ficheiros — a tabela fica com o mesmo tamanho e espaço livre interno. E a cascata é silenciosa: ninguém no código da aplicação vê quantas linhas foram apagadas, o que torna impossível auditar a operação exigida pelo próprio requisito de conformidade que a motivou.</p>
+      <p>O que faço diferente: <code>ON DELETE RESTRICT</code> nas relações de cardinalidade alta e um processo explícito de eliminação. Apaga-se por lotes de 5 000 a 50 000 linhas, cada lote em transacção própria, da folha para a raiz da árvore de dependências, com registo de progresso numa tabela de trabalho para poder retomar. Se a tabela grande estiver particionada pelo cliente ou pelo <em>tenant</em>, o caminho preferido é <code>DETACH PARTITION</code> seguido de <code>DROP TABLE</code>, que é uma operação de metadados em vez de 12 milhões de apagamentos.</p>
+      <p>Quando a cascata é a escolha certa: relações de composição estrita e cardinalidade pequena e limitada — linhas de encomenda, moradas de um perfil, permissões de um utilizador —, onde o filho não tem existência sem o pai e a contagem é conhecida às dezenas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Funciona, a base trata disso» — não vê nem a duração da transacção nem os bloqueios.</td></tr>
+        <tr><td>Mid</td><td>Vê que será lento e sugere apagar por lotes, mas não fala de WAL, replicação, índices de FK nem auditoria.</td></tr>
+        <tr><td>Sénior</td><td>Descreve transacção longa, WAL, bloqueios, <em>autovacuum</em> e falta de índice na FK; propõe lotes com retoma e nomeia quando a cascata é correcta.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta particionamento com <code>DETACH</code>, a trilha de auditoria da eliminação e a distinção entre apagar e anonimizar quando há obrigação legal de reter.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como sabe se as colunas de chave estrangeira estão indexadas? Escreva a consulta.»</li>
+      <li>«E se a lei obrigar a reter as facturas sete anos?»</li>
+      <li>«Qual o tamanho de lote e como o calibra?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não saber que o PostgreSQL não indexa automaticamente o lado filho da chave estrangeira.</li>
+      <li>Achar que <code>DELETE</code> devolve espaço ao sistema de ficheiros.</li>
+      <li>Confundir apagamento com anonimização perante um requisito de retenção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-22-4" class="h2"><span class="secnum">22.4</span> Modelar tempo: histórico, soft delete e auditoria<a class="anchor" href="#sec-22-4" aria-label="ligação">#</a></h2>
+
+<p>Três requisitos são frequentemente confundidos num só. «Poder repor um registo apagado» é reversibilidade. «Saber qual era o escalão do cliente em Março» é histórico de estado. «Saber quem alterou o quê e quando» é auditoria. Cada um tem a sua estrutura: reversibilidade resolve-se com um estado no próprio registo, histórico com versões com validade temporal, auditoria com um registo imutável de eventos. Responder aos três com um <code>deleted_at</code> é o erro mais comum desta secção.</p>
+
+<p>O <em>soft delete</em> tem quatro custos concretos. Primeiro, unicidade: qualquer <code>UNIQUE</code> passa a incluir linhas apagadas e tem de se tornar índice único parcial. Segundo, integridade referencial: a chave estrangeira continua a ver a linha apagada, portanto a base deixa de impedir que um registo vivo aponte para um pai apagado — o invariante muda-se para a aplicação, que é onde não devia estar. Terceiro, todas as consultas passam a precisar do predicado; uma esquecida numa junção é uma fuga de dados que passa nos testes porque em ambiente de teste não há registos apagados. Quarto, custo de leitura: numa tabela em que 60% das linhas estão apagadas, cada varredura de índice lê aproximadamente 2,5 vezes mais entradas do que o resultado útil, salvo se todos os índices relevantes forem parciais.</p>
+
+<p>Para histórico, o padrão robusto em PostgreSQL 17 é uma tabela de versões com um intervalo <code>tstzrange</code> e uma restrição <code>EXCLUDE</code> que impede sobreposições — o equivalente prático a uma dimensão de tipo 2 de <em>data warehouse</em>. O PostgreSQL 17 não tem tabelas com versionamento de sistema como as definidas no SQL:2011, portanto a escrita das versões é feita por <em>trigger</em> ou pela camada de aplicação. Vale a pena distinguir tempo de validade — quando o facto foi verdadeiro no mundo — de tempo de transacção — quando a base soube dele; sistemas financeiros e de seguros precisam dos dois, e é a essa modelação bitemporal que uma pergunta de <em>deep dive</em> costuma chegar.</p>
+
+<figure class="listing sql" id="lst-22-4"><div class="lhead"><span class="lnum">Listagem 22.4</span>
+<span class="lcap">Histórico com intervalos sem sobreposição e consulta ao estado numa data.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE customer_version (
+    customer_id  bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
+    valid_during tstzrange   NOT NULL,   -- tempo de validade (mundo real)
+    recorded_at  timestamptz NOT NULL DEFAULT now(),  -- tempo de transacção
+    recorded_by  text        NOT NULL DEFAULT current_user,
+    email        citext      NOT NULL,
+    tier         text        NOT NULL,
+    EXCLUDE USING gist (customer_id WITH =, valid_during WITH &amp;&amp;),
+    CONSTRAINT customer_version_ck CHECK (NOT isempty(valid_during))
+);
+CREATE INDEX customer_version_ix ON customer_version USING gist (valid_during);
+
+-- Estado do cliente 42 em 1 de Março de 2026
+SELECT tier, email
+FROM   customer_version
+WHERE  customer_id = 42
+  AND  valid_during @&gt; timestamptz '2026-03-01 00:00:00+00';
+
+-- Fechar a versão corrente e abrir a nova, atomicamente
+BEGIN;
+UPDATE customer_version
+   SET valid_during = tstzrange(lower(valid_during), now(), '[)')
+ WHERE customer_id = 42 AND upper_inf(valid_during);
+INSERT INTO customer_version (customer_id, valid_during, email, tier)
+VALUES (42, tstzrange(now(), NULL, '[)'), 'ana@exemplo.pt', 'GOLD');
+COMMIT;</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Soft delete</em> dá reversibilidade imediata e custa correcção: unicidade, integridade referencial e um predicado obrigatório em cada consulta. Apagamento verdadeiro com cópia para uma tabela de arquivo dá um modelo limpo e custa um caminho de reposição escrito à mão. A escolha inverte-se quando a taxa de reposição é significativa — acima de uns poucos por cento das eliminações — ou quando o registo é referenciado por outros vivos; abaixo disso, arquivar e apagar sai mais barato ao longo de três anos.</p></aside>
 
 <div class="qa" id="q-22-7" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Explique quando é que o planeador escolhe <em>nested loop</em>, <em>hash join</em> ou <em>merge join</em>, e o que faz quando vê um <em>nested loop</em> com 1,2 milhões de iterações.</div>
+  <div class="qprompt">O <em>soft delete</em> está implementado com <code>deleted_at</code> em 40 tabelas e um filtro no repositório. Que problemas prevê e como os resolveria sem reescrever o sistema?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Os três algoritmos têm perfis de custo diferentes e o planeador escolhe pelo número de linhas que <em>estima</em> em cada lado. O <em>nested loop</em> percorre o lado externo e, para cada linha, procura o lado interno; custa <code>N × custo_da_procura</code>, o que é imbatível quando N é pequeno (dezenas a poucos milhares) e existe índice do lado interno, e catastrófico quando N cresce. O <em>hash join</em> constrói uma tabela de dispersão com o lado mais pequeno e depois faz um varrimento único do maior; custa <code>M + N</code> mas exige memória para o <em>hash</em> e só serve igualdade. O <em>merge join</em> ordena os dois lados e percorre-os em paralelo; custa a ordenação, que é gratuita se ambos já vierem ordenados de índices, e é o único que trata bem <em>joins</em> de intervalo além da igualdade.</p>
-      <p>Um <em>nested loop</em> com <code>loops=1188402</code> quase nunca é uma escolha deliberada: é o sintoma de uma estimativa errada. O planeador achou que o lado externo devolvia 40 linhas, escolheu o <em>nested loop</em> por isso, e o lado externo devolveu 1,2 milhões. A prova está no próprio plano: comparar <code>rows=40</code> com <code>rows=1188402</code> no nó externo. Corrigir o <em>join</em> não é a solução; corrigir a estimativa é.</p>
-      <p>As três causas de estimativa errada, por frequência: estatísticas desactualizadas (resolve-se com <code>ANALYZE</code> e com <code>autovacuum_analyze_scale_factor</code> mais agressivo na tabela); histograma demasiado grosseiro numa coluna com muitos valores distintos (<code>ALTER TABLE … ALTER COLUMN … SET STATISTICS 500</code>, contra os 100 por omissão); e correlação entre colunas que o planeador assume independentes — <code>WHERE cidade = 'Lisboa' AND distrito = 'Lisboa'</code> multiplica duas selectividades como se fossem independentes e subestima por uma ordem de grandeza, o que se corrige com <code>CREATE STATISTICS … (dependencies, ndistinct, mcv) ON cidade, distrito FROM enderecos</code>.</p>
-      <p>Só depois de as estimativas estarem correctas é que faz sentido mexer no resto: <code>work_mem</code> se o <em>hash join</em> partir em lotes, ou reescrever a consulta se um <code>OR</code> ou uma sub-consulta correlacionada estiver a impedir um plano melhor. Desactivar <code>enable_nestloop</code> é instrumento de diagnóstico, não remédio: fixa o plano de hoje e garante um incidente daqui a seis meses quando a distribuição de dados mudar.</p></div>
+      <p>Prevejo quatro problemas, por ordem de gravidade. O primeiro é a fuga: basta uma consulta que não passe pelo repositório — um relatório, uma junção escrita à mão, um <em>export</em> — para devolver registos apagados. O segundo é a unicidade: todas as <code>UNIQUE</code> passaram a contar linhas apagadas, portanto reutilizar o email de um cliente eliminado falha com violação de restrição. O terceiro é a integridade: a chave estrangeira continua satisfeita por um pai apagado, logo o modelo já não impede um filho vivo pendurado num pai morto. O quarto é o custo de leitura, que cresce com a fracção de registos apagados.</p>
+      <p>Sem reescrever, ataco por três frentes. Substituo cada <code>UNIQUE</code> afectada por índice único parcial <code>WHERE deleted_at IS NULL</code> e torno parciais os índices das consultas quentes — o que reduz simultaneamente o tamanho do índice e o trabalho de varredura. Crio uma vista por tabela, <code>customer_live</code>, com o predicado embutido, e faço com que tudo o que não é caminho de administração leia a vista; onde houver <em>row level security</em> disponível, uma política com <code>USING (deleted_at IS NULL)</code> aplica o filtro mesmo a quem escreve SQL directamente, o que é a única defesa que não depende de disciplina. E acrescento um teste de arquitectura que falha a compilação quando uma consulta nova toca a tabela base em vez da vista.</p>
+      <p>A médio prazo, separo os três requisitos. Reversibilidade fica no <code>deleted_at</code> com janela de retenção curta, tipicamente 30 dias, e uma tarefa que apaga definitivamente ou arquiva depois disso — o que trava o crescimento da fracção morta. Histórico de estado vai para tabelas de versões. Auditoria vai para um registo próprio, imutável, apenas com acrescento.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não sabe nomear os três algoritmos ou acha que o <em>hash join</em> é sempre o melhor.</td></tr>
-        <tr><td>Mid</td><td>Descreve os três correctamente mas trata o <em>nested loop</em> lento como escolha errada do planeador, não como sintoma de estimativa.</td></tr>
-        <tr><td>Sénior</td><td>Perfis de custo com ordens de grandeza, diagnostica pela razão estimado/real, e liga às três causas de erro de estatísticas com os comandos concretos.</td></tr>
-        <tr><td>Staff</td><td>Traz <code>CREATE STATISTICS</code> multivariadas, discute o risco de fixar planos e a interacção com <em>plan cache</em> de <em>prepared statements</em> genéricos.</td></tr>
+        <tr><td>Insuficiente</td><td>Não vê problema nenhum: «basta filtrar por <code>deleted_at IS NULL</code>».</td></tr>
+        <tr><td>Mid</td><td>Identifica o risco de esquecer o filtro e sugere uma classe base no ORM; não menciona unicidade nem integridade referencial.</td></tr>
+        <tr><td>Sénior</td><td>Enumera unicidade, integridade, fuga e custo, com correcções concretas (índice parcial, vista, RLS) e uma política de retenção.</td></tr>
+        <tr><td>Staff</td><td>Separa reversibilidade, histórico e auditoria como requisitos distintos e desenha o caminho de migração incremental com o custo de cada etapa.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como é que sabe qual dos lados foi escolhido para construir o <em>hash</em>?»</li>
-      <li>«O que muda com <code>work_mem</code> num <em>hash join</em> com <code>Batches: 8</code>?»</li>
-      <li>«Quando é que um <em>merge join</em> ganha claramente?»</li>
-      <li>«Que estatísticas multivariadas cria e como confirma que estão a ser usadas?»</li></ul></div>
+      <li>«Que <em>constraint</em> impede um filho vivo de apontar para um pai apagado?»</li>
+      <li>«E quando o requisito de esquecimento obriga a apagar mesmo?»</li>
+      <li>«Como estima a fracção de linhas mortas por tabela?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor <code>enable_nestloop = off</code> em produção como correcção.</li>
-      <li>Não olhar para a estimativa do lado externo.</li>
-      <li>Achar que o <em>merge join</em> exige sempre uma ordenação explícita.</li></ul></div>
+      <li>Confiar apenas no filtro do ORM como garantia.</li>
+      <li>Não ver que a chave estrangeira deixou de garantir o invariante.</li>
+      <li>Manter <em>soft delete</em> indefinidamente, sem janela de retenção.</li></ul></div>
   </div>
 </div>
 
-<div class="lab" id="lab-22-1" data-box="lab" data-lang="sql">
-  <div class="labhead"><span class="labttl">Exercício 22.1 — Do plano à correcção: 6,8 s para menos de 5 ms</span>
-    <div class="labpills"><span class="qpill">Alvo p95 &lt; 5 ms</span><span class="qpill">25 min</span></div></div>
-  <div class="labbody">
-    <p>O painel de operações lista as 50 encomendas pendentes mais recentes do canal <code>WEB</code> dos últimos 7 dias, com o e-mail do cliente. Corre de 10 em 10 segundos em 40 separadores de <em>browser</em> e é responsável por 38% do tempo de CPU da réplica de leitura. A tabela <code>orders</code> tem 48 M linhas (esquema na Listagem 22.1), <code>customers</code> tem 2,1 M, e existe o índice de chave primária em ambas mais <code>idx_orders_created_status (created_at, status)</code>. <code>work_mem</code> está em 4 MB, <code>shared_buffers</code> em 8 GB. A Listagem 22.6 é o plano real. Restrições: não pode alterar o SQL da aplicação a ponto de mudar o resultado, não pode subir <code>work_mem</code> globalmente, e a criação de índices tem de ser feita sem bloquear escritas. Entregue: o diagnóstico linha a linha, o DDL, e a previsão quantificada do plano resultante.</p>
-    <figure class="listing text" id="lst-22-6"><div class="lhead"><span class="lnum">Listagem 22.6</span>
-      <span class="lcap">Ponto de partida: o plano de 6,8 s do painel de operações.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-      <pre class="code" data-lang="text"><code>=# EXPLAIN (ANALYZE, BUFFERS)
--#  SELECT o.id, o.created_at, o.total_cents, c.email
--#  FROM orders o JOIN customers c ON c.id = o.customer_id
--#  WHERE o.status = 'PENDING' AND o.channel = 'WEB'
--#    AND o.created_at &gt;= now() - interval '7 days'
--#  ORDER BY o.created_at DESC
--#  LIMIT 50;
-
- Limit  (cost=688204.11..688204.23 rows=50 width=44)
-        (actual time=6802.114..6802.140 rows=50 loops=1)
-   Buffers: shared hit=9214 read=393882, temp read=2418 written=2426
-   -&gt;  Sort  (cost=688204.11..688396.44 rows=76932 width=44)
-             (actual time=6802.112..6802.131 rows=50 loops=1)
-         Sort Key: o.created_at DESC
-         Sort Method: top-N heapsort  Memory: 41kB
-         -&gt;  Hash Join  (cost=79114.02..685648.90 rows=76932 width=44)
-                        (actual time=1204.882..6781.004 rows=74118 loops=1)
-               Hash Cond: (o.customer_id = c.id)
-               -&gt;  Index Scan using idx_orders_created_status on orders o
-                            (cost=0.57..601884.20 rows=76932 width=24)
-                            (actual time=0.912..5402.664 rows=74118 loops=1)
-                     Index Cond: ((created_at &gt;= (now() - '7 days'::interval))
-                              AND (status = 'PENDING'::text))
-                     Filter: (channel = 'WEB'::text)
-                     Rows Removed by Filter: 41208
-                     Buffers: shared hit=4102 read=298441
-               -&gt;  Hash  (cost=41204.00..41204.00 rows=2100000 width=28)
-                         (actual time=1198.442..1198.443 rows=2100000 loops=1)
-                     Buckets: 65536  Batches: 64  Memory Usage: 3904kB
-                     -&gt;  Seq Scan on customers c  (cost=0.00..41204.00 rows=2100000 width=28)
-                                  (actual time=0.008..302.118 rows=2100000 loops=1)
-                           Buffers: shared hit=5112 read=95441
- Planning Time: 0.288 ms
- Execution Time: 6809.442 ms</code></pre></figure>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing sql" id="lst-22-7"><div class="lhead"><span class="lnum">Listagem 22.7</span>
-        <span class="lcap">Índice parcial ordenado que colapsa o <em>sort</em>, o filtro e o <em>hash join</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="sql"><code>-- 1. O índice que resolve filtro + ordenação + LIMIT num único varrimento.
---    Parcial porque PENDING+WEB são 0,19% de orders: 92 000 entradas, ~4 MB.
-CREATE INDEX CONCURRENTLY idx_orders_pending_web_created
-    ON orders (created_at DESC)
-    WHERE status = 'PENDING' AND channel = 'WEB';
-
--- 2. O predicado tem de aparecer literalmente na consulta para o planeador
---    provar a contenção. Se a aplicação usa bind, fixa-se a consulta:
---    ... WHERE o.status = 'PENDING' AND o.channel = 'WEB' AND o.created_at &gt;= $1
-
--- 3. O hash de customers com Batches: 64 desaparece sozinho assim que o lado
---    externo passa a devolver 50 linhas: o planeador troca para nested loop
---    sobre a chave primária de customers. Nada a fazer além do índice acima.
-
--- 4. Se ainda assim se quiser um index-only scan do lado de orders:
-CREATE INDEX CONCURRENTLY idx_orders_pending_web_created_inc
-    ON orders (created_at DESC) INCLUDE (id, customer_id, total_cents)
-    WHERE status = 'PENDING' AND channel = 'WEB';
-DROP INDEX CONCURRENTLY idx_orders_pending_web_created;
-
--- 5. Manutenção: fila de alta rotação, logo autovacuum agressivo na tabela.
-ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01,
-                        autovacuum_analyze_scale_factor = 0.01);
-
--- 6. Verificação (plano esperado):
---  Limit  (cost=0.99..118.42 rows=50 width=44) (actual time=0.048..0.412 rows=50 loops=1)
---    Buffers: shared hit=214
---    -&gt;  Nested Loop  (actual time=0.046..0.402 rows=50 loops=1)
---          -&gt;  Index Scan using idx_orders_pending_web_created on orders o
---                       (actual time=0.031..0.062 rows=50 loops=1)
---                Index Cond: (created_at &gt;= (now() - '7 days'::interval))
---          -&gt;  Index Scan using customers_pkey on customers c
---                       (actual time=0.005..0.005 rows=1 loops=50)
---                Index Cond: (id = o.customer_id)
---  Execution Time: 0.462 ms</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Diagnóstico correcto:</strong> o índice existia e era usado — a armadilha é achar que o problema é «falta de índice». O problema é a <em>ordem</em> das colunas (<code>created_at</code> antes de <code>status</code>) e a ausência de <code>channel</code>, que empurra 115 326 linhas para a <em>heap</em> e descarta 41 208 por filtro.</li>
-        <li><strong>O nó de <code>Sort</code> era uma consequência, não uma causa.</strong> Com o índice ordenado por <code>created_at DESC</code> e o predicado no <code>WHERE</code> do índice, o <code>ORDER BY</code> desaparece do plano e o <code>LIMIT 50</code> pára o varrimento à 50.ª entrada.</li>
-        <li><strong>O <code>Hash</code> com <code>Batches: 64</code></strong> é o segundo maior custo (1,2 s) e desaparece sem tocar em <code>work_mem</code>: assim que o lado externo passa de 74 118 para 50 linhas, o <em>nested loop</em> com a chave primária de <code>customers</code> passa a ser 4 ordens de grandeza mais barato. Quem propõe subir <code>work_mem</code> está a tratar o sintoma.</li>
-        <li><strong>Custo de escrita:</strong> o índice parcial só é tocado quando uma linha entra ou sai de (<code>PENDING</code>, <code>WEB</code>) — cerca de 2 escritas por encomenda WEB no seu ciclo de vida, contra 1 escrita por <code>INSERT</code> num índice total. Espaço: 4 MB contra 1,8 GB.</li>
-        <li><strong>Caso limite:</strong> se a aplicação for um <code>PreparedStatement</code> JDBC com <code>status</code> em <em>bind</em>, o plano genérico deixa de usar o índice parcial a partir da 6.ª execução (<code>prepareThreshold</code> por omissão 5). Sintoma clássico: rápido no arranque, lento passados segundos.</li>
-        <li><strong>Verificação:</strong> <code>pg_stat_user_indexes.idx_scan</code> para confirmar que o índice novo é usado e que <code>idx_orders_created_status</code> deixou de ser; só depois se remove o antigo.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<h2 id="sec-22-5" class="h2"><span class="secnum">22.5</span> Porque o índice não é usado<a class="anchor" href="#sec-22-5" aria-label="ligação">#</a></h2>
-
-<p>As causas cabem em três famílias e a entrevista costuma percorrê-las todas. A primeira é o predicado não ser <em>sargable</em> — não poder ser traduzido num intervalo de chaves. Envolver a coluna numa função destrói o índice, porque o índice guarda <code>created_at</code> e não <code>date_trunc('day', created_at)</code>: <code>WHERE date_trunc('day', created_at) = date '2026-08-30'</code> força varrimento completo, enquanto <code>WHERE created_at &gt;= date '2026-08-30' AND created_at &lt; date '2026-08-31'</code> usa o índice e devolve o mesmo. Quando a reescrita não é possível, cria-se um índice de expressão sobre exactamente a mesma expressão. O mesmo se aplica a <code>LIKE</code>: <code>'abc%'</code> é um prefixo, logo um intervalo de chaves, logo usa B-tree; <code>'%abc'</code> e <code>'%abc%'</code> não são, e só um índice GIN de trigramas os resolve. Detalhe que apanha muita gente: num agrupamento (<em>collation</em>) diferente de <code>C</code>, nem <code>LIKE 'abc%'</code> usa um B-tree normal — é preciso declarar a classe de operadores <code>text_pattern_ops</code>.</p>
-
-<p>A segunda família é a incompatibilidade de tipos. Uma coluna <code>bigint</code> comparada com um parâmetro <code>numeric</code>, ou <code>varchar</code> comparada com <code>text</code> de outro agrupamento, obriga a uma conversão implícita do lado da coluna e o índice deixa de servir. Em Java isto acontece com frequência através de JPA quando uma chave é mapeada como <code>String</code> contra uma coluna <code>uuid</code>, ou quando um <code>Long</code> nulo se torna <code>bytea</code>. A denúncia está no <code>EXPLAIN</code>: o predicado aparece como <code>(id)::numeric = $1</code> em vez de <code>id = $1</code>.</p>
-
-<p>A terceira família é a estimativa. O índice está lá, é utilizável, e o planeador acha que não vale a pena porque tem números errados. Estatísticas velhas depois de uma carga em massa, histograma de 100 <em>buckets</em> insuficiente para uma coluna com 4 milhões de valores distintos, ou — o caso mais interessante — colunas correlacionadas cujas selectividades o planeador multiplica assumindo independência.</p>
-
-<figure class="listing text" id="lst-22-8"><div class="lhead"><span class="lnum">Listagem 22.8</span>
-  <span class="lcap">Correlação entre colunas: estimativa de 812 linhas para 402 118 reais, e a correcção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="text"><code>=# EXPLAIN ANALYZE SELECT * FROM orders
--#  WHERE tenant_id = 42 AND channel = 'WEB' AND status = 'DELIVERED';
-
- Bitmap Heap Scan on orders  (cost=18.44..3204.11 rows=812 width=96)
-                             (actual time=88.114..2914.882 rows=402118 loops=1)
-   Recheck Cond: (tenant_id = 42)
-   Filter: ((channel = 'WEB'::text) AND (status = 'DELIVERED'::text))
-   Rows Removed by Filter: 218904
-   -&gt;  Bitmap Index Scan on idx_orders_tenant  (cost=0.00..18.24 rows=621022 width=0)
-
--- rows=812 estimado contra 402118 real: erro de 495x.
--- O planeador multiplicou 0,0129 (tenant) x 0,62 (WEB) x 0,91 (DELIVERED)
--- assumindo independência. Neste inquilino, 100% do trafego e WEB.
-
-=# CREATE STATISTICS stat_orders_tenant_ch_st (dependencies, ndistinct, mcv)
--#     ON tenant_id, channel, status FROM orders;
-=# ANALYZE orders;
-
- Bitmap Heap Scan on orders  (cost=6204.44..184112.90 rows=398441 width=96)
-                             (actual time=41.208..902.114 rows=402118 loops=1)
--- estimativa a 1% do real; o plano acima do no passa a escolher hash join
--- em vez de nested loop e o relatorio completo cai de 41 s para 3,1 s.</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Depois de uma restauração com <code>pg_restore</code> ou de uma carga em massa com <code>COPY</code>, as estatísticas estão vazias e o planeador assume valores por omissão que podem estar 1000× errados. O <code>autovacuum</code> acaba por corrigir, mas só depois de <code>autovacuum_analyze_threshold + 0.1 × n_linhas</code> alterações — numa tabela recém-carregada, isso pode nunca acontecer. Correr <code>ANALYZE</code> explicitamente no fim de qualquer carga em massa e na última etapa de qualquer <em>pipeline</em> de migração.</p></aside>
-
-<div class="qa" id="q-22-8" data-box="qa" data-area="sql" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SQL</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Estas duas consultas usam índice ou não: <code>WHERE lower(email) = 'ana@x.pt'</code> e <code>WHERE nome LIKE '%silva%'</code>? E como as torna rápidas sem mudar o resultado?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Nenhuma das duas usa um B-tree normal sobre a coluna, e por razões diferentes. Na primeira, o índice guarda <code>email</code> e o predicado pergunta por <code>lower(email)</code> — são valores distintos, o intervalo de chaves não é derivável, o plano é <code>Seq Scan</code> com <code>Filter</code>. A correcção é um índice de expressão sobre exactamente a mesma expressão: <code>CREATE INDEX CONCURRENTLY idx_customers_email_lower ON customers (lower(email))</code>. «Exactamente a mesma» é literal: <code>lower(email)</code> e <code>lower(email::text)</code> não coincidem, e a função tem de ser <code>IMMUTABLE</code> — é por isso que <code>date_trunc('day', ts)</code> sobre <code>timestamptz</code> não pode ser indexada sem fixar o fuso, porque o resultado depende de <code>TimeZone</code>.</p>
-      <p>Na segunda, <code>'%silva%'</code> não tem prefixo fixo, logo não define intervalo nenhum de um B-tree. A correcção é a extensão <code>pg_trgm</code>: <code>CREATE EXTENSION pg_trgm; CREATE INDEX CONCURRENTLY idx_customers_nome_trgm ON customers USING gin (nome gin_trgm_ops)</code>. O índice decompõe cada valor em trigramas e resolve <code>LIKE</code> e <code>ILIKE</code> com padrões arbitrários e ainda <code>similarity()</code> para tolerância a erros. Custo: numa tabela de 2,1 milhões de nomes, o GIN ocupa 300 a 500 MB contra 60 MB de um B-tree, e o <code>INSERT</code> fica 3 a 5 vezes mais caro. Só compensa se a pesquisa por subcadeia for um requisito real e não uma conveniência de <em>UI</em>.</p>
-      <p>Antes de qualquer índice, a pergunta melhor: em vez de indexar <code>lower(email)</code>, o e-mail devia estar normalizado à entrada, ou a coluna devia ser do tipo <code>citext</code>. E para <code>'%silva%'</code>, se o requisito real for «começa por», <code>silva%</code> com um B-tree em <code>text_pattern_ops</code> resolve tudo com 60 MB. O sénior negoceia o requisito antes de pagar 500 MB e um índice caro de manter.</p>
-      <p>Um terceiro caso que costuma vir a seguir: <code>WHERE created_at::date = '2026-08-30'</code>. Igual à primeira família — reescreve-se como intervalo semi-aberto <code>&gt;= '2026-08-30' AND &lt; '2026-08-31'</code>, que usa o índice existente, é correcto com fusos horários e evita criar um índice novo.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Acha que ambas usam o índice porque a coluna está indexada.</td></tr>
-        <tr><td>Mid</td><td>Sabe que a função quebra o índice e conhece índices funcionais, mas não sabe resolver <code>'%silva%'</code>.</td></tr>
-        <tr><td>Sénior</td><td>Explica <em>sargability</em>, propõe índice de expressão e <code>pg_trgm</code> com tamanhos e custo de escrita, e menciona <code>IMMUTABLE</code> e a correspondência exacta da expressão.</td></tr>
-        <tr><td>Staff</td><td>Questiona o requisito («começa por» contra «contém»), propõe normalização à entrada ou <code>citext</code>, e diz quando a pesquisa deve sair da base de dados para um motor dedicado.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque é que <code>date_trunc</code> sobre <code>timestamptz</code> não é indexável directamente?»</li>
-      <li>«O que é <code>text_pattern_ops</code> e quando é preciso?»</li>
-      <li>«Quanto custa um GIN de trigramas na escrita?»</li>
-      <li>«E se o requisito for pesquisa com ordenação por relevância?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor <code>UPPER</code> em ambos os lados como se resolvesse o problema do índice.</li>
-      <li>Sugerir carregar a tabela para a aplicação e filtrar em Java.</li>
-      <li>Criar o GIN de trigramas sem uma palavra sobre espaço e custo de <code>INSERT</code>.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-22-9" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+<div class="qa" id="q-22-8" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O plano estima 812 linhas e devolve 402 118. O índice existe e é utilizável. Como diagnostica e corrige um erro de estimativa desta ordem?</div>
+  <div class="qprompt">O negócio precisa de responder a «qual era o preço deste produto a 12 de Março?» e também a «que preço é que o sistema achava, a 12 de Março, que estava em vigor a 1 de Janeiro?». Como modela isto?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um erro de 495× não é ruído; é uma premissa errada. Começo por confirmar quando é que a tabela foi analisada pela última vez: <code>SELECT last_analyze, last_autoanalyze, n_live_tup, n_mod_since_analyze FROM pg_stat_user_tables WHERE relname = 'orders'</code>. Se <code>n_mod_since_analyze</code> for da ordem de milhões, corro <code>ANALYZE orders</code> e repito o plano — resolve metade dos casos e custa segundos.</p>
-      <p>Se as estatísticas estiverem frescas, olho para <code>pg_stats</code> da coluna: <code>n_distinct</code>, <code>most_common_vals</code> e o comprimento do histograma. Duas patologias típicas. Uma coluna com 4 milhões de valores distintos e <code>default_statistics_target = 100</code> tem 100 <em>buckets</em> para descrever tudo — sobe-se com <code>ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 1000</code> seguido de <code>ANALYZE</code>, ao custo de planeamento mais lento (o planeador percorre mais entradas) e de <code>ANALYZE</code> a amostrar 300 × 1000 linhas em vez de 300 × 100. E um <code>n_distinct</code> mal amostrado numa coluna com distribuição enviesada, que se pode fixar à mão com <code>ALTER TABLE … ALTER COLUMN … SET (n_distinct = -0.4)</code> quando se conhece a proporção real.</p>
-      <p>A causa do exemplo é a terceira: correlação. O planeador estima a selectividade de <code>tenant_id = 42 AND channel = 'WEB' AND status = 'DELIVERED'</code> multiplicando as três selectividades marginais como se fossem independentes. Se o inquilino 42 for exclusivamente WEB, a multiplicação subestima por duas ordens de grandeza. A ferramenta é <code>CREATE STATISTICS … (dependencies, ndistinct, mcv) ON tenant_id, channel, status FROM orders</code> seguida de <code>ANALYZE</code>: <code>dependencies</code> captura implicações funcionais, <code>ndistinct</code> o número de combinações reais, e <code>mcv</code> a lista das combinações mais frequentes com as suas frequências. Confirma-se em <code>pg_stats_ext</code>.</p>
-      <p>O que fica de fora e é preciso dizer: as estatísticas estendidas não ajudam predicados sobre resultados de <em>joins</em>, nem sub-consultas correlacionadas, nem funções opacas — o planeador atribui 0,5% a uma função definida pelo utilizador sem <code>support function</code>. Nesses casos a saída é reescrever a consulta (materializar o passo intermédio numa CTE com <code>MATERIALIZED</code>, ou dividir em duas consultas) e não afinar estatísticas.</p></div>
+      <p>São duas perguntas em eixos temporais diferentes, portanto o modelo é bitemporal: cada versão tem um intervalo de tempo de validade — quando o preço vigorou no mundo — e um intervalo de tempo de transacção — quando a base conheceu essa afirmação. A primeira pergunta filtra pelo tempo de validade com o tempo de transacção aberto; a segunda fixa os dois.</p>
+      <p>A implementação em PostgreSQL 17 é uma tabela <code>price_version(product_id, valid_during tstzrange, system_during tstzrange, amount numeric(12,4))</code> com <code>EXCLUDE USING gist</code> sobre <code>(product_id WITH =, valid_during WITH &amp;&amp;)</code> restrito às linhas correntes por índice parcial. Uma correcção retroactiva nunca actualiza uma linha: fecha o <code>system_during</code> da afirmação antiga e insere uma nova com o mesmo <code>valid_during</code> e valor diferente. É por isso que o modelo é apenas de acrescento — a reemissão de uma factura de Janeiro continua a produzir o mesmo resultado que produziu em Janeiro.</p>
+      <p>O custo é real e há que dizê-lo. As consultas ganham dois predicados de intervalo e passam a depender de índices GiST, que são maiores e mais lentos a manter do que B-tree; o número de linhas cresce com cada correcção; e a maioria dos ORM não sabe exprimir isto, portanto estas leituras são SQL escrito à mão. A regra de decisão é: se ninguém alguma vez precisar de reconstruir o que o sistema sabia numa data passada — auditoria financeira, cálculo de sinistros, resolução de disputas —, o tempo de transacção é peso morto e uma tabela de versões unitemporal chega.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não repara na diferença entre estimado e real; propõe outro índice.</td></tr>
-        <tr><td>Mid</td><td>Diz «correr ANALYZE» e fica por aí.</td></tr>
-        <tr><td>Sénior</td><td>Verifica <code>pg_stat_user_tables</code>, inspecciona <code>pg_stats</code>, sobe <code>STATISTICS</code> na coluna certa, e identifica a correlação como causa provável.</td></tr>
-        <tr><td>Staff</td><td>Aplica <code>CREATE STATISTICS</code> com os três tipos, valida em <code>pg_stats_ext</code>, quantifica o custo do <code>ANALYZE</code> e do planeamento, e sabe onde as estatísticas estendidas não chegam.</td></tr>
+        <tr><td>Insuficiente</td><td>Uma coluna <code>updated_at</code> e um <em>trigger</em> de auditoria, sem perceber que são duas perguntas distintas.</td></tr>
+        <tr><td>Mid</td><td>Propõe tabela de histórico com <code>valid_from</code>/<code>valid_to</code>, mas não distingue tempo de validade de tempo de transacção.</td></tr>
+        <tr><td>Sénior</td><td>Modelo bitemporal com dois intervalos, apenas com acrescento, e <code>EXCLUDE</code> a garantir não-sobreposição das versões correntes.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo dos índices GiST, o crescimento de linhas, o efeito no ORM e o critério para não fazer bitemporal.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quantas linhas amostra o <code>ANALYZE</code> e como depende de <code>default_statistics_target</code>?»</li>
-      <li>«Que custo tem subir <code>STATISTICS</code> para 1000 numa tabela de 48 M linhas?»</li>
-      <li>«Qual é a diferença entre <code>dependencies</code> e <code>mcv</code>?»</li>
-      <li>«Como é que isto interage com tabelas particionadas?»</li></ul></div>
+      <li>«Como impede que existam duas versões correntes sobrepostas?»</li>
+      <li>«Que índice serve a consulta “preço em vigor agora”, que é 99% do tráfego?»</li>
+      <li>«Como faz isto sem <code>tstzrange</code>, se a base for MySQL?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Subir <code>default_statistics_target</code> globalmente para 1000 sem medir o efeito no <code>Planning Time</code>.</li>
-      <li>Confundir estatísticas estendidas com índices.</li>
-      <li>Não repetir o <code>ANALYZE</code> depois de criar as estatísticas — sem isso não existem valores.</li></ul></div>
+      <li>Fazer <code>UPDATE</code> sobre versões passadas numa correcção retroactiva.</li>
+      <li>Guardar intervalos como dois <code>timestamp</code> sem restrição de não-sobreposição.</li>
+      <li>Propor bitemporal em todo o lado, sem critério de custo.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-22-6" class="h2"><span class="secnum">22.6</span> Custo de escrita, bloat e manutenção<a class="anchor" href="#sec-22-6" aria-label="ligação">#</a></h2>
+<h2 id="sec-22-5" class="h2"><span class="secnum">22.5</span> Tipos, precisão e dinheiro<a class="anchor" href="#sec-22-5" aria-label="ligação">#</a></h2>
 
-<p>Cada índice é um imposto sobre a escrita. Um <code>INSERT</code> numa tabela com sete índices faz oito escritas lógicas e propaga oito conjuntos de registos ao WAL; num <em>benchmark</em> típico, passar de dois para oito índices reduz o débito de <code>INSERT</code> em 40% a 60% e multiplica o volume de WAL por 2 a 3 — o que se paga outra vez na replicação e nas cópias de segurança. É por isso que a pergunta «que índices removia?» é tão reveladora quanto «que índices criava?».</p>
+<p>Dinheiro nunca vai para vírgula flutuante binária. Um <code>double precision</code> tem 53 bits de mantissa e não representa exactamente 0,1; somar mil linhas acumula erro e a reconciliação com o extracto bancário falha por cêntimos que ninguém consegue explicar. As duas representações defensáveis são <code>numeric(p,s)</code>, aritmética decimal exacta com escala fixa, e inteiro em unidades menores — cêntimos em <code>bigint</code>. O <code>numeric</code> é mais lento porque a aritmética é feita em software e não em instruções do processador, tipicamente uma ordem de grandeza acima de <code>bigint</code>, mas em cargas OLTP normais o tempo de aritmética é ruído face ao acesso a páginas. O tipo <code>money</code> do PostgreSQL evita-se: a escala depende da configuração regional do servidor.</p>
 
-<p>O modelo MVCC do PostgreSQL agrava isto: um <code>UPDATE</code> não altera a linha, cria uma nova versão e marca a antiga como morta. Por omissão, todas as entradas de índice têm de apontar para a nova versão, mesmo que a coluna indexada não tenha mudado. A optimização <em>Heap-Only Tuple</em> evita-o com duas condições cumulativas: nenhuma coluna indexada foi alterada, e há espaço livre no <strong>mesmo</strong> bloco da <em>heap</em>. É por isso que baixar o <code>fillfactor</code> de uma tabela muito actualizada de 100 para 85 costuma valer 20% a 40% de débito de escrita — deixa espaço no bloco para as novas versões. E é por isso que um índice a mais numa coluna que é actualizada frequentemente pode destruir HOT para todas as actualizações da tabela.</p>
+<p>A escala escolhe-se pelo pior caso do domínio, não pela moeda. Duas casas chegam para guardar totais em euros, mas não para preços unitários de fornecedores, taxas de câmbio ou cálculo de juros; o padrão prático é <code>numeric(18,4)</code> para montantes e <code>numeric(18,8)</code> para taxas, com o arredondamento a acontecer uma única vez, num sítio explícito e documentado. Do lado do Java, mapeia-se para <code>BigDecimal</code> com <code>RoundingMode</code> explícito, nunca para <code>double</code>, e nunca se constrói um <code>BigDecimal</code> a partir de um literal de vírgula flutuante.</p>
 
-<p>O <em>bloat</em> é o espaço ocupado por versões mortas ainda não reciclado. O <code>VACUUM</code> marca esse espaço como reutilizável mas não devolve ao sistema de ficheiros (excepto blocos vazios no fim); o ficheiro não encolhe. Um índice B-tree numa fila de trabalho com alta rotação chega facilmente a 20× o tamanho dos dados vivos. A reparação sem paragem é <code>REINDEX INDEX CONCURRENTLY</code>, disponível desde a versão 12: constrói um índice novo em paralelo, troca no fim, e só exige um bloqueio curto — ao custo de espaço em disco para dois índices em simultâneo e de um erro que deixa um índice <code>INVALID</code> para trás se falhar. <code>VACUUM FULL</code> reescreve a tabela e devolve o espaço, mas tira um <code>ACCESS EXCLUSIVE LOCK</code> durante minutos ou horas: em produção usa-se <code>pg_repack</code>.</p>
+<p>Em tempo, a regra é <code>timestamptz</code> por omissão. Os dois tipos ocupam 8 bytes; a diferença é semântica. <code>timestamptz</code> guarda um instante absoluto em UTC e converte na entrada e na saída conforme o <code>TimeZone</code> da sessão; <code>timestamp</code> guarda um par data-hora sem instante associado, o que significa que duas sessões com fusos diferentes lêem o mesmo valor como momentos distintos. Escrever <code>timestamp</code> «porque guardamos sempre UTC» funciona até alguém ligar-se com outra configuração ou até uma transição de hora de Verão duplicar uma hora local. <code>timestamp</code> sem fuso é correcto exactamente num caso: quando o valor é uma hora de parede sem instante — as 09:00 de abertura de uma loja, que são 09:00 locais em todos os dias do ano.</p>
 
-<figure class="listing sql" id="lst-22-9"><div class="lhead"><span class="lnum">Listagem 22.9</span>
-  <span class="lcap">Índices nunca usados e candidatos a <code>REINDEX</code>, com números.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="sql"><code>-- Índices que nunca serviram uma consulta desde o último reset das estatísticas.
--- Confirmar o uptime antes de concluir: um índice de fecho de mês parece morto em 29 dias.
-SELECT s.relname, s.indexrelname, s.idx_scan,
-       pg_size_pretty(pg_relation_size(s.indexrelid)) AS tamanho
-  FROM pg_stat_user_indexes s
-  JOIN pg_index i ON i.indexrelid = s.indexrelid
- WHERE s.idx_scan = 0
-   AND NOT i.indisunique
-   AND pg_relation_size(s.indexrelid) &gt; 100 * 1024 * 1024
- ORDER BY pg_relation_size(s.indexrelid) DESC;
+<figure class="listing sql" id="lst-22-5"><div class="lhead"><span class="lnum">Listagem 22.5</span>
+<span class="lcap">Tipos para dinheiro, tempo e domínios enumerados.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE currency (
+    code        char(3)  PRIMARY KEY,          -- ISO 4217
+    minor_unit  smallint NOT NULL CHECK (minor_unit BETWEEN 0 AND 4),
+    active      boolean  NOT NULL DEFAULT true
+);
 
--- Bloat aproximado por índice (exacto, mas varre o índice: correr fora de pico).
-CREATE EXTENSION IF NOT EXISTS pgstattuple;
-SELECT indexrelname,
-       pg_size_pretty(pg_relation_size(indexrelid)) AS tamanho,
-       round((pgstatindex(indexrelid)).avg_leaf_density::numeric, 1) AS densidade_folhas
-  FROM pg_stat_user_indexes
- WHERE schemaname = 'public'
- ORDER BY pg_relation_size(indexrelid) DESC
- LIMIT 20;
--- densidade_folhas abaixo de 50 num índice grande = candidato a REINDEX CONCURRENTLY
+CREATE TABLE payment (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id      bigint         NOT NULL REFERENCES sales_order(id) ON DELETE RESTRICT,
+    amount        numeric(18,4)  NOT NULL CHECK (amount &gt; 0),
+    currency      char(3)        NOT NULL REFERENCES currency(code),
+    fx_rate       numeric(18,8),                       -- taxa aplicada, se houver
+    amount_eur    numeric(18,4)  NOT NULL,
+    captured_at   timestamptz    NOT NULL DEFAULT now(),  -- instante absoluto
+    settlement_day date          NOT NULL,               -- dia de negócio, decidido a montante
+    store_opens_at time           NOT NULL DEFAULT '09:00'  -- hora de parede, sem instante
+);
 
--- Reduzir a amplificação de escrita numa tabela muito actualizada.
-ALTER TABLE orders SET (fillfactor = 85);
-REINDEX TABLE CONCURRENTLY orders;   -- aplica o fillfactor aos índices existentes</code></pre></figure>
+-- Porque não double precision: o erro acumula e a reconciliação falha
+SELECT sum(0.1::double precision) AS flutuante,   -- diferente de 1.0
+       sum(0.1::numeric)          AS decimal_exacto
+FROM   generate_series(1, 10);
 
-<div class="qa" id="q-22-10" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
+-- Domínio fechado sem tipo enum: continua a ser uma tabela, com FK
+CREATE TABLE payment_status (
+    code       text PRIMARY KEY,
+    label_pt   text NOT NULL,
+    is_final   boolean NOT NULL
+);
+ALTER TABLE payment
+    ADD COLUMN status text NOT NULL DEFAULT 'PENDING'
+        REFERENCES payment_status(code);</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p><code>numeric(18,4)</code> ocupa cerca de 12 bytes por valor face aos 8 de <code>bigint</code> ou <code>double precision</code>, e a aritmética decimal em software custa aproximadamente uma ordem de grandeza mais do que a inteira. Numa consulta OLTP que lê 40 linhas, isso são microssegundos contra os 200-800 microssegundos de acesso a páginas: irrelevante. Num agregado analítico sobre 200 milhões de linhas, deixa de o ser — e aí a resposta é pré-agregar, não trocar por <code>double</code>.</p></aside>
+
+<div class="qa" id="q-22-9" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Encontra <code>amount double precision</code> na tabela de pagamentos de um sistema em produção com 80 milhões de linhas. Qual é o impacto e como corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O impacto é erro de representação que se acumula e nunca é reprodutível na mesma ordem. O binário de 64 bits do IEEE 754 tem 53 bits de mantissa e não representa exactamente 0,1 nem 0,01; qualquer soma de valores monetários acumula desvio, e o desvio depende da ordem das parcelas — o que significa que a mesma agregação com outro plano de execução, ou paralelizada por mais <em>workers</em>, dá um resultado ligeiramente diferente. Em reconciliação, isto aparece como diferenças de cêntimos que ninguém consegue atribuir.</p>
+      <p>A correcção é <code>numeric(18,4)</code> — ou <code>bigint</code> em unidades menores, se a equipa já estiver disciplinada quanto à moeda. A migração numa tabela de 80 milhões de linhas não se faz com <code>ALTER TABLE ... TYPE</code>, que reescreve toda a tabela com bloqueio exclusivo. O padrão é: acrescentar <code>amount_num numeric(18,4)</code>, que em PostgreSQL 17 é uma alteração de metadados; escrever nas duas colunas a partir da aplicação; preencher o histórico por lotes de dezenas de milhares de linhas com pausa entre lotes para o <em>autovacuum</em> acompanhar; correr uma verificação que compara as duas colunas com a tolerância esperada; trocar a leitura; e só depois deixar cair a coluna antiga.</p>
+      <p>A parte que separa níveis é o que se faz com os dados já corrompidos. O valor gravado é o valor errado, não há como o recuperar do <code>double</code>; é preciso decidir a fonte de verdade — o extracto do processador de pagamentos, os eventos originais em Kafka, os ficheiros de liquidação — e reconstruir a partir dela, com um relatório das linhas que divergem acima do limite aceite. Migrar o tipo sem reconstruir os valores deixa o erro no sítio, agora com aparência de exactidão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Arredonda-se a duas casas na leitura» ou não vê problema nenhum em <code>double</code> para dinheiro.</td></tr>
+        <tr><td>Mid</td><td>Sabe que deve ser <code>numeric</code>/<code>BigDecimal</code> e propõe <code>ALTER TABLE</code> directo, sem ver o bloqueio nem os dados já errados.</td></tr>
+        <tr><td>Sénior</td><td>Explica a mantissa e a dependência da ordem de soma, faz migração em duas colunas por lotes e valida.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a reconstrução a partir da fonte de verdade, o relatório de divergências e o efeito nos relatórios financeiros já emitidos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Que escala escolhe e porquê? E para taxas de câmbio?»</li>
+      <li>«Como mapeia em Java sem cair em <code>new BigDecimal(0.1)</code>?»</li>
+      <li>«Quanto tempo bloqueia um <code>ALTER TABLE ... TYPE</code> nessa tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor o tipo <code>money</code> do PostgreSQL.</li>
+      <li>Achar que arredondar na apresentação resolve o erro acumulado.</li>
+      <li>Migrar o tipo e não tocar nos valores históricos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-22-10" data-box="qa" data-area="dados" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um relatório diário dá totais diferentes conforme a máquina que o corre. As colunas de data são <code>timestamp</code>. Diagnostique e diga o que muda no modelo.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O diagnóstico é que <code>timestamp</code> sem fuso não guarda um instante: guarda um par data-hora sem referência. O valor entra convertido — ou não convertido — segundo o <code>TimeZone</code> de quem escreveu, e sai interpretado segundo o de quem lê. Quando o relatório corta o dia com <code>WHERE created_at &gt;= '2026-03-01'</code>, cada máquina com configuração diferente inclui um conjunto diferente de linhas na fronteira. Em Portugal, com hora de Verão, há ainda uma hora local que se repete e outra que não existe.</p>
+      <p>A mudança é <code>timestamptz</code>: 8 bytes, exactamente como <code>timestamp</code>, mas guarda o instante absoluto em UTC e faz a conversão na entrada e na saída pelo fuso da sessão. As comparações passam a ser entre instantes e deixam de depender de quem corre a consulta. Em Java 21, o correspondente é <code>OffsetDateTime</code> ou <code>Instant</code>, nunca <code>LocalDateTime</code>.</p>
+      <p>Falta a parte de modelação, que é o que distingue a resposta. «Dia» é um conceito de negócio, não uma projecção do instante: um pagamento capturado às 23:40 UTC pertence a que dia contabilístico, no fuso do comerciante ou no da empresa? A resposta é uma coluna <code>date</code> explícita — <code>settlement_day</code> — decidida uma vez pela aplicação, à entrada, com o fuso de negócio conhecido. O relatório agrupa por essa coluna, que é indexável e determinística, em vez de aplicar <code>AT TIME ZONE</code> sobre 80 milhões de linhas em cada execução, o que além de ambíguo impede o uso do índice.</p>
+      <p>Onde <code>timestamp</code> sem fuso continua certo: horas de parede recorrentes — abertura da loja às 09:00, um alarme às 07:00 — que devem permanecer 09:00 locais quando o fuso muda.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Configura-se o mesmo fuso em todas as máquinas» e fica-se por aí.</td></tr>
+        <tr><td>Mid</td><td>Sabe que deve ser <code>timestamptz</code>, mas acha que este guarda o fuso e não fala do dia de negócio.</td></tr>
+        <tr><td>Sénior</td><td>Explica a semântica dos dois tipos, corrige o modelo e introduz a coluna de dia de negócio com o fuso decidido a montante.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o mapeamento em Java, o efeito na hora de Verão, a migração dos dados existentes e o efeito no particionamento por data.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«<code>timestamptz</code> guarda o fuso original? Porque não?»</li>
+      <li>«Como converte a coluna existente sem perder informação?»</li>
+      <li>«E se cada <em>tenant</em> tiver o seu fuso contabilístico?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Acreditar que <code>timestamptz</code> guarda o fuso de origem.</li>
+      <li>Agrupar relatórios com <code>AT TIME ZONE</code> sobre a tabela inteira.</li>
+      <li>Mapear para <code>LocalDateTime</code> em Java e assumir UTC por convenção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-22-11" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">Bases de dados</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">A equipa quer acrescentar o quinto índice a uma tabela que recebe 3 000 <code>INSERT</code> por segundo. Que argumentos traz para a discussão e como decide?</div>
+  <div class="qprompt">Para o estado do pagamento: tipo <code>ENUM</code> do PostgreSQL, <code>text</code> com <code>CHECK</code>, ou tabela de referência com chave estrangeira?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Trago três números e uma alternativa. O primeiro número é o custo directo: cada índice adicional acrescenta uma escrita lógica e o respectivo registo no WAL por cada <code>INSERT</code>. Passar de quatro para cinco índices custa tipicamente 8% a 15% de débito de escrita e um aumento proporcional de WAL — a 3 000 <code>INSERT</code>/s, isso é uma perda mensurável e vai aparecer no atraso da réplica antes de aparecer na latência da API.</p>
-      <p>O segundo número é o efeito em HOT. Se a coluna nova for actualizada depois do <code>INSERT</code> — um campo de estado, por exemplo —, o índice deixa de permitir actualizações <em>heap-only</em> nessa tabela para todas as actualizações que toquem nessa coluna. Já vi isso duplicar o <em>bloat</em> e o trabalho de <code>autovacuum</code>. Verifica-se antes com <code>n_tup_upd</code> contra <code>n_tup_hot_upd</code> em <code>pg_stat_user_tables</code>: se o rácio HOT estiver hoje em 90% e a coluna candidata for actualizada, prever a queda.</p>
-      <p>O terceiro número é o retorno: quantas execuções por minuto tem a consulta que motiva o índice, e quanto tempo total consome hoje segundo <code>pg_stat_statements</code>. Um índice que poupa 400 ms numa consulta que corre 3 vezes por dia não paga 10% de débito de escrita permanente; um que poupa 40 ms numa consulta que corre 200 vezes por segundo paga-se mil vezes.</p>
-      <p>A alternativa que quase sempre falta na discussão: antes de acrescentar o quinto, verificar se algum dos quatro existentes é redundante. Um índice em <code>(a)</code> é redundante perante <code>(a, b)</code> — o prefixo à esquerda serve os mesmos predicados, apenas com folhas ligeiramente maiores. Frequentemente a proposta certa é «criamos <code>(a, b, c)</code> e removemos <code>(a)</code> e <code>(a, b)</code>», o que melhora as leituras <em>e</em> as escritas. Se o índice for mesmo necessário e a escrita for crítica, um índice parcial reduz o custo à fracção de linhas que interessa.</p></div>
+      <p>Tabela de referência, salvo em dois casos. O critério é a frequência de mudança do conjunto e a quantidade de atributos que cada valor carrega.</p>
+      <p>O tipo <code>ENUM</code> é compacto — 4 bytes — e rápido, mas o conjunto vive no catálogo, não nos dados. Acrescentar um valor é <code>ALTER TYPE ... ADD VALUE</code>, uma migração; remover ou renomear um valor é bastante mais penoso e, na prática, obriga a recriar o tipo e a reescrever as colunas que o usam. A ordenação é a de declaração, o que surpreende quem espera ordem alfabética, e inserir um valor no meio exige <code>BEFORE</code>/<code>AFTER</code> explícito. Nenhum <em>driver</em> ou ferramenta o trata de forma uniforme.</p>
+      <p><code>text</code> com <code>CHECK (status IN (...))</code> é o meio-termo mais comum: legível, alterável com uma migração que substitui a restrição, e sem nada além do valor. Custa mais bytes por linha do que o <code>ENUM</code> e não permite anexar atributos ao estado.</p>
+      <p>A tabela de referência ganha quando o estado tem propriedades — se é terminal, se é visível ao cliente, a etiqueta traduzida, se permite reembolso. Essas propriedades são dados: passam a poder ser consultadas em SQL, alteradas sem migração de esquema e usadas em junções, em vez de ficarem espalhadas por <code>switch</code> no código. O custo é uma junção — normalmente irrelevante, porque a tabela tem dezenas de linhas e vive nas páginas em cache — e mais uma chave estrangeira a verificar por inserção.</p>
+      <p>Os dois casos em que não uso tabela: conjuntos verdadeiramente imutáveis e sem atributos, como o lado de uma transacção contabilística, onde <code>CHECK</code> chega; e colunas de altíssimo volume onde os 4 bytes do <code>ENUM</code> face aos 8 ou 12 de um código de texto se traduzem em gigabytes numa tabela de milhares de milhões de linhas.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Índices só afectam a escrita um bocadinho»; aceita ou rejeita sem dados.</td></tr>
-        <tr><td>Mid</td><td>Sabe que há custo de escrita mas não quantifica nem menciona WAL, HOT ou redundância.</td></tr>
-        <tr><td>Sénior</td><td>Quantifica escrita e WAL, verifica o rácio HOT, exige o retorno medido em <code>pg_stat_statements</code>, e procura redundância antes de acrescentar.</td></tr>
-        <tr><td>Staff</td><td>Liga ao atraso de replicação e ao volume de cópias de segurança, propõe índice parcial e define um critério de revisão periódica do conjunto de índices.</td></tr>
+        <tr><td>Insuficiente</td><td>Escolhe por gosto, sem mencionar migrações nem atributos do estado.</td></tr>
+        <tr><td>Mid</td><td>Prefere <code>ENUM</code> «porque valida», sem saber o custo de alterar o tipo.</td></tr>
+        <tr><td>Sénior</td><td>Compara os três em migração, atributos, bytes e ferramentas, e escolhe com um critério explícito.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o efeito no mapeamento Java e nos contratos de API, e como evolui o conjunto de estados sem quebrar consumidores.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que é uma actualização HOT e o que a impede?»</li>
-      <li>«Como mede o efeito real antes de aplicar em produção?»</li>
-      <li>«Que <code>fillfactor</code> escolhe e porquê?»</li>
-      <li>«Como remove um índice em produção sem risco de regressão?»</li></ul></div>
+      <li>«Como remove um valor de um <code>ENUM</code> já usado em produção?»</li>
+      <li>«Onde vive a máquina de estados — na base ou no domínio?»</li>
+      <li>«Como mapeia isto para um <code>enum</code> de Java sem partir com um valor novo?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Criar índices por precaução, «não faz mal ter».</li>
-      <li>Não distinguir índice redundante de índice necessário.</li>
-      <li>Ignorar o efeito no WAL e na réplica.</li></ul></div>
+      <li>Guardar o ordinal do <code>enum</code> de Java na coluna.</li>
+      <li>Não saber que <code>ALTER TYPE ... ADD VALUE</code> é uma migração de esquema.</li>
+      <li>Duplicar a lista de estados na base e no código sem uma fonte única.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-22-7" class="h2"><span class="secnum">22.7</span> Diagnosticar a query lenta em produção<a class="anchor" href="#sec-22-7" aria-label="ligação">#</a></h2>
+<h2 id="sec-22-6" class="h2"><span class="secnum">22.6</span> Multi-tenancy no modelo de dados<a class="anchor" href="#sec-22-6" aria-label="ligação">#</a></h2>
 
-<p>Em produção não se começa pelo <code>EXPLAIN</code>: começa-se por saber qual das consultas é que importa. A ferramenta é a extensão <code>pg_stat_statements</code>, que normaliza cada instrução (substitui literais por marcadores) e acumula por instrução o número de chamadas, o tempo total, a média, o desvio-padrão, as linhas devolvidas e as páginas lidas. O critério de ordenação certo é <code>total_exec_time</code>, não <code>mean_exec_time</code>: uma consulta de 3 ms que corre 20 000 vezes por minuto consome mais recursos do que uma de 4 s que corre uma vez por hora, e é aquela que compensa optimizar. A extensão custa 1% a 2% de sobrecarga e deve estar ligada em todos os ambientes.</p>
+<p>Há três desenhos e a escolha faz-se por três eixos: isolamento exigido pelo contrato, custo operacional por <em>tenant</em> e distribuição do tamanho dos <em>tenants</em>. Discriminador partilhado é uma coluna <code>tenant_id</code> em todas as tabelas, com a mesma tabela a servir todos. Schema por <em>tenant</em> replica o conjunto de tabelas dentro da mesma base. Base por <em>tenant</em> replica tudo.</p>
 
-<p>A partir daí, a sequência é fixa: identificar a instrução, obter um plano representativo (com <code>auto_explain</code> a registar planos acima de um limiar, ou executando o <code>EXPLAIN (ANALYZE, BUFFERS)</code> numa réplica com os mesmos parâmetros), diagnosticar pelo método da secção 22.4, propor a alteração, prever o efeito, aplicar com <code>CONCURRENTLY</code>, e confirmar no <code>pg_stat_statements</code> depois de um <code>pg_stat_statements_reset()</code>. Prever o efeito antes de aplicar é o que distingue engenharia de tentativa e erro — e é exactamente o que o entrevistador está a testar.</p>
+<p>O discriminador escala em número de <em>tenants</em> e é o único desenho em que uma migração é uma operação. O seu ponto fraco é o isolamento: uma cláusula <code>WHERE</code> em falta é uma fuga de dados entre clientes, e é por isso que a coluna <code>tenant_id</code> não deve ser defendida apenas pelo código. A <em>row level security</em> do PostgreSQL aplica o predicado no motor: com <code>FORCE ROW LEVEL SECURITY</code> e uma política ligada a <code>current_setting('app.tenant_id')</code>, uma consulta escrita à mão numa consola continua isolada. O padrão em Spring Boot 3.x é executar <code>SET LOCAL app.tenant_id = ...</code> no início de cada transacção, a partir de um interceptor, para que o valor não sobreviva à devolução da ligação ao <em>pool</em>.</p>
 
-<figure class="listing sql" id="lst-22-10"><div class="lhead"><span class="lnum">Listagem 22.10</span>
-  <span class="lcap">As consultas que consomem a base de dados, e as que lêem demasiado por linha devolvida.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-  <pre class="code" data-lang="sql"><code>-- Top 10 por tempo total (o critério certo), com percentagem do total.
-SELECT round(total_exec_time::numeric, 0)               AS ms_total,
-       calls,
-       round(mean_exec_time::numeric, 2)                AS ms_medio,
-       round(stddev_exec_time::numeric, 2)              AS ms_desvio,
-       round(100 * total_exec_time / sum(total_exec_time) OVER (), 1) AS pct,
-       rows / greatest(calls, 1)                        AS linhas_por_chamada,
-       left(query, 90)                                  AS instrucao
-  FROM pg_stat_statements
- WHERE calls &gt; 50
- ORDER BY total_exec_time DESC
- LIMIT 10;
+<p>Schema por <em>tenant</em> dá isolamento perceptível e uma via natural de exportação, e paga-se em catálogo e em migrações. Com 2 000 <em>tenants</em> e 40 tabelas cada, são 80 000 relações mais os índices, com efeito no planeamento, no <em>autovacuum</em> e no tempo de <code>pg_dump</code>; uma migração que demore 200 ms por schema demora mais de 6 horas em série e obriga a orquestração, a acompanhamento de progresso e a tolerar o período em que metade dos <em>tenants</em> tem o esquema novo e a outra metade o antigo. Base por <em>tenant</em> dá o isolamento mais forte e o custo mais alto: um <em>pool</em> de ligações por base, cópias de segurança por base, e qualquer relatório agregado passa a ser um processo externo.</p>
 
--- Consultas que lêem muitos blocos por linha devolvida: candidatas a índice.
-SELECT left(query, 90) AS instrucao, calls,
-       (shared_blks_hit + shared_blks_read) / greatest(rows, 1) AS blocos_por_linha,
-       round(mean_exec_time::numeric, 2) AS ms_medio
-  FROM pg_stat_statements
- WHERE calls &gt; 100 AND rows &gt; 0
- ORDER BY 3 DESC
- LIMIT 10;
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 22.2</span> Estratégias de multi-tenancy, avaliadas para 2 000 <em>tenants</em> com 40 tabelas por <em>tenant</em>.</div>
+<div class="tscroll"><table><thead><tr><th>Eixo</th><th>Discriminador <code>tenant_id</code></th><th>Schema por <em>tenant</em></th><th>Base por <em>tenant</em></th></tr></thead><tbody>
+<tr><td>Isolamento</td><td>Lógico; depende de RLS ou de disciplina no código</td><td>Por objecto; erro de <code>search_path</code> ainda é possível</td><td>Físico; a mais forte</td></tr>
+<tr><td>Migração de esquema</td><td>1 operação</td><td>2 000 operações orquestradas (&gt; 6 h em série a 200 ms cada)</td><td>2 000 operações e 2 000 janelas de manutenção</td></tr>
+<tr><td>Catálogo e planeamento</td><td>40 relações</td><td>≈ 80 000 relações mais índices; <em>autovacuum</em> e <code>pg_dump</code> sofrem</td><td>40 relações por base, mas 2 000 bases a monitorizar</td></tr>
+<tr><td>Ligações</td><td>Um <em>pool</em></td><td>Um <em>pool</em>, com <code>search_path</code> por transacção</td><td>Um <em>pool</em> por base; ou um <em>proxy</em> pelo meio</td></tr>
+<tr><td>Agregação entre <em>tenants</em></td><td>Uma consulta</td><td><code>UNION ALL</code> gerado ou vista externa</td><td>Processo de exportação e armazém de dados</td></tr>
+<tr><td>Raio de impacto de um erro</td><td>Todos os <em>tenants</em></td><td>Um <em>tenant</em> por objecto afectado</td><td>Um <em>tenant</em></td></tr>
+<tr><td>Quando escolher</td><td>SaaS com muitos <em>tenants</em> pequenos; distribuição homogénea</td><td>Dezenas a poucas centenas de <em>tenants</em>, com exigência contratual de separação</td><td>Poucos <em>tenants</em> grandes, requisitos de residência de dados ou de cifra por cliente</td></tr>
+</tbody></table></div></div>
 
--- Registar automaticamente o plano de tudo o que passe de 500 ms.
--- postgresql.conf: shared_preload_libraries = 'pg_stat_statements,auto_explain'
-SET auto_explain.log_min_duration = '500ms';
-SET auto_explain.log_analyze = on;
-SET auto_explain.log_buffers = on;
-SET auto_explain.log_nested_statements = on;</code></pre></figure>
+<figure class="listing sql" id="lst-22-6"><div class="lhead"><span class="lnum">Listagem 22.6</span>
+<span class="lcap">Discriminador com particionamento por hash e isolamento imposto pelo motor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>CREATE TABLE invoice (
+    tenant_id   uuid          NOT NULL,
+    id          bigint        GENERATED ALWAYS AS IDENTITY,
+    number      text          NOT NULL,
+    total       numeric(18,4) NOT NULL CHECK (total &gt;= 0),
+    issued_at   timestamptz   NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, id)
+) PARTITION BY HASH (tenant_id);
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Paginação por <code>OFFSET</code> é O(offset): o motor produz e descarta todas as linhas anteriores. Com 20 linhas por página, a página 1 custa 20 linhas, a página 500 custa 10 020 e a página 5 000 custa 100 020 — numa tabela real, 6 ms na primeira página e 1 900 ms na página 5 000. A paginação por chave (<em>keyset</em>) é O(1) por página: <code>WHERE (created_at, id) &lt; ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20</code> mantém-se em 0,4 ms na página 5 000, ao custo de perder o salto directo para uma página arbitrária.</p></aside>
+CREATE TABLE invoice_p0 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+CREATE TABLE invoice_p1 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 1);
+-- ... p2 a p7
 
-<div class="qa" id="q-22-11" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O p99 da API subiu de 180 ms para 2,4 s às 09:15 e a CPU da base de dados está a 95%. Descreva os primeiros 15 minutos, comando a comando.</div>
+-- numa tabela particionada, o índice único tem de conter a chave de partição
+CREATE UNIQUE INDEX invoice_number_uq ON invoice (tenant_id, number);
+CREATE INDEX invoice_issued_ix        ON invoice (tenant_id, issued_at DESC);
+
+ALTER TABLE invoice ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoice FORCE  ROW LEVEL SECURITY;   -- aplica-se também ao dono da tabela
+
+CREATE POLICY invoice_tenant_isolation ON invoice
+    USING      (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- em cada transacção da aplicação, antes da primeira consulta:
+--   SET LOCAL app.tenant_id = '3f1c...';   -- LOCAL: morre no COMMIT, não polui o pool</code></pre></figure>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Com o discriminador, <code>tenant_id</code> deve ser a primeira coluna de praticamente todos os índices. Não é uma questão de estética: torna cada índice uma colecção de intervalos contíguos por <em>tenant</em>, o que mantém as leituras de um <em>tenant</em> pequeno em poucas páginas mesmo quando a tabela global tem mil milhões de linhas, e permite ao planeador eliminar partições quando existe particionamento por <code>tenant_id</code>.</p></aside>
+
+<div class="qa" id="q-22-12" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">SaaS B2B com 2 000 <em>tenants</em>: 1 900 têm menos de 10 mil linhas e 4 têm mais de 300 milhões, e dois clientes exigem por contrato que os seus dados estejam separados. Que estratégia de multi-tenancy propõe?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Primeiro, o que está a correr agora: <code>SELECT pid, now() - query_start AS duracao, state, wait_event_type, wait_event, left(query, 120) FROM pg_stat_activity WHERE state &lt;&gt; 'idle' ORDER BY duracao DESC LIMIT 20</code>. Isto distingue em segundos os três cenários possíveis — uma consulta pesada nova, bloqueios em cadeia, ou saturação genérica. Se <code>wait_event_type</code> for <code>Lock</code>, o problema não é de índices e vai-se a <code>pg_locks</code> e à cadeia de bloqueio; se for <code>IO</code> ou nulo com CPU alta, é trabalho a mais.</p>
-      <p>Segundo, o que mudou: comparo <code>pg_stat_statements</code> com a linha de base. Se houver <em>snapshots</em> periódicos, a diferença dá o culpado directamente; se não, ordeno por <code>total_exec_time</code> e procuro instruções com <code>calls</code> muito acima do habitual ou <code>mean_exec_time</code> muito acima do <code>stddev</code>. Em paralelo pergunto o óbvio: houve <em>deploy</em>, migração, ou uma campanha de <em>marketing</em> às 09:15? Uma alteração de plano provocada por <code>ANALYZE</code> ou por crescimento de tabela é a explicação quando não houve <em>deploy</em> nenhum.</p>
-      <p>Terceiro, mitigação antes de correcção. Se for uma consulta identificada, <code>pg_cancel_backend</code> nas execuções mais longas e, se existir, um <em>feature flag</em> para desligar o painel ou o relatório que a dispara. Se for saturação de ligações, verificar o <em>pooler</em> — 400 ligações activas num servidor de 16 vCPU são 25 vezes o paralelismo útil e a CPU vai-se em troca de contexto; o PgBouncer em modo <em>transaction</em> com um <em>pool</em> de 3 a 4 vezes o número de núcleos é a correcção. Só depois se aplica <code>statement_timeout</code> por papel para impedir que uma consulta de relatório volte a arrastar o serviço.</p>
-      <p>Quarto, correcção definitiva com medição: obter o plano com <code>auto_explain</code> ou reproduzir numa réplica, diagnosticar, criar o índice com <code>CONCURRENTLY</code>, e verificar em <code>pg_stat_statements</code> após <code>reset</code> que o <code>total_exec_time</code> daquela instrução caiu para a fracção prevista. O que fica registado no incidente é a previsão e a medição, não «criámos um índice e melhorou».</p></div>
+      <p>Proponho um modelo híbrido, porque a distribuição é fortemente assimétrica e a exigência contratual só existe para dois clientes: discriminador <code>tenant_id</code> partilhado como padrão, base dedicada para os dois clientes com cláusula de separação, e uma decisão explícita sobre os quatro <em>tenants</em> gigantes.</p>
+      <p>O padrão é o discriminador com <code>tenant_id uuid</code> como primeira coluna de todas as chaves primárias e de todos os índices, particionamento por hash de <code>tenant_id</code>, e <em>row level security</em> com <code>FORCE</code> para que o isolamento não dependa de nenhuma cláusula <code>WHERE</code> escrita à mão. Isto resolve os 1 900 pequenos com uma migração por implantação e um <em>pool</em> de ligações. Schema por <em>tenant</em> está fora: 2 000 schemas por 40 tabelas são 80 000 relações e uma migração que demora horas.</p>
+      <p>Os quatro gigantes são o problema interessante. Com particionamento por hash, cada um cai numa partição e desequilibra-a; a saída é uma lista de partições dedicadas para esses <em>tenants</em> e hash para o resto, ou uma partição por <em>tenant</em> nos que passem um limite acordado, digamos 50 milhões de linhas. Isso mantém as varreduras e o <em>autovacuum</em> contidos por <em>tenant</em> e dá um caminho de saída barato: se um gigante crescer para lá do que a instância aguenta, extrai-se a partição.</p>
+      <p>Os dois clientes contratuais vão para bases dedicadas com o mesmo esquema e o mesmo código; o encaminhamento é uma <code>DataSource</code> escolhida por <em>tenant</em>, com um catálogo de <em>tenants</em> a mapear identificador para <em>datasource</em>. O custo que digo em voz alta: passa a haver dois caminhos de migração e é preciso um teste que garanta que os dois esquemas convergem, além de relatórios agregados que já não são uma consulta única. É o preço de vender a esses dois clientes.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Reiniciava a base de dados» ou «adicionava mais réplicas»; nenhum comando concreto.</td></tr>
-        <tr><td>Mid</td><td>Vai a <code>pg_stat_activity</code> e mata consultas, mas não separa mitigação de correcção nem usa <code>pg_stat_statements</code>.</td></tr>
-        <tr><td>Sénior</td><td>Sequência ordenada com comandos reais, distingue bloqueio de saturação, mitiga primeiro, corrige depois, e mede o efeito.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a pergunta sobre o que mudou às 09:15, o dimensionamento do <em>pool</em>, <code>statement_timeout</code> por papel como defesa permanente, e o registo da previsão no <em>postmortem</em>.</td></tr>
+        <tr><td>Insuficiente</td><td>Escolhe uma das três estratégias sem olhar à distribuição de tamanhos nem ao requisito contratual.</td></tr>
+        <tr><td>Mid</td><td>Propõe discriminador com <code>tenant_id</code> e filtro no repositório; não menciona RLS, particionamento nem os <em>tenants</em> gigantes.</td></tr>
+        <tr><td>Sénior</td><td>Discriminador com RLS e <code>tenant_id</code> à cabeça dos índices, particionamento, e reconhece a necessidade de tratamento especial para os grandes e os contratuais.</td></tr>
+        <tr><td>Staff</td><td>Desenha o híbrido, o encaminhamento de <code>DataSource</code>, a convergência dos esquemas, o custo operacional dos dois caminhos e o critério para promover um <em>tenant</em> a base dedicada.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como distingue uma mudança de plano de um aumento de tráfego?»</li>
-      <li>«Que <code>wait_event</code> esperaria ver em cada cenário?»</li>
-      <li>«Que sobrecarga tem <code>pg_stat_statements</code> e <code>auto_explain</code>?»</li>
-      <li>«Como dimensiona o <em>pool</em> de ligações para 16 vCPU?»</li></ul></div>
+      <li>«Como move um <em>tenant</em> do partilhado para uma base dedicada sem indisponibilidade?»</li>
+      <li>«Onde põe o <code>SET LOCAL</code> do <em>tenant</em> e o que acontece se o esquecer?»</li>
+      <li>«Qual é o custo da RLS no plano de execução e como o mede?»</li>
+      <li>«Como impede um <em>tenant</em> grande de esgotar o <em>pool</em> partilhado?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Criar índices em produção durante o incidente sem <code>CONCURRENTLY</code>.</li>
-      <li>Não ter linha de base com que comparar.</li>
-      <li>Confundir CPU alta com falta de índice sem verificar bloqueios primeiro.</li></ul></div>
+      <li>Isolamento assente apenas em filtros do ORM.</li>
+      <li>Propor schema por <em>tenant</em> para 2 000 <em>tenants</em> sem contar as migrações.</li>
+      <li>Não indexar <code>tenant_id</code> como primeira coluna.</li>
+      <li>Guardar o <code>tenant_id</code> numa variável de sessão sem <code>LOCAL</code>, com <em>pool</em> de ligações.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-22-12" data-box="qa" data-area="sql" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">SQL</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O endpoint <code>GET /orders?page=N&amp;size=20</code> responde em 6 ms na primeira página e 1,9 s na página 5 000. Explique porquê e reescreva-o.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>OFFSET</code> não salta linhas, descarta-as. Para servir a página 5 000 com 20 elementos, o motor produz 100 020 linhas ordenadas e deita fora 100 000. O custo é linear na profundidade da página, o que se vê no plano: o nó <code>Limit</code> mostra <code>rows=20</code> mas o filho mostra <code>actual rows=100020</code>. Nenhum índice resolve isto, porque o trabalho é intrínseco à semântica do <code>OFFSET</code>.</p>
-      <p>A reescrita é paginação por chave. Em vez de um número de página, o cliente recebe um cursor com a última chave vista e pede o que vem a seguir. A chave tem de ser <strong>total</strong>, isto é, única, senão perdem-se ou duplicam-se linhas em empates: com <code>created_at</code> a repetir-se no mesmo milissegundo, acrescenta-se <code>id</code> como desempate e usa-se a comparação de tuplos, que o PostgreSQL traduz directamente num limite de varrimento do índice composto.</p>
-      <p>Serve-se com <code>SELECT id, created_at, total_cents FROM orders WHERE customer_id = $1 AND (created_at, id) &lt; ($2, $3) ORDER BY created_at DESC, id DESC LIMIT 20</code>, com índice em <code>(customer_id, created_at DESC, id DESC)</code>. O plano passa a ser <code>Index Scan</code> com 20 linhas lidas, e o tempo é constante em qualquer profundidade — 0,4 ms na página 5 000, contra 1 900 ms. O cursor devolve-se opaco (base64 do par) para não prender o cliente ao formato interno.</p>
-      <p>O que se perde e quando não usar: desaparece o salto para uma página arbitrária e desaparece o número total de páginas — um <code>count(*)</code> exacto sobre milhões de linhas custa um varrimento completo de qualquer forma, e substitui-se por uma estimativa de <code>pg_class.reltuples</code> ou por «mais de 10 000». Se a interface exigir mesmo navegação por número de página e o conjunto for pequeno (abaixo de 10 000 linhas), <code>OFFSET</code> é aceitável e mais simples. No Spring Data, isto significa trocar <code>Pageable</code> por <code>Slice</code> e um parâmetro de cursor, ou uma consulta explícita — o <code>Pageable</code> com <code>Page</code> emite sempre o <code>count</code>.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe um índice para «acelerar o OFFSET» ou cache da página.</td></tr>
-        <tr><td>Mid</td><td>Conhece keyset pagination mas esquece o desempate por chave única e o índice correspondente.</td></tr>
-        <tr><td>Sénior</td><td>Explica o custo linear, usa comparação de tuplos com desempate, define o índice, quantifica o ganho e nomeia o que se perde.</td></tr>
-        <tr><td>Staff</td><td>Trata o cursor como parte do contrato da API (opaco, estável, com política de expiração), resolve o <code>count</code> com estimativa, e mapeia para <code>Slice</code> no Spring Data.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se forem inseridas linhas novas entre dois pedidos do mesmo cursor?»</li>
-      <li>«Como devolve o total de resultados sem <code>count(*)</code>?»</li>
-      <li>«Porque é que <code>(a, b) &lt; ($1, $2)</code> é melhor do que <code>a &lt; $1 OR (a = $1 AND b &lt; $2)</code>?»</li>
-      <li>«Como faz isto num <code>Pageable</code> do Spring Data?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Paginar sem <code>ORDER BY</code> determinístico.</li>
-      <li>Esquecer o desempate e assumir que <code>created_at</code> é único.</li>
-      <li>Manter o <code>count(*)</code> exacto e queixar-se do desempenho.</li></ul></div>
-  </div>
-</div>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>A RLS aplica o isolamento no motor e sobrevive a SQL escrito à mão, a novos serviços e a correcções em incidente; em troca, o predicado entra em todos os planos e o depuramento fica menos óbvio, porque uma consulta pode devolver zero linhas por causa de uma variável de sessão em falta. Se a base for escrita por um único serviço bem testado e a auditoria não exigir controlo no motor, um filtro central com teste de arquitectura é mais simples; assim que existe um segundo escritor, a RLS deixa de ser opcional.</p></aside>
 
-<div class="lab" id="lab-22-2" data-box="lab" data-lang="sql">
-  <div class="labhead"><span class="labttl">Exercício 22.2 — Desenhar o conjunto mínimo de índices para cinco consultas</span>
-    <div class="labpills"><span class="qpill">Alvo ≤ 4 índices</span><span class="qpill">30 min</span></div></div>
-  <div class="labbody">
-    <p>Sobre o esquema da Listagem 22.1 (<code>orders</code> com 48 M linhas, 3 000 <code>INSERT</code>/s no pico; <code>customers</code> com 2,1 M), desenhe o conjunto <strong>mínimo</strong> de índices que serve estas cinco consultas, e justifique cada um. Restrições: no máximo quatro índices novos em <code>orders</code>, orçamento total de espaço de 3 GB, e cada índice tem de ser justificado por pelo menos uma consulta. Para cada consulta, indique o plano esperado. Q1: <code>SELECT id, created_at, status, total_cents FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20</code> (450 pedidos/s, é o histórico do cliente). Q2: <code>SELECT count(*) FROM orders WHERE tenant_id = $1 AND status = 'PENDING'</code> (2 pedidos/s, painel). Q3: <code>SELECT … FROM orders WHERE tenant_id = $1 AND created_at &gt;= $2 AND created_at &lt; $3 AND status = ANY($4) ORDER BY created_at DESC LIMIT 100</code> (30 pedidos/s, pesquisa de <em>back-office</em>). Q4: <code>SELECT id FROM customers WHERE lower(email) = lower($1)</code> (120 pedidos/s, autenticação). Q5: <code>SELECT status, sum(total_cents) FROM orders WHERE tenant_id = $1 AND created_at &gt;= $2 GROUP BY status</code> (1 pedido/s, relatório mensal).</p>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing sql" id="lst-22-11"><div class="lhead"><span class="lnum">Listagem 22.11</span>
-        <span class="lcap">Três índices em <code>orders</code> e um em <code>customers</code> cobrem as cinco consultas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="sql"><code>-- I1 (Q1): histórico do cliente. INCLUDE evita a ida à heap: index-only scan.
---     48 M x ~44 B = 2,1 GB. Justificado por 450 req/s.
-CREATE INDEX CONCURRENTLY i1_orders_cust_created
-    ON orders (customer_id, created_at DESC)
-    INCLUDE (status, total_cents);
+<h2 id="sec-22-7" class="h2"><span class="secnum">22.7</span> Resumo e checklist<a class="anchor" href="#sec-22-7" aria-label="ligação">#</a></h2>
 
--- I2 (Q2): parcial. PENDING = 0,3% => 144 000 entradas, ~5 MB.
---     Index Only Scan sobre o índice inteiro em cache; count sem tocar na heap.
-CREATE INDEX CONCURRENTLY i2_orders_pending_tenant
-    ON orders (tenant_id)
-    WHERE status = 'PENDING';
-
--- I3 (Q3 e Q5): igualdade (tenant_id) -&gt; intervalo/ordenação (created_at).
---     status fica fora da chave: ANY($4) com lista variável não delimita o
---     varrimento; entra em INCLUDE para o filtro e o GROUP BY de Q5 serem
---     resolvidos sem ir à heap. 48 M x ~40 B = 1,9 GB.
-CREATE INDEX CONCURRENTLY i3_orders_tenant_created
-    ON orders (tenant_id, created_at DESC)
-    INCLUDE (status, total_cents);
-
--- I4 (Q4): índice de expressão; lower(email) tem de coincidir literalmente.
---     UNIQUE porque o e-mail é identidade: dá também a garantia de integridade.
-CREATE UNIQUE INDEX CONCURRENTLY i4_customers_email_lower
-    ON customers (lower(email));
-
--- NÃO criar:
---   (created_at) sozinho          -- prefixo errado; nenhuma consulta o usa só
---   (status)                      -- 91% DELIVERED: nunca escolhido
---   (tenant_id, status, created_at) -- redundante com I3 para Q3/Q5 e pior para
---                                   -- ANY(); I2 já resolve o caso de Q2
---   (customer_id) sozinho         -- prefixo à esquerda de I1
-
-ANALYZE orders;
-ANALYZE customers;</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li><strong>Orçamento cumprido:</strong> 2,1 GB (I1) + 5 MB (I2) + 1,9 GB (I3) = 4,0 GB, acima dos 3 GB. A negociação certa é remover o <code>INCLUDE (status, total_cents)</code> de I3, que baixa para 1,3 GB e mantém Q3 rápido à custa de idas à <em>heap</em> em Q5, que corre 1 vez por segundo. Total: 3,4 GB — e apresentar o desvio residual em vez de o esconder é o comportamento esperado.</li>
-        <li><strong>Custo de escrita:</strong> quatro índices em <code>orders</code> significam quatro escritas lógicas extra por <code>INSERT</code>. A 3 000 <code>INSERT</code>/s, I2 é praticamente gratuito (só entra se o estado for <code>PENDING</code>), I1 e I3 pagam-se integralmente. Estimativa: 20% a 30% de perda de débito de escrita face à tabela sem índices secundários.</li>
-        <li><strong>Porque <code>status</code> não entra na chave de I3:</strong> <code>status = ANY($4)</code> com uma lista de tamanho variável não produz um limite de varrimento único; o PostgreSQL faria varrimentos múltiplos ou aplicaria o predicado como filtro. Pôr <code>status</code> depois de <code>created_at</code> na chave também não ajuda, porque <code>created_at</code> é um intervalo e tudo o que vem a seguir deixa de delimitar.</li>
-        <li><strong>Q1 e Q3 partilham prefixo?</strong> Não: <code>customer_id</code> e <code>tenant_id</code> são colunas diferentes e nenhuma implica a outra. É a razão por que são precisos dois índices largos em vez de um.</li>
-        <li><strong>Caso limite de I2:</strong> se a fila de pendentes crescer para milhões numa avaria a jusante, o índice parcial cresce na mesma proporção e o <code>count(*)</code> deixa de ser instantâneo. A defesa é um contador aproximado ou uma tabela de agregados actualizada por <em>trigger</em>, não um índice maior.</li>
-        <li><strong>Verificação:</strong> uma semana depois, <code>pg_stat_user_indexes.idx_scan</code> para confirmar que os quatro são usados; qualquer um com <code>idx_scan = 0</code> e a aplicação em produção é candidato a remoção (depois de excluir consultas sazonais de fecho de mês).</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<p>Há um limite acima do qual nenhum índice ajuda, e reconhecê-lo é parte da resposta. Quando o relatório agrega milhões de linhas para devolver dezenas, o trabalho é a agregação e não a localização: uma <code>MATERIALIZED VIEW</code> com <code>REFRESH … CONCURRENTLY</code> troca 4 s de latência por dados com alguns minutos de atraso, ao custo de um índice único obrigatório sobre a vista e de um trabalho periódico a manter. A escolha contrária — manter a agregação em tempo real e pagar os 4 s — é a certa quando o resultado alimenta uma decisão financeira que não tolera atraso.</p>
-
-<h2 id="sec-22-8" class="h2"><span class="secnum">22.8</span> Resumo e checklist<a class="anchor" href="#sec-22-8" aria-label="ligação">#</a></h2>
-
-<p>O que reter deste capítulo, em forma comprimida para revisão na véspera:</p>
+<p>O que reter deste capítulo, na forma em que é útil dentro da entrevista:</p>
 
 <ul class="lst">
-  <li>A ordem das colunas num índice composto é igualdade primeiro, intervalo depois, ordenação e cobertura no fim. Trocar a ordem custou 137× no exemplo da Listagem 22.2, com o mesmo nome de nó no plano.</li>
-  <li>Selectividade decide, cardinalidade não. Acima de 8% a 12% das linhas (com <code>random_page_cost = 4.0</code>), o <code>Seq Scan</code> ganha e é a escolha certa; o meio-termo é o <code>Bitmap Heap Scan</code>.</li>
-  <li><code>cost</code> não é tempo, e <code>actual time</code> é por iteração: com <code>loops=N</code>, multiplica-se. O nó a corrigir é o de maior tempo <em>próprio</em>, não o de topo.</li>
-  <li><code>Buffers</code> antes de milissegundos. <code>temp read/written</code> e <code>Batches &gt; 1</code> apontam para <code>work_mem</code>; <code>Rows Removed by Filter</code> aponta para um índice em falta; <code>Heap Fetches</code> alto aponta para <code>autovacuum</code>.</li>
-  <li>Um desvio superior a 10× entre <code>rows</code> estimadas e reais é um problema de estatísticas, não de índices: <code>ANALYZE</code>, <code>SET STATISTICS</code>, e <code>CREATE STATISTICS</code> para colunas correlacionadas.</li>
-  <li>Funções sobre a coluna, <code>LIKE '%x'</code> e conversões implícitas de tipo destroem a utilização do índice. As saídas são reescrever como intervalo, índice de expressão, ou GIN de trigramas.</li>
-  <li>Cada índice é uma escrita extra por <code>INSERT</code> e um bloqueio a mais sobre a optimização HOT. Antes de acrescentar o quinto, procurar o redundante entre os quatro existentes.</li>
-  <li>Em produção começa-se por <code>pg_stat_statements</code> ordenado por <code>total_exec_time</code>, nunca por <code>mean_exec_time</code>, e prevê-se o efeito antes de aplicar.</li>
-  <li><code>OFFSET</code> é linear na profundidade da página; a paginação por chave com comparação de tuplos é constante e exige um desempate único.</li>
+<li>Normalizar até 3FN é o ponto de partida; copiar valores históricos — preço, morada de facturação — não é violação de 3FN, é modelar factos diferentes.</li>
+<li>Desnormalizar só depois de o plano de execução estar correcto, com rácio de leitura/escrita conhecido e um mecanismo de detecção de divergência.</li>
+<li>A chave primária propaga-se a todas as chaves estrangeiras e índices: 8 bytes de diferença por linha tornam-se gigabytes e páginas a competir por <code>shared_buffers</code>.</li>
+<li>UUIDv4 destrói a localidade de escrita no B-tree — divisões de página e folhas a 50-70%; UUIDv7 ou ULID devolvem a localidade sem exigir coordenação.</li>
+<li>Chave natural fica como <code>UNIQUE</code>, nunca como primária: os identificadores de negócio mudam, são largos e nem sempre existem no momento da inserção.</li>
+<li>As <em>constraints</em> defendem contra todos os escritores, não só contra a aplicação actual; adicionam-se com <code>NOT VALID</code> seguido de <code>VALIDATE</code> para não bloquear tabelas grandes.</li>
+<li><code>ON DELETE CASCADE</code> só em composição estrita e cardinalidade pequena; o lado filho da chave estrangeira precisa sempre de índice.</li>
+<li>Reversibilidade, histórico e auditoria são três requisitos com três estruturas; <em>soft delete</em> exige índices únicos parciais e uma janela de retenção.</li>
+<li>Dinheiro em <code>numeric</code> ou em unidades menores; tempo em <code>timestamptz</code>, com o dia de negócio como coluna <code>date</code> própria.</li>
 </ul>
 
-<p>Checklist accionável antes da ronda de bases de dados:</p>
+<p>Checklist para rever um esquema, próprio ou dado numa entrevista:</p>
 
 <ul class="lst">
-  <li>Saber recitar, sem hesitação, a ordem igualdade → intervalo → ordenação e explicar porquê a partir da estrutura do B-tree.</li>
-  <li>Ler um plano de 20 linhas em voz alta, de baixo para cima, nomeando os quatro números que se procuram primeiro.</li>
-  <li>Ter na ponta da língua os valores por omissão que importam: <code>random_page_cost = 4.0</code>, <code>work_mem = 4MB</code>, <code>default_statistics_target = 100</code>, <code>autovacuum_vacuum_scale_factor = 0.2</code>.</li>
-  <li>Conseguir escrever de memória o DDL de um índice parcial, de um índice de expressão, de um <code>INCLUDE</code> e de um GIN de trigramas.</li>
-  <li>Ter uma história real de uma consulta optimizada com número antes e número depois, e a previsão que se fez antes de aplicar.</li>
-  <li>Nunca propor um índice sem dizer o que custa em espaço e em escrita, e sem dizer como se confirma que passou a ser usado.</li>
-  <li>Saber quando a resposta certa não é um índice: <code>work_mem</code>, estatísticas, vista materializada, particionamento, ou negociar o requisito.</li>
-  <li>Ter pronta a distinção entre mitigar (cancelar, <em>flag</em>, <code>statement_timeout</code>) e corrigir (índice, reescrita), e a ordem em que se fazem durante um incidente.</li>
+<li>Cada tabela tem chave primária declarada e ela é estreita, imutável e disponível na inserção.</li>
+<li>Se a chave é <code>uuid</code>, é v7 ou ULID, é do tipo <code>uuid</code> e não de texto, e existe razão para não ser <code>bigint</code>.</li>
+<li>Toda a coluna de chave estrangeira tem índice; todo o <code>CASCADE</code> tem cardinalidade máxima conhecida.</li>
+<li>Cada invariante estrutural tem <code>NOT NULL</code>, <code>CHECK</code>, <code>UNIQUE</code> ou <code>EXCLUDE</code> — e cada <code>UNIQUE</code> foi revista contra o <em>soft delete</em>.</li>
+<li>Nenhuma coluna monetária é <code>double precision</code>, <code>real</code> ou <code>money</code>; a escala aguenta taxas e preços unitários.</li>
+<li>Todas as colunas de instante são <code>timestamptz</code>; as horas de parede estão identificadas e justificadas.</li>
+<li>Existe resposta escrita para «qual era o valor a 12 de Março» ou existe decisão explícita de não a suportar.</li>
+<li>Em multi-tenancy, <code>tenant_id</code> é a primeira coluna dos índices e o isolamento não depende de nenhuma cláusula <code>WHERE</code> escrita à mão.</li>
+<li>Cada migração pendente foi avaliada quanto ao bloqueio que adquire e ao tempo que o mantém na maior tabela afectada.</li>
 </ul>

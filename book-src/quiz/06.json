@@ -1,26 +1,46 @@
 {"chapter": 6, "questions": [
-  {"q": "Sobre `List.of(\"a\",\"bb\",\"ccc\").stream().map(s -> s.length()).peek(System.out::println).count()` numa JVM Java 21: quantas linhas são impressas?",
-   "options": ["Três, uma por elemento.", "Nenhuma, porque `count()` pode determinar o tamanho pela fonte e o `peek` é eliminado.", "Uma, porque `count()` corta no primeiro elemento.", "Três, mas só se o stream for sequencial."],
+  {"q": "Uma classe declara `void registar(List<String> l)` e `void registar(List<Integer> l)`. O que acontece?",
+   "options": [
+     "Compila, e a JVM escolhe a sobrecarga pelo tipo em runtime.",
+     "Não compila: depois do apagamento as duas assinaturas são `registar(List)`.",
+     "Compila, mas gera um aviso de poluição do heap em cada chamada.",
+     "Compila apenas se as duas listas forem declaradas `final`."],
    "answer": 1,
-   "explain": "Desde o Java 9, `count()` pode saltar o percurso quando a fonte é SIZED e nenhuma operação altera a contagem; `map` não altera, portanto o `peek` não corre. Basta acrescentar um `filter` para o tamanho deixar de ser conhecido e as três linhas voltarem a aparecer. `count()` não é uma operação de corte antecipado, logo a opção da única linha está errada."},
+   "explain": "O apagamento substitui os argumentos de tipo, deixando `registar(List)` nos dois casos, e duas assinaturas iguais na mesma classe são erro de compilação. A JVM nunca vê o argumento de tipo, portanto não pode despachar por ele; e `final` não altera assinaturas. A poluição do heap é um problema distinto, ligado a varargs genéricos."},
 
-  {"q": "Um relatório usa `txs.stream().filter(Tx::aprovada).collect(Collectors.groupingBy(Tx::comerciante, Collectors.counting()))`. Os comerciantes que só tiveram transacções recusadas desaparecem do mapa. Qual é a correcção mínima?",
-   "options": ["Trocar `groupingBy` por `groupingByConcurrent`.", "Remover o `filter` e mover o predicado para dentro do `groupingBy` com `Collectors.filtering`.", "Acrescentar `Collectors.collectingAndThen` com um `Map::copyOf` no fim.", "Substituir `counting()` por `summingLong(t -> 1L)`."],
-   "answer": 1,
-   "explain": "`filter` a montante elimina os elementos antes de existirem grupos, por isso o grupo nunca é criado. `Collectors.filtering` aplica o predicado dentro do grupo já formado e devolve contagem zero para esses comerciantes. `groupingByConcurrent` só muda a estratégia de concorrência, `collectingAndThen` só torna o mapa imutável e `summingLong` conta exactamente o mesmo subconjunto filtrado."},
-
-  {"q": "Num contentor Kubernetes com `resources.limits.cpu: 2`, um endpoint chama `ids.parallelStream().map(clienteHttp::obter).toList()` para 100 ids, cada chamada com 150 ms de latência. Qual é a consequência mais grave?",
-   "options": ["O tempo total fica em cerca de 150 ms porque o ForkJoinPool cria um thread por elemento.", "O `ForkJoinPool.commonPool()`, com paralelismo 1, fica bloqueado em I/O e afecta todo o processo.", "O `toList()` lança `IllegalStateException` porque o stream é paralelo.", "A ordem dos resultados deixa de corresponder à ordem dos ids."],
-   "answer": 1,
-   "explain": "O paralelismo por omissão é `availableProcessors() - 1`, ou seja 1 neste contentor, e o pool é global ao processo — o I/O bloqueante prende-o e paralisa todos os `CompletableFuture` sem executor explícito. O pool não cria um thread por elemento, `toList()` funciona bem em paralelo e preserva a ordem de encontro. Para I/O usa-se um executor de threads virtuais."},
-
-  {"q": "Um campo `Function<String,String> f = configService.obterMapa()::get` é inicializado no arranque. Após um recarregamento que substitui a instância devolvida por `obterMapa()`, o serviço continua a devolver valores antigos. Porquê?",
-   "options": ["Porque `Function` guarda um cache interno dos resultados.", "Porque a referência de método avaliou `configService.obterMapa()` uma só vez, ao ser criada, e capturou o receptor.", "Porque o campo teria de ser `volatile` para ver a nova instância.", "Porque `Map::get` devolve sempre o valor da primeira chamada para a mesma chave."],
-   "answer": 1,
-   "explain": "Em `expr::metodo` a expressão do receptor é avaliada no momento da criação da referência, ficando presa à instância então devolvida; o lambda `k -> configService.obterMapa().get(k)` reavaliaria em cada invocação. `volatile` não ajuda porque o campo `f` não é reatribuído, e nem `Function` nem `Map::get` fazem cache."},
-
-  {"q": "Qual destas afirmações sobre `reduce` e `collect` é correcta?",
-   "options": ["`reduce(\"\", String::concat)` sobre 100 000 cadeias tem o mesmo custo que `Collectors.joining()`.", "O `combiner` de um `Collector` é invocado em todos os percursos, sequenciais e paralelos.", "`reduce` com um acumulador que muta e devolve o argumento é correcto em série e pode dar resultados errados em paralelo.", "`collect` não pode ser usado em streams paralelos porque o contentor é mutável."],
+  {"q": "Quer um método que copie elementos de uma origem para um destino. Qual assinatura respeita PECS?",
+   "options": [
+     "`static <T> void copiar(List<? extends T> destino, List<? super T> origem)`",
+     "`static <T> void copiar(List<T> destino, List<T> origem)`",
+     "`static <T> void copiar(List<? super T> destino, List<? extends T> origem)`",
+     "`static <T> void copiar(List<?> destino, List<?> origem)`"],
    "answer": 2,
-   "explain": "`reduce` assume acumulação imutável e associativa; mutar o argumento funciona por acaso em série e corrompe resultados em paralelo, onde a identidade é partilhada entre ramos — é exactamente o caso que `collect` cobre com supplier/accumulator/combiner. `reduce` com `String::concat` é O(n²) contra O(n) de `joining()`, o `combiner` só é chamado em execução paralela, e `collect` é seguro em paralelo por usar contentores privados por ramo."}
+   "explain": "A origem produz valores, logo `? extends T`; o destino consome-os, logo `? super T`. A opção 0 troca os lados e não deixa escrever no destino. A opção 1 compila mas obriga os dois lados ao mesmo tipo exacto, recusando `List<Object>` como destino de `List<Integer>`. A opção 3 não permite escrever nada além de `null` sem captura do wildcard."},
+
+  {"q": "Um `record Encomenda(String id, List<Linha> linhas)` é usado em várias threads. Qual afirmação é correcta?",
+   "options": [
+     "É profundamente imutável: os componentes de um record são copiados automaticamente.",
+     "É imutável apenas se o construtor compacto fizer `linhas = List.copyOf(linhas)`.",
+     "É imutável porque a classe gerada é `final`.",
+     "Basta declarar o componente como `final List<Linha> linhas` para garantir a imutabilidade."],
+   "answer": 1,
+   "explain": "Um record garante que a referência é final, não que o objecto referido seja imutável: quem passou a lista pode continuar a alterá-la. A cópia defensiva no construtor compacto, com `List.copyOf`, é o que fecha a fuga, ao custo de uma alocação por instância. A classe ser `final` impede a herança, não a mutação; e os componentes já são implicitamente finais, pelo que repetir `final` nada acrescenta."},
+
+  {"q": "Um `switch` exaustivo sobre uma interface `sealed` com três subtipos foi compilado. Depois, alguém acrescenta um quarto subtipo e recompila apenas o módulo da hierarquia. O que acontece em runtime quando chega uma instância do novo subtipo?",
+   "options": [
+     "O switch devolve `null` silenciosamente.",
+     "É lançada `MatchException`.",
+     "É lançada `ClassCastException` no primeiro `case`.",
+     "A JVM recompila o switch e trata o novo subtipo."],
+   "answer": 1,
+   "explain": "A exaustividade é verificada em compilação; com compilação separada, o switch compilado deixa de cobrir todos os subtipos e a JVM sinaliza a situação com `MatchException`, em vez de deixar passar um resultado indefinido. Não há recompilação em runtime nem conversão implícita. A mitigação operacional é recompilar todos os módulos que consomem a hierarquia quando esta muda."},
+
+  {"q": "Num caminho quente, `return repo.procurar(id).orElse(carregarDoServicoRemoto(id));` mostra latência elevada mesmo com 99% de acertos no repositório. Porquê?",
+   "options": [
+     "`orElse` avalia sempre o argumento, logo o serviço remoto é chamado em todas as invocações.",
+     "`Optional` obriga a uma passagem extra pelo garbage collector antes de devolver o valor.",
+     "`orElse` desembrulha o Optional duas vezes, duplicando o custo do acesso ao repositório.",
+     "`procurar` devolve `Optional.empty()` sempre que o valor está em cache."],
+   "answer": 0,
+   "explain": "`orElse` recebe um valor, não um fornecedor: a expressão do argumento é avaliada antes da chamada, presente ou ausente o valor. A correcção é `orElseGet(() -> carregarDoServicoRemoto(id))`, que só invoca o fornecedor no ramo de ausência. A alocação do Optional existe mas é irrelevante face a uma chamada remota, e as restantes explicações descrevem comportamentos que não existem."}
 ]}

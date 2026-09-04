@@ -1,46 +1,46 @@
 {"chapter": 36, "questions": [
-  {"q": "Um repositório Spring Data expõe `@Query(\"select f from Fatura f where f.estado = '\" + estado + \"'\")` montado com concatenação de strings em JPQL. Qual é a avaliação correcta?",
+  {"q": "Um serviço em ECS é implantado com canário a 5% durante 5 minutos. O serviço recebe 8 pedidos por segundo. O <em>workflow</em> promove para 100% porque nenhum alarme disparou. Qual é o problema?",
    "options": [
-     "É seguro: o JPA traduz para prepared statement e escapa os valores automaticamente.",
-     "É vulnerável a injecção: a concatenação acontece antes de o JPQL ser analisado, e o valor passa a fazer parte da gramática da consulta.",
-     "É seguro desde que a entidade tenha validação Bean Validation nos campos.",
-     "É vulnerável apenas se o dialecto for PostgreSQL, porque outros motores escapam a plica."],
+     "O canário devia observar 5% do tráfego durante pelo menos 60 minutos para o alarme ser válido.",
+     "A janela só expõe cerca de 120 pedidos, o que não dá sinal estatístico para distinguir uma taxa de erro de 0,1% de uma de 2%.",
+     "O ECS não suporta encaminhamento por peso no ALB, pelo que os 5% não são reais.",
+     "O canário só funciona se a versão nova e a antiga usarem esquemas de base de dados diferentes."],
    "answer": 1,
-   "explain": "O que protege é o parâmetro vinculado (`:estado`), não o facto de existir um ORM: o JPQL concatenado é analisado já com o valor lá dentro e produz a mesma classe de falha do SQL nativo. A validação de bean corre sobre a entidade depois da consulta e não impede nada, e o comportamento não depende do dialecto — nenhum motor escapa valores que já chegaram como texto da consulta."},
+   "explain": "5% de 8 pedidos por segundo durante 5 minutos são cerca de 120 pedidos: com essa amostra, uma taxa de erro de 2% produz 2 ou 3 falhas, indistinguíveis do ruído. Alargar a janela para 60 minutos ajuda mas torna o <em>lead time</em> impraticável; em serviços de baixo tráfego a escolha correcta é blue-green com reposição rápida, ou sondas sintéticas que gerem carga determinística. O ALB suporta pesos por grupo-alvo, e o canário é ortogonal ao esquema da base de dados."},
 
-  {"q": "Uma API `stateless` valida `Bearer` tokens e a equipa quer revogar o acesso de um utilizador em menos de 60 segundos após o despedimento. Qual é a solução coerente com o desenho actual?",
+  {"q": "Uma migração Flyway adiciona `NOT NULL` a uma coluna existente de uma tabela PostgreSQL com 80 milhões de linhas, e corre no arranque da aplicação com 6 réplicas. Qual é o efeito mais provável?",
    "options": [
-     "Aumentar a validade do access token para 24 horas e apagar a conta no fornecedor de identidade.",
-     "Manter o access token curto (5 a 15 minutos) e revogar o refresh token, aceitando a janela residual, ou consultar uma lista de revogação em Redis limitada aos tokens emitidos antes do corte.",
-     "Reemitir todas as chaves de assinatura do fornecedor, invalidando todos os tokens de todos os utilizadores.",
-     "Verificar a expiração no cliente antes de enviar o pedido."],
+     "Nada de especial: o PostgreSQL valida a restrição com um bloqueio partilhado que permite leituras e escritas.",
+     "As 6 réplicas corrompem a tabela de histórico do Flyway por escreverem em simultâneo.",
+     "A varredura completa mantém um bloqueio ACCESS EXCLUSIVE durante minutos e as réplicas em espera excedem a sonda de arranque, entrando em ciclo de reinícios.",
+     "O Flyway divide automaticamente a operação em lotes para evitar bloqueios longos."],
+   "answer": 2,
+   "explain": "Adicionar `NOT NULL` a uma coluna existente obriga a uma varredura completa sob ACCESS EXCLUSIVE, que bloqueia leituras e escritas durante minutos numa tabela desse tamanho. O Flyway serializa as réplicas com um bloqueio consultivo — não há corrupção — mas as cinco em espera podem exceder o limite da sonda de arranque e ser reiniciadas em ciclo. O caminho seguro é ADD CONSTRAINT ... CHECK ... NOT VALID seguido de VALIDATE CONSTRAINT, num passo do <em>pipeline</em> e não no arranque."},
+
+  {"q": "O `backend \"s3\"` de uma raiz Terraform tem `bucket`, `key`, `region` e `encrypt = true`, mas nem `dynamodb_table` nem `use_lockfile`. Dois engenheiros correm `apply` ao mesmo tempo. O que acontece?",
+   "options": [
+     "O S3 serializa as escritas do objecto de estado, pelo que o segundo `apply` espera pelo primeiro.",
+     "Não há bloqueio: ambos leem o mesmo estado inicial e a última escrita vence, deixando um estado que não descreve nenhuma das duas intenções.",
+     "O Terraform detecta a concorrência pelo `lineage` do estado e aborta os dois `apply`.",
+     "O versionamento do <em>bucket</em> impede a segunda escrita e devolve um erro de conflito."],
    "answer": 1,
-   "explain": "Um token assinado é válido até `exp`, aconteça o que acontecer à conta, por isso a revogação só se obtém encurtando a validade e revogando o refresh, ou reintroduzindo um pequeno estado consultado apenas para os tokens ainda por expirar. Aumentar a validade agrava o problema; rodar as chaves derruba a autenticação de todos os utilizadores; e verificações do lado do cliente não são controlos de segurança, porque o atacante controla o cliente."},
+   "explain": "Sem `dynamodb_table` (mecanismo clássico) ou `use_lockfile = true` (bloqueio nativo do S3 por escrita condicional, desde o Terraform 1.10) não existe qualquer serialização: os dois processos leem o mesmo estado e o último a escrever sobrepõe-se, ficando recursos criados que o estado não conhece. O versionamento do <em>bucket</em> permite recuperar a versão anterior mas não previne o conflito, e o `lineage` só identifica a origem do estado."},
 
-  {"q": "Numa API REST autenticada por cabeçalho `Authorization: Bearer`, um colega quer acrescentar `.csrf(c -> c.disable())` à cadeia de filtros. Quando é que isso é aceitável?",
+  {"q": "Um serviço Java com Spring Boot serve 1 200 pedidos por segundo constantes com p99 de 120 ms, e a equipa quer reduzir custo passando para AWS Lambda. Qual é a objecção tecnicamente mais forte?",
    "options": [
-     "Nunca: a protecção CSRF é sempre obrigatória em Spring Security.",
-     "Sempre que a resposta for JSON, porque o CSRF só afecta formulários HTML.",
-     "Quando essa cadeia não usa nenhuma credencial que o navegador anexe automaticamente — sem cookie de sessão e sem token guardado em cookie.",
-     "Quando existir `SameSite=None` no cookie de sessão, que já bloqueia pedidos entre sítios."],
+     "O Lambda não permite ligações a bases de dados em sub-redes privadas.",
+     "A tráfego constante o Lambda é tipicamente mais caro que Fargate, e o arranque a frio da JVM (2-6 s) degrada o p99 sempre que a concorrência sobe.",
+     "O Lambda tem um limite de 100 invocações concorrentes por conta, insuficiente para essa carga.",
+     "O Spring Boot não pode ser empacotado como função Lambda."],
+   "answer": 1,
+   "explain": "O modelo do Lambda é vantajoso em cargas esporádicas e caro em tráfego constante — 1 200 pedidos por segundo dão cerca de 3 mil milhões de invocações mensais. Somando o arranque a frio da JVM, que só é mitigado com SnapStart ou imagem nativa, a proposta piora o p99 e a factura. O Lambda liga-se a sub-redes privadas, o Spring Boot pode ser empacotado como função, e o limite de concorrência por região é da ordem dos milhares e ajustável."},
+
+  {"q": "Depois de repor a versão anterior de um serviço, os pedidos continuam a falhar. A versão revertida lê a coluna `email`, que a migração da versão nova removeu com `DROP COLUMN`. Que regra foi violada?",
+   "options": [
+     "A migração devia ter corrido no arranque da aplicação em vez de num passo do <em>pipeline</em>.",
+     "Faltou um `terraform apply` para reconciliar o esquema com o estado declarado.",
+     "O esquema tem de ser compatível com a versão N-1 e a versão N em simultâneo; a contracção só ocorre quando nenhuma versão em execução lê o elemento antigo.",
+     "O <em>rollback</em> devia ter incluído a reposição de uma cópia de segurança da base de dados."],
    "answer": 2,
-   "explain": "O CSRF depende de o navegador enviar a credencial sozinho; um cabeçalho `Authorization` tem de ser posto por código, logo não há vector. O formato da resposta é irrelevante — uma API JSON com cookie de sessão continua vulnerável — e `SameSite=None` é precisamente o valor mais permissivo, que autoriza o envio entre sítios em vez de o impedir."},
-
-  {"q": "Um `GET /api/contratos/{id}` verifica `@PreAuthorize(\"hasRole('GESTOR')\")` e depois faz `repo.findById(id)`. Um gestor consegue ler contratos de outra empresa. Qual é a correcção estrutural?",
-   "options": [
-     "Substituir os ids sequenciais por UUID, para que não sejam adivinháveis.",
-     "Devolver 403 em vez de 200 quando o contrato pertencer a outra empresa.",
-     "Acrescentar `if (contrato.empresaId() != principal.empresaId()) throw ...` a seguir à leitura.",
-     "Fazer da empresa parte da consulta — `findByIdAndEmpresaId` ou filtro obrigatório no repositório — e devolver 404 quando não houver correspondência."],
-   "answer": 3,
-   "explain": "O papel autoriza a operação, não o objecto; a falha só desaparece quando o caminho de leitura sem o principal deixa de existir, o que se consegue pondo a propriedade na assinatura da consulta ou num filtro obrigatório da camada de dados. Identificadores opacos apenas dificultam o varrimento, o `if` posterior corrige um método e não a classe de bugs, e responder 403 confirma que o recurso existe, o que ajuda a enumeração."},
-
-  {"q": "A equipa vai guardar palavras-passe de 3 milhões de utilizadores num serviço novo em Spring Boot 3.x. Qual é a configuração defensável?",
-   "options": [
-     "SHA-256 com salt aleatório por utilizador guardado noutra coluna, por ser rápido e não bloquear threads.",
-     "AES-256 com a chave no cofre, para permitir recuperar a palavra-passe em suporte ao cliente.",
-     "Argon2id (ou bcrypt) via `DelegatingPasswordEncoder`, com parâmetros calibrados para 100-500 ms no hardware de produção.",
-     "Base64 do SHA-512 com dez mil iterações feitas à mão num ciclo `for`."],
-   "answer": 2,
-   "explain": "Palavras-passe exigem uma função de derivação deliberadamente lenta e com salt por utilizador, calibrada por tempo medido no hardware real e não por um número copiado; o `DelegatingPasswordEncoder` guarda o identificador do algoritmo no valor, o que permite migrar sem reposições em massa. SHA-256 é rápido por desenho e testa milhares de milhões de candidatos por segundo em GPU, cifra reversível transforma a base de dados num ficheiro de palavras-passe em claro, e ciclos artesanais de hashing não têm nem a resistência a memória nem a comparação em tempo constante das bibliotecas."}
+   "explain": "Numa implantação progressiva convivem duas versões do código com um único esquema, pelo que qualquer alteração destrutiva tem de ficar para a fase de contracção, dias ou semanas depois, confirmada por métricas de leituras residuais. Onde a migração corre não muda a incompatibilidade, o Terraform não gere esquemas de tabelas, e repor uma cópia de segurança perderia todas as escritas entretanto confirmadas — a prevenção por expand/contract é a única resposta barata."}
 ]}

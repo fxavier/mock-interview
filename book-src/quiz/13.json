@@ -1,46 +1,51 @@
 {"chapter": 13, "questions": [
-  {"q": "Uma entidade `Encomenda` implementa `equals` e `hashCode` sobre o campo `id`, gerado por sequência. O código cria a encomenda com `new`, adiciona-a a um `HashSet` do agregado pai e só depois chama `persist`. Que defeito surge?",
+  {"q": "Com `int i = 0;`, o que vale `i` depois de `i = i++ + ++i;`?",
    "options": [
-     "Nenhum: o `HashSet` recalcula os códigos de dispersão quando o elemento é alterado.",
-     "Depois do `flush`, o `id` deixa de ser nulo, o `hashCode` muda e o elemento fica num *bucket* errado — `contains` devolve `false` sobre o próprio objecto que lá está.",
-     "O `persist` falha com `IdentifierGenerationException` porque o `id` ainda é nulo no momento da inserção no `HashSet`.",
-     "O Hibernate substitui automaticamente `equals` e `hashCode` por comparação de identidade no *proxy*, pelo que o comportamento é sempre correcto."],
+     "`3`, porque os dois incrementos se somam ao valor final.",
+     "`2`: o operando esquerdo devolve `0` e deixa `i` a `1`, o direito devolve `2`, a soma é `2` e a atribuição escreve por cima.",
+     "`1`, porque a atribuição acontece antes do segundo incremento.",
+     "É comportamento indefinido, como em C."
+   ],
    "answer": 1,
-   "explain": "O `HashSet` calcula o *bucket* no momento da inserção e nunca o recalcula. Com o `hashCode` dependente de um `id` que passa de `null` a um valor no `flush`, o elemento fica inacessível: `contains` e `remove` falham e `orphanRemoval` pode apagar o que não devia. A correcção é uma chave de negócio imutável no `equals` e um `hashCode` constante por classe. As restantes opções inventam comportamentos que nem o `HashSet` nem o Hibernate têm."},
+   "explain": "Java define a ordem: os operandos avaliam-se estritamente da esquerda para a direita, e a atribuição acontece no fim. `i++` devolve `0` e põe `i` a `1`; `++i` põe `i` a `2` e devolve `2`; a soma é `2`, escrita por cima do `2` que lá estava. Ao contrário de C, não há comportamento indefinido — há uma regra, e é a ordem de avaliação, não a precedência."},
 
-  {"q": "É preciso importar 2 milhões de linhas de um ficheiro CSV para PostgreSQL num serviço Spring Boot 3.5. O primeiro protótipo usa `repository.saveAll(lista)` com `hibernate.jdbc.batch_size=50`. Qual é a avaliação correcta?",
+  {"q": "Cinco tarefas, cada uma a dormir 200 ms, submetidas a um `newFixedThreadPool(2)`. Quanto tempo demora o conjunto?",
    "options": [
-     "É a abordagem certa: com `batch_size` definido, o JPA atinge o mesmo débito que o `COPY` do PostgreSQL.",
-     "Basta aumentar `batch_size` para 5 000 para resolver tanto o débito como o consumo de memória.",
-     "O contexto de persistência acumula 2 milhões de entidades e respectivos *snapshots*; para volumes destes usa-se `JdbcTemplate.batchUpdate` ou o `CopyManager`, com uma ordem de grandeza de diferença.",
-     "O problema resolve-se envolvendo o `saveAll` em `@Transactional(readOnly = true)` para desligar o *dirty checking*."],
+     "200 ms: as tarefas são independentes e correm todas em paralelo.",
+     "1000 ms: o `pool` não ajuda porque `Thread.sleep` bloqueia.",
+     "600 ms: são três ondas de duas threads (⌈5/2⌉ × 200 ms).",
+     "400 ms: duas ondas, porque a última tarefa aproveita a thread que ficar livre primeiro."
+   ],
    "answer": 2,
-   "explain": "Com 2 milhões de entidades geridas, o contexto de persistência guarda cada objecto mais o seu *snapshot* e o *dirty checking* varre tudo a cada *flush*: é `OutOfMemoryError` antes de ser lentidão. Aumentar o `batch_size` agrava a memória e não toca no problema estrutural; `readOnly` numa escrita é contraditório e o PostgreSQL rejeitaria as inserções. Carregamentos em massa saem do contexto de persistência: `batchUpdate` ou `COPY`, com ganhos entre 25× e 75×."},
+   "explain": "Com `N` tarefas de duração igual `d` num `pool` de `P` threads, o tempo é `⌈N/P⌉ × d`. Aqui, ⌈5/2⌉ = 3 ondas de 200 ms = 600 ms. É a fórmula que explica porque é que a intuição do «máximo das durações» falha sempre que a capacidade do `pool` é menor do que o número de tarefas."},
 
-  {"q": "Depois de definir `hibernate.jdbc.batch_size=50`, `order_inserts=true` e `order_updates=true`, a contagem de idas e voltas ao inserir entidades continua igual. A chave primária está declarada com `@GeneratedValue(strategy = GenerationType.IDENTITY)`. Porquê?",
+  {"q": "Porque é que memoizar Fibonacci com `cache.computeIfAbsent(n, k -> fib(k - 1) + fib(k - 2))` sobre uma `ConcurrentHashMap` não funciona?",
    "options": [
-     "Porque `IDENTITY` obriga o Hibernate a executar cada `INSERT` imediatamente para obter o identificador gerado, o que desactiva o *batching* de inserções.",
-     "Porque `order_inserts` só actua em entidades com `@Version` e a entidade não a tem.",
-     "Porque `batch_size` acima de 20 é ignorado pelo *driver* PostgreSQL.",
-     "Porque o *batching* só funciona com `@Transactional(propagation = REQUIRES_NEW)`."],
-   "answer": 0,
-   "explain": "O Hibernate precisa do identificador para registar a entidade no mapa de identidade, e uma coluna `identity` só o devolve depois de a instrução correr — logo não pode adiar nem agrupar os `INSERT`. A correcção é `GenerationType.SEQUENCE` com `allocationSize` igual ao tamanho do lote. `order_inserts` não depende de `@Version`, o *driver* não ignora o tamanho do lote, e a propagação não tem qualquer relação com o agrupamento JDBC."},
-
-  {"q": "Uma consulta JPQL faz `join fetch` de duas colecções da mesma raiz, ambas mapeadas como `List` sem `@OrderColumn`. O que acontece e qual é a correcção adequada?",
-   "options": [
-     "Corre normalmente; o Hibernate deduplica as linhas do produto cartesiano de forma transparente desde a versão 6.",
-     "Lança `MultipleBagFetchException` no arranque; corrige-se trazendo uma colecção por `join fetch` e a outra por lote, com `default_batch_fetch_size`.",
-     "Lança `LazyInitializationException` na primeira leitura; corrige-se ligando o `open-in-view`.",
-     "Lança `MultipleBagFetchException`; corrige-se mudando `FetchType` das duas colecções para `EAGER`."],
+     "Funciona, mas é lento por causa do bloqueio por `bin`.",
+     "A função de mapeamento reentra no mesmo mapa enquanto a entrada está a ser calculada, e a `ConcurrentHashMap` lança `IllegalStateException: Recursive update`.",
+     "`computeIfAbsent` não aceita chaves `Integer` por causa do cache de invólucros.",
+     "Só falha se houver mais do que uma thread; num programa de thread única é seguro."
+   ],
    "answer": 1,
-   "explain": "Duas *bags* — `List` sem índice de ordem — não podem ser trazidas na mesma consulta porque o produto cartesiano tornaria impossível reconstruir as multiplicidades; o Hibernate falha na criação do repositório com `MultipleBagFetchException`. A saída sã é trazer uma colecção por `join fetch` e as restantes por lote de *fetch*. Passar a `EAGER` mantém o mesmo conflito e alastra-o a todas as consultas; o `open-in-view` é irrelevante aqui."},
+   "explain": "A chamada recursiva volta a entrar no mapa a partir de dentro da função de mapeamento. A `ConcurrentHashMap` detecta a reentrância e lança `IllegalStateException: Recursive update`; uma `HashMap` lança `ConcurrentModificationException` desde o Java 9 e, antes disso, podia entrar em ciclo infinito. A forma correcta para recursão é explícita: `get`, calcular, `put`."},
 
-  {"q": "Um método executa `@Modifying @Query(\"update Artigo a set a.stock = a.stock - 1 where a.id = :id\")` e, na mesma transacção, faz depois `repository.findById(id)` para devolver o novo valor. O valor devolvido está errado. Porquê?",
+  {"q": "Qual das afirmações sobre assincronia é verdadeira?",
    "options": [
-     "Porque a consulta de modificação em massa não passa pelo contexto de persistência: a entidade já carregada continua na *cache* de primeiro nível com o valor antigo e o `findById` devolve-a sem tocar na base de dados.",
-     "Porque `@Modifying` obriga a `REQUIRES_NEW` e a alteração ainda não foi confirmada.",
-     "Porque o nível de isolamento `READ COMMITTED` impede ler o que a própria transacção escreveu.",
-     "Porque `@Modifying` executa a instrução apenas no `commit`, depois do `findById`."],
-   "answer": 0,
-   "explain": "As instruções de modificação em massa em JPQL ou SQL nativo são enviadas directamente à base de dados: não fazem *dirty checking*, não incrementam `@Version` e não sincronizam o contexto de persistência. O `findById` devolve a instância gerida obsoleta a partir da *cache* de primeiro nível. Resolve-se com `clearAutomatically = true` e `flushAutomatically = true` em `@Modifying`, ou recarregando após `em.clear()`. Uma transacção vê sempre as suas próprias escritas, e `@Modifying` não muda a propagação nem adia a execução."}
+     "Assíncrono e paralelo são o mesmo: ambos executam trabalho ao mesmo tempo.",
+     "Assincronia reduz a latência de cada pedido individual, porque a chamada devolve imediatamente.",
+     "Assincronia melhora sobretudo o `throughput`; a latência de um pedido só melhora se houver trabalho independente a correr em simultâneo.",
+     "I/O não-bloqueante consome menos CPU do que I/O bloqueante para o mesmo volume de dados."
+   ],
+   "answer": 2,
+   "explain": "O ganho é de `throughput`: as threads deixam de estar paradas à espera de I/O e a mesma máquina serve mais pedidos concorrentes. A latência de uma chamada remota não muda por ser assíncrona; só desce quando trabalho independente passa a correr em simultâneo e o tempo deixa de ser a soma para passar a ser o caminho crítico. Assíncrono não é paralelo (um `event loop` de thread única é assíncrono sem paralelismo), e não-bloqueante poupa threads, não instruções."},
+
+  {"q": "Para `n = 8`, quantas vezes corre `c++` em `for (int i = 1; i <= n; i *= 2) for (int j = 0; j < i; j++) c++;`?",
+   "options": [
+     "64, porque são dois ciclos aninhados sobre `n`.",
+     "24, porque o exterior corre 3 vezes e o interior 8.",
+     "15: o exterior toma os valores 1, 2, 4 e 8, e a soma geométrica é `2n - 1` — ou seja, O(n).",
+     "8, porque o interior é dominado pelo exterior."
+   ],
+   "answer": 2,
+   "explain": "O exterior duplica: 1, 2, 4, 8 — quatro iterações, `log₂ n + 1`. O interior corre exactamente `i` vezes, portanto `1 + 2 + 4 + 8 = 15`, que é `2n - 1`. Dois ciclos aninhados com comportamento linear: a complexidade conta-se somando iterações, não contando chavetas."}
 ]}

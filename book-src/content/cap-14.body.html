@@ -1,918 +1,752 @@
-<p>Uma ronda sobre APIs REST raramente mede se o candidato sabe o que significa REST. Mede se já viu um contrato sobreviver a três anos de clientes que não controla, a um <em>retry</em> automático que duplicou 4 000 pagamentos, e a um <em>timeout</em> de 30 segundos herdado por omissão que transformou uma dependência lenta numa indisponibilidade total. Os candidatos caem em três sítios previsíveis: descrevem métodos e códigos de estado sem os ligar a garantias operacionais, tratam idempotência como sinónimo de «não faz mal repetir», e desenham resiliência com uma anotação de <em>retry</em> sem calcular o orçamento de latência em que ela cabe. Este capítulo trata o contrato como aquilo que é — uma promessa com custo de rescisão — e liga cada escolha de desenho a um número mensurável em produção.</p>
+<p>Esta é a ronda em que se separa quem usa Spring de quem sabe o que o Spring faz. As perguntas parecem simples — «porquê injecção por construtor?», «o que faz o <code>@Transactional</code>?» — mas todas descem para o mesmo sítio: o contentor cria objectos, embrulha alguns num <em>proxy</em>, e tudo o que é declarativo no Spring depende de a chamada passar por esse embrulho. Onde os candidatos caem é em três pontos: explicam anotações em vez de mecanismos, não sabem dizer em que momento do arranque o <em>proxy</em> passa a existir, e não conseguem depurar uma auto-configuração que não activou. Este capítulo cobre o contentor, o ciclo de vida, a auto-configuração do Boot, a ligação entre propriedades e objectos, a AOP que suporta transacções e <em>cache</em>, e o que se expõe do Actuator num <em>cluster</em> Kubernetes.</p>
 
-<h2 id="sec-14-1" class="h2"><span class="secnum">14.1</span> Desenhar o contrato: recursos, verbos e códigos<a class="anchor" href="#sec-14-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-14-1" class="h2"><span class="secnum">14.1</span> IoC, injecção de dependências e proxies<a class="anchor" href="#sec-14-1" aria-label="ligação">#</a></h2>
 
-<p>O ponto de partida de um contrato HTTP não é a lista de <em>endpoints</em>, é a lista de recursos com identidade estável e a semântica que cada método promete sobre eles. Dessa semântica saem duas propriedades que a infra-estrutura assume sem perguntar: <strong>segurança</strong> (o método não altera estado observável) e <strong>idempotência</strong> (N execuções idênticas deixam o servidor no mesmo estado que uma). Não são adornos de documentação: um <em>proxy</em>, uma <em>CDN</em>, um cliente HTTP com <em>retry</em> por omissão e uma <em>service mesh</em> tomam decisões automáticas com base nelas. O Envoy, por exemplo, só reenvia por omissão os métodos que a configuração declara reidentificáveis; se um <code>POST</code> for marcado como reidentificável porque «na prática é seguro», o serviço acabou de contratar duplicação silenciosa.</p>
+<p>O contentor do Spring é um mapa de definições de <em>bean</em> — nome, tipo, âmbito, dependências, modo de criação — que é lido primeiro e instanciado depois. A separação entre as duas fases é o que torna possível tudo o resto: quando o <code>AnnotationConfigApplicationContext</code> chega ao <code>refresh()</code>, já sabe que existe um <em>bean</em> chamado <code>servicoPagamentos</code> antes de qualquer instância existir, e é por isso que consegue detectar ciclos, aplicar <code>BeanFactoryPostProcessor</code> às definições e decidir quais os objectos que terão de ser substituídos por um <em>proxy</em>.</p>
 
-<p>A discussão prática que aparece em quase todas as entrevistas é a fronteira entre acção e recurso. Um sistema de pagamentos precisa de «capturar», «estornar» e «cancelar»; nenhum destes é um substantivo. Há duas saídas defensáveis. A primeira é modelar a acção como recurso subordinado com identidade própria — <code>POST /v1/pagamentos/{id}/capturas</code> cria uma captura, devolve <code>201</code> com <code>Location</code>, e a captura passa a ser consultável, auditável e idempotentizável por chave. A segunda é assumir o estilo RPC sobre HTTP num sufixo explícito — <code>POST /v1/pagamentos/{id}:capturar</code> — e documentar que não é REST. A escolha errada é a terceira: <code>PUT /v1/pagamentos/{id}</code> com um campo <code>estado: "CAPTURADO"</code>, que obriga o servidor a inferir a transição a partir de um diff e destrói a auditoria.</p>
+<p>A injecção por construtor é a única forma que respeita esta ordem sem excepções. O objecto sai do construtor completo e imutável, os campos podem ser <code>final</code>, e um ciclo é detectado no arranque em vez de produzir um <code>NullPointerException</code> ao primeiro pedido em produção. A injecção por campo, com <code>@Autowired</code> sobre um atributo privado, obriga o contentor a construir o objecto meio-vazio e a preenchê-lo por reflexão depois — o que torna o ciclo possível e, mais importante, torna o teste unitário impossível sem <code>ReflectionTestUtils</code> ou um contexto Spring inteiro.</p>
 
-<p>Nos códigos de estado, o erro sénior não é escolher <code>422</code> em vez de <code>400</code> — é usar <code>200</code> com um campo <code>sucesso: false</code> no corpo. Essa decisão retira aos <em>proxies</em>, aos painéis e aos alertas a única informação que eles sabem ler sem conhecer o domínio, e transforma a taxa de erro do serviço numa métrica que mente. Um serviço que devolve <code>200</code> para falhas de negócio aparece com 0% de erros num painel enquanto 12% dos pedidos falham.</p>
+<p>Desde o Spring Boot 2.6 que <code>spring.main.allow-circular-references</code> vale <code>false</code> por defeito: um ciclo entre <em>singletons</em> falha o arranque com <code>BeanCurrentlyInCreationException</code>. Não é uma regra estética. Um ciclo A→B→A significa que nenhuma das duas classes tem uma responsabilidade fechada, e a solução correcta é quase sempre extrair um terceiro colaborador com a parte partilhada, ou inverter uma das direcções para um evento (<code>ApplicationEventPublisher</code>) quando a dependência é apenas de notificação.</p>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.1</span> Propriedades que a infra-estrutura assume por método, e o que se perde ao contrariá-las.</div>
-<div class="tscroll"><table><thead><tr><th>Método</th><th>Seguro</th><th>Idempotente</th><th>Sucesso típico</th><th>O que quebra se for mal usado</th></tr></thead><tbody>
-<tr><td><code>GET</code></td><td>Sim</td><td>Sim</td><td><code>200</code>, <code>304</code></td><td>Um <code>GET</code> que altera estado é reexecutado por <em>prefetch</em> do browser e por <em>crawlers</em> internos.</td></tr>
-<tr><td><code>POST</code></td><td>Não</td><td>Não</td><td><code>201</code> + <code>Location</code>, <code>202</code></td><td>Reenvio automático duplica recursos; exige chave de idempotência explícita.</td></tr>
-<tr><td><code>PUT</code></td><td>Não</td><td>Sim</td><td><code>200</code>, <code>204</code></td><td>Substituição total: campos omitidos são apagados, e clientes antigos apagam campos novos.</td></tr>
-<tr><td><code>PATCH</code></td><td>Não</td><td>Não garantida</td><td><code>200</code>, <code>204</code></td><td>Um <em>patch</em> com <code>{"saldo": {"incremento": 10}}</code> repetido soma duas vezes.</td></tr>
-<tr><td><code>DELETE</code></td><td>Não</td><td>Sim</td><td><code>204</code>, <code>200</code></td><td>Devolver <code>404</code> na segunda chamada faz um <em>retry</em> legítimo parecer erro.</td></tr>
-</tbody></table></div></div>
+<figure class="listing java" id="lst-14-1"><div class="lhead"><span class="lnum">Listagem 14.1</span>
+<span class="lcap">Injecção por construtor no código próprio; @Bean para o que é de terceiros.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class ServicoPagamentos {
 
-<figure class="listing text" id="lst-14-1"><div class="lhead"><span class="lnum">Listagem 14.1</span>
-<span class="lcap">Merge patch (RFC 7386) e JSON Patch (RFC 6902) sobre o mesmo recurso: semânticas diferentes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code>PATCH /v1/clientes/8842 HTTP/1.1
-Content-Type: application/merge-patch+json
-If-Match: "w/rev-17"
+    private final RepositorioPagamentos repositorio;   // final: não muda depois do arranque
+    private final ClienteAntifraude antifraude;
+    private final Clock relogio;
 
-{"email": "ana@exemplo.pt", "telefoneAlternativo": null}
---&gt; 200 OK   (email actualizado; telefoneAlternativo REMOVIDO: null significa apagar)
+    // Sem @Autowired: com um único construtor o Spring usa-o desde a versão 4.3.
+    public ServicoPagamentos(RepositorioPagamentos repositorio,
+                             ClienteAntifraude antifraude,
+                             Clock relogio) {
+        this.repositorio = repositorio;
+        this.antifraude = antifraude;
+        this.relogio = relogio;
+    }
+}
 
-PATCH /v1/clientes/8842 HTTP/1.1
-Content-Type: application/json-patch+json
-If-Match: "w/rev-17"
+// proxyBeanMethods = false: modo "lite". O Spring não gera o proxy CGLIB desta
+// classe de configuração e poupa uma classe e algumas dezenas de ms no arranque.
+// Preço: uma chamada directa a outro método @Bean daqui criaria um objecto novo.
+@Configuration(proxyBeanMethods = false)
+public class ConfiguracaoInfra {
 
-[
-  {"op": "test",    "path": "/email", "value": "ana.antiga@exemplo.pt"},
-  {"op": "replace", "path": "/email", "value": "ana@exemplo.pt"},
-  {"op": "add",     "path": "/etiquetas/-", "value": "vip"}
-]
---&gt; 200 OK   se o test passar; 409 Conflict se outro cliente já mudou o email
---&gt; 412 Precondition Failed se o ETag deixou de corresponder</code></pre></figure>
+    @Bean
+    ClienteAntifraude clienteAntifraude(RestClient.Builder builder,
+                                        PropriedadesAntifraude props) {
+        return new ClienteAntifraude(builder
+                .baseUrl(props.baseUrl())
+                .requestFactory(fabricaComTimeouts(props))
+                .build());
+    }
 
-<div class="qa" id="q-14-1" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos um recurso de perfil de cliente com 40 campos. A equipa móvel quer alterar só o email. Qual escolhe — <code>PUT</code>, <code>PATCH</code> ou <code>POST</code> — e o que muda em cada um?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>PATCH</code> com <code>application/merge-patch+json</code> e controlo de concorrência optimista por <code>ETag</code>/<code>If-Match</code>. A razão não é economia de largura de banda — 40 campos são talvez 2 KB, irrelevante — é evitar a perda de escrita que o <code>PUT</code> garante neste cenário.</p>
-      <p>O mecanismo: <code>PUT</code> é substituição total do recurso. Se a aplicação móvel foi compilada quando o perfil tinha 40 campos e o servidor entretanto acrescentou <code>consentimentoMarketing</code>, o <code>PUT</code> do cliente antigo omite esse campo e o servidor, cumprindo a semântica, apaga-o. Este é o modo de falha clássico das APIs móveis: uma versão da aplicação que fica um ano no terreno começa a apagar campos que nunca conheceu. O <code>PUT</code> só é seguro quando o cliente leu o recurso completo imediatamente antes e o devolve integralmente — e mesmo aí precisa de <code>If-Match</code> para não sobrepor uma escrita concorrente.</p>
-      <p>O preço do <code>PATCH</code> é perder a idempotência garantida pelo método. Um <em>merge patch</em> puro (só substituições e remoções por <code>null</code>) é de facto idempotente e um <em>retry</em> é inofensivo; um <em>patch</em> com operações relativas — incrementos, <code>add</code> a um <em>array</em> — não é, e repetir duplica. A regra prática: se o corpo do <code>PATCH</code> contém apenas valores finais, é idempotente na prática e pode ser reenviado; se contém operações, exige chave de idempotência ou um <code>test</code> de JSON Patch que falhe na segunda passagem.</p>
-      <p><code>POST</code> entra quando a alteração é uma acção com regras próprias, não uma edição de campo. Mudar o email num sistema com verificação não é escrever uma coluna: dispara um fluxo de confirmação, invalida sessões e regista um evento de segurança. Nesse caso <code>POST /v1/clientes/8842/alteracoes-de-email</code> cria um recurso de pedido com o seu próprio ciclo de vida, devolve <code>202 Accepted</code> e torna o estado intermédio consultável — o que o <code>PATCH</code> não consegue exprimir.</p>
-      <p>Quando a escolha inversa ganha: em APIs internas de configuração, geridas por Terraform ou GitOps, o <code>PUT</code> total é preferível porque o ficheiro declarativo <em>é</em> a verdade e a convergência total é o objectivo. Aí, apagar o que não está no documento é a funcionalidade, não o defeito.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«<code>PUT</code> é para actualizar e <code>POST</code> é para criar.» Nenhuma menção a substituição total ou a concorrência.</td></tr>
-        <tr><td>Mid</td><td>Escolhe <code>PATCH</code> pela poupança de tráfego; sabe que <code>PUT</code> substitui tudo mas não liga isso a versões de cliente antigas.</td></tr>
-        <tr><td>Sénior</td><td>Perda de escrita com clientes desactualizados, <code>If-Match</code>/<code>ETag</code>, distingue <em>merge patch</em> idempotente de operações relativas, e sabe quando a acção merece recurso próprio.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o custo de suporte de JSON Patch (validação, superfície de ataque em <code>path</code>), a política da organização para os dois formatos, e o caso em que o <code>PUT</code> declarativo é a escolha certa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como distingue "campo não enviado" de "campo posto a null" num <code>PATCH</code> em Java?»</li>
-      <li>«O cliente não envia <code>If-Match</code>. Rejeita ou aceita?»</li>
-      <li>«O <em>merge patch</em> é idempotente? Justifique.»</li>
-      <li>«Como valida um <code>PATCH</code> com Bean Validation se metade dos campos está ausente?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar <code>PUT</code> parcial (ignorar campos ausentes) e continuar a chamar-lhe <code>PUT</code>.</li>
-      <li>Não perceber que <code>Optional&lt;String&gt;</code> num DTO não resolve a ambiguidade de <code>null</code> sem configuração explícita do Jackson.</li>
-      <li>Responder «depende» sem escolher e sem enunciar o critério de decisão.</li></ul></div>
-  </div>
-</div>
+    @Bean
+    Clock relogio() {
+        return Clock.systemUTC();   // injectável e substituível no teste
+    }
 
-<div class="qa" id="q-14-2" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Um pedido de pagamento chega bem formado, mas o cartão não tem saldo. Que código de estado devolve, e como decide em geral entre 4xx e 5xx?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>422 Unprocessable Content</code>. O pedido é sintacticamente válido e autorizado, mas o estado do domínio impede-o. O critério geral tem uma pergunta única: <em>repetir o mesmo pedido, sem alterar nada, pode ter sucesso?</em> Se não, é 4xx — o cliente tem de mudar alguma coisa. Se sim, é 5xx — o servidor tem de melhorar.</p>
-      <p>Esse critério é operacional, não filosófico. A taxa de 5xx é o que alimenta o SLO de disponibilidade, dispara o alerta às 3 da manhã e conta para o orçamento de erro; a taxa de 4xx é um sinal de qualidade de integração dos clientes. Classificar «saldo insuficiente» como <code>500</code> significa que 3% do tráfego normal consome permanentemente o orçamento de erro e o alerta é desligado por ruído em duas semanas. O inverso — devolver <code>400</code> quando a base de dados está indisponível — esconde uma indisponibilidade real atrás de uma métrica que ninguém vigia.</p>
-      <p>A grelha que se defende numa entrevista: <code>400</code> para JSON malformado ou tipo errado; <code>401</code> sem credencial válida e <code>403</code> com credencial válida mas sem permissão; <code>404</code> quando o recurso não existe ou não deve ser revelado; <code>409</code> para conflito de estado que o cliente pode resolver relendo (versão desactualizada, duplicado detectado); <code>422</code> para regra de negócio violada; <code>429</code> com <code>Retry-After</code> para limitação de débito; <code>503</code> com <code>Retry-After</code> quando o próprio serviço se está a proteger; <code>504</code> quando uma dependência excedeu o <em>timeout</em>.</p>
-      <p>A distinção entre <code>409</code> e <code>422</code> é onde os candidatos fortes se separam: <code>409</code> promete que o cliente pode reler o estado e voltar a tentar com sucesso — é retentável depois de uma leitura; <code>422</code> promete que só um pedido diferente resolve. Essa promessa é lida por SDKs gerados e por camadas de <em>retry</em> automático, por isso é contratual e não estética.</p>
-      <p>Quando a escolha inversa ganha: em <em>gateways</em> públicos, é comum colapsar toda a família de erros de negócio em <code>400</code> com um código de domínio no corpo, precisamente porque clientes escritos em linguagens diversas tratam mal os códigos menos comuns e alguns <em>proxies</em> corporativos reescrevem <code>422</code>. É uma cedência deliberada de expressividade em troca de compatibilidade, e deve ser documentada como tal.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Devolvo <code>200</code> com uma flag de erro no corpo» ou «<code>500</code>, que é erro».</td></tr>
-        <tr><td>Mid</td><td>Escolhe <code>400</code> e sabe que 4xx é do cliente e 5xx do servidor, sem ligar isso a alertas ou SLO.</td></tr>
-        <tr><td>Sénior</td><td>Aplica o critério da retentabilidade, distingue <code>409</code> de <code>422</code>, liga 5xx ao orçamento de erro e usa <code>Retry-After</code>.</td></tr>
-        <tr><td>Staff</td><td>Discute o efeito nos clientes gerados por OpenAPI, a política de colapso de códigos em APIs públicas e a governação da tabela de erros entre equipas.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«A dependência a jusante devolveu <code>429</code>. O que devolve ao seu cliente?»</li>
-      <li>«E se o utilizador não tem permissão para saber que o recurso existe?»</li>
-      <li>«Que código dá a um pedido que aceitou mas ainda não processou?»</li>
-      <li>«Como impede que um <code>422</code> em massa dispare o alerta de disponibilidade?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><code>200</code> para falhas, com <code>{"ok": false}</code> no corpo.</li>
-      <li>Deixar escapar <code>500</code> por excepções não tratadas, com <em>stack trace</em> no corpo da resposta.</li>
-      <li>Não saber que a escolha do código determina se um cliente automático repete o pedido.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-14-3" data-box="qa" data-area="api" data-level="senior" data-freq="baixa">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Ocasional</span></div></div>
-  <div class="qprompt">HATEOAS é o nível 3 do modelo de maturidade de Richardson. Usa-o? Justifique a decisão com o que ganha e o que custa.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Na prática, quase nunca na forma completa; parcialmente, sim, e em dois sítios onde paga: ligações de paginação e ligações de transição de estado. A resposta honesta numa entrevista é que a maioria das APIs de sucesso está no nível 2 e que HATEOAS completo falha por uma razão empírica — nenhum cliente real descobre o contrato em tempo de execução; todos codificam os caminhos a partir da documentação ou de um SDK gerado.</p>
-      <p>O que HATEOAS promete é desacoplar o cliente da estrutura de URLs para permitir mudá-la sem quebrar ninguém. O custo é que o cliente tem de percorrer ligações a partir de uma raiz, o que multiplica as idas ao servidor: uma operação que era uma chamada passa a três, e com 40 ms de latência por salto na Europa, uma travessia de três níveis acrescenta 80 ms ao p50. Além disso, um corpo HAL ou <em>application/hal+json</em> com 12 ligações por elemento numa página de 100 elementos cresce 30% a 60% em bytes — relevante em redes móveis.</p>
-      <p>As duas partes que sobrevivem ao teste de utilidade são concretas. Primeira, paginação: devolver <code>next</code> e <code>prev</code> como URL opaca permite ao servidor mudar de <em>offset</em> para cursor sem que o cliente saiba, e é a única forma limpa de esconder um cursor cifrado. Segunda, transições permitidas: incluir num pagamento as acções actualmente legais (<code>capturar</code>, <code>anular</code>) evita que o cliente reimplemente a máquina de estados e mostre botões que vão dar <code>422</code>. Isto reduz erros de integração de forma mensurável — é comum ver a taxa de 4xx de um parceiro cair para metade depois de expor as transições.</p>
-      <p>Quando a escolha inversa ganha: em APIs internas entre equipas com contrato versionado e testes de contrato automatizados, HATEOAS acrescenta peso sem benefício, porque a coordenação de mudança já existe por outra via. Em APIs públicas com centenas de integradores que nunca se poderá contactar, esconder URLs por trás de ligações é o que permite reestruturar o encaminhamento sem uma migração coordenada.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não sabe o que é, ou recita a definição sem opinião.</td></tr>
-        <tr><td>Mid</td><td>Descreve HAL e o modelo de Richardson correctamente, mas sem custo nem caso de uso concreto.</td></tr>
-        <tr><td>Sénior</td><td>Rejeita a forma completa com argumento empírico e adopta as duas partes úteis (paginação e transições), com números de custo.</td></tr>
-        <tr><td>Staff</td><td>Liga a decisão ao modelo de governação: quem se pode coordenar com os clientes determina quanto acoplamento de URL é aceitável.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como serializaria as ligações — HAL, JSON:API ou um campo próprio?»</li>
-      <li>«As transições permitidas dependem de permissões. Calcula-as por pedido?»</li>
-      <li>«Isso não duplica a máquina de estados no servidor e no cliente?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Defender HATEOAS completo por pureza, sem nunca o ter posto em produção.</li>
-      <li>Desprezar totalmente a ideia sem reconhecer o valor das ligações de paginação.</li></ul></div>
-  </div>
-</div>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Expor identificadores internos (chaves primárias sequenciais) em URLs custa uma fuga de informação — um concorrente estima o volume de negócio pela diferença entre dois ids em 24 horas — e uma superfície de enumeração. Identificadores opacos (UUIDv7, ULID) fecham isso, mas um UUID como chave primária em PostgreSQL 17 aumenta o índice em cerca de 60% face a um <code>bigint</code> e, se for UUIDv4, fragmenta o B-tree por inserção aleatória. O compromisso comum: <code>bigint</code> interno como chave primária e um identificador público ordenável no tempo com índice único próprio.</p></aside>
-
-<h2 id="sec-14-2" class="h2"><span class="secnum">14.2</span> Versionamento e evolução sem quebrar clientes<a class="anchor" href="#sec-14-2" aria-label="ligação">#</a></h2>
-
-<p>Versionar é a última linha de defesa, não a primeira. A primeira é a disciplina de compatibilidade: acrescentar campos opcionais, nunca remover nem mudar o tipo de um existente, nunca alterar o significado de um valor, nunca tornar obrigatório algo que era opcional, e tolerar campos desconhecidos na desserialização — em Jackson, isso significa garantir que <code>FAIL_ON_UNKNOWN_PROPERTIES</code> está desactivado nos clientes, o que o Spring Boot já faz por omissão desde há muito. Uma equipa que segue estas regras evolui durante anos dentro de <code>v1</code>. Só quando a mudança é genuinamente incompatível — remover um campo de que 200 clientes dependem, ou mudar a unidade de um montante — é que a versão entra em jogo, e nessa altura o custo é de operação, não de sintaxe.</p>
-
-<p>Os dois formatos que se discutem são versão no caminho (<code>/v1/pagamentos</code>) e versão em cabeçalho ou tipo de conteúdo (<code>Accept: application/vnd.acme.pagamento+json;version=2</code>). O caminho vence em quase todas as organizações por razões que nada têm a ver com pureza REST: é visível nos <em>logs</em> de acesso sem <em>parsing</em>, é encaminhável por regra de <em>ingress</em> sem inspecção de cabeçalhos, é testável com um <em>browser</em> e um <code>curl</code>, e sobrevive a <em>proxies</em> corporativos que descartam cabeçalhos desconhecidos. O cabeçalho vence quando se quer versionar recursos individualmente em vez de toda a API, evitando o salto colectivo de <code>v1</code> para <code>v2</code> que obriga todos os clientes a migrar mesmo os <em>endpoints</em> que não mudaram.</p>
-
-<p>O custo real do versionamento é a duplicação em produção. Manter <code>v1</code> e <code>v2</code> significa duas superfícies de teste, dois caminhos de correcção de <em>bugs</em> e a tentação de bifurcar o domínio. A técnica que reduz esse custo é uma só implementação interna com adaptadores de tradução na fronteira: <code>v1</code> e <code>v2</code> são dois <em>mappers</em> sobre o mesmo modelo, e a versão antiga vive como uma projecção. Uma janela de descontinuação típica em API pública é de 12 a 18 meses, com cabeçalhos <code>Deprecation</code> e <code>Sunset</code> a partir do primeiro dia e um painel de utilização por versão e por cliente — sem esse painel, não há como saber quando é seguro desligar.</p>
-
-<div class="qa" id="q-14-4" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Precisamos de mudar o campo <code>montante</code> de euros decimais para cêntimos inteiros numa API com 300 integradores externos. Como executa isso?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Nunca mudando o significado do campo existente. Uma alteração de unidade no mesmo nome e no mesmo tipo é o pior tipo de quebra: não falha na desserialização, não aparece nos testes de contrato de esquema, e produz transacções com valor 100 vezes errado. A execução tem quatro fases.</p>
-      <p>Fase 1, expansão: acrescentar <code>montanteEmCentimos</code> como campo opcional na resposta, mantendo <code>montante</code> intacto. Na escrita, aceitar qualquer um dos dois e rejeitar com <code>400</code> se ambos vierem com valores inconsistentes. Isto é adição pura e não quebra ninguém; entra em produção numa semana.</p>
-      <p>Fase 2, medição: instrumentar o uso por campo, por versão e por <code>client_id</code>. Sem essa métrica, a fase 4 é adivinhação. O painel útil tem três números por integrador: pedidos por dia, percentagem que ainda envia o campo antigo, e data da última utilização.</p>
-      <p>Fase 3, migração assistida: publicar <code>Deprecation: true</code> e <code>Sunset: Sat, 30 Jan 2027 23:59:59 GMT</code> nas respostas que ainda usam o campo antigo, contactar os integradores por ordem decrescente de volume, e dar ambiente de teste. Na prática, 80% do tráfego costuma concentrar-se em menos de 20 integradores — esses migram-se com pessoas, os restantes com prazo.</p>
-      <p>Fase 4, remoção: só depois de o painel mostrar zero utilização durante um período de observação superior ao ciclo de <em>release</em> mais lento dos clientes, tipicamente 30 a 90 dias. A remoção acontece na versão nova; a antiga desliga-se com <code>410 Gone</code> e um <em>problem detail</em> que diz onde ler a migração.</p>
-      <p>Quando a escolha inversa ganha: numa API interna com todos os consumidores no mesmo <em>monorepo</em> e implantação coordenada, o processo colapsa em duas fases — mudar tudo num <em>pull request</em> atómico é mais barato do que manter dois campos. A diferença é quem controla o calendário de implantação dos clientes.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Mudo o campo e aviso os clientes por email.»</td></tr>
-        <tr><td>Mid</td><td>Cria <code>/v2</code> imediatamente e duplica o controlador, sem medir utilização nem planear a remoção.</td></tr>
-        <tr><td>Sénior</td><td>Expansão e contracção com campo novo, telemetria por cliente, <code>Deprecation</code>/<code>Sunset</code>, e critério objectivo para desligar.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a política organizacional (janela de suporte, comunicação, contrato de SLA), e reconhece o risco específico de mudança de unidade sem mudança de tipo.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se um integrador não migrar até à data limite?»</li>
-      <li>«Como testa que <code>v1</code> e <code>v2</code> produzem o mesmo resultado económico?»</li>
-      <li>«Porque não usar <code>long</code> em cêntimos desde o início em vez de <code>BigDecimal</code>?»</li>
-      <li>«Como faz a mesma mudança no evento Kafka que já publicou?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Reutilizar o nome do campo com outra unidade ou outro tipo.</li>
-      <li>Assumir que os clientes actualizam quando lhes é pedido, sem telemetria que o confirme.</li>
-      <li>Criar <code>v2</code> para uma mudança que era aditiva.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-14-5" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Como garante, em CI, que uma alteração ao nosso controlador não quebra três serviços consumidores que não controlamos?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Com duas camadas complementares: verificação de compatibilidade do esquema OpenAPI a cada <em>commit</em>, e testes de contrato dirigidos pelo consumidor. Uma sozinha deixa passar metade dos problemas.</p>
-      <p>A primeira camada é barata e determinística: gerar o OpenAPI a partir do código (springdoc-openapi no Spring Boot 3.x), guardar o documento aprovado no repositório e falhar a construção se a comparação com a versão anterior detectar uma quebra — campo obrigatório novo na entrada, campo removido na saída, tipo alterado, <em>enum</em> com valor retirado. Corre em segundos e apanha as quebras estruturais. O que não apanha: semântica. Mudar o significado de um <em>enum</em> mantendo o nome passa incólume.</p>
-      <p>A segunda camada é o contrato dirigido pelo consumidor, ao estilo Pact ou Spring Cloud Contract. Cada consumidor publica as interacções de que depende — «para <code>GET /v1/pagamentos/42</code> preciso de <code>estado</code> e de <code>montanteEmCentimos</code>» — e o <em>pipeline</em> do produtor verifica todos os contratos publicados antes de fundir. A propriedade valiosa é o inverso do teste ponta-a-ponta: o produtor descobre a quebra sem executar os consumidores, em 30 segundos em vez de 30 minutos, e sem ambientes partilhados instáveis.</p>
-      <p>A peça que separa quem já o fez de quem leu sobre isso é o portão de implantação. Um contrato só protege se o <em>pipeline</em> souber que versão do consumidor está em produção — em Pact, isso é <code>can-i-deploy</code> contra a matriz de versões implantadas. Sem isso, verificam-se contratos de versões de consumidor que já ninguém corre, e a suite dá falsa confiança.</p>
-      <p>Quando a escolha inversa ganha: com mais de 20 consumidores heterogéneos, ou consumidores externos que nunca vão publicar contratos, o esforço de manter Pact ultrapassa o benefício. Aí a defesa passa a ser esquema estrito, versionamento explícito e uma bateria de exemplos de resposta congelados como testes de aproximação — mais fraca, mas sustentável.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Temos testes de integração num ambiente de <em>staging</em>.»</td></tr>
-        <tr><td>Mid</td><td>Conhece OpenAPI e talvez Pact de nome; descreve a ideia sem o portão de implantação nem o custo de manutenção.</td></tr>
-        <tr><td>Sénior</td><td>Combina verificação de esquema com contratos do consumidor, explica o que cada camada não apanha, e menciona a matriz de versões.</td></tr>
-        <tr><td>Staff</td><td>Discute onde o contrato deixa de compensar, a propriedade dos contratos entre equipas, e como evitar que a suite se torne um travão social à mudança.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quem é o dono do ficheiro de contrato: produtor ou consumidor?»</li>
-      <li>«Um consumidor depende de um campo que queremos remover e não responde. O que faz?»</li>
-      <li>«Como testa contratos de eventos Kafka, onde não há pedido/resposta?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Escrever o OpenAPI à mão em paralelo com o código, deixando os dois divergir.</li>
-      <li>Confundir teste de contrato com teste ponta-a-ponta com todos os serviços a correr.</li></ul></div>
-  </div>
-</div>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Tornar um campo obrigatório numa resposta é aditivo; torná-lo obrigatório num pedido é uma quebra. A simetria é enganadora e é a origem mais comum de incidentes de compatibilidade: a validação nova passa em todos os testes internos, porque os testes internos já enviam o campo. Regra prática: qualquer <code>@NotNull</code> acrescentado a um DTO de entrada exige o mesmo processo de descontinuação que uma remoção de campo.</p></aside>
-
-<h2 id="sec-14-3" class="h2"><span class="secnum">14.3</span> Erros: RFC 9457, correlação e mensagens accionáveis<a class="anchor" href="#sec-14-3" aria-label="ligação">#</a></h2>
-
-<p>A RFC 9457 — que substituiu a RFC 7807 mantendo o formato — define um corpo de erro legível por máquinas com <code>Content-Type: application/problem+json</code> e cinco campos padrão: <code>type</code> (URI que identifica o tipo de problema e serve de chave estável), <code>title</code> (resumo legível, constante por tipo), <code>status</code>, <code>detail</code> (específico desta ocorrência) e <code>instance</code>. Tudo o resto são extensões livres, e é aí que vive o valor prático: código de erro do domínio, lista de campos inválidos, identificador de correlação e, quando aplicável, <code>retryAfter</code>.</p>
-
-<p>A regra que separa um erro útil de um erro decorativo é a estabilidade: <code>type</code> e o código de domínio são contrato e nunca mudam; <code>detail</code> é texto e pode mudar a qualquer momento. Quem inverte isto obriga os clientes a fazer correspondência de <em>strings</em> em mensagens — e depois não pode corrigir uma gralha sem quebrar integrações. O segundo critério é a accionabilidade: «pedido inválido» não permite acção; «o campo <code>iban</code> falhou a validação de dígitos de controlo» permite. O terceiro é o sigilo: nada de <em>stack traces</em>, nomes de tabelas, SQL ou nomes de sistemas internos no corpo — isso vai para o <em>log</em>, ligado ao <code>traceId</code> que também vai na resposta.</p>
-
-<p>O Spring Boot 3.x traz suporte de primeira classe: <code>ProblemDetail</code> como tipo de retorno, <code>ErrorResponseException</code> para excepções que já carregam o problema, e a propriedade <code>spring.mvc.problemdetails.enabled=true</code> para converter automaticamente as excepções tratadas pelo <code>ResponseEntityExceptionHandler</code>. O trabalho que sobra é traduzir as excepções de domínio e garantir que nenhuma excepção escapa sem tradução — um <em>handler</em> genérico de último recurso que devolve <code>500</code> com um <code>type</code> genérico e o <code>traceId</code>, nunca a mensagem da excepção.</p>
-
-<figure class="listing text" id="lst-14-2"><div class="lhead"><span class="lnum">Listagem 14.2</span>
-<span class="lcap">Resposta de erro RFC 9457 com extensões de domínio e correlação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code>HTTP/1.1 422 Unprocessable Content
-Content-Type: application/problem+json
-traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-
-{
-  "type": "https://api.acme.pt/problemas/saldo-insuficiente",
-  "title": "Saldo insuficiente",
-  "status": 422,
-  "detail": "A conta 8842 tem 1250 cêntimos disponíveis e o pedido exige 4990.",
-  "instance": "/v1/pagamentos/9f1c2e6a-3b7d-7c11-9a4e-0f2b8d6a1c33",
-  "codigo": "PAG_SALDO_INSUFICIENTE",
-  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "disponivelEmCentimos": 1250,
-  "exigidoEmCentimos": 4990
+    private ClientHttpRequestFactory fabricaComTimeouts(PropriedadesAntifraude p) {
+        var settings = ClientHttpRequestFactorySettings.DEFAULTS
+                .withConnectTimeout(p.connectTimeout())
+                .withReadTimeout(p.readTimeout());
+        return ClientHttpRequestFactories.get(settings);
+    }
 }</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Num serviço com cerca de 400 <em>beans</em>, passar as classes de configuração de <code>proxyBeanMethods = true</code> para <code>false</code> retira uma classe CGLIB gerada por classe de configuração e costuma valer entre 50 e 150 ms de arranque — irrelevante num serviço que reinicia uma vez por dia, relevante numa função <em>serverless</em> ou num <em>autoscaler</em> que arranca 40 réplicas num pico.</p></aside>
+
+<div class="qa" id="q-14-1" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vejo <code>@Autowired</code> em campos em quase todo o código desta base. Convença-me a mudar para injecção por construtor — e diga-me em que caso a injecção por campo ou por <em>setter</em> continua a ser a escolha certa.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A injecção por construtor troca falhas de execução por falhas de arranque e devolve o objecto ao domínio do <code>new</code>. São quatro ganhos concretos: campos <code>final</code> e, portanto, publicação segura entre <em>threads</em> sem sincronização; dependências obrigatórias explícitas na assinatura, o que torna o construtor a documentação do acoplamento; teste unitário com <code>new ServicoPagamentos(mock, mock, Clock.fixed(...))</code> sem contexto Spring nem reflexão; e detecção do ciclo no <code>refresh()</code> em vez de um <code>NullPointerException</code> no primeiro pedido.</p>
+      <p>O quinto ganho é social e é o que convence quem decide: um construtor com nove parâmetros é visualmente insuportável e provoca a divisão da classe. Com <code>@Autowired</code> em campos, a mesma classe cresce até vinte dependências sem que ninguém repare — o <em>code smell</em> fica invisível. A injecção por campo esconde o acoplamento; a injecção por construtor cobra-o.</p>
+      <p>O custo é <em>boilerplate</em>, e é menor do que parece: com um único construtor o Spring dispensa <code>@Autowired</code> desde a versão 4.3, e o Lombok resolve o resto com <code>@RequiredArgsConstructor</code> — embora numa base grande valha a pena escrever o construtor à mão para que ele continue a doer quando cresce.</p>
+      <p>Quando é que a alternativa ganha: dependências genuinamente opcionais ou reconfiguráveis em execução (<em>setter</em> com <code>ObjectProvider</code> ou <code>Optional</code>); ciclos que não se conseguem quebrar por razões de calendário, em que <code>@Lazy</code> num dos lados é a solução táctica; e classes de teste, onde <code>@Autowired</code> em campo é aceitável porque o JUnit 5 já instancia a classe e o construtor está ocupado com os parâmetros do próprio JUnit. Em código de produção, a injecção por campo não tem hoje justificação técnica.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É a boa prática recomendada.» Não explica o que muda no objecto nem no teste.</td></tr>
+        <tr><td>Mid</td><td>Fala de imutabilidade e de testes, mas não sabe dizer o que acontece ao ciclo, nem quando a alternativa é aceitável.</td></tr>
+        <tr><td>Sénior</td><td>Campos <code>final</code>, falha no arranque em vez de em produção, teste sem contexto, e o argumento do construtor gordo como detector de responsabilidade a mais. Nomeia as excepções.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a estratégia de migração numa base de 500 classes (regra de arquitectura no ArchUnit, migração por módulo, proibição no <em>linter</em>) e o efeito em contextos de teste fatiados.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece exactamente ao arranque se houver um ciclo A→B→A com injecção por construtor?»</li>
+      <li>«E se tiver dois <em>beans</em> do mesmo tipo no construtor?»</li>
+      <li>«Como impede que amanhã alguém volte a pôr <code>@Autowired</code> num campo?»</li>
+      <li>«Injectar um <code>Clock</code> em vez de chamar <code>Instant.now()</code> — porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Defender que é indiferente porque «o Spring resolve na mesma».</li>
+      <li>Não perceber que o campo injectado por reflexão não pode ser <code>final</code>.</li>
+      <li>Achar que <code>@RequiredArgsConstructor</code> é a resposta à pergunta, em vez de uma conveniência.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-2" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Depois de actualizar o Boot, a aplicação deixou de arrancar com <code>Relying upon circular references is discouraged</code>. Explique o que mudou, o que estava a acontecer antes e como resolve isto sem pôr a <em>flag</em> a <code>true</code>.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Mudou o valor por defeito de <code>spring.main.allow-circular-references</code>, que passou a <code>false</code> no Boot 2.6 e assim continua no 3.x. Antes, o contentor resolvia ciclos entre <em>singletons</em> com uma <em>cache</em> intermédia de objectos em criação: A era instanciado, ficava registado como «em criação», e quando B pedia A recebia a referência ainda incompleta. Funcionava com injecção por campo ou por <em>setter</em> porque a injecção acontece depois do construtor.</p>
+      <p>Isso nunca foi inócuo. A referência que B recebia podia ser o objecto cru em vez do <em>proxy</em> — e é exactamente aí que nasce o defeito clássico: B chama A, o <code>@Transactional</code> de A não se aplica porque B tem a instância nua, e ninguém percebe porquê durante meses. Com AOP no ciclo, o Spring chega a falhar com <code>BeanCurrentlyInCreationException</code> mesmo com a <em>flag</em> ligada.</p>
+      <p>A correcção por ordem de preferência: extrair o comportamento partilhado para um terceiro <em>bean</em> de que ambos dependem, que é o que o ciclo está a dizer que existe; inverter a direcção fraca para um evento de domínio publicado com <code>ApplicationEventPublisher</code> quando A só precisa de avisar B; e, apenas como medida temporária com prazo e comentário, <code>@Lazy</code> num dos parâmetros do construtor, que injecta um <em>proxy</em> e adia a resolução até à primeira chamada.</p>
+      <p>Repor <code>spring.main.allow-circular-references=true</code> é aceitável durante uma actualização de versão grande, para desacoplar a migração da refactorização, desde que fique num bilhete com data. Deixá-la ligada permanentemente é assumir que ninguém vai voltar a olhar para o desenho.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe ligar a <em>flag</em> e passar à frente, ou sugere <code>@Lazy</code> em todo o lado.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o Boot passou a proibir ciclos e conhece <code>@Lazy</code>, mas não explica a <em>cache</em> de objectos em criação.</td></tr>
+        <tr><td>Sénior</td><td>Explica a resolução antiga por referência incompleta, mostra porque isso partia o <em>proxy</em>, e ordena as correcções pondo a extracção de um terceiro <em>bean</em> em primeiro lugar.</td></tr>
+        <tr><td>Staff</td><td>Trata o ciclo como sinal de fronteira de módulo errada e propõe a verificação estrutural (ArchUnit, Spring Modulith) que impede a reincidência.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o ciclo com injecção por construtor nunca funcionou?»</li>
+      <li>«O que faz exactamente o <code>@Lazy</code> nesse parâmetro?»</li>
+      <li>«Como é que um evento síncrono muda a semântica transaccional entre os dois lados?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que o ciclo é um problema do Spring e não do desenho das classes.</li>
+      <li>Confundir ciclo de <em>beans</em> com ciclo de <em>packages</em> ou de módulos Maven.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-3" data-box="qa" data-area="spring" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Qual é a diferença prática entre declarar um <em>bean</em> com <code>@Component</code> e declará-lo com um método <code>@Bean</code> numa classe <code>@Configuration</code>? E o que muda com <code>proxyBeanMethods = false</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>@Component</code> é declaração no próprio tipo e exige que o tipo seja nosso e esteja debaixo do <em>component scan</em>; o Spring instancia-o pelo construtor e o nome do <em>bean</em> deriva do nome da classe. <code>@Bean</code> é declaração externa: o método fabrica o objecto, o que permite registar tipos de bibliotecas de terceiros que não podemos anotar, criar várias instâncias do mesmo tipo com nomes diferentes, aplicar lógica condicional na construção e devolver um tipo mais abstracto do que o concreto.</p>
+      <p>A regra prática de equipa: <code>@Component</code>, <code>@Service</code> e <code>@Repository</code> para código próprio; <code>@Bean</code> para tudo o que vem de fora — <code>DataSource</code>, <code>ObjectMapper</code>, clientes HTTP, <code>MeterBinder</code>. Assim, todas as decisões de infra-estrutura ficam concentradas em duas ou três classes de configuração, em vez de espalhadas por anotações no domínio.</p>
+      <p><code>proxyBeanMethods</code> controla o modo da classe de configuração. Com o valor por defeito <code>true</code> (modo <em>full</em>), o Spring gera uma subclasse CGLIB da classe de configuração e intercepta as chamadas entre métodos <code>@Bean</code>: chamar <code>relogio()</code> de dentro de outro método <code>@Bean</code> devolve o <em>singleton</em> do contentor, não um objecto novo. Com <code>false</code> (modo <em>lite</em>), não há <em>proxy</em>: a mesma chamada executa o método e cria um segundo objecto que o contentor desconhece.</p>
+      <p>O <em>trade-off</em>: <code>false</code> poupa uma classe gerada e algum tempo de arranque, e é o que as auto-configurações do Boot usam; mas exige disciplina — as dependências entre <em>beans</em> passam a ser declaradas como parâmetros do método <code>@Bean</code>, nunca por chamada directa. Numa classe onde um método <code>@Bean</code> chama outro, pôr <code>false</code> introduz silenciosamente duas instâncias de um objecto que se julgava único, e se esse objecto tiver estado — uma <em>cache</em>, um contador, um <em>pool</em> — o defeito só aparece em carga.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São as duas maneiras de criar <em>beans</em>, é indiferente.»</td></tr>
+        <tr><td>Mid</td><td>Distingue código próprio de terceiros e sabe que <code>@Bean</code> dá controlo, mas desconhece <code>proxyBeanMethods</code>.</td></tr>
+        <tr><td>Sénior</td><td>Explica o <em>proxy</em> CGLIB da classe de configuração, o que acontece à chamada entre métodos <code>@Bean</code> nos dois modos, e o risco de estado duplicado.</td></tr>
+        <tr><td>Staff</td><td>Liga isto à política do repositório: configuração de infra concentrada, modo <em>lite</em> por defeito com parâmetros explícitos, e teste de contexto que verifica a contagem de <em>beans</em> críticos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que dois <code>DataSource</code> convivem no mesmo contexto?»</li>
+      <li>«Qual é a diferença real entre <code>@Service</code> e <code>@Component</code>?»</li>
+      <li>«E <code>@Repository</code> — o que é que traz além da semântica?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Anotar classes de bibliotecas externas por cópia para dentro do projecto.</li>
+      <li>Não saber que <code>@Repository</code> traz tradução de excepções de persistência.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-2" class="h2"><span class="secnum">14.2</span> Scopes, ciclo de vida e ordem de inicialização<a class="anchor" href="#sec-14-2" aria-label="ligação">#</a></h2>
+
+<p>O Spring traz seis âmbitos, e numa aplicação de <em>backend</em> bem desenhada usam-se dois. <code>singleton</code> é o defeito: uma instância por contentor, criada no arranque, obrigatoriamente sem estado mutável partilhado porque vai ser chamada por dezenas de <em>threads</em> em paralelo. <code>prototype</code> cria uma instância por pedido de injecção. Os âmbitos <em>web</em> — <code>request</code>, <code>session</code>, <code>application</code>, <code>websocket</code> — existem, mas guardar estado por sessão num serviço que corre em oito réplicas atrás de um balanceador é uma decisão de arquitectura que raramente sobrevive à pergunta seguinte.</p>
+
+<p>A sequência de criação de um <em>singleton</em> é fixa e vale a pena saber de cor: construtor com as dependências injectadas, injecção de campos e <em>setters</em>, <em>callbacks</em> de <code>Aware</code>, <code>BeanPostProcessor.postProcessBeforeInitialization</code>, <code>@PostConstruct</code>, <code>InitializingBean.afterPropertiesSet()</code>, <code>init-method</code> e por fim <code>postProcessAfterInitialization</code> — que é onde o <em>proxy</em> de AOP é criado. A consequência prática desta última posição é a armadilha mais cara desta secção: dentro de <code>@PostConstruct</code>, o objecto ainda não está embrulhado, logo chamar um método <code>@Transactional</code>, <code>@Async</code> ou <code>@Cacheable</code> do próprio <em>bean</em> a partir daí não faz absolutamente nada de declarativo.</p>
+
+<p>Depois de todos os <em>singletons</em> estarem prontos, o contentor chama <code>SmartInitializingSingleton.afterSingletonsInstantiated()</code>; depois do contexto refrescado e do servidor a aceitar ligações, correm os <code>ApplicationRunner</code> e <code>CommandLineRunner</code>, ordenáveis com <code>@Order</code>. Para trabalho de arranque que precise de transacção ou de chamadas de rede, é aí que se põe — nunca em <code>@PostConstruct</code>.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um <em>bean</em> <code>prototype</code> não tem ciclo de vida completo: o contentor cria-o, injecta-o e esquece-o. <code>@PreDestroy</code> nunca é chamado e o <code>destroy-method</code> também não. Um <code>prototype</code> que abra um ficheiro, uma ligação ou uma <em>thread</em> é uma fuga garantida; se tiver recursos, o consumidor tem de os fechar explicitamente ou o objecto não deve ser um <em>bean</em> de todo.</p></aside>
+
+<figure class="listing java" id="lst-14-2"><div class="lhead"><span class="lnum">Listagem 14.2</span>
+<span class="lcap">Obter um prototype de dentro de um singleton sem congelar a primeira instância.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Component
+@Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+public class SessaoImportacao {
+    private final List&lt;String&gt; erros = new ArrayList&lt;&gt;();   // estado por importação
+    void registarErro(String e) { erros.add(e); }
+    List&lt;String&gt; erros() { return List.copyOf(erros); }
+}
+
+@Service
+public class ImportadorFicheiros {
+
+    // ObjectProvider pede uma instância nova a cada get(); injectar
+    // SessaoImportacao directamente congelaria UMA instância no singleton.
+    private final ObjectProvider&lt;SessaoImportacao&gt; sessoes;
+
+    public ImportadorFicheiros(ObjectProvider&lt;SessaoImportacao&gt; sessoes) {
+        this.sessoes = sessoes;
+    }
+
+    public List&lt;String&gt; importar(Path ficheiro) {
+        SessaoImportacao sessao = sessoes.getObject();   // instância nova, thread-safe
+        // ... processamento, sessao.registarErro(...) ...
+        return sessao.erros();
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-14-4" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um colega injectou um <em>bean</em> <code>prototype</code> num <code>@Service</code> <em>singleton</em> e queixa-se de que recebe sempre o mesmo objecto. Explique porquê e dê-me as opções de correcção, com o custo de cada uma.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Recebe sempre o mesmo objecto porque a injecção acontece uma única vez, na criação do <em>singleton</em>. O âmbito <code>prototype</code> promete uma instância nova <em>por pedido ao contentor</em>, e o <em>singleton</em> só pede uma vez, no arranque. O campo fica com essa instância para o resto da vida da aplicação — e, se o <code>prototype</code> tiver estado mutável, passa a ser estado partilhado entre todas as <em>threads</em>, que é o pior resultado possível.</p>
+      <p>Três correcções, por ordem de preferência. Primeira: injectar <code>ObjectProvider&lt;T&gt;</code> e chamar <code>getObject()</code> onde a instância é precisa — explícito, sem magia, sem custo de <em>proxy</em>, e testável passando um <em>stub</em> do <code>ObjectProvider</code>. Segunda: <code>@Scope(value = "prototype", proxyMode = ScopedProxyMode.TARGET_CLASS)</code>, que injecta um <em>proxy</em> CGLIB que resolve uma instância nova a cada chamada de método — mais transparente para quem lê, mas esconde o comportamento e obriga a que a classe não seja <code>final</code>. Terceira: <code>@Lookup</code> num método abstracto, que o Spring sobrepõe por geração de código — funciona, mas é hoje uma solução legada e obriga a classe a não poder ser instanciada com <code>new</code>.</p>
+      <p>A pergunta que devolvo ao colega é anterior a tudo isto: esse objecto precisa mesmo de ser um <em>bean</em>? Se o único motivo de existir no contentor é ter estado por operação, quase sempre a resposta certa é <code>new</code> dentro do método, ou um <em>record</em> passado como parâmetro. Um objecto com estado por operação e sem dependências injectadas não ganha nada em ser gerido pelo contentor, e perde a possibilidade de ser criado num teste sem Spring.</p>
+      <p>O caso em que o <code>prototype</code> se justifica é quando o objecto com estado por operação precisa também de dependências geridas — por exemplo, uma sessão de importação que precisa do <code>Clock</code>, do repositório e do <code>MeterRegistry</code>. Aí, <code>ObjectProvider</code> mais <code>getObject()</code> é a combinação com melhor relação entre clareza e custo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe explicar porque a instância não muda; sugere pôr o serviço a <code>prototype</code>.</td></tr>
+        <tr><td>Mid</td><td>Diz que a injecção só acontece uma vez e conhece <code>ObjectProvider</code>, mas não compara as opções.</td></tr>
+        <tr><td>Sénior</td><td>Explica o momento da injecção, dá as três opções com custo, e levanta o risco de estado partilhado entre <em>threads</em>.</td></tr>
+        <tr><td>Staff</td><td>Questiona a necessidade do <em>bean</em>, propõe <code>new</code> ou passagem por parâmetro, e nota que o <code>prototype</code> não recebe <code>@PreDestroy</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quem fecha os recursos de um <code>prototype</code>?»</li>
+      <li>«O que muda se em vez de <code>prototype</code> for âmbito <code>request</code>?»</li>
+      <li>«Como testa o serviço sem levantar contexto Spring?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Guardar estado mutável de pedido num <em>bean</em> <em>singleton</em>.</li>
+      <li>Usar <code>ApplicationContext.getBean()</code> espalhado pelo código de domínio.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-5" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Preciso de carregar uma <em>cache</em> a partir da base de dados quando a aplicação arranca. Onde põe esse código: <code>@PostConstruct</code>, <code>InitializingBean</code>, <code>ApplicationRunner</code> ou um <em>listener</em> de <code>ApplicationReadyEvent</code>? Justifique.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>ApplicationRunner</code>, ou um <em>listener</em> de <code>ApplicationReadyEvent</code> — nunca <code>@PostConstruct</code>. A razão é a posição de cada um na sequência de arranque. O <code>@PostConstruct</code> corre a meio da criação daquele <em>bean</em>: o <em>proxy</em> de AOP ainda não foi criado (isso acontece no <code>postProcessAfterInitialization</code>, depois), e não há garantia de que os outros <em>beans</em> de que a carga depende já estejam prontos — só os que foram injectados. Uma consulta com <code>@Transactional</code> chamada de dentro do <code>@PostConstruct</code> do mesmo <em>bean</em> corre sem transacção nenhuma, silenciosamente.</p>
+      <p><code>InitializingBean.afterPropertiesSet()</code> corre logo a seguir ao <code>@PostConstruct</code> e sofre exactamente do mesmo problema, com o custo adicional de acoplar a classe a uma interface do Spring. Não há razão para preferir a interface à anotação em código novo.</p>
+      <p><code>ApplicationRunner</code> corre depois de o contexto estar refrescado, com todos os <em>proxies</em> criados e todos os <em>singletons</em> vivos. É o sítio certo para trabalho que toca na base de dados, na rede ou em transacções. Se lançar excepção, o arranque falha e o processo termina — o que é o comportamento desejado para uma <em>cache</em> sem a qual o serviço serve respostas erradas.</p>
+      <p>O <em>trade-off</em> importante é operacional, não sintáctico: qualquer carga síncrona no arranque entra no tempo até o <em>pod</em> ficar <em>ready</em>. Uma carga de 40 segundos com uma <code>initialDelaySeconds</code> de 20 na sonda de <em>liveness</em> produz um ciclo infinito de reinícios em Kubernetes. Para cargas longas, o padrão correcto é arrancar com a <em>cache</em> vazia, marcar a aplicação como não-pronta com <code>AvailabilityChangeEvent.publish(ctx, ReadinessState.REFUSING_TRAFFIC)</code>, carregar em segundo plano e só depois publicar <code>ACCEPTING_TRAFFIC</code> — o <em>pod</em> vive, mas não recebe tráfego enquanto a <em>cache</em> estiver fria.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Escolhe <code>@PostConstruct</code> «porque é onde se inicializa».</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>ApplicationRunner</code> mas não sabe explicar em que ponto o <em>proxy</em> passa a existir.</td></tr>
+        <tr><td>Sénior</td><td>Ordena a sequência de arranque, explica porque o <code>@Transactional</code> não se aplica dentro do <code>@PostConstruct</code>, e escolhe em função disso.</td></tr>
+        <tr><td>Staff</td><td>Traz a dimensão operacional: efeito no tempo até <em>ready</em>, interacção com as sondas do Kubernetes e o padrão de carga assíncrona com estado de <em>readiness</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a <em>cache</em> demorar 3 minutos a carregar?»</li>
+      <li>«Como garante que dois <code>ApplicationRunner</code> correm por uma ordem determinada?»</li>
+      <li>«O que acontece ao <em>pod</em> se o <code>ApplicationRunner</code> lançar excepção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Usar <code>@Order</code> a pensar que controla a ordem de criação dos <em>beans</em> — controla apenas a ordem dentro de colecções e de <em>runners</em>.</li>
+      <li>Fazer chamadas de rede bloqueantes no <code>@PostConstruct</code> sem <em>timeout</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-3" class="h2"><span class="secnum">14.3</span> Como funciona a auto-configuração do Boot<a class="anchor" href="#sec-14-3" aria-label="ligação">#</a></h2>
+
+<p>A auto-configuração não é magia, é uma lista num ficheiro de texto. <code>@SpringBootApplication</code> compõe <code>@SpringBootConfiguration</code>, <code>@ComponentScan</code> e <code>@EnableAutoConfiguration</code>; esta última importa um selector que lê, de todos os JAR do <em>classpath</em>, o ficheiro <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code> — uma classe por linha. No Boot 3 este é o único mecanismo: o antigo <code>spring.factories</code> deixou de ser suportado para auto-configurações.</p>
+
+<p>Cada classe da lista é uma <code>@AutoConfiguration</code> cheia de condições. <code>@ConditionalOnClass</code> avalia-se sobre o <em>classpath</em> sem carregar a classe (o Boot lê os metadados do <em>bytecode</em>, por isso uma condição sobre uma classe ausente não provoca <code>NoClassDefFoundError</code>). <code>@ConditionalOnProperty</code> avalia-se sobre o <code>Environment</code>. E <code>@ConditionalOnMissingBean</code> — a condição que dá ao Boot o seu carácter — só regista o <em>bean</em> se o utilizador não tiver registado um do mesmo tipo.</p>
+
+<p>O que faz <code>@ConditionalOnMissingBean</code> funcionar é a ordem: todas as auto-configurações são processadas depois das definições do utilizador, e ordenadas entre si por <code>@AutoConfiguration(after = ..., before = ...)</code>. Daí a regra que separa o sénior do mid: <code>@ConditionalOnMissingBean</code> só é fiável dentro de auto-configurações. Usá-la numa <code>@Configuration</code> da própria aplicação é apostar numa ordem de registo que ninguém garante — o mesmo código pode activar ou não conforme o nome da classe ou a ordem do <em>scan</em>.</p>
 
 <figure class="listing java" id="lst-14-3"><div class="lhead"><span class="lnum">Listagem 14.3</span>
-<span class="lcap">Tradução de excepções de domínio para <code>ProblemDetail</code> em Spring Boot 3.x.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@RestControllerAdvice
-class TradutorDeErros extends ResponseEntityExceptionHandler {
+<span class="lcap">Auto-configuração de uma biblioteca interna: condições, ordem e ponto de extensão.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// src/main/resources/META-INF/spring/
+//   org.springframework.boot.autoconfigure.AutoConfiguration.imports
+//   -&gt; com.acme.idem.IdempotenciaAutoConfiguration
 
-    private static final URI BASE = URI.create("https://api.acme.pt/problemas/");
-    private static final Logger log = LoggerFactory.getLogger(TradutorDeErros.class);
+@AutoConfiguration(after = RedisAutoConfiguration.class)
+@ConditionalOnClass(StringRedisTemplate.class)
+@ConditionalOnProperty(prefix = "acme.idempotencia", name = "enabled",
+                       havingValue = "true", matchIfMissing = true)
+@EnableConfigurationProperties(PropriedadesIdempotencia.class)
+public class IdempotenciaAutoConfiguration {
 
-    @ExceptionHandler(SaldoInsuficienteException.class)
-    ProblemDetail saldo(SaldoInsuficienteException e) {
-        ProblemDetail p = ProblemDetail.forStatusAndDetail(
-                HttpStatus.UNPROCESSABLE_ENTITY,
-                "A conta %d tem %d cêntimos disponíveis e o pedido exige %d."
-                        .formatted(e.conta(), e.disponivel(), e.exigido()));
-        p.setType(BASE.resolve("saldo-insuficiente"));
-        p.setTitle("Saldo insuficiente");
-        p.setProperty("codigo", "PAG_SALDO_INSUFICIENTE");
-        p.setProperty("disponivelEmCentimos", e.disponivel());
-        p.setProperty("exigidoEmCentimos", e.exigido());
-        return correlacionar(p);                 // 422: não se regista como erro
+    @Bean
+    @ConditionalOnMissingBean            // a aplicação pode substituir com o seu
+    ArmazemIdempotencia armazemIdempotencia(StringRedisTemplate redis,
+                                            PropriedadesIdempotencia props) {
+        return new ArmazemRedis(redis, props.ttl());
     }
 
-    @ExceptionHandler(AdquirenteIndisponivelException.class)
-    ProblemDetail adquirente(AdquirenteIndisponivelException e) {
-        ProblemDetail p = ProblemDetail.forStatusAndDetail(
-                HttpStatus.SERVICE_UNAVAILABLE,
-                "Serviço temporariamente indisponível. Repita mais tarde.");
-        p.setType(BASE.resolve("dependencia-indisponivel"));
-        p.setTitle("Dependência indisponível");
-        p.setProperty("codigo", "PAG_ADQUIRENTE_INDISPONIVEL");
-        p.setProperty("retryAfterSegundos", 5);
-        log.warn("adquirente {} indisponível", e.adquirente(), e);   // detalhe fica no log
-        return correlacionar(p);
-    }
-
-    @ExceptionHandler(Exception.class)            // rede de segurança: nada escapa por traduzir
-    ProblemDetail inesperado(Exception e) {
-        ProblemDetail p = ProblemDetail.forStatusAndDetail(
-                HttpStatus.INTERNAL_SERVER_ERROR, "Erro interno.");
-        p.setType(BASE.resolve("erro-interno"));
-        p.setTitle("Erro interno");
-        log.error("excepção não tratada", e);     // a mensagem NUNCA vai no corpo
-        return correlacionar(p);
-    }
-
-    private ProblemDetail correlacionar(ProblemDetail p) {
-        SpanContext ctx = Span.current().getSpanContext();
-        if (ctx.isValid()) {
-            p.setProperty("traceId", ctx.getTraceId());
-        }
-        return p;
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnBean(ArmazemIdempotencia.class)
+    FilterRegistrationBean&lt;FiltroIdempotencia&gt; filtroIdempotencia(
+            ArmazemIdempotencia armazem, PropriedadesIdempotencia props) {
+        var reg = new FilterRegistrationBean&lt;&gt;(new FiltroIdempotencia(armazem, props));
+        reg.setOrder(Ordered.HIGHEST_PRECEDENCE + 20);
+        return reg;
     }
 }</code></pre></figure>
 
-<div class="qa" id="q-14-6" data-box="qa" data-area="api" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Desenhe o formato de erro da nossa API pública. O que vai no corpo, o que fica de fora, e como é que o cliente distingue erros programaticamente?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>application/problem+json</code> conforme a RFC 9457, com três extensões obrigatórias: um código de domínio estável em maiúsculas, o <code>traceId</code>, e — quando o erro é de validação — uma lista de erros por campo. A distinção programática faz-se pelo par (<code>status</code>, <code>codigo</code>), nunca pelo texto.</p>
-      <p>A razão para o código de domínio existir além do <code>type</code> é prática: o <code>type</code> é uma URI e obriga a comparações longas e frágeis em <em>switch</em>; um código curto entra directamente num <em>enum</em> gerado. A razão para o <code>traceId</code> ir no corpo é ainda mais prática: reduz o ciclo de suporte de dias para minutos, porque o integrador cola o identificador no <em>ticket</em> e a equipa salta directamente para o rasto no Tempo ou no Jaeger, em vez de procurar por janela temporal.</p>
-      <p>Fica de fora tudo o que ajude um atacante ou revele a implementação: <em>stack traces</em>, mensagens de excepção cruas, SQL, nomes de tabelas ou de serviços internos, e — em erros de autenticação — a distinção entre «utilizador não existe» e «palavra-passe errada», que permite enumeração de contas. Fica também de fora o texto localizado por omissão; a localização é responsabilidade do cliente a partir do código, e o servidor só a faz se receber <code>Accept-Language</code> e tiver as traduções sob controlo.</p>
-      <p>Para validação, a estrutura que funciona é uma extensão <code>erros</code> com um objecto por campo — <code>{"campo": "iban", "codigo": "IBAN_INVALIDO", "detalhe": "dígitos de controlo não conferem"}</code> — devolvendo <strong>todos</strong> os campos inválidos de uma vez. Devolver o primeiro erro obriga o cliente a um ciclo de tentativa por campo; num formulário de 12 campos isso são 12 idas ao servidor em vez de uma.</p>
-      <p>Quando a escolha inversa ganha: numa API de altíssimo débito onde o corpo de erro é medido em bytes por segundo agregados, ou num <em>gateway</em> antigo que não deixa passar tipos de conteúdo desconhecidos, aceita-se <code>application/json</code> com a mesma estrutura de campos. O que não se cede é a estabilidade do código e a presença do <code>traceId</code>.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Um campo <code>mensagem</code> com o <code>getMessage()</code> da excepção.</td></tr>
-        <tr><td>Mid</td><td>Estrutura própria com código e mensagem; não conhece a RFC nem separa contrato de texto.</td></tr>
-        <tr><td>Sénior</td><td>RFC 9457, código estável versus <code>detail</code> mutável, <code>traceId</code>, lista completa de erros de validação, e o que se omite por segurança.</td></tr>
-        <tr><td>Staff</td><td>Trata o catálogo de erros como artefacto versionado e gerado, com propriedade clara e teste que impede a introdução de códigos novos sem documentação.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quem garante que dois serviços não usam o mesmo código para coisas diferentes?»</li>
-      <li>«O <code>traceId</code> no corpo não é fuga de informação?»</li>
-      <li>«Como evita que uma excepção nova escape sem tradução?»</li>
-      <li>«Localiza as mensagens no servidor ou no cliente?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><em>Stack trace</em> ou mensagem crua de excepção no corpo da resposta pública.</li>
-      <li>Clientes obrigados a comparar <em>strings</em> de <code>detail</code> para decidir o comportamento.</li>
-      <li>Erros de validação devolvidos um de cada vez.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-14-7" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Um parceiro diz que «às vezes o pagamento falha». Não tem <em>timestamp</em> nem identificador. O que é que a API devia ter feito para esta conversa ser de cinco minutos?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Devia propagar contexto de rasto normalizado e devolvê-lo em todas as respostas, de sucesso e de erro. Concretamente: aceitar <code>traceparent</code> do W3C Trace Context à entrada, gerar um novo se não vier, propagar a todas as chamadas a jusante e ao Kafka, e incluir o <code>traceId</code> no corpo do <em>problem detail</em> e num cabeçalho de resposta. Com isso, o parceiro cola um identificador e a investigação começa no rasto completo.</p>
-      <p>O segundo elemento é a distinção entre correlação técnica e correlação de negócio. O <code>traceId</code> vive tipicamente 7 a 30 dias no sistema de rastos e cobre um pedido; a chave de negócio — número de referência do pagamento, chave de idempotência — vive anos na base de dados e cobre todas as tentativas relacionadas. Um bom desenho devolve as duas: <code>traceId</code> para depurar agora, referência para reconciliar depois. Se o parceiro só tiver a referência, a consulta faz-se na base de dados; se tiver o <code>traceId</code>, no rastreador.</p>
-      <p>O terceiro elemento é a amostragem. Com amostragem de cabeça a 1%, 99 em cada 100 rastos não existem quando o parceiro liga — e o <code>traceId</code> devolvido aponta para o vazio. A correcção é amostragem baseada em cauda ou, mais simples e mais barata, uma regra que force a amostragem para 100% quando a resposta é 5xx ou quando a latência excede o p99, mantendo 1% no tráfego normal. Num serviço com 2 000 pedidos por segundo e 0,3% de erros, isso significa guardar cerca de 20 rastos por segundo do caminho normal e 6 por segundo de erros — volume perfeitamente comportável.</p>
-      <p>Em Spring Boot 3.x, isto é Micrometer Tracing com a ponte OpenTelemetry: o <code>traceId</code> entra automaticamente no MDC e nos <em>logs</em> estruturados, o que fecha o ciclo entre rasto e registo sem código de cola.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Procuramos nos <em>logs</em> pela hora aproximada.»</td></tr>
-        <tr><td>Mid</td><td>Gera um UUID de correlação por pedido e põe-no no <em>log</em>; não o devolve ao cliente nem o propaga a jusante.</td></tr>
-        <tr><td>Sénior</td><td>W3C Trace Context propagado ponta a ponta, devolvido ao cliente, com distinção entre chave técnica e chave de negócio.</td></tr>
-        <tr><td>Staff</td><td>Discute retenção, custo de armazenamento, amostragem enviesada para erros e latência, e o efeito disso no tempo médio de diagnóstico.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O <code>traceId</code> atravessa o Kafka? Como?»</li>
-      <li>«Com 1% de amostragem, o rasto do incidente existe?»</li>
-      <li>«Que campos põe no <em>log</em> estruturado além do <code>traceId</code>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Inventar um cabeçalho próprio de correlação ignorando o <code>traceparent</code> normalizado.</li>
-      <li>Não devolver identificador nenhum ao cliente nas respostas de erro.</li>
-      <li>Registar o corpo completo do pedido «para depurar», incluindo dados pessoais e números de cartão.</li></ul></div>
-  </div>
-</div>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>A RFC 9457 substituiu a RFC 7807 sem alterar o formato do corpo nem o tipo de conteúdo <code>application/problem+json</code>; clarificou o registo de tipos de problema e o uso de várias instâncias de problema. Código escrito para 7807 continua conforme. Numa entrevista, saber que o formato é estável e que a mudança foi editorial vale mais do que citar o número da RFC.</p></aside>
-
-<h2 id="sec-14-4" class="h2"><span class="secnum">14.4</span> Idempotência, retries e exactly-once aparente<a class="anchor" href="#sec-14-4" aria-label="ligação">#</a></h2>
-
-<p>Numa rede, o cliente nunca sabe a diferença entre «o pedido não chegou» e «o pedido chegou e a resposta perdeu-se». Como não pode distinguir, tem de repetir; como repete, o servidor tem de ser capaz de reconhecer a repetição. Não existe <em>exactly-once</em> na entrega — existe <em>at-least-once</em> na entrega mais desduplicação no receptor, o que produz <em>efeito</em> exactly-once. Esta frase, dita assim, é um dos sinais mais fiáveis de senioridade nesta área.</p>
-
-<p>O mecanismo padrão para HTTP é a chave de idempotência: o cliente gera um identificador único por intenção de negócio (não por tentativa) e envia-o no cabeçalho <code>Idempotency-Key</code>; o servidor guarda-o com o resultado e devolve a resposta memorizada em qualquer repetição. Três detalhes distinguem uma implementação real de um esboço. Primeiro, a chave tem de ser gravada na <strong>mesma transacção</strong> que o efeito de negócio, ou com um registo prévio em estado «em curso» — se for gravada depois, existe uma janela em que a operação já aconteceu e a chave ainda não, e um <em>retry</em> nessa janela duplica. Segundo, é preciso guardar a impressão digital do pedido (<em>hash</em> do corpo e do caminho) e devolver <code>422</code> se a mesma chave voltar com corpo diferente — caso contrário um erro do cliente transforma-se em silêncio. Terceiro, é preciso decidir o que fazer quando chega uma repetição enquanto a primeira ainda corre: devolver <code>409</code> com <code>Retry-After</code> é a resposta mais segura, porque esperar por um <em>lock</em> ocupa uma <em>thread</em> e propaga a lentidão.</p>
-
-<p>A retenção é uma decisão de custo. Uma janela de 24 horas cobre praticamente todos os <em>retries</em> automáticos; 7 dias cobrem repetições manuais de operadores e reconciliações diárias. Com 5 milhões de pedidos por dia e cerca de 400 bytes por registo (chave, impressão, estado, corpo memorizado truncado), 7 dias custam aproximadamente 14 GB — barato face ao custo de um único pagamento duplicado. A limpeza faz-se por partição temporal ou por índice em <code>expira_em</code> com um trabalho periódico, nunca por <code>DELETE</code> sem limite numa tabela quente.</p>
-
-<div class="qa" id="q-14-8" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
+<div class="qa" id="q-14-6" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O nosso <code>POST /v1/pagamentos</code> criou 4 000 pagamentos duplicados numa noite em que a rede oscilou. Explique porquê e como o corrige.</div>
+  <div class="qprompt">Explique-me, do <code>main</code> até ao <em>bean</em> registado, como o Spring Boot decide criar um <code>DataSource</code> sem que ninguém o tenha declarado. E como é que descobre porque é que uma auto-configuração que esperava não activou?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque <code>POST</code> não é idempotente e o cliente não tem forma de distinguir «não chegou» de «chegou e a resposta perdeu-se». Com <em>timeouts</em> a disparar, o cliente repetiu e o servidor criou um recurso novo em cada tentativa — o comportamento correcto para a semântica do método. A correcção é dar ao servidor a capacidade de reconhecer a intenção repetida: chave de idempotência com garantia transaccional.</p>
-      <p>O desenho: o cliente gera a chave uma vez por intenção — tipicamente um UUIDv7 derivado do carrinho ou da encomenda, não um valor novo a cada tentativa — e envia-a em <code>Idempotency-Key</code>. O servidor insere <code>(chave, impressao_do_pedido, estado=EM_CURSO)</code> numa tabela com restrição de unicidade. Se a inserção passa, é a primeira vez: executa e, na mesma transacção que o efeito de negócio, actualiza o registo para <code>CONCLUIDO</code> com o estado HTTP e o corpo da resposta. Se a inserção viola a unicidade, é repetição: se a impressão digital diferir, devolve <code>422</code>; se o estado for <code>EM_CURSO</code>, devolve <code>409</code> com <code>Retry-After: 1</code>; se estiver <code>CONCLUIDO</code>, devolve a resposta memorizada com o mesmo código e um cabeçalho que indique que foi repetida.</p>
-      <p>O erro subtil que quase todos cometem: escrever a chave numa transacção separada, depois da operação. Isso deixa uma janela de alguns milissegundos — precisamente a janela em que o <em>timeout</em> do cliente dispara — em que a operação existe e a chave não. Em PostgreSQL há outro detalhe operacional: uma violação de unicidade dentro de uma transacção aborta-a, pelo que a inserção da chave deve ocorrer numa transacção própria (propagação <code>REQUIRES_NEW</code>) ou protegida por um <em>savepoint</em>, sob pena de o tratamento do duplicado falhar com «transacção actual abortada».</p>
-      <p>Segunda linha de defesa, independente da primeira: uma restrição de unicidade de negócio na tabela de pagamentos — por exemplo <code>(id_comerciante, referencia_externa)</code>. A chave de idempotência protege contra repetições da mesma tentativa; a restrição de negócio protege contra dois caminhos de código distintos que criam o mesmo pagamento. Uma não substitui a outra.</p>
-      <p>Quando a escolha inversa ganha: se a operação for naturalmente idempotente por identificador fornecido pelo cliente — <code>PUT /v1/pagamentos/{uuid-do-cliente}</code> — não é preciso tabela de idempotência nenhuma; a chave primária faz o trabalho. É a solução mais simples e deve ser a primeira a considerar em APIs internas onde se pode exigir ao cliente que gere o identificador.</p></div>
+      <p>O <code>SpringApplication.run</code> cria o contexto e regista as definições do utilizador vindas do <em>component scan</em> e das classes <code>@Configuration</code>. <code>@EnableAutoConfiguration</code> importa o <code>AutoConfigurationImportSelector</code>, que recolhe as linhas de todos os ficheiros <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code> no <em>classpath</em>, remove as exclusões, ordena as classes com <code>@AutoConfiguration(after/before)</code> e regista-as no fim — depois das do utilizador.</p>
+      <p>Para o <code>DataSource</code>, a <code>DataSourceAutoConfiguration</code> exige <code>DataSource</code> no <em>classpath</em>, exige que não exista já um <em>bean</em> <code>DataSource</code> registado, e escolhe a implementação de <em>pool</em> pela primeira disponível — HikariCP, que vem no <code>spring-boot-starter-jdbc</code>. As propriedades <code>spring.datasource.*</code> alimentam-na por <code>@ConfigurationProperties</code>. Declarar um <code>@Bean DataSource</code> na aplicação desliga toda essa cadeia sem nenhuma configuração adicional: é o <code>@ConditionalOnMissingBean</code> a ceder o lugar.</p>
+      <p>Para diagnosticar, há três instrumentos por ordem de custo. Arrancar com <code>--debug</code> imprime o <code>ConditionEvaluationReport</code>, com as secções <em>Positive matches</em>, <em>Negative matches</em> e <em>Exclusions</em> — a linha negativa diz exactamente qual a condição que falhou («did not find class», «found bean of type X»). O mesmo relatório está em <code>/actuator/conditions</code> quando o Actuator está activo. E, para tempos de arranque, <code>/actuator/startup</code> com um <code>BufferingApplicationStartup</code> configurado dá a árvore de passos com duração.</p>
+      <p>As três causas reais que aparecem em produção: falta a dependência que satisfaz o <code>@ConditionalOnClass</code>; existe já um <em>bean</em> do tipo, muitas vezes registado por outro <em>starter</em> interno; ou a classe da aplicação está num <em>package</em> acima do esperado e o <em>component scan</em> arrasta metade do mundo, mascarando o problema. Em bibliotecas partilhadas, o erro mais comum é registar a configuração com <code>@Configuration</code> mais <code>@ComponentScan</code> em vez de a expor como auto-configuração — o que obriga cada consumidor a importá-la à mão e destrói a ordem em relação às auto-configurações do Boot.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Verificamos antes de inserir se já existe um pagamento igual» — leitura seguida de escrita, sem restrição, com condição de corrida.</td></tr>
-        <tr><td>Mid</td><td>Propõe <code>Idempotency-Key</code> com uma tabela, mas grava-a depois da operação e não trata a repetição concorrente.</td></tr>
-        <tr><td>Sénior</td><td>Chave gravada transaccionalmente, impressão digital do pedido, tratamento de <code>EM_CURSO</code>, resposta memorizada, retenção com números.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a restrição de unicidade de negócio como defesa independente, a reconciliação diária como terceira rede, e o efeito da tabela no débito de escrita.</td></tr>
+        <tr><td>Insuficiente</td><td>«O Boot vê o que está no <em>classpath</em> e configura sozinho.» Sem mecanismo.</td></tr>
+        <tr><td>Mid</td><td>Menciona <code>@EnableAutoConfiguration</code> e as condições, mas não sabe onde está a lista nem como depurar.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o ficheiro <code>AutoConfiguration.imports</code>, a ordem depois do utilizador, o papel do <code>@ConditionalOnMissingBean</code> e usa <code>--debug</code> ou <code>/actuator/conditions</code> para diagnosticar.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a escrita de um <em>starter</em> interno: metadados de configuração, testes com <code>ApplicationContextRunner</code>, e política de versões para não partir consumidores.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quanto tempo guarda as chaves e porquê esse valor?»</li>
-      <li>«O cliente reutiliza a chave com um corpo diferente. O que devolve?»</li>
-      <li>«Duas repetições chegam em simultâneo a dois nós. O que acontece?»</li>
-      <li>«Como isto se comporta se a base de dados for particionada por comerciante?»</li></ul></div>
+      <li>«Como escreve um teste que prova que a sua auto-configuração recua perante um <em>bean</em> do utilizador?»</li>
+      <li>«Como exclui uma auto-configuração específica?»</li>
+      <li>«Porque é que <code>@ConditionalOnMissingBean</code> não deve ser usada na aplicação?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confiar numa verificação de existência sem restrição de unicidade na base de dados.</li>
-      <li>Gerar a chave de idempotência no servidor — não resolve nada, porque muda a cada tentativa.</li>
-      <li>Afirmar que Kafka ou HTTP dão <em>exactly-once</em> na entrega.</li></ul></div>
+      <li>Continuar a falar de <code>spring.factories</code> como mecanismo actual no Boot 3.</li>
+      <li>Resolver conflitos de <em>beans</em> ligando <code>spring.main.allow-bean-definition-overriding</code>.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-14-9" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Configure a política de <em>retry</em> do nosso cliente para um serviço a jusante que ocasionalmente devolve 503. Que parâmetros escolhe e porquê?</div>
+<div class="qa" id="q-14-7" data-box="qa" data-area="spring" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Vamos extrair para uma biblioteca partilhada por 14 serviços a nossa configuração de <em>tracing</em>, <em>retry</em> e cliente HTTP. Como a desenha para que os serviços possam sobrepor partes sem copiar código?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Três tentativas no total, recuo exponencial com base de 100 ms e multiplicador 2, aleatorização de pelo menos 50% do intervalo, e um orçamento global de <em>retries</em> limitado a cerca de 10% do débito. Só se repete o que é seguro repetir: <code>503</code>, <code>429</code> respeitando <code>Retry-After</code>, <code>504</code>, erros de ligação e de <em>timeout</em> — nunca <code>400</code>, <code>401</code>, <code>403</code>, <code>404</code> ou <code>422</code>, e nunca um <code>POST</code> sem chave de idempotência.</p>
-      <p>A aleatorização é o parâmetro que os candidatos esquecem e é o que evita o efeito de rebanho. Sem <em>jitter</em>, mil clientes que falharam no mesmo segundo repetem todos aos 100 ms, depois todos aos 300 ms: o serviço que estava a recuperar recebe mil pedidos sincronizados e volta a cair. Com aleatorização de 50%, as mil repetições espalham-se por uma janela e o pico instantâneo cai para uma fracção. Em Resilience4j, isto é <code>enableRandomizedWait</code> com <code>randomizedWaitFactor</code>.</p>
-      <p>O número de tentativas é limitado pelo orçamento de latência, não pelo optimismo. Se o <em>timeout</em> por tentativa é 800 ms e há 3 tentativas com esperas de 100 ms e 200 ms, o pior caso é 2,7 s — que tem de caber no <em>timeout</em> que o chamador impõe a este serviço. Se o orçamento a montante for 2 s, três tentativas são impossíveis e a resposta correcta é duas, ou uma degradação em vez de repetição.</p>
-      <p>O ponto que separa sénior de staff é o efeito multiplicativo em cadeia. Numa cadeia de quatro serviços em que cada um repete três vezes, uma falha na base gera até 3<sup>4</sup> = 81 pedidos por pedido original. Uma dependência que oscila 2% transforma-se numa tempestade. As duas defesas são: repetir apenas na fronteira mais próxima da falha (idealmente num único nível da cadeia, não em todos) e usar orçamento de <em>retries</em> — o cliente do Google e o Envoy implementam isto como um limite de percentagem de repetições sobre pedidos activos, que corta os <em>retries</em> assim que a taxa de erro sobe, exactamente quando eles fazem mais mal.</p>
-      <p>Quando a escolha inversa ganha: em operações de leitura baratas e idempotentes com p99 de 10 ms, cinco tentativas rápidas com recuo curto podem ser preferíveis, porque o custo marginal é desprezável e a taxa de sucesso sobe. A regra é sempre a mesma — o orçamento de latência decide.</p></div>
+      <p>Desenha-se como <em>starter</em>, com dois artefactos: um <code>acme-http-spring-boot-starter</code> que só declara dependências, e um <code>acme-http-autoconfigure</code> com as classes <code>@AutoConfiguration</code> listadas em <code>AutoConfiguration.imports</code>. A separação permite a um serviço usar as classes sem apanhar as dependências transitivas, e é a convenção que o ecossistema reconhece.</p>
+      <p>Cada <em>bean</em> exposto leva <code>@ConditionalOnMissingBean</code>, para que o serviço que precise de outra coisa declare o seu <code>@Bean</code> e ganhe. Tudo o que é ajustável fica num <em>record</em> <code>@ConfigurationProperties</code> com prefixo próprio (<code>acme.http.*</code>), valores por defeito no construtor canónico e validação com <code>@Validated</code>; e gera-se <code>spring-configuration-metadata.json</code> com o processador de anotações para que o IDE ofereça completação e documentação das propriedades.</p>
+      <p>Para pontos de extensão finos, o padrão é o <em>customizer</em>: expor um <code>@Bean</code> que recebe <code>ObjectProvider&lt;ClienteCustomizer&gt;</code> e aplica todos os <em>customizers</em> encontrados por ordem de <code>@Order</code>. Assim um serviço acrescenta um cabeçalho ou um interceptor sem substituir o <em>bean</em> inteiro — é a diferença entre 14 equipas a ajustar e 14 equipas a copiar 200 linhas.</p>
+      <p>Os testes são a parte que distingue uma biblioteca fiável: <code>ApplicationContextRunner</code> permite montar o contexto com e sem cada dependência, com e sem <em>bean</em> do utilizador, e afirmar em milissegundos que a condição se comporta como prometido — muito mais barato do que <code>@SpringBootTest</code>. Os <em>trade-offs</em> a assumir em voz alta: uma auto-configuração ligada por defeito acelera a adopção mas retira controlo, por isso vale a pena um <code>@ConditionalOnProperty</code> com <code>matchIfMissing = true</code> que dê a cada serviço um interruptor; e a biblioteca fixa versões de Boot para todos, o que exige uma cadência de actualização combinada em vez de imposta.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Repetimos até funcionar», ou repete todos os códigos de erro, incluindo <code>400</code>.</td></tr>
-        <tr><td>Mid</td><td>Recuo exponencial com número fixo de tentativas; não menciona <em>jitter</em> nem o efeito em cadeia.</td></tr>
-        <tr><td>Sénior</td><td><em>Jitter</em>, lista explícita de condições retentáveis, ligação ao orçamento de latência, e exigência de idempotência para repetir escritas.</td></tr>
-        <tr><td>Staff</td><td>Amplificação multiplicativa em cadeia, orçamento de <em>retries</em> como percentagem do débito, e política de repetir num único nível.</td></tr>
+        <tr><td>Insuficiente</td><td>Propõe copiar as classes de configuração para cada serviço, ou um módulo com <code>@ComponentScan</code> global.</td></tr>
+        <tr><td>Mid</td><td>Cria um módulo com <code>@Configuration</code> e pede aos consumidores que façam <code>@Import</code>; não usa condições.</td></tr>
+        <tr><td>Sénior</td><td>Estrutura <em>starter</em> mais <em>autoconfigure</em>, <code>@ConditionalOnMissingBean</code>, propriedades tipadas com prefixo e testes com <code>ApplicationContextRunner</code>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o padrão <em>customizer</em>, metadados de configuração, política de versões e o custo organizacional de acoplar 14 equipas a uma versão de Boot.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Onde na cadeia é que a repetição deve viver: cliente, <em>gateway</em> ou <em>mesh</em>?»</li>
-      <li>«O serviço devolveu <code>429</code> com <code>Retry-After: 30</code>. Respeita ou usa o seu recuo?»</li>
-      <li>«Como combina <em>retry</em> com disjuntor sem que um anule o outro?»</li>
-      <li>«Que métrica lhe diz que a política de repetição está a piorar a situação?»</li></ul></div>
+      <li>«Como faz uma alteração incompatível nessa biblioteca sem parar 14 equipas?»</li>
+      <li>«E se dois serviços precisarem de versões diferentes do <em>starter</em>?»</li>
+      <li>«Como testa que a condição de <em>classpath</em> se comporta sem a dependência presente?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Repetir sem <em>jitter</em> e não perceber o efeito de rebanho.</li>
-      <li>Repetir <code>POST</code> não idempotente «porque provavelmente não chegou».</li>
-      <li>Configurar repetição em todas as camadas sem contar o produto das tentativas.</li></ul></div>
+      <li>Uma biblioteca partilhada que impõe <code>@ComponentScan</code> sobre o <em>package</em> do consumidor.</li>
+      <li>Propriedades sem prefixo próprio, a colidir com as do Boot.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-4" class="h2"><span class="secnum">14.4</span> Configuração, profiles e propriedades externas<a class="anchor" href="#sec-14-4" aria-label="ligação">#</a></h2>
+
+<p>O <code>Environment</code> do Spring é uma pilha ordenada de fontes de propriedades, e a primeira que responde ganha. Saber a ordem é o que permite responder à pergunta operacional mais frequente de todas — «porque é que a variável de ambiente que pus no <em>deployment</em> não teve efeito?» — sem tentativa e erro.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.1</span> Precedência prática das fontes de configuração no Spring Boot 3.x (a de cima ganha).</div>
+<div class="tscroll"><table><thead><tr><th>Fonte</th><th>Exemplo</th><th>Uso típico</th></tr></thead><tbody>
+<tr><td>Argumentos da linha de comandos</td><td><code>--acme.http.read-timeout=2s</code></td><td>Depuração pontual, tarefas <em>batch</em></td></tr>
+<tr><td>Propriedades de sistema da JVM</td><td><code>-Dspring.profiles.active=prod</code></td><td>Arranque em contentor</td></tr>
+<tr><td>Variáveis de ambiente</td><td><code>ACME_HTTP_READ_TIMEOUT=2s</code></td><td>Segredos e diferenças por ambiente</td></tr>
+<tr><td>Ficheiro externo específico do <em>profile</em></td><td><code>./config/application-prod.yaml</code></td><td><em>ConfigMap</em> montado</td></tr>
+<tr><td>Ficheiro externo genérico</td><td><code>./config/application.yaml</code></td><td>Sobreposição por ambiente</td></tr>
+<tr><td>Empacotado específico do <em>profile</em></td><td><code>classpath:application-prod.yaml</code></td><td>Diferenças versionadas com o código</td></tr>
+<tr><td>Empacotado genérico</td><td><code>classpath:application.yaml</code></td><td>Valores por defeito</td></tr>
+</tbody></table></div></div>
+
+<p>A ligação entre propriedades e objectos faz-se de duas maneiras, e a escolha não é de gosto. <code>@Value("${acme.http.read-timeout}")</code> injecta um valor solto, resolve-se por texto, não tem validação, não tem metadados para o IDE, exige o nome exacto da propriedade e falha em execução se a expressão estiver errada. <code>@ConfigurationProperties</code> liga um grupo inteiro a um tipo, suporta <em>relaxed binding</em> (<code>ACME_HTTP_READ_TIMEOUT</code> liga a <code>acme.http.read-timeout</code>), converte tipos ricos como <code>Duration</code> e <code>DataSize</code>, valida com Jakarta Validation e falha no arranque.</p>
+
+<figure class="listing java" id="lst-14-4"><div class="lhead"><span class="lnum">Listagem 14.4</span>
+<span class="lcap">Propriedades tipadas com record, valores por defeito e validação no arranque.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Validated
+@ConfigurationProperties(prefix = "acme.http")
+public record PropriedadesHttp(
+        @NotBlank String baseUrl,
+        @DefaultValue("500ms") Duration connectTimeout,
+        @DefaultValue("2s")    Duration readTimeout,
+        @Min(1) @Max(200) @DefaultValue("50") int maxLigacoes) {
+
+    // Construtor compacto: invariantes que a validação declarativa não cobre.
+    public PropriedadesHttp {
+        if (readTimeout.compareTo(connectTimeout) &lt; 0) {
+            throw new IllegalArgumentException(
+                "read-timeout (" + readTimeout + ") tem de ser >= connect-timeout ("
+                + connectTimeout + ")");
+        }
+    }
+}
+
+// Uma vez na aplicação; dispensa @EnableConfigurationProperties por tipo.
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class Aplicacao {
+    public static void main(String[] args) { SpringApplication.run(Aplicacao.class, args); }
+}</code></pre></figure>
+
+<figure class="listing yaml" id="lst-14-5"><div class="lhead"><span class="lnum">Listagem 14.5</span>
+<span class="lcap">Documento único com profiles activados por condição e grupos de profiles.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>spring:
+  application:
+    name: servico-pagamentos
+  profiles:
+    group:
+      prod: [ "prod-db", "prod-observabilidade" ]   # um nome liga vários profiles
+
+acme:
+  http:
+    base-url: http://localhost:8081
+    read-timeout: 2s
+
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+acme:
+  http:
+    base-url: https://antifraude.interno.acme.eu
+    read-timeout: 800ms      # SLA mais apertado em produção
+logging:
+  level:
+    root: INFO
+    com.acme: INFO           # DEBUG em prod custa I/O e dinheiro de ingestão</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Profiles</em> são convenientes para diferenças de ambiente (<code>dev</code>, <code>prod</code>) mas péssimos como interruptores de funcionalidade. Cada <code>@Profile</code> numa classe de <em>bean</em> cria uma combinação de contexto que ninguém testa: com quatro <em>profiles</em> independentes há 16 configurações possíveis e o <em>pipeline</em> só valida duas. Para ligar e desligar comportamento, usa-se <code>@ConditionalOnProperty</code> com uma propriedade explícita — testável, documentada nos metadados e alterável sem redesdobrar quando vem de um servidor de configuração.</p></aside>
+
+<div class="qa" id="q-14-8" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando é que usa <code>@Value</code> e quando é que usa <code>@ConfigurationProperties</code>? Dê-me um caso em que o <code>@Value</code> falha de uma forma que o <code>@ConfigurationProperties</code> não falharia.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Regra: <code>@ConfigurationProperties</code> para qualquer grupo de propriedades que descreva um subsistema — cliente HTTP, política de <em>retry</em>, limites de <em>batch</em>; <code>@Value</code> apenas para valores isolados e sem parentesco, ou onde é preciso SpEL. Numa base madura, o número de <code>@Value</code> em código de produção deve caber numa mão.</p>
+      <p>O caso concreto em que o <code>@Value</code> falha: uma propriedade que só existe em produção, injectada num <em>bean</em> criado a pedido. Como o <code>@Value</code> é resolvido no momento em que o <em>bean</em> é criado, e não há validação global, o arranque passa e o erro só aparece quando o <em>bean</em> é instanciado — no caso de um <em>bean</em> <em>lazy</em> ou de âmbito de pedido, isso significa um erro 500 em produção. Com <code>@ConfigurationProperties</code> mais <code>@Validated</code>, um <code>@NotBlank</code> em falta faz o contexto rebentar no arranque, o <em>pod</em> nunca fica <em>ready</em>, e o <em>rollout</em> em Kubernetes pára automaticamente sem afectar as réplicas antigas.</p>
+      <p>Há um segundo caso, mais insidioso: <em>relaxed binding</em>. Uma variável de ambiente <code>ACME_HTTP_READ_TIMEOUT</code> liga-se sem problema a <code>acme.http.read-timeout</code> num tipo <code>@ConfigurationProperties</code>, mas <code>@Value("${acme.http.read-timeout}")</code> depende de a fonte expor exactamente esse nome — o que funciona, mas deixa de funcionar assim que alguém escreve <code>acme.http.readTimeout</code> algures. A ligação relaxada é uma propriedade do <em>binder</em>, não do <code>Environment</code>.</p>
+      <p>O terceiro ganho é ferramental: o processador de anotações gera <code>spring-configuration-metadata.json</code>, o IDE oferece completação e descrição, e o <code>/actuator/configprops</code> mostra os valores efectivos com segredos ocultados. Com <code>@Value</code> não há inventário: a única forma de saber que propriedades a aplicação lê é <code>grep</code>. O custo do <code>@ConfigurationProperties</code> é uma classe por grupo — dez a quinze linhas — e é o melhor negócio de configuração que o Boot oferece.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«São equivalentes, o <code>@Value</code> é mais rápido de escrever.»</td></tr>
+        <tr><td>Mid</td><td>Sabe que <code>@ConfigurationProperties</code> agrupa e é mais limpo, mas não fala de validação nem de <em>relaxed binding</em>.</td></tr>
+        <tr><td>Sénior</td><td>Dá a regra, o exemplo da falha tardia versus falha no arranque, e a ligação relaxada com variáveis de ambiente.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta os metadados, o <code>/actuator/configprops</code>, a interacção com o <em>rollout</em> do Kubernetes e a política para segredos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como valida no arranque que uma propriedade obrigatória existe?»</li>
+      <li>«Onde põe as palavras-passe da base de dados e como evita que apareçam no <code>/actuator/env</code>?»</li>
+      <li>«Como muda um valor sem redesdobrar?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Segredos em <code>application.yaml</code> versionado no repositório.</li>
+      <li><code>@Value</code> com valor por defeito duplicado em cinco classes.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-9" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Alguém pôs <code>ACME_HTTP_READ_TIMEOUT=5s</code> no <em>deployment</em> de produção e o serviço continua a usar 800 ms. Como investiga isto em cinco minutos, sem redesdobrar?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começa-se por olhar para o valor efectivo em vez de para o ficheiro. <code>/actuator/configprops</code> mostra o objecto <code>@ConfigurationProperties</code> como foi ligado, e <code>/actuator/env/acme.http.read-timeout</code> mostra a lista de fontes que declaram essa propriedade, por ordem de precedência, com a que ganhou identificada. Em cinco minutos isto resolve a esmagadora maioria dos casos, e por isso estes dois pontos ficam expostos numa porta de gestão interna mesmo quando tudo o resto está fechado.</p>
+      <p>As causas ordenadas por frequência real: existe um <code>application-prod.yaml</code> externo montado como <em>ConfigMap</em> em <code>./config/</code>, que tem precedência sobre a variável de ambiente na leitura do Boot? Não — é ao contrário, a variável de ambiente ganha ao ficheiro; por isso a primeira suspeita passa a ser um argumento de linha de comandos ou uma propriedade de sistema <code>-D</code> no <code>JAVA_TOOL_OPTIONS</code>, que ganham a ambos. Segunda suspeita: o valor não está a ser lido por <code>@ConfigurationProperties</code> mas por um <code>@Value</code> com um nome ligeiramente diferente, e a ligação relaxada não se aplica. Terceira: o <em>bean</em> guardou o valor no arranque e o <em>pod</em> não foi reiniciado depois da alteração do <em>ConfigMap</em>.</p>
+      <p>A quarta, específica de Kubernetes e a que mais tempo consome: o <em>ConfigMap</em> foi actualizado mas o <em>Deployment</em> não mudou, logo não houve <em>rollout</em>, logo os <em>pods</em> continuam com o ambiente antigo — as variáveis de ambiente de um processo são fixas desde o <code>exec</code>. A correcção estrutural é anotar o <em>Deployment</em> com um <em>hash</em> do <em>ConfigMap</em>, para que qualquer alteração force um novo <em>rollout</em>.</p>
+      <p>Nota de segurança que vale pontos: <code>/actuator/env</code> expõe configuração e é um alvo de exfiltração. Fica em porta de gestão separada, sem acesso pela <em>ingress</em> pública, e os valores sensíveis são ocultados por <code>management.endpoint.env.show-values=when-authorized</code> — o Boot 3 oculta valores por defeito, o que é o comportamento que se quer.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe adicionar <em>logs</em> e redesdobrar para ver o valor.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>/actuator/env</code> mas não sabe a ordem de precedência de cor.</td></tr>
+        <tr><td>Sénior</td><td>Usa <code>configprops</code> e <code>env</code>, recita a precedência, e identifica o <code>@Value</code> sem ligação relaxada como suspeito.</td></tr>
+        <tr><td>Staff</td><td>Chega à causa de plataforma (<em>ConfigMap</em> sem <em>rollout</em>), propõe o <em>hash</em> no <em>Deployment</em> e fecha a exposição do <em>endpoint</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é que um <em>ConfigMap</em> montado como ficheiro difere de um montado como variável de ambiente?»</li>
+      <li>«Como recarrega configuração sem reiniciar o processo?»</li>
+      <li>«Quem pode chamar <code>/actuator/env</code> no vosso <em>cluster</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Expor os <em>endpoints</em> do Actuator com <code>include: "*"</code> na mesma porta da API pública.</li>
+      <li>Assumir que alterar um <em>ConfigMap</em> altera o ambiente de um processo já em execução.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-14-5" class="h2"><span class="secnum">14.5</span> AOP: transacções, cache e o problema da auto-invocação<a class="anchor" href="#sec-14-5" aria-label="ligação">#</a></h2>
+
+<p>Tudo o que é declarativo no Spring — <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@Retryable</code>, <code>@PreAuthorize</code> — é implementado por interceptação. No fim da inicialização de um <em>bean</em> elegível, um <code>BeanPostProcessor</code> substitui a instância por um <em>proxy</em>, e é o <em>proxy</em> que fica no contentor. Quem injecta esse <em>bean</em> recebe o <em>proxy</em>; a instância original só é conhecida pelo <em>proxy</em>, que a guarda como alvo.</p>
+
+<p>Daqui sai a regra que explica noventa por cento dos defeitos desta área: <strong>o comportamento declarativo só se aplica a chamadas que entram pelo <em>proxy</em></strong>. Uma chamada de <code>this.metodo()</code> dentro do mesmo objecto vai directa ao alvo e não vê anotação nenhuma. Um método <code>private</code> nunca é interceptado, seja qual for o tipo de <em>proxy</em>. E um método chamado a partir de <code>@PostConstruct</code> executa antes de o <em>proxy</em> existir.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.2</span> Mecanismos de interceptação e o que cada um consegue interceptar.</div>
+<div class="tscroll"><table><thead><tr><th>Mecanismo</th><th>Como funciona</th><th>Limites</th><th>Quando é a escolha certa</th></tr></thead><tbody>
+<tr><td><em>Proxy</em> dinâmico JDK</td><td>Implementa as interfaces do <em>bean</em>; delega no alvo</td><td>Só métodos declarados em interfaces; o tipo do <em>bean</em> deixa de ser a classe concreta</td><td>Código orientado a interfaces, sem injecção pelo tipo concreto</td></tr>
+<tr><td>CGLIB (defeito no Boot)</td><td>Subclasse gerada em <em>runtime</em>, sobrepõe os métodos</td><td>Não intercepta <code>private</code>, <code>static</code> nem <code>final</code>; a classe não pode ser <code>final</code></td><td>Defeito razoável; o Boot fixa <code>spring.aop.proxy-target-class=true</code></td></tr>
+<tr><td>AspectJ com <em>weaving</em></td><td>Modifica o <em>bytecode</em> em compilação ou carregamento</td><td>Exige agente ou <em>plugin</em> de compilação; depuração mais difícil</td><td>Quando é mesmo necessário interceptar auto-invocação ou <code>private</code></td></tr>
+</tbody></table></div></div>
+
+<figure class="listing java" id="lst-14-6"><div class="lhead"><span class="lnum">Listagem 14.6</span>
+<span class="lcap">Três chamadas, três comportamentos: só a que passa pelo proxy abre transacção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+public class ServicoRelatorios {
+
+    @Transactional(readOnly = true)
+    public Relatorio publico(long id) {          // 1) chamada externa: intercepta
+        return carregar(id);                     // 2) this.carregar(): NÃO intercepta
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Relatorio carregar(long id) { ... }   // anotação ignorada na chamada 2
+
+    @Cacheable("relatorios")
+    private Relatorio interno(long id) { ... }   // 3) private: nunca interceptado
+}
+
+// Verificação rápida em runtime, útil num teste de arquitectura:
+//   AopUtils.isAopProxy(bean)        -> é proxy?
+//   AopUtils.isCglibProxy(bean)      -> subclasse CGLIB?
+//   TransactionSynchronizationManager.isActualTransactionActive()  -> há transacção?</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Não há aviso nenhum. O código compila, os testes que chamam o método público passam, e a anotação ignorada só se manifesta quando uma linha falha a meio e o lote inteiro reverte — ou quando um <code>@Cacheable</code> nunca produz um acerto e a base de dados leva 100% do tráfego que se julgava servido por <em>cache</em>. Um teste que conte transacções ou acertos de <em>cache</em> é a única defesa barata.</p></aside>
+
+<div class="qa" id="q-14-10" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um método anotado com <code>@Transactional</code> não está a abrir transacção nenhuma. Dê-me todas as causas possíveis, por ordem do que verificaria primeiro.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Verifico por esta ordem, porque é a ordem da frequência real. Primeira: auto-invocação — o método é chamado de dentro da mesma classe, a chamada não passa pelo <em>proxy</em> e a anotação é ignorada. Segunda: visibilidade — o método é <code>private</code>, e um <code>private</code> nunca é interceptado; a regra segura é anotar apenas métodos públicos invocados de fora. Terceira: o objecto não é um <em>bean</em> — foi criado com <code>new</code> algures, e sem contentor não há <em>proxy</em>.</p>
+      <p>Quarta: <code>final</code>. Com <em>proxy</em> CGLIB, que é o defeito no Boot, um método <code>final</code> não pode ser sobreposto e uma classe <code>final</code> não pode ser subclassificada; a interceptação desaparece ou o arranque falha. Quinta: a chamada parte de <code>@PostConstruct</code>, que corre antes de o <em>proxy</em> existir. Sexta: não há <code>PlatformTransactionManager</code> adequado — típico com dois <code>DataSource</code>, em que o <code>@Transactional</code> sem <code>transactionManager = "..."</code> escolhe o <code>@Primary</code> e abre transacção na base de dados errada.</p>
+      <p>Sétima, a mais subtil: a excepção lançada é <em>checked</em>. A transacção existiu, mas o <code>rollback</code> não aconteceu, porque a regra por defeito só reverte em <code>RuntimeException</code> e <code>Error</code>. Quem observa «os dados ficaram gravados apesar do erro» descreve isto e não a ausência de transacção. Resolve-se com <code>@Transactional(rollbackFor = Exception.class)</code> ou, melhor, envolvendo em <em>unchecked</em> na fronteira.</p>
+      <p>Para confirmar em vez de adivinhar: activar <code>logging.level.org.springframework.transaction.interceptor=TRACE</code>, que imprime uma linha por transacção iniciada e concluída; ou, num teste, afirmar <code>TransactionSynchronizationManager.isActualTransactionActive()</code> dentro do método. As correcções para a auto-invocação, por ordem de preferência: extrair o método para um <em>bean</em> colaborador — o que quase sempre revela que a responsabilidade estava mal colocada; usar <code>TransactionTemplate</code> explicitamente onde é preciso controlo fino; injectar-se a si próprio com <code>@Lazy</code>; e, em último lugar, <code>AopContext.currentProxy()</code> com <code>@EnableAspectJAutoProxy(exposeProxy = true)</code>, que funciona mas amarra o código ao Spring de uma forma que ninguém gosta de ler.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Sugere pôr a anotação na classe ou acrescentar <code>@EnableTransactionManagement</code> sem saber porquê.</td></tr>
+        <tr><td>Mid</td><td>Refere a auto-invocação e o <code>private</code>, mas não explica o <em>proxy</em> nem menciona a regra de <em>rollback</em>.</td></tr>
+        <tr><td>Sénior</td><td>Lista as causas por frequência, explica o <em>proxy</em> criado no fim da inicialização, distingue «sem transacção» de «sem <em>rollback</em>» e sabe como confirmar.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o caso de vários <code>TransactionManager</code>, propõe teste ou regra ArchUnit que impeça a reincidência e discute o custo de AspectJ.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escreve um teste que falha se alguém reintroduzir a auto-invocação?»</li>
+      <li>«Porque é que o defeito é reverter só em <em>unchecked</em>?»</li>
+      <li>«O que muda se activar AspectJ com <em>load-time weaving</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que <code>@Transactional</code> na classe resolve a auto-invocação.</li>
+      <li>Não distinguir «não abriu transacção» de «abriu mas não reverteu».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-14-11" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Anotámos um método com <code>@Async</code> e outro com <code>@Cacheable</code>, e ambos parecem não fazer nada. Que perguntas faz? E que armadilhas específicas do <code>@Async</code> acrescentaria mesmo que ele funcionasse?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro, as perguntas comuns aos dois, porque partilham o mesmo mecanismo de <em>proxy</em>: a chamada vem de fora do <em>bean</em>? O método é público e não <code>final</code>? Está activada a anotação de habilitação (<code>@EnableAsync</code>, <code>@EnableCaching</code>, esta última implícita quando há um <em>starter</em> de <em>cache</em> configurado)? Existe o <em>bean</em> de infra-estrutura correspondente — um <code>CacheManager</code>, um <code>Executor</code>?</p>
+      <p>Depois, as específicas. No <code>@Cacheable</code>: qual é a chave? Com vários parâmetros e sem <code>key</code> explícita, o <code>SimpleKeyGenerator</code> compõe uma chave com todos — inclui um <code>Pageable</code> ou um <code>Clock</code> e o acerto nunca acontece. E, se a <em>cache</em> for Redis, o valor tem de ser serializável de forma estável: mudar um campo de um DTO com serialização Java rebenta a leitura de tudo o que já está lá, o que obriga a versionar o prefixo da chave.</p>
+      <p>No <code>@Async</code>, três armadilhas independentes do <em>proxy</em>. A primeira é o <em>executor</em>: sem configuração explícita, o Boot fornece um <code>SimpleAsyncTaskExecutor</code>, que na configuração por defeito não reutiliza <em>threads</em> — é aceitável com <em>virtual threads</em> ligadas (<code>spring.threads.virtual.enabled=true</code>), e é um risco sério sem elas. Deve declarar-se um <code>ThreadPoolTaskExecutor</code> com fila limitada e uma <code>RejectedExecutionHandler</code> escolhida, para que a saturação produza rejeição visível em vez de uma fila infinita que acaba em <code>OutOfMemoryError</code>.</p>
+      <p>A segunda é o valor de retorno: um método <code>@Async</code> que devolva <code>void</code> perde a excepção — vai para o <code>AsyncUncaughtExceptionHandler</code>, que por defeito só regista. Devolver <code>CompletableFuture</code> devolve o controlo do erro a quem chama. A terceira é o contexto: a transacção, o <code>SecurityContext</code> e o <em>span</em> de <em>tracing</em> vivem em <code>ThreadLocal</code> e não atravessam a fronteira da <em>thread</em> sem propagação explícita — daí que <code>@Transactional</code> em conjunto com <code>@Async</code> no mesmo método seja quase sempre um erro: a transacção fica na <em>thread</em> nova, e quem chamou já retornou.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não liga as duas anotações ao mesmo mecanismo; propõe «pôr <code>@EnableAsync</code> e ver».</td></tr>
+        <tr><td>Mid</td><td>Identifica a auto-invocação, mas não sabe qual é o <em>executor</em> por defeito nem como se compõe a chave da <em>cache</em>.</td></tr>
+        <tr><td>Sénior</td><td>Diagnóstico partilhado do <em>proxy</em>, chave da <em>cache</em>, <em>executor</em> dimensionado com fila limitada, e perda de contexto entre <em>threads</em>.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta serialização e versionamento de chaves em Redis, política de rejeição sob saturação e o efeito das <em>virtual threads</em> na escolha do <em>pool</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como dimensiona a fila e o número de <em>threads</em> desse <em>executor</em>?»</li>
+      <li>«O que acontece ao <em>trace id</em> quando o trabalho salta para outra <em>thread</em>?»</li>
+      <li>«Como invalida uma entrada de <em>cache</em> em oito réplicas ao mesmo tempo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Combinar <code>@Async</code> e <code>@Transactional</code> no mesmo método sem perceber onde fica a transacção.</li>
+      <li>Fila ilimitada num <code>ThreadPoolTaskExecutor</code> «para não perder trabalho».</li></ul></div>
   </div>
 </div>
 
 <div class="lab" id="lab-14-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 14.1 — Endpoint idempotente com chave e repetição segura</span>
-    <div class="labpills"><span class="qpill">Correcção sob concorrência</span><span class="qpill">30 min</span></div></div>
+  <div class="labhead"><span class="labttl">Exercício 14.1 — Diagnosticar e corrigir um <code>@Transactional</code> auto-invocado</span>
+    <div class="labpills"><span class="qpill">Diagnóstico</span><span class="qpill">25 min</span></div></div>
   <div class="labbody">
-    <p>Implemente <code>POST /v1/pagamentos</code> em Spring Boot 3.x de forma a que N chamadas com o mesmo <code>Idempotency-Key</code> produzam exactamente um pagamento e devolvam sempre a mesma resposta. Restrições: PostgreSQL como única fonte de verdade (sem Redis, sem <em>lock</em> distribuído externo); duas instâncias do serviço a receber as repetições em paralelo; a chave é opcional apenas para clientes internos, obrigatória para os externos. Comportamento exigido: primeira chamada devolve <code>201</code> com <code>Location</code>; repetição depois de concluída devolve o mesmo <code>201</code> e o mesmo corpo, com <code>Idempotent-Replay: true</code>; repetição enquanto a primeira ainda corre devolve <code>409</code> com <code>Retry-After: 1</code>; mesma chave com corpo diferente devolve <code>422</code>. Exemplo: dois <code>POST</code> simultâneos com chave <code>7f3a…</code> e corpo <code>{"contaOrigem": 8842, "montanteEmCentimos": 4990}</code> resultam em um único registo em <code>pagamento</code> e duas respostas <code>201</code> idênticas (uma delas marcada como repetição).</p>
+    <p>O serviço abaixo importa um ficheiro com 10 000 linhas de pagamentos. O requisito é que cada linha seja gravada na sua própria transacção: uma linha inválida deve ser registada como erro e as restantes têm de ficar gravadas. Em produção observa-se o contrário — quando a linha 7 412 falha com <code>DataIntegrityViolationException</code>, o lote inteiro desaparece e o relatório vem vazio. O código é: <code>@Transactional public Relatorio importar(List&lt;Linha&gt; linhas)</code> que percorre as linhas e chama <code>this.gravarLinha(linha)</code>, sendo <code>gravarLinha</code> anotado com <code>@Transactional(propagation = Propagation.REQUIRES_NEW)</code> e a apanhar a excepção dentro do <code>try</code>. Tarefas: (a) explicar em três frases porque é que o lote reverte todo; (b) corrigir sem AspectJ nem <code>AopContext</code>; (c) escrever o teste que falha antes da correcção e passa depois; (d) dizer qual é o efeito no <em>pool</em> de ligações e como dimensioná-lo.</p>
     <h4>A sua solução</h4>
     <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
     <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-14-4"><div class="lhead"><span class="lnum">Listagem 14.4</span>
-        <span class="lcap">Idempotência ancorada numa restrição de unicidade, com registo prévio em estado <code>EM_CURSO</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>@RestController
-@RequestMapping("/v1/pagamentos")
-class PagamentoController {
+      <figure class="listing java" id="lst-14-7"><div class="lhead"><span class="lnum">Listagem 14.7</span>
+        <span class="lcap">Colaborador separado para forçar a passagem pelo proxy, e o teste que o prova.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// (b) O comportamento REQUIRES_NEW passa para um bean próprio: a chamada
+//     sai do objecto, entra pelo proxy, e cada linha ganha transacção nova.
+@Component
+public class GravadorLinha {
 
-    private final ServicoIdempotente idempotencia;
-    private final PagamentoService pagamentos;
-    private final ObjectMapper json;
+    private final RepositorioPagamentos repositorio;
 
-    PagamentoController(ServicoIdempotente idempotencia, PagamentoService pagamentos,
-                        ObjectMapper json) {
-        this.idempotencia = idempotencia;
-        this.pagamentos = pagamentos;
-        this.json = json;
+    public GravadorLinha(RepositorioPagamentos repositorio) {
+        this.repositorio = repositorio;
     }
 
-    @PostMapping
-    ResponseEntity&lt;String&gt; criar(@RequestHeader(name = "Idempotency-Key", required = false) String chave,
-                                 @Valid @RequestBody PedidoPagamento pedido) throws Exception {
-
-        if (chave == null || chave.isBlank()) {           // clientes internos: caminho directo
-            Pagamento p = pagamentos.criar(pedido);
-            return criado(p, false);
-        }
-        String impressao = impressaoDigital(pedido);      // SHA-256 do corpo canonizado
-        Resultado r = idempotencia.executar(chave, impressao, () -&gt; {
-            Pagamento p = pagamentos.criar(pedido);       // corre na MESMA transacção
-            return new Resposta(201, escrever(p), p.id().toString());
-        });
-
-        return switch (r) {
-            case Resultado.Primeira f -&gt; ResponseEntity.status(f.resposta().estado())
-                    .location(URI.create("/v1/pagamentos/" + f.resposta().id()))
-                    .body(f.resposta().corpo());
-            case Resultado.Repetida rep -&gt; ResponseEntity.status(rep.resposta().estado())
-                    .header("Idempotent-Replay", "true")
-                    .location(URI.create("/v1/pagamentos/" + rep.resposta().id()))
-                    .body(rep.resposta().corpo());
-            case Resultado.EmCurso ignorado -&gt; throw new PedidoEmCursoException();   // -&gt; 409
-            case Resultado.CorpoDiferente ignorado -&gt; throw new ChaveReutilizadaException(); // -&gt; 422
-        };
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void gravar(Linha linha) {
+        repositorio.save(Pagamento.de(linha));   // valida e persiste
     }
 }
 
 @Service
-class ServicoIdempotente {
+public class ImportadorPagamentos {
 
-    private final JdbcClient db;
-    private final Duration retencao = Duration.ofDays(7);
+    private final GravadorLinha gravador;
 
-    ServicoIdempotente(JdbcClient db) { this.db = db; }
+    public ImportadorPagamentos(GravadorLinha gravador) { this.gravador = gravador; }
 
-    /** A reserva da chave corre em transacção PRÓPRIA: uma violação de unicidade
-     *  aborta a transacção onde ocorre, e não pode arrastar a transacção de negócio. */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    boolean reservar(String chave, String impressao) {
-        int linhas = db.sql("""
-                INSERT INTO idempotencia (chave, impressao, estado, expira_em)
-                VALUES (?, ?, 'EM_CURSO', ?)
-                ON CONFLICT (chave) DO NOTHING
-                """)
-                .params(chave, impressao, Instant.now().plus(retencao))
-                .update();
-        return linhas == 1;                                // 1 = ganhou a corrida
-    }
-
-    @Transactional                                         // transacção de negócio
-    Resultado executar(String chave, String impressao, Supplier&lt;Resposta&gt; accao) {
-        if (!reservar(chave, impressao)) {
-            Registo existente = db.sql("SELECT * FROM idempotencia WHERE chave = ?")
-                    .param(chave).query(Registo.class).single();
-            if (!MessageDigest.isEqual(existente.impressao().getBytes(UTF_8),
-                                       impressao.getBytes(UTF_8))) {
-                return new Resultado.CorpoDiferente();
+    // SEM @Transactional aqui: uma transacção exterior a envolver 10 000 linhas
+    // manteria 10 000 bloqueios abertos durante minutos.
+    public Relatorio importar(List&lt;Linha&gt; linhas) {
+        var erros = new ArrayList&lt;String&gt;();
+        for (Linha linha : linhas) {
+            try {
+                gravador.gravar(linha);          // passa pelo proxy: commit por linha
+            } catch (DataAccessException e) {    // transacção interna já reverteu
+                erros.add(linha.id() + ": " + e.getMostSpecificCause().getMessage());
             }
-            if (existente.estado() == Estado.EM_CURSO) {
-                return new Resultado.EmCurso();            // não bloqueia uma thread à espera
-            }
-            return new Resultado.Repetida(existente.resposta());
         }
+        return new Relatorio(linhas.size() - erros.size(), erros);
+    }
+}
 
-        Resposta resposta = accao.get();                   // efeito de negócio
+// (c) Teste que falha antes da correcção e passa depois.
+@SpringBootTest
+@Testcontainers
+class ImportadorPagamentosIT {
 
-        db.sql("""
-                UPDATE idempotencia
-                   SET estado = 'CONCLUIDO', estado_http = ?, corpo = ?, recurso_id = ?
-                 WHERE chave = ?
-                """)
-                .params(resposta.estado(), resposta.corpo(), resposta.id(), chave)
-                .update();                                 // MESMA transacção do efeito
+    @Autowired ImportadorPagamentos importador;
+    @Autowired RepositorioPagamentos repositorio;
 
-        return new Resultado.Primeira(resposta);
+    @Test
+    void linha_invalida_nao_arrasta_as_validas() {
+        var linhas = List.of(
+                new Linha("A1", "10.00"),
+                new Linha("A2", null),      // viola NOT NULL: rebenta no flush
+                new Linha("A3", "30.00"));
+
+        Relatorio r = importador.importar(linhas);
+
+        assertThat(r.gravadas()).isEqualTo(2);
+        assertThat(r.erros()).hasSize(1).first().asString().contains("A2");
+        assertThat(repositorio.count()).isEqualTo(2);   // antes da correcção: 0
     }
 }</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>Custo por pedido: uma inserção com <code>ON CONFLICT</code> e uma actualização, ambas por chave primária — O(log n) no B-tree, na ordem de 0,2 a 0,5 ms cada em PostgreSQL 17 com a tabela em memória. O acréscimo de latência ronda 1 ms; a duplicação de um pagamento custa ordens de grandeza mais.</li>
-        <li>A corrida entre duas instâncias resolve-se na base de dados, não na aplicação: <code>ON CONFLICT (chave) DO NOTHING</code> devolve 0 linhas ao perdedor. Quem propõe «verificar se existe e depois inserir» tem uma condição de corrida e o entrevistador vai atrás dela.</li>
-        <li>A actualização para <code>CONCLUIDO</code> tem de estar na mesma transacção que o efeito de negócio. Se estiverem separadas, uma falha entre as duas deixa a chave presa em <code>EM_CURSO</code> e todas as repetições recebem <code>409</code> para sempre — daí ser indispensável um prazo de expiração de <code>EM_CURSO</code> (por exemplo 60 s) que permita a uma nova tentativa reclamar a chave.</li>
-        <li>Se a transacção de negócio falhar, a reserva feita em <code>REQUIRES_NEW</code> não é revertida — é o comportamento desejado para evitar corridas, mas exige o mesmo mecanismo de expiração para não bloquear repetições legítimas.</li>
-        <li>A impressão digital deve ser calculada sobre uma forma canónica do corpo (chaves ordenadas, espaços normalizados); comparar bytes crus faz um cliente que reordena campos JSON receber <code>422</code> indevidamente. A comparação usa <code>MessageDigest.isEqual</code> para não depender do tempo de execução.</li>
-        <li>Guardar o corpo da resposta memorizada tem limite: acima de alguns KB, guarda-se apenas o identificador do recurso e reconstrói-se a resposta por leitura. Guardar 2 MB por chave numa tabela quente é como se destrói o <em>cache</em> de páginas.</li>
-        <li>Casos limite a mencionar sem ser perguntado: chave reutilizada depois da expiração (comporta-se como pedido novo — daí a retenção ter de exceder a janela de repetição do cliente), chave partilhada entre comerciantes diferentes (a unicidade deve ser sobre <code>(id_comerciante, chave)</code>), e limpeza dos registos expirados por partição em vez de <code>DELETE</code> massivo.</li>
+        <li>(a) A resposta esperada em três frases: <code>this.gravarLinha(...)</code> não passa pelo <em>proxy</em>, logo <code>REQUIRES_NEW</code> é ignorado; tudo corre na transacção exterior aberta por <code>importar</code>; quando o <em>driver</em> marca a transacção como <em>rollback-only</em>, o <code>commit</code> final reverte as 10 000 linhas mesmo com a excepção apanhada.</li>
+        <li>Apanhar a excepção dentro da mesma transacção não a salva: o Spring marca a transacção como <em>rollback-only</em> e o <code>commit</code> termina com <code>UnexpectedRollbackException</code>. Quem sabe isto ganha meio nível.</li>
+        <li>(d) <code>REQUIRES_NEW</code> suspende a transacção exterior e pede uma <strong>segunda</strong> ligação ao <em>pool</em>. Com transacção exterior mantida e N <em>threads</em> a importar, são necessárias 2N ligações; com um Hikari de 10 e 10 <em>threads</em>, o resultado é <em>deadlock</em> de <em>pool</em> — cada <em>thread</em> segura uma ligação e espera pela segunda. Retirar o <code>@Transactional</code> exterior elimina o problema na raiz.</li>
+        <li>Custo por linha: uma transacção por linha significa 10 000 <em>commits</em>. Com <code>fsync</code> a 1 ms, são 10 s só de <em>commits</em>. A alternativa é agrupar em lotes de 100 a 500 linhas por transacção, trocando granularidade de erro por 20 a 100 vezes menos <em>commits</em> — é o <em>trade-off</em> que se deve enunciar sem que o perguntem.</li>
+        <li>Alternativa sem novo <em>bean</em>: injectar um <code>TransactionTemplate</code> com <code>PROPAGATION_REQUIRES_NEW</code> e envolver a gravação. Mais explícito e sem <em>proxy</em> à mistura; menos idiomático para quem espera anotações.</li>
+        <li>O que o entrevistador procura: que se nomeie o <em>proxy</em> como causa, que não se proponha <code>AopContext</code> como primeira opção, que o teste conte registos em vez de verificar <em>logs</em>, e que se fale do <em>pool</em> sem ser perguntado.</li>
       </ul>
     </div>
   </div>
 </div>
 
-<figure class="listing sql" id="lst-14-5"><div class="lhead"><span class="lnum">Listagem 14.5</span>
-<span class="lcap">Tabela de idempotência particionada por dia, com expiração barata.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE TABLE idempotencia (
-    id_comerciante bigint       NOT NULL,
-    chave          text         NOT NULL,
-    impressao      char(64)     NOT NULL,          -- SHA-256 hex do corpo canónico
-    estado         text         NOT NULL CHECK (estado IN ('EM_CURSO', 'CONCLUIDO')),
-    estado_http    smallint,
-    recurso_id     uuid,
-    corpo          text,                            -- truncado; acima de 8 KB guarda-se só recurso_id
-    criado_em      timestamptz  NOT NULL DEFAULT now(),
-    expira_em      timestamptz  NOT NULL,
-    PRIMARY KEY (id_comerciante, chave, criado_em)
-) PARTITION BY RANGE (criado_em);
+<h2 id="sec-14-6" class="h2"><span class="secnum">14.6</span> Actuator e o que expor em produção<a class="anchor" href="#sec-14-6" aria-label="ligação">#</a></h2>
 
--- Uma partição por dia: a limpeza é DROP PARTITION (milissegundos),
--- não um DELETE de milhões de linhas numa tabela quente.
-CREATE TABLE idempotencia_2026_09_01 PARTITION OF idempotencia
-    FOR VALUES FROM ('2026-09-01') TO ('2026-09-02');
+<p>O Actuator é a superfície operacional da aplicação e, por isso, também é superfície de ataque. No Boot 3 apenas o <em>endpoint</em> <code>health</code> está exposto por HTTP por defeito; tudo o resto exige inclusão explícita. A configuração correcta em Kubernetes tem três decisões: que <em>endpoints</em> incluir, em que porta, e como separar <em>liveness</em> de <em>readiness</em>.</p>
 
--- Reclamar chaves presas em EM_CURSO por falha de processo (janela de 60 s).
-UPDATE idempotencia
-   SET estado = 'EM_CURSO', criado_em = now()
- WHERE id_comerciante = $1 AND chave = $2
-   AND estado = 'EM_CURSO' AND criado_em &lt; now() - interval '60 seconds';</code></pre></figure>
+<p>A separação das sondas é a parte que mais custa quando está errada. A sonda de <em>liveness</em> responde a uma única pergunta: «este processo está irrecuperável e deve ser morto?». Se ela incluir a base de dados, uma indisponibilidade de 60 segundos do PostgreSQL faz o <em>kubelet</em> reiniciar todas as réplicas ao mesmo tempo — transformando uma falha recuperável de dependência numa indisponibilidade total com <em>cold start</em> em cima. A sonda de <em>readiness</em>, essa, deve incluir as dependências sem as quais a aplicação não consegue servir: aí sim, o <em>pod</em> sai do <em>Service</em>, deixa de receber tráfego, e volta sozinho quando a base de dados regressa.</p>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Com 5 milhões de pedidos por dia, 400 bytes por registo de idempotência e 7 dias de retenção, a tabela ronda 14 GB — cerca de 2 GB por partição diária. O <code>DROP</code> de uma partição demora milissegundos; um <code>DELETE</code> equivalente de 5 milhões de linhas gera dezenas de GB de WAL, prende o <em>autovacuum</em> durante horas e degrada o p99 de escrita da tabela.</p></aside>
+<figure class="listing yaml" id="lst-14-8"><div class="lhead"><span class="lnum">Listagem 14.8</span>
+<span class="lcap">Actuator numa porta de gestão separada, com grupos de health distintos.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>management:
+  server:
+    port: 9090                 # fora da porta 8080 exposta pelo ingress
+  endpoints:
+    web:
+      exposure:
+        include: [ health, info, metrics, prometheus, conditions, configprops, loggers ]
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true          # cria /actuator/health/liveness e /readiness
+      group:
+        liveness:
+          include: [ livenessState ]                    # NUNCA a base de dados
+        readiness:
+          include: [ readinessState, db, redis ]        # dependências para servir
+  metrics:
+    tags:
+      application: ${spring.application.name}
 
-<h2 id="sec-14-5" class="h2"><span class="secnum">14.5</span> Timeouts, circuit breakers e bulkheads<a class="anchor" href="#sec-14-5" aria-label="ligação">#</a></h2>
+server:
+  shutdown: graceful           # termina pedidos em curso antes de fechar
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s</code></pre></figure>
 
-<p>Um serviço sem <em>timeout</em> explícito herda o do cliente HTTP, que historicamente é infinito ou dezenas de segundos. É a causa mais comum de indisponibilidade em cascata: a dependência não falha, apenas fica lenta; as <em>threads</em> do serviço ficam retidas à espera; o <em>pool</em> esgota-se; e o serviço deixa de responder também aos pedidos que nem sequer tocam nessa dependência. A defesa não é uma técnica, são três em camada — orçamento de <em>timeout</em>, isolamento de recursos e disjuntor — e cada uma resolve um problema distinto.</p>
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Com <code>server.shutdown=graceful</code> e <code>timeout-per-shutdown-phase: 30s</code>, o <code>terminationGracePeriodSeconds</code> do <em>pod</em> tem de ser maior — 45 s é uma margem sã. Falta ainda o intervalo entre o SIGTERM e a remoção efectiva do <em>endpoint</em> pelo <em>kube-proxy</em>, que não é instantâneo: um <code>preStop</code> com espera de 5 a 10 segundos elimina a maior parte dos erros 502 durante um <em>rollout</em>.</p></aside>
 
-<p>O orçamento parte do compromisso externo e distribui-se para dentro. Se o SLO da API é p99 de 500 ms, e a chamada a jusante mais lenta tem p99 de 120 ms, o <em>timeout</em> dessa chamada deve ficar entre o p99,9 observado e a fracção do orçamento que lhe cabe — tipicamente 2 a 3 vezes o p99, nunca 30 segundos «para não falhar». O erro clássico é o <em>timeout</em> do chamador ser menor do que o tempo total que o chamado precisa com as suas próprias repetições: o chamador desiste, repete, e o chamado continua a trabalhar em pedidos que já ninguém espera — trabalho fantasma que consome capacidade exactamente durante o incidente.</p>
-
-<div class="formula">orçamento_ponta_a_ponta ≥ Σᵢ (timeout_i × tentativas_i + espera_i) + processamento_local + folga (≈20%)</div>
-
-<p>O <em>bulkhead</em> resolve o segundo problema: impedir que uma dependência lenta consuma todos os recursos partilhados. Com <em>threads</em> de plataforma, isso significa limitar chamadas concorrentes por dependência — 25 chamadas concorrentes para o adquirente, 50 para o serviço de fraude — de modo a que o esgotamento fique confinado. Com <em>virtual threads</em> em Java 21+, o <em>pool</em> de <em>threads</em> deixa de ser o recurso escasso, mas o limite continua a ser necessário: o que se esgota passa a ser o <em>pool</em> de ligações HTTP, as ligações à base de dados ou a memória das respostas em curso. Trocar <em>threads</em> por <em>virtual threads</em> sem manter um limite de concorrência por dependência substitui um esgotamento visível por um esgotamento mais tardio e mais difícil de diagnosticar.</p>
-
-<p>O disjuntor resolve o terceiro: parar de bater numa porta fechada. Quando a taxa de falha ultrapassa um limiar numa janela deslizante, o circuito abre e as chamadas falham imediatamente, poupando a latência do <em>timeout</em> e dando folga à dependência para recuperar. O parâmetro que quase todos ignoram é o <code>slowCallRateThreshold</code>: numa degradação real, os pedidos não falham, ficam lentos — e um disjuntor que só conta excepções nunca abre.</p>
-
-<figure class="listing yaml" id="lst-14-6"><div class="lhead"><span class="lnum">Listagem 14.6</span>
-<span class="lcap">Resilience4j: disjuntor sensível a chamadas lentas, limitador de tempo, repetição com aleatorização e <em>bulkhead</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="yaml"><code>resilience4j:
-  circuitbreaker:
-    instances:
-      adquirente:
-        slidingWindowType: COUNT_BASED
-        slidingWindowSize: 100          # decide sobre as ultimas 100 chamadas
-        minimumNumberOfCalls: 20        # nao abre com amostra pequena
-        failureRateThreshold: 50        # 50% de falhas -> aberto
-        slowCallRateThreshold: 60       # 60% de chamadas lentas -> aberto tambem
-        slowCallDurationThreshold: 400ms
-        waitDurationInOpenState: 10s
-        permittedNumberOfCallsInHalfOpenState: 5
-        automaticTransitionFromOpenToHalfOpenEnabled: true
-        recordExceptions:
-          - java.io.IOException
-          - java.util.concurrent.TimeoutException
-        ignoreExceptions:               # erros de negocio NAO abrem o circuito
-          - pt.acme.pagamentos.SaldoInsuficienteException
-
-  timelimiter:
-    instances:
-      adquirente:
-        timeoutDuration: 800ms
-        cancelRunningFuture: true
-
-  retry:
-    instances:
-      adquirente:
-        maxAttempts: 3                  # 1 original + 2 repeticoes
-        waitDuration: 100ms
-        enableExponentialBackoff: true
-        exponentialBackoffMultiplier: 2
-        enableRandomizedWait: true
-        randomizedWaitFactor: 0.5       # jitter: evita o efeito de rebanho
-        retryExceptions:
-          - java.io.IOException
-          - java.util.concurrent.TimeoutException
-        ignoreExceptions:
-          - pt.acme.pagamentos.SaldoInsuficienteException
-
-  bulkhead:
-    instances:
-      adquirente:
-        maxConcurrentCalls: 25          # isolamento: nunca mais de 25 em voo
-        maxWaitDuration: 0              # rejeita de imediato em vez de acumular fila</code></pre></figure>
-
-<figure class="listing java" id="lst-14-7"><div class="lhead"><span class="lnum">Listagem 14.7</span>
-<span class="lcap">Ordem das camadas e degradação explícita; <code>RestClient</code> com <em>timeouts</em> finitos.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@Configuration
-class ClientesHttp {
-
-    @Bean
-    RestClient adquirenteClient(RestClient.Builder builder) {
-        ClientHttpRequestFactorySettings def = ClientHttpRequestFactorySettings.defaults()
-                .withConnectTimeout(Duration.ofMillis(200))   // TCP + TLS
-                .withReadTimeout(Duration.ofMillis(800));     // resposta completa
-        return builder
-                .baseUrl("https://adquirente.interno")
-                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(def))
-                .build();
-    }
-}
-
-@Service
-class AdquirenteGateway {
-
-    private final RestClient http;
-
-    AdquirenteGateway(RestClient http) { this.http = http; }
-
-    // Ordem efectiva das anotacoes: Bulkhead -&gt; CircuitBreaker -&gt; Retry -&gt; TimeLimiter.
-    // O Retry por DENTRO do disjuntor faz cada repeticao contar para a janela deslizante,
-    // que e o que permite ao circuito abrir durante uma degradacao prolongada.
-    @Bulkhead(name = "adquirente", type = Bulkhead.Type.SEMAPHORE)
-    @CircuitBreaker(name = "adquirente", fallbackMethod = "degradar")
-    @Retry(name = "adquirente")
-    @TimeLimiter(name = "adquirente")
-    CompletableFuture&lt;Autorizacao&gt; autorizar(PedidoPagamento pedido) {
-        return CompletableFuture.supplyAsync(() -&gt; http.post()
-                .uri("/autorizacoes")
-                .header("Idempotency-Key", pedido.chaveIdempotencia())
-                .body(pedido)
-                .retrieve()
-                .body(Autorizacao.class));
-    }
-
-    // A degradacao e uma decisao de produto, nao um catch vazio:
-    // abaixo de 50 euros aceita-se offline e reconcilia-se depois; acima, recusa-se.
-    CompletableFuture&lt;Autorizacao&gt; degradar(PedidoPagamento pedido, Throwable causa) {
-        if (pedido.montanteEmCentimos() &lt;= 5000) {
-            return CompletableFuture.completedFuture(Autorizacao.diferida(pedido, causa));
-        }
-        return CompletableFuture.failedFuture(new AdquirenteIndisponivelException("visa", causa));
-    }
-}</code></pre></figure>
-
-<div class="qa" id="q-14-10" data-box="qa" data-area="sd" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
+<div class="qa" id="q-14-12" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O SLO da nossa API é p99 de 500 ms. Ela chama três serviços a jusante. Como reparte os <em>timeouts</em> e o que acontece quando um deles fica lento em vez de falhar?</div>
+  <div class="qprompt">Que <em>endpoints</em> do Actuator expõe num serviço em produção, em que porta, e como configura as sondas de <em>liveness</em> e de <em>readiness</em> em Kubernetes?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Reparto de fora para dentro, a partir do orçamento externo, e conto as repetições. Com 500 ms de orçamento: reservo 20% de folga para GC, agendamento e serialização, o que deixa 400 ms para o trabalho. Se as três chamadas forem sequenciais e o serviço A tiver p99 de 60 ms, B de 100 ms e C de 40 ms, os <em>timeouts</em> ficam em 150 ms, 200 ms e 120 ms — cerca de 2 vezes o p99 de cada — e a soma no pior caso ultrapassa o orçamento, o que obriga a paralelizar as duas chamadas independentes ou a cortar uma tentativa. Se A e C forem independentes, executam-se em paralelo e o custo passa a ser <code>max(150, 120) + 200 = 350 ms</code>, que cabe.</p>
-      <p>A regra que evita erros: o <em>timeout</em> é sempre derivado de percentis observados, nunca de números redondos escolhidos por conforto. Um <em>timeout</em> de 2 vezes o p99 falha cerca de 0,1% a 0,5% das chamadas em regime normal — proporção que tem de ser absorvida pela repetição ou pela degradação. Um <em>timeout</em> de 10 vezes o p99 nunca dispara em regime normal e também nunca protege durante o incidente.</p>
-      <p>A parte da pergunta que é a verdadeira armadilha é a segunda: lentidão não é falha. Se B degrada de 100 ms para 700 ms sem devolver erros, um disjuntor configurado apenas por <code>failureRateThreshold</code> permanece fechado, cada pedido consome uma <em>thread</em> durante 700 ms, o <em>pool</em> satura e o p99 do serviço inteiro sobe — incluindo o dos pedidos que não passam por B. Por isso três mecanismos têm de estar activos: <code>slowCallDurationThreshold</code> com <code>slowCallRateThreshold</code> para que o disjuntor abra com lentidão; <em>bulkhead</em> por dependência para confinar a saturação; e propagação de prazo, para o serviço não continuar a trabalhar num pedido cujo chamador já desistiu.</p>
-      <p>A propagação de prazo é o que separa staff: enviar o tempo restante a cada salto (um cabeçalho de <em>deadline</em>, à maneira do gRPC) permite que o serviço a jusante rejeite imediatamente o que não consegue concluir a tempo. Sem isso, durante um incidente, uma fracção significativa da capacidade é gasta a produzir respostas que ninguém vai ler.</p>
-      <p>Quando a escolha inversa ganha: em trabalho assíncrono aceite com <code>202</code> e consultado depois, o orçamento apertado deixa de fazer sentido — o correcto é um <em>timeout</em> generoso por tarefa e um limite de concorrência. A pergunta que decide é se há um humano à espera do outro lado.</p></div>
+      <p>Numa porta de gestão separada (<code>management.server.port=9090</code>), nunca publicada pela <em>ingress</em>: <code>health</code>, <code>info</code>, <code>prometheus</code>, <code>metrics</code>, e — para diagnóstico — <code>conditions</code>, <code>configprops</code> e <code>loggers</code>. O <code>loggers</code> é o mais valioso dos três: permite subir o nível de <code>com.acme.pagamentos</code> para DEBUG durante quatro minutos num incidente sem redesdobrar nada. E é também escrita, portanto exige autenticação real, não apenas isolamento de rede.</p>
+      <p>Ficam de fora da exposição por HTTP, mesmo na porta interna, <code>heapdump</code> e <code>shutdown</code>: o primeiro despeja o <em>heap</em> inteiro, com <em>tokens</em> e dados pessoais, e um pedido chega para causar uma pausa de vários segundos; o segundo mata o processo. O <code>threaddump</code> é aceitável em rede interna e é indispensável quando um <em>pod</em> fica com latência sem carga.</p>
+      <p>As sondas separam-se por semântica. <em>Liveness</em> inclui apenas <code>livenessState</code>: responde a «o processo está partido de forma irrecuperável?». Incluir a base de dados aqui converte uma falha de 60 segundos do PostgreSQL num reinício simultâneo de todas as réplicas, com o <em>cold start</em> a agravar a recuperação. <em>Readiness</em> inclui <code>readinessState</code> mais os indicadores das dependências sem as quais não se serve — <code>db</code>, e <code>redis</code> se a <em>cache</em> for obrigatória. Com <code>management.endpoint.health.probes.enabled=true</code>, o Boot cria <code>/actuator/health/liveness</code> e <code>/actuator/health/readiness</code>, que se apontam directamente nas sondas do <em>Deployment</em>.</p>
+      <p>Números que ancoram a configuração: <code>livenessProbe</code> com <code>periodSeconds: 10</code> e <code>failureThreshold: 3</code> significa até 30 segundos entre a falha e o reinício; o <code>startupProbe</code> é o que dá margem ao arranque (por exemplo <code>failureThreshold: 30</code> com <code>periodSeconds: 5</code>, ou seja 150 segundos) sem obrigar a inflacionar o <code>initialDelaySeconds</code> da <em>liveness</em>. E, do lado do desligar, <code>server.shutdown=graceful</code> com um <code>terminationGracePeriodSeconds</code> superior ao <code>timeout-per-shutdown-phase</code>, mais um <code>preStop</code> de 5 a 10 segundos para dar tempo à remoção do <em>endpoint</em> pelo <em>kube-proxy</em>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não sabe que <em>timeouts</em> existem no cliente HTTP ou usa o valor por omissão sem o conhecer.</td></tr>
-        <tr><td>Mid</td><td>Define um <em>timeout</em> igual para todas as chamadas, sem relação com percentis nem com o orçamento total.</td></tr>
-        <tr><td>Sénior</td><td>Reparte o orçamento com folga, deriva de percentis, conta as repetições, paraleliza o que é independente, e distingue lentidão de falha.</td></tr>
-        <tr><td>Staff</td><td>Propagação de prazo entre saltos, cancelamento do trabalho abandonado, e o efeito do <em>timeout</em> mal repartido na capacidade durante um incidente.</td></tr>
+        <tr><td>Insuficiente</td><td><code>include: "*"</code> na mesma porta da API, e a mesma sonda para <em>liveness</em> e <em>readiness</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe separar as sondas e expor <code>health</code> e <code>prometheus</code>, mas não explica o efeito de pôr a base de dados na <em>liveness</em>.</td></tr>
+        <tr><td>Sénior</td><td>Porta separada, lista justificada de <em>endpoints</em>, grupos de <em>health</em> distintos, e o cenário de reinício em cascata como argumento.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <em>startup probe</em>, <em>graceful shutdown</em> com os tempos coerentes, <code>preStop</code>, e a política de autenticação do <code>loggers</code>.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que acontece à ligação e ao trabalho a jusante quando o <em>timeout</em> dispara?»</li>
-      <li>«Como propaga o prazo restante em HTTP?»</li>
-      <li>«Com <em>virtual threads</em>, o problema do <em>pool</em> esgotado desaparece?»</li>
-      <li>«Que alerta lhe diz que os <em>timeouts</em> estão mal calibrados?»</li></ul></div>
+      <li>«O que acontece se a <em>readiness</em> falhar em todas as réplicas ao mesmo tempo?»</li>
+      <li>«Como escreve um <code>HealthIndicator</code> próprio e como impede que ele fique lento?»</li>
+      <li>«Porque é que o <code>/actuator/prometheus</code> não deve estar na <em>ingress</em> pública?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li><em>Timeouts</em> de 30 s «para não falhar em pedidos legítimos».</li>
-      <li>Não perceber que o <em>timeout</em> do cliente não cancela o trabalho no servidor.</li>
-      <li>Somar <em>timeouts</em> sem contar as repetições de cada nível.</li></ul></div>
+      <li>Sonda de <em>liveness</em> que consulta a base de dados.</li>
+      <li>Expor <code>heapdump</code> ou <code>shutdown</code> «porque está numa rede privada».</li>
+      <li>Um <code>HealthIndicator</code> sem <em>timeout</em> que faz a sonda expirar quando a dependência fica lenta.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-14-11" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Configure um disjuntor com Resilience4j para o nosso adquirente de cartões. Justifique cada parâmetro e diga como combina disjuntor, repetição e limitador de tempo.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Janela de contagem de 100 chamadas com mínimo de 20 antes de decidir, limiar de falha a 50%, limiar de chamadas lentas a 60% com fronteira de 400 ms, 10 s em estado aberto e 5 chamadas permitidas em meio-aberto. O mínimo de 20 evita que três falhas num serviço com pouco tráfego abram o circuito; o limiar de lentidão é o que faz o disjuntor funcionar em degradações reais, onde quase nada devolve erro.</p>
-      <p>A decisão que gera discussão é a ordem das camadas. Em Resilience4j, com anotações, a ordem efectiva é <em>bulkhead</em>, disjuntor, repetição, limitador de tempo — ou seja, a repetição fica <strong>dentro</strong> do disjuntor. É o que se quer: cada tentativa individual conta para a janela deslizante, portanto uma degradação prolongada abre o circuito. Se a repetição envolvesse o disjuntor, uma falha de três tentativas contaria como um único evento e o circuito precisaria de três vezes mais tráfego para abrir — e, pior, continuaria a repetir contra um circuito aberto.</p>
-      <p>O <code>ignoreExceptions</code> é obrigatório e quase sempre esquecido: erros de negócio — saldo insuficiente, cartão recusado — não são falhas da dependência. Se contarem para a taxa de falha, uma campanha de <em>marketing</em> que gere 60% de recusas legítimas abre o circuito e derruba os pagamentos que iam ser aprovados. Só entram na contagem excepções de infra-estrutura: <code>IOException</code>, <code>TimeoutException</code> e 5xx.</p>
-      <p>O disjuntor sem <em>fallback</em> apenas troca uma falha lenta por uma falha rápida — o que já é ganho, porque liberta capacidade. Mas o valor real está na degradação: abaixo de 50 euros, autorizar localmente e reconciliar depois; acima, recusar com <code>503</code> e <code>Retry-After</code>. Essa fronteira é uma decisão de risco do negócio, não do engenheiro, e dizê-lo em voz alta é um sinal forte.</p>
-      <p>Quando a escolha inversa ganha: para uma dependência não crítica cuja falha já é tratada por omissão de dados — um serviço de recomendações, por exemplo — um <em>timeout</em> agressivo de 50 ms com <em>fallback</em> vazio é mais simples e igualmente eficaz; o disjuntor acrescenta estado e configuração sem melhorar o resultado.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Descreve o disjuntor como «tenta outra vez mais tarde»; confunde-o com repetição.</td></tr>
-        <tr><td>Mid</td><td>Enuncia os três estados e um limiar de falha; não trata chamadas lentas nem exclui erros de negócio.</td></tr>
-        <tr><td>Sénior</td><td>Parâmetros justificados com números, limiar de lentidão, <code>ignoreExceptions</code>, ordem correcta de repetição dentro do disjuntor, e <em>fallback</em> com significado.</td></tr>
-        <tr><td>Staff</td><td>Liga o comportamento ao SLO e ao orçamento de erro, define a métrica de transição de estado a alertar, e reconhece quando o disjuntor não vale o estado que introduz.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Em meio-aberto, quantas chamadas deixa passar e porquê esse número?»</li>
-      <li>«O circuito está aberto em três das dez instâncias. Isso é problema?»</li>
-      <li>«Que métricas exporta e qual delas alerta?»</li>
-      <li>«Um <em>fallback</em> que devolve <em>cache</em> antiga é aceitável em pagamentos?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Contar erros de negócio 4xx para a taxa de falha do circuito.</li>
-      <li>Repetição por fora do disjuntor, martelando um circuito aberto.</li>
-      <li>Configurar disjuntores sem exportar métricas de transição de estado.</li></ul></div>
-  </div>
-</div>
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Para arranque, os instrumentos por ordem de retorno: <code>--debug</code> ou <code>/actuator/conditions</code> para ver o que activou; <code>/actuator/startup</code> com <code>BufferingApplicationStartup</code> para a árvore de passos com duração; <code>spring.main.lazy-initialization=true</code> só em ambiente de desenvolvimento, porque adia falhas para o primeiro pedido; e, quando o arranque é mesmo crítico, processamento AOT com <em>CDS</em> ou imagem nativa GraalVM, que troca segundos de arranque por minutos de compilação e por reflexão que passa a exigir declaração explícita.</p></aside>
 
-<div class="qa" id="q-14-12" data-box="qa" data-area="sd" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">System design e distribuídos</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Migrámos para <em>virtual threads</em> em Java 21. Ainda precisamos de <em>bulkheads</em> e de limitação de débito, ou o problema do <em>pool</em> esgotado desapareceu?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O problema não desapareceu, mudou de sítio — e ficou mais difícil de ver. Com <em>threads</em> de plataforma, o <em>pool</em> de 200 <em>threads</em> era simultaneamente o gargalo e o mecanismo de protecção: ao esgotar-se, produzia rejeição rápida e um sintoma óbvio. Com <em>virtual threads</em>, criam-se centenas de milhares sem custo e o serviço aceita alegremente 50 000 pedidos concorrentes — que passam a competir por recursos que não escalaram: as 20 ligações do <em>pool</em> HikariCP, as ligações do cliente HTTP, e a memória das respostas em curso.</p>
-      <p>O modo de falha típico é o <code>OutOfMemoryError</code> ou uma fila invisível: 50 000 <em>virtual threads</em> à espera de 20 ligações à base de dados formam uma fila que não aparece em nenhuma métrica de <em>pool</em>, com latência a subir linearmente com a profundidade da fila. O sintoma é p99 catastrófico sem qualquer saturação de CPU e sem <em>threads</em> bloqueadas visíveis nos painéis clássicos.</p>
-      <p>Por isso o limite de concorrência continua a ser obrigatório, só que passa a ser explícito em vez de acidental: <em>bulkhead</em> por semáforo com um valor por dependência (25 chamadas ao adquirente, 40 à base de dados), limitação de débito à entrada, e uma fila com rejeição rápida em vez de espera ilimitada. A regra é dimensionar pela lei de Little: com uma taxa alvo de 500 pedidos por segundo e 40 ms de serviço médio, a concorrência necessária é 500 × 0,04 = 20 — e conceder muito mais do que isso apenas converte capacidade em fila e latência.</p>
-      <p>Há ainda dois detalhes específicos das <em>virtual threads</em> que valem pontos: fixação (<em>pinning</em>) em blocos <code>synchronized</code> com E/S dentro, resolvida em versões mais recentes mas ainda presente em bibliotecas antigas, e o facto de <code>ThreadLocal</code> deixar de ser uma optimização quando há milhões de <em>threads</em> — o padrão passa a ser passar contexto explicitamente ou usar valores com âmbito.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Com <em>virtual threads</em> deixa de haver limites de concorrência.»</td></tr>
-        <tr><td>Mid</td><td>Sabe que as <em>virtual threads</em> são baratas e que a base de dados continua limitada, sem quantificar nem propor mecanismo.</td></tr>
-        <tr><td>Sénior</td><td>Identifica o deslocamento do gargalo, mantém <em>bulkhead</em> e limitação explícitos, dimensiona pela lei de Little.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a fila invisível como problema de observabilidade, a rejeição rápida como política, fixação e o impacto em <code>ThreadLocal</code>.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como mede a profundidade da fila invisível?»</li>
-      <li>«Que dimensão dá ao <em>pool</em> HikariCP com <em>virtual threads</em>?»</li>
-      <li>«Rejeitar cedo ou enfileirar? Qual o critério?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Remover limites de concorrência ao migrar para <em>virtual threads</em>.</li>
-      <li>Aumentar o <em>pool</em> de ligações à base de dados para «acompanhar» as <em>threads</em>.</li></ul></div>
-  </div>
-</div>
+<h2 id="sec-14-7" class="h2"><span class="secnum">14.7</span> Resumo e checklist<a class="anchor" href="#sec-14-7" aria-label="ligação">#</a></h2>
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um <em>timeout</em> no cliente HTTP não cancela o trabalho no servidor. Quando o cliente desiste aos 800 ms, a transacção a jusante continua, escreve na base de dados e consome capacidade. Durante um incidente com repetições activas, é comum 40% a 60% do trabalho do serviço degradado ser trabalho fantasma — respostas que ninguém vai ler. Só a propagação de prazo com verificação no receptor, ou o cancelamento explícito, elimina esse desperdício.</p></aside>
-
-<h2 id="sec-14-6" class="h2"><span class="secnum">14.6</span> Paginação, filtros e payloads grandes<a class="anchor" href="#sec-14-6" aria-label="ligação">#</a></h2>
-
-<p>Paginação por <em>offset</em> é a que toda a gente escreve primeiro e a que falha de duas maneiras. A primeira é de desempenho: <code>OFFSET 100000 LIMIT 20</code> obriga o PostgreSQL a produzir e descartar 100 000 linhas; o custo cresce linearmente com a profundidade e a página 5 000 pode demorar 200 vezes mais do que a página 1. A segunda é de correcção: entre a página 1 e a página 2, uma inserção desloca todas as linhas e o cliente vê um registo duas vezes ou nenhuma — num processo de exportação que percorre 500 páginas, isso significa dados errados sem qualquer erro visível.</p>
-
-<p>A paginação por cursor — ou paginação por chave — resolve as duas. Em vez de saltar N linhas, filtra-se por uma chave de ordenação estável e única: <code>WHERE (criado_em, id) &lt; (?, ?) ORDER BY criado_em DESC, id DESC LIMIT 20</code>. Com um índice composto em <code>(criado_em DESC, id DESC)</code>, o custo é O(log n) para localizar mais O(k) para ler a página, independentemente da profundidade: a página 5 000 custa o mesmo que a página 1. O par <code>(criado_em, id)</code> é indispensável porque <code>criado_em</code> sozinho não é único e linhas com o mesmo instante seriam saltadas ou repetidas.</p>
-
-<p>O cursor deve ser opaco — <em>base64</em> do par ordenado, idealmente assinado — por duas razões: impedir que o cliente o construa à mão e fique acoplado ao esquema, e permitir mudar a chave de ordenação sem quebrar ninguém. O preço do cursor é real: não há salto para uma página arbitrária, não há contagem total sem uma consulta separada (que em tabelas grandes é cara e muitas vezes se substitui por uma estimativa do planeador), e a ordenação fica limitada às colunas cobertas pelo índice.</p>
-
-<figure class="listing text" id="lst-14-8"><div class="lhead"><span class="lnum">Listagem 14.8</span>
-<span class="lcap">Resposta paginada por cursor, com ligações opacas e sem contagem total.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code>GET /v1/pagamentos?limite=20&amp;estado=CAPTURADO&amp;desde=2026-08-01 HTTP/1.1
-
-HTTP/1.1 200 OK
-Content-Type: application/json
-Cache-Control: private, max-age=10
-
-{
-  "dados": [
-    {"id": "9f1c2e6a-3b7d-7c11-9a4e-0f2b8d6a1c33",
-     "estado": "CAPTURADO",
-     "montanteEmCentimos": 4990,
-     "criadoEm": "2026-08-30T14:22:07.412Z"}
-  ],
-  "pagina": {
-    "limite": 20,
-    "temMais": true,
-    "proximo": "eyJjcmlhZG9FbSI6IjIwMjYtMDgtMzBUMTQ6MjI6MDcuNDEyWiIsImlkIjoiOWYxYzJlNmEifQ",
-    "totalAproximado": 184000
-  },
-  "_ligacoes": {
-    "proximo": "/v1/pagamentos?limite=20&amp;estado=CAPTURADO&amp;cursor=eyJjcmlhZG9FbSI6..."
-  }
-}</code></pre></figure>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 14.2</span> Custo e garantias das três estratégias de paginação numa tabela de 50 milhões de linhas.</div>
-<div class="tscroll"><table><thead><tr><th>Estratégia</th><th>Custo da página K</th><th>Estável sob escrita</th><th>Salto arbitrário</th><th>Quando usar</th></tr></thead><tbody>
-<tr><td><em>Offset</em></td><td>O(K × limite) — página 5 000 na ordem de centenas de ms</td><td>Não</td><td>Sim</td><td>Interfaces internas com menos de 20 páginas e dados quase estáticos.</td></tr>
-<tr><td>Cursor / chave</td><td>O(log n + limite) — constante, tipicamente 1 a 5 ms</td><td>Sim, para a frente</td><td>Não</td><td>APIs públicas, exportações, listas infinitas.</td></tr>
-<tr><td>Instantâneo materializado</td><td>O(limite) após custo inicial da consulta</td><td>Sim, totalmente</td><td>Sim</td><td>Relatórios que exigem consistência absoluta e contagem exacta.</td></tr>
-</tbody></table></div></div>
-
-<div class="qa" id="q-14-13" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">APIs e integração</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Um parceiro exporta o histórico de 2 milhões de transacções pela nossa API paginada e queixa-se de lentidão e de registos em falta. Qual é o diagnóstico e a correcção?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Os dois sintomas têm a mesma causa: paginação por <em>offset</em> sobre uma tabela que continua a receber escritas. A lentidão vem de o <code>OFFSET</code> obrigar a base de dados a percorrer e descartar todas as linhas anteriores — na página 50 000 com limite 40, são 2 milhões de linhas produzidas para devolver 40. Os registos em falta vêm de a janela deslizar: cada nova transacção inserida antes do ponto de leitura empurra uma linha para a página seguinte, que o cliente já passou.</p>
-      <p>A correcção é paginação por chave com ordenação estável e única, com o cursor a codificar <code>(criado_em, id)</code> e o índice composto correspondente. Isso torna o custo por página constante — tipicamente 1 a 5 ms em vez de centenas — e elimina o salto de registos para a frente, porque o predicado é sobre valores e não sobre posições. Para exportações que só percorrem para a frente, é a solução completa.</p>
-      <p>Se o parceiro exigir consistência absoluta — o histórico exactamente como estava às 00:00 — a paginação por cursor não chega, porque continua a ver escritas posteriores ao início. Aí a resposta correcta é mudar o padrão: um <em>endpoint</em> de exportação assíncrona que aceita o pedido com <code>202</code>, produz um ficheiro a partir de um instante consistente (uma transacção de leitura repetível ou uma cópia analítica), guarda-o em S3 e devolve uma URL pré-assinada com validade de 24 horas. Dois milhões de linhas em CSV comprimido são dezenas de MB e transferem-se numa ligação, em vez de 50 000 pedidos HTTP.</p>
-      <p>Números que sustentam a mudança de padrão: 50 000 pedidos a 40 ms cada são cerca de 33 minutos de relógio e 50 000 travessias completas de autenticação, autorização e serialização; uma exportação assíncrona faz o mesmo trabalho numa única leitura sequencial em poucos minutos, com uma fracção do custo de CPU. O <em>trade-off</em> é latência até ao primeiro byte e complexidade operacional (armazenamento, expiração, autorização da URL).</p>
-      <p>Quando a escolha inversa ganha: para listas interactivas em que o utilizador salta para a página 7, o <em>offset</em> continua a ser o mais simples, desde que se limite a profundidade máxima — por exemplo, recusar <code>offset</code> acima de 10 000 com <code>400</code> e exigir um filtro mais estreito.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Aumentamos o limite por página» ou «acrescentamos um índice» sem identificar o custo do <code>OFFSET</code>.</td></tr>
-        <tr><td>Mid</td><td>Sabe que <em>offset</em> é lento em profundidade; não liga os registos em falta à instabilidade da janela.</td></tr>
-        <tr><td>Sénior</td><td>Diagnostica ambos os sintomas, propõe cursor <code>(criado_em, id)</code> com índice composto e cursor opaco, e quantifica o ganho.</td></tr>
-        <tr><td>Staff</td><td>Questiona o padrão: exportação em massa não é caso de uso de API paginada; propõe assíncrono com instantâneo consistente e URL pré-assinada.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O cursor deve ser opaco ou legível? Porquê?»</li>
-      <li>«O parceiro quer ordenar por montante. Como suporta isso com cursor?»</li>
-      <li>«Como devolve o total sem uma contagem completa?»</li>
-      <li>«E se o parceiro quiser paginar para trás?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Cursor baseado apenas num <em>timestamp</em> não único.</li>
-      <li>Expor <code>offset</code> ilimitado numa API pública.</li>
-      <li>Devolver <code>COUNT(*)</code> exacto em cada página de uma tabela de 50 milhões de linhas.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-14-7" class="h2"><span class="secnum">14.7</span> REST vs gRPC vs GraphQL na entrevista<a class="anchor" href="#sec-14-7" aria-label="ligação">#</a></h2>
-
-<p>Esta pergunta não procura um vencedor, procura saber se o candidato escolhe por restrição ou por moda. As três tecnologias resolvem problemas diferentes: REST optimiza para alcance e para infra-estrutura que já existe; gRPC optimiza para latência, contrato forte e comunicação interna de alto débito; GraphQL optimiza para clientes heterogéneos que agregam dados de várias fontes e não querem depender do calendário da equipa de <em>backend</em>.</p>
-
-<p>Os números que sustentam a escolha do gRPC internamente: Protobuf sobre HTTP/2 com multiplexação e cabeçalhos comprimidos corta tipicamente 30% a 60% dos bytes face a JSON e reduz o custo de serialização de forma mensurável em serviços com muitas chamadas pequenas; o <em>streaming</em> bidireccional resolve casos que em REST exigem <em>polling</em> ou WebSocket; e prazos são de primeira classe no protocolo, o que torna a propagação de <em>deadline</em> automática em vez de convenção. O que se perde: legibilidade sem ferramentas, suporte directo no <em>browser</em> (exige grpc-web e um <em>proxy</em>), <em>caching</em> HTTP, e uma barreira de entrada para integradores externos que sabem fazer <code>curl</code> e não sabem compilar <em>stubs</em>.</p>
-
-<p>O custo escondido do GraphQL é o que separa quem o pôs em produção de quem leu a documentação: uma única consulta pode gerar centenas de acessos à base de dados sem <em>dataloader</em>, o <em>caching</em> HTTP desaparece porque tudo é <code>POST</code> para um só <em>endpoint</em>, a autorização passa a ser por campo em vez de por recurso, e a limitação de débito por número de pedidos deixa de significar alguma coisa — passa a ser preciso analisar a complexidade da consulta antes de a executar. Nenhum destes problemas é impeditivo; todos são trabalho que não existe em REST.</p>
-
-<div class="qa" id="q-14-14" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Estamos a partir um monólito em serviços. Um colega propõe gRPC para tudo, outro propõe manter REST. Que critério usa e qual é a sua decisão?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Decido pela fronteira: gRPC para comunicação interna serviço-a-serviço de alto débito e baixa latência, REST com OpenAPI para tudo o que atravessa a fronteira da organização ou é consumido por <em>browsers</em> e aplicações móveis. Não é um compromisso, é reconhecer que o critério dominante muda de lado da fronteira: dentro, o custo é latência e serialização; fora, é o custo de integração de quem não controlamos.</p>
-      <p>Os critérios explícitos, por ordem de peso. Primeiro, quem é o consumidor: se houver um <em>browser</em> na cadeia, gRPC exige grpc-web e um <em>proxy</em> de tradução, o que introduz uma peça de infra-estrutura por um ganho que raramente se justifica no perfil de tráfego de uma interface. Segundo, o perfil de tráfego: com chamadas internas na ordem de milhares por segundo e cargas pequenas, a poupança de 30% a 60% de bytes e o custo de serialização mais baixo têm efeito visível em CPU e em p99; com dezenas de chamadas por segundo, é irrelevante e o critério passa a ser a ergonomia. Terceiro, o valor do contrato forte: o <code>.proto</code> compilado dá geração de código e evolução com regras claras (números de campo reservados, nunca reutilizados), o que reduz erros de integração face a JSON não tipado. Quarto, o ecossistema já instalado: se o <em>gateway</em>, a autenticação, o WAF, o registo de acessos e os painéis estão todos construídos para HTTP/JSON, introduzir gRPC obriga a duplicá-los.</p>
-      <p>A decisão prática numa migração de monólito é ainda mais simples do que o debate sugere: nos primeiros meses, o gargalo não é a serialização, são as fronteiras de domínio mal traçadas. Escolher gRPC no início adiciona uma variável nova ao problema mais difícil. A ordem que defendo é REST com OpenAPI e testes de contrato desde o primeiro dia, medir, e migrar para gRPC os caminhos internos que a medição mostrar serem quentes — tipicamente 2 ou 3 pares de serviços, não vinte.</p>
-      <p>GraphQL não entra nesta discussão como transporte entre serviços. Entra, se entrar, como camada de agregação para clientes — uma fachada sobre os serviços, não o protocolo entre eles. Usar GraphQL serviço-a-serviço acumula os custos dos dois modelos sem os benefícios de nenhum.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Escolhe por preferência pessoal ou por «é mais moderno», sem critério.</td></tr>
-        <tr><td>Mid</td><td>Sabe que gRPC é binário e mais rápido; não quantifica nem considera <em>browser</em>, <em>gateway</em> ou ferramentas.</td></tr>
-        <tr><td>Sénior</td><td>Separa fronteira interna de externa, quantifica o ganho, pesa o ecossistema instalado, e coloca GraphQL como fachada e não como transporte.</td></tr>
-        <tr><td>Staff</td><td>Sequencia a decisão no tempo (medir antes de optimizar), reconhece que as fronteiras de domínio são o risco dominante, e define o gatilho objectivo para migrar um caminho para gRPC.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como evolui um <code>.proto</code> sem quebrar consumidores?»</li>
-      <li>«Como faz observabilidade e <em>tracing</em> em gRPC?»</li>
-      <li>«Que gatilho concreto o faria migrar um caminho de REST para gRPC?»</li>
-      <li>«E os eventos assíncronos? Onde entram nesta decisão?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Adoptar gRPC para APIs públicas consumidas por parceiros externos.</li>
-      <li>Afirmar ganhos de desempenho sem qualquer medição no contexto próprio.</li>
-      <li>Propor GraphQL como protocolo entre microserviços.</li></ul></div>
-  </div>
-</div>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Cada chamada síncrona entre serviços multiplica as probabilidades de falha: quatro dependências com 99,9% de disponibilidade cada dão 99,6% ao conjunto — cerca de 3 horas de indisponibilidade por mês em vez de 43 minutos. Substituir uma chamada síncrona por um evento assíncrono elimina esse acoplamento de disponibilidade, mas troca-o por consistência eventual, desduplicação no consumidor e uma janela em que o sistema está visivelmente desalinhado. A pergunta que decide é se há um humano à espera da resposta.</p></aside>
-
-<h2 id="sec-14-8" class="h2"><span class="secnum">14.8</span> Resumo e checklist<a class="anchor" href="#sec-14-8" aria-label="ligação">#</a></h2>
+<p>O que reter deste capítulo, em forma directamente utilizável numa resposta:</p>
 
 <ul class="lst">
-  <li>Segurança e idempotência dos métodos não são teoria: <em>proxies</em>, <em>meshes</em> e clientes automáticos repetem pedidos com base nelas. Marcar mal um método é contratar duplicação silenciosa.</li>
-  <li>O critério para 4xx versus 5xx é a retentabilidade sem alteração, e a consequência é operacional: só os 5xx alimentam o SLO e disparam alertas. <code>200</code> com erro no corpo faz a taxa de erro mentir.</li>
-  <li>Versionar é a última defesa. Expandir, medir por cliente, descontinuar com <code>Deprecation</code>/<code>Sunset</code>, contrair — e nunca reutilizar o nome de um campo com outra unidade ou outro tipo.</li>
-  <li>Em RFC 9457, o <code>type</code> e o código de domínio são contrato e nunca mudam; o <code>detail</code> é texto e pode mudar. <em>Stack traces</em> e nomes internos nunca vão no corpo; o <code>traceId</code> vai sempre.</li>
-  <li>Não existe <em>exactly-once</em> na entrega. Existe <em>at-least-once</em> mais desduplicação no receptor: chave de idempotência gravada na mesma transacção do efeito, impressão digital do pedido, e restrição de unicidade de negócio como segunda linha.</li>
-  <li>Repetir sem <em>jitter</em> cria efeito de rebanho; repetir em todos os níveis multiplica as tentativas (3<sup>4</sup> = 81 numa cadeia de quatro). Repetir num único nível, com orçamento de repetições sobre o débito.</li>
-  <li>Lentidão não é falha: um disjuntor sem <code>slowCallRateThreshold</code> nunca abre numa degradação real, e erros de negócio em <code>ignoreExceptions</code> impedem que uma campanha comercial derrube o serviço.</li>
-  <li>Paginação por <em>offset</em> é O(K × limite) e instável sob escrita; por cursor <code>(criado_em, id)</code> é constante e estável. Exportação em massa não é caso de uso de API paginada.</li>
-  <li><em>Virtual threads</em> deslocam o gargalo do <em>pool</em> de <em>threads</em> para as ligações e a memória, e tornam a fila invisível. O limite de concorrência passa a ser explícito, dimensionado pela lei de Little.</li>
+  <li>O contentor lê definições antes de criar instâncias; é essa separação que permite detectar ciclos, ordenar auto-configurações e substituir <em>beans</em> por <em>proxies</em>.</li>
+  <li>Injecção por construtor: campos <code>final</code>, falha no arranque em vez de em produção, teste sem contexto Spring, e um construtor que dói quando a classe faz demasiado.</li>
+  <li>Ciclos entre <em>singletons</em> falham por defeito desde o Boot 2.6; a correcção é extrair um terceiro colaborador ou inverter a direcção fraca para um evento, não ligar a <em>flag</em>.</li>
+  <li><code>proxyBeanMethods = false</code> poupa uma classe CGLIB por configuração, mas transforma qualquer chamada entre métodos <code>@Bean</code> numa segunda instância silenciosa.</li>
+  <li>O <em>proxy</em> de AOP nasce no fim da inicialização do <em>bean</em>: dentro de <code>@PostConstruct</code> ainda não existe, e por isso trabalho de arranque com transacções ou rede vai para <code>ApplicationRunner</code>.</li>
+  <li>Auto-configuração é a lista em <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code>, avaliada depois das definições do utilizador; <code>@ConditionalOnMissingBean</code> só é fiável lá dentro.</li>
+  <li><code>@ConfigurationProperties</code> com <em>record</em> validado falha no arranque e produz metadados; <code>@Value</code> falha tarde e não deixa inventário.</li>
+  <li>Comportamento declarativo só se aplica a chamadas que entram pelo <em>proxy</em>: auto-invocação, <code>private</code> e <code>final</code> desligam-no sem qualquer aviso.</li>
+  <li><em>Liveness</em> nunca consulta dependências externas; <em>readiness</em> consulta as que são precisas para servir. Trocar as duas transforma uma falha recuperável numa indisponibilidade total.</li>
 </ul>
 
-<p><strong>Checklist antes da ronda de APIs:</strong></p>
+<p>Checklist accionável antes da entrevista:</p>
 
 <ul class="lst">
-  <li>Saber dizer, em duas frases, porque <code>PATCH</code> não é idempotente em geral mas um <em>merge patch</em> de valores finais o é na prática.</li>
-  <li>Ter a grelha de códigos pronta: <code>400</code>, <code>401</code>/<code>403</code>, <code>404</code>, <code>409</code>, <code>422</code>, <code>429</code>, <code>503</code>, <code>504</code> — e a consequência operacional de cada um.</li>
-  <li>Conseguir desenhar, no quadro, a tabela de idempotência com a restrição de unicidade, o estado <code>EM_CURSO</code>, a impressão digital e o prazo de expiração.</li>
-  <li>Ter números decorados: <em>timeout</em> entre 2 e 3 vezes o p99, folga de 20% no orçamento, <em>jitter</em> de 50%, retenção de chaves de 24 h a 7 dias.</li>
-  <li>Saber a ordem das camadas de Resilience4j e justificar porque a repetição fica dentro do disjuntor.</li>
-  <li>Ter um exemplo próprio de degradação com significado de negócio, não um <em>catch</em> que devolve lista vazia.</li>
-  <li>Conseguir escrever a consulta de paginação por chave com o índice composto correcto, à mão.</li>
-  <li>Preparar uma resposta de 90 segundos para «REST, gRPC ou GraphQL?» que comece pela fronteira e termine com um gatilho de medição.</li>
-  <li>Ter uma história real de incidente causado por <em>timeout</em>, repetição ou duplicação — com o número antes e o número depois.</li>
+  <li>Saber recitar a sequência de inicialização de um <em>singleton</em> até ao ponto onde o <em>proxy</em> é criado.</li>
+  <li>Ter uma história pessoal de um <code>@Transactional</code> ou <code>@Cacheable</code> que não funcionou, com o diagnóstico e a correcção.</li>
+  <li>Conseguir escrever de memória uma <code>@AutoConfiguration</code> com <code>@ConditionalOnClass</code>, <code>@ConditionalOnMissingBean</code> e <code>@ConfigurationProperties</code>.</li>
+  <li>Saber onde vive a lista de auto-configurações no Boot 3 e como se depura com <code>--debug</code> ou <code>/actuator/conditions</code>.</li>
+  <li>Ter de cor a precedência das fontes de configuração até ao quarto lugar.</li>
+  <li>Conseguir explicar num diagrama de duas caixas porque é que <code>this.metodo()</code> não é interceptado.</li>
+  <li>Ter os valores das sondas do último serviço em produção — <code>periodSeconds</code>, <code>failureThreshold</code>, <code>terminationGracePeriodSeconds</code> — e saber justificá-los.</li>
+  <li>Saber dizer o tempo de arranque real do último serviço e o que já se tentou para o reduzir.</li>
 </ul>

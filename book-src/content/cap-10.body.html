@@ -1,796 +1,712 @@
-<p>Esta é a área em que o entrevistador deixa de avaliar o que o candidato sabe e passa a avaliar o que acontece ao código dele seis meses depois, quando outra pessoa o altera às três da manhã. Excepções e testes medem a mesma coisa por dois ângulos: se o candidato desenha para o leitor seguinte e para o modo de falha, ou apenas para o caminho feliz. Onde os candidatos caem é previsível — recitam a diferença entre <em>checked</em> e <em>unchecked</em> sem uma regra de decisão de API, escrevem <code>catch (Exception e)</code> a seguir a explicar porque é que isso é mau, descrevem a pirâmide de testes e depois propõem <code>@SpringBootTest</code> para tudo, e citam 85% de cobertura como prova de qualidade sem saber dizer quantas asserções essa cobertura tem. Este capítulo cobre a decisão de API por trás das excepções, o desenho de hierarquias de erro, a repartição real de testes num serviço Spring Boot 3.5, o que se mocka e o que nunca se mocka, Testcontainers contra bases em memória, e porque é que cobertura, <em>mutation score</em> e taxa de <em>flakiness</em> medem três coisas diferentes.</p>
+<p>Uma ronda de JVM não pergunta o que é o <em>garbage collector</em>: pergunta o que o candidato faz às três da manhã quando o p99 de um serviço salta de 40 ms para 900 ms e o painel de GC mostra pausas de 1,2 s. O que separa os níveis é a ordem das operações — quem é sénior mede antes de mexer, sabe que número procurar e sabe qual é a flag que não vai resolver nada. Onde os candidatos caem é em três sítios: descrevem a divisão jovem/velha como se fosse o modelo de todos os recolectores, confundem <code>OutOfMemoryError</code> com <em>OOMKilled</em> do <em>kernel</em>, e recitam flags que copiaram de um blogue de 2013 sem saberem que metade foi removida do JDK. Este capítulo percorre o caminho completo — da classe carregada ao código nativo, do <em>layout</em> de memória ao recolector, da pausa lida no <em>log</em> ao diagnóstico de cada variante de OOM — e termina onde a maioria dos incidentes reais acontece hoje: uma JVM dentro de um contentor com um limite de memória que ninguém calculou.</p>
 
-<h2 id="sec-10-1" class="h2"><span class="secnum">10.1</span> Checked vs unchecked: a decisão de API<a class="anchor" href="#sec-10-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-10-1" class="h2"><span class="secnum">10.1</span> Da classe ao código nativo: carregamento, verificação e JIT<a class="anchor" href="#sec-10-1" aria-label="ligação">#</a></h2>
 
-<p>A pergunta «checked ou unchecked?» não é sobre sintaxe, é sobre quem fica responsável por decidir o que fazer com a falha. Uma excepção <em>checked</em> é uma cláusula do contrato: o compilador obriga cada chamador a escolher entre tratar ou propagar, e essa obrigação propaga-se por toda a cadeia de chamadas. Uma excepção <em>unchecked</em> declara o contrário — nenhum chamador intermédio tem informação para agir, e a decisão pertence a uma fronteira única, tipicamente o <em>handler</em> HTTP, o consumidor de mensagens ou o <em>scheduler</em>.</p>
+<p>Uma classe atravessa três fases antes de o primeiro <em>bytecode</em> correr: carregamento (obter os <em>bytes</em> e criar o objecto <code>Class</code>), ligação (verificação do <em>bytecode</em>, preparação dos campos estáticos com valores por omissão, resolução de referências simbólicas) e inicialização (execução do <code>&lt;clinit&gt;</code>, que corre no primeiro uso activo e apenas uma vez, protegido por um bloqueio por classe). A verificação é a fase que garante que o <em>bytecode</em> não viola as regras da máquina virtual — é também a fase que custa tempo de arranque e a razão pela qual desligá-la em produção com <code>-Xverify:none</code> deixou de ser opção: a flag está obsoleta e é ignorada.</p>
 
-<p>A regra de decisão que resiste a follow-ups tem duas condições cumulativas para <em>checked</em>: a falha faz parte da operação normal (não é um <em>bug</em>) <strong>e</strong> existe uma acção alternativa plausível no chamador imediato. Ficheiro que pode não existir, pagamento recusado pelo emissor, ficheiro de configuração com formato inválido durante o arranque — casos em que há um plano B local. Tudo o resto é <em>unchecked</em>: argumento inválido, invariante violado, base de dados em baixo, serialização impossível. O próprio ecossistema fez esta escolha há vinte anos — a hierarquia <code>DataAccessException</code> do Spring é inteiramente <em>unchecked</em> e existe precisamente para converter <code>SQLException</code> (checked) numa taxonomia que o chamador possa ignorar ou mapear conforme a camada.</p>
+<p>O carregamento é feito por uma hierarquia de três <em>class loaders</em> com delegação ao pai primeiro. O <em>bootstrap</em> carrega <code>java.base</code> e os módulos essenciais e é o único que devolve <code>null</code> em <code>getClassLoader()</code>. O <em>platform loader</em> carrega os módulos da plataforma que não estão no <em>bootstrap</em>. O <em>application loader</em> carrega o <em>classpath</em> e o <em>module path</em> da aplicação. A delegação parent-first é o que impede uma classe <code>java.lang.String</code> colocada num JAR de substituir a real. Servidores de aplicações e plataformas de <em>plugins</em> invertem parcialmente a delegação para isolar versões, e é daí que vêm dois problemas clássicos de entrevista: <code>ClassCastException</code> entre duas cópias da mesma classe carregada por <em>loaders</em> diferentes — a identidade de um tipo é o par (nome, <em>loader</em>) — e a fuga de metaspace, porque uma classe só é descarregada quando o seu <em>loader</em> se torna inalcançável.</p>
 
-<p>O custo prático das <em>checked</em> subiu com Java 8. Nenhuma das interfaces funcionais do JDK — <code>Function</code>, <code>Supplier</code>, <code>Consumer</code> — declara excepções verificadas, pelo que qualquer método <em>checked</em> obriga a um <code>try/catch</code> dentro da <em>lambda</em>, a um <em>wrapper</em> funcional próprio ou ao truque de <em>sneaky throws</em>. Uma API nova que atire <code>checked</code> em métodos que serão usados dentro de <code>stream().map(...)</code> está a impor um custo de fricção em cada local de chamada. É por isso que quase todas as bibliotecas escritas depois de 2014 — incluindo os clientes HTTP modernos e as APIs reactivas — usam exclusivamente <em>unchecked</em>.</p>
+<p>Executado o <em>bytecode</em>, entra o compilador. A JVM começa a interpretar, conta invocações e iterações de ciclo, e promove os métodos quentes: C1 compila depressa e produz código médio com instrumentação de perfil; C2 compila devagar e produz código agressivamente optimizado a partir desse perfil. Com <em>tiered compilation</em> — ligada por omissão — um método sobe tipicamente nível 0 (interpretador) para 3 (C1 com perfil completo) e daí para 4 (C2). As optimizações que fazem a diferença são <em>inlining</em> (que abre a porta a todas as outras), análise de escape com substituição escalar, desdobramento de ciclos e desvirtualização de chamadas monomórficas. Todas são especulativas: quando a assunção falha — carrega-se uma segunda implementação de uma interface que até aí era monomórfica, um ramo nunca tomado passa a ser tomado — o código é desoptimizado, a execução volta ao interpretador e o método é recompilado com o novo perfil.</p>
 
-<p>Há ainda um custo de tempo de execução que separa uma resposta de mid de uma resposta de sénior: o preço de uma excepção não está no <code>throw</code>, está no <code>fillInStackTrace()</code> executado no construtor de <code>Throwable</code>, proporcional à profundidade da pilha. Numa pilha típica de aplicação Spring, com 60 a 120 <em>frames</em>, criar a excepção custa uma ordem de grandeza de microssegundos, contra dezenas de nanossegundos para uma alocação normal. Usar excepções para controlo de fluxo num ciclo quente é, por isso, uma escolha de desempenho e não só de estilo.</p>
+<figure class="listing text" id="lst-10-1"><div class="lhead"><span class="lnum">Listagem 10.1</span>
+<span class="lcap">Excerto de <code>-Xlog:jit+compilation=debug</code> e desoptimização por armadilha rara.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>  4312  721       3       com.acme.pricing.RuleEngine::evaluate (214 bytes)
+  4498  902       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)
+  6120  902       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)   made not entrant
+[6.120s][info][deoptimization] Uncommon trap: reason=class_check action=maybe_recompile
+                             compile_id=902 compiler=c2 level=4
+                             method=com/acme/pricing/RuleEngine.evaluate ()D @ 48
+  6380  915       4       com.acme.pricing.RuleEngine::evaluate (214 bytes)
 
-<figure class="listing java" id="lst-10-1"><div class="lhead"><span class="lnum">Listagem 10.1</span>
-<span class="lcap">Hierarquia selada de domínio e tradução da excepção checked na fronteira.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// Fronteira do domínio: nada acima desta camada volta a ver IOException nem SQLException.
-public sealed class PagamentoException extends RuntimeException
-        permits SaldoInsuficiente, LimiteDiarioExcedido, AdquirenteIndisponivel {
+# CodeCache: size=245760Kb used=238904Kb max_used=239100Kb free=6856Kb
+# CodeCache is full. Compiler has been disabled.</code></pre></figure>
 
-    private final String codigo;
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>O arranque é dominado por carregar e ligar milhares de classes, não por compilar. Um serviço Spring Boot 3.x típico carrega 12 000 a 18 000 classes ao arrancar. O CDS (arquivo de classes partilhado) e as variantes de arquivo da aplicação gravam essas classes já analisadas num ficheiro mapeado em memória e cortam 20% a 40% do tempo de arranque sem alterar uma linha de código — a diferença mais barata que existe entre <code>3,8 s</code> e <code>2,5 s</code> de <em>startup</em>.</p></aside>
 
-    protected PagamentoException(String codigo, String mensagem, Throwable causa) {
-        super(mensagem, causa);
-        this.codigo = codigo;
-    }
-
-    public String codigo() { return codigo; }
-}
-
-public final class AdquirenteIndisponivel extends PagamentoException {
-    public AdquirenteIndisponivel(String adquirente, Duration decorrido, Throwable causa) {
-        super("ADQUIRENTE_INDISPONIVEL",
-              "adquirente %s não respondeu em %d ms".formatted(adquirente, decorrido.toMillis()),
-              causa);                                  // a causa nunca se perde
-    }
-}
-
-// Adaptador: a excepção de terceiros é traduzida uma única vez, no sítio certo.
-final class AdquirenteHttp implements Adquirente {
-
-    @Override
-    public Resposta autorizar(Pedido pedido) {
-        var inicio = Instant.now();
-        try {
-            return cliente.post(pedido);               // declara IOException
-        } catch (IOException e) {
-            throw new AdquirenteIndisponivel("acme", Duration.between(inicio, Instant.now()), e);
-        }
-    }
-}</code></pre></figure>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O custo dominante de uma excepção é a captura da pilha. Com 60 a 120 <em>frames</em>, a criação anda na casa dos microssegundos; a mesma excepção sem pilha (construtor <code>super(msg, causa, false, false)</code>) volta às dezenas de nanossegundos. A JVM tem ainda a optimização <code>OmitStackTraceInFastThrow</code>, activa por defeito, que substitui excepções implícitas repetidas — <code>NullPointerException</code>, <code>ArrayIndexOutOfBoundsException</code> — por instâncias pré-alocadas sem pilha depois de alguns milhares de ocorrências no mesmo sítio. É a explicação para o <code>NullPointerException</code> sem <em>stack trace</em> que aparece em produção e nunca em desenvolvimento; desliga-se com <code>-XX:-OmitStackTraceInFastThrow</code>.</p></aside>
-
-<div class="qa" id="q-10-1" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+<div class="qa" id="q-10-1" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos uma biblioteca interna cujos métodos declaram quase todos <code>throws IOException</code>, e as equipas que a consomem embrulham tudo em <code>RuntimeException</code>. Quando é que uma excepção deve ser checked e quando não deve?</div>
+  <div class="qprompt">Descreva a hierarquia de <em>class loaders</em> e a delegação. Depois explique-me porque é que, no nosso servidor, cada <em>redeploy</em> a quente aumenta o metaspace em cerca de 40 MB e ao fim de nove <em>redeploys</em> a aplicação morre.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O sintoma descrito já é a resposta: se todos os chamadores fazem a mesma coisa — embrulhar e propagar — então a excepção não devia ser <em>checked</em>. Uma <em>checked</em> só se justifica quando o chamador imediato tem informação suficiente para tomar uma decisão diferente do chamador seguinte. Se a decisão é sempre a mesma, o compilador está a impor cerimónia sem gerar escolha.</p>
-      <p>A regra que aplico tem duas condições cumulativas para <em>checked</em>: a falha é esperada em operação normal, e existe uma acção alternativa local. <code>Files.newBufferedReader</code> em ficheiro de configuração opcional passa nas duas — há um <em>fallback</em>. Uma falha de rede a meio de um pedido HTTP passa na primeira e falha na segunda: o serviço de aplicação não sabe fazer nada de diferente do controlador. Nesse caso é <em>unchecked</em>, traduzida no adaptador e tratada numa fronteira única.</p>
-      <p>O caso concreto tem uma correcção barata: manter a assinatura da biblioteca mas introduzir um adaptador de fronteira por cada integração, que apanha <code>IOException</code> uma vez e lança uma excepção de domínio <em>unchecked</em> com código estável e causa preservada. As dezenas de <code>try/catch</code> a meio da lógica desaparecem, o <em>handler</em> global passa a mapear por tipo, e o mapeamento para HTTP fica num sítio só. Se a biblioteca for nossa e ainda tiver poucos consumidores, mudo a assinatura; se tiver muitos, deprecio o método e ofereço a variante <em>unchecked</em> ao lado, porque partir a compilação de trinta repositórios não vale a limpeza.</p>
-      <p>O <em>trade-off</em> que reconheço explicitamente: <em>unchecked</em> em tudo transfere para a disciplina de equipa o que o compilador garantia — deixa de haver aviso quando um caminho de falha novo aparece. Compenso isso com uma hierarquia selada, um <em>handler</em> com <code>switch</code> exaustivo (que deixa de compilar quando alguém acrescenta uma subclasse) e testes que asseveram o código de erro devolvido. Onde a escolha contrária ganha: num SDK público consumido por milhares de aplicações, com um punhado de falhas recuperáveis bem definidas, a <em>checked</em> é o mecanismo mais barato de documentar o contrato — o Java NIO e o JDBC fizeram essa escolha e não é errada nesse contexto.</p></div>
+      <p>São três <em>loaders</em> com delegação ao pai primeiro: <em>bootstrap</em> (<code>java.base</code> e módulos essenciais, devolve <code>null</code>), <em>platform</em> e <em>application</em>. Cada pedido sobe a cadeia antes de descer: o <em>loader</em> só procura nos seus próprios recursos depois de o pai declarar que não conhece a classe. Isto garante que os tipos da plataforma são únicos e que a identidade de uma classe é o par (nome binário, <em>class loader</em>) — duas cópias da mesma classe carregadas por <em>loaders</em> diferentes são tipos distintos e o <em>cast</em> entre elas lança <code>ClassCastException</code> com uma mensagem que parece absurda porque os dois nomes são iguais.</p>
+      <p>O crescimento de 40 MB por <em>redeploy</em> é uma fuga de <em>class loader</em>. Um <em>redeploy</em> a quente cria um <em>loader</em> novo para a aplicação e descarta o antigo. As classes do <em>loader</em> antigo — e o próprio metaspace que ocupam — só são libertadas quando o <em>loader</em> se torna inalcançável, o que exige que nada fora da aplicação lhe segure uma referência, directa ou indirecta. Como uma classe referencia o seu <em>loader</em> e um objecto referencia a sua classe, basta um único objecto sobrevivente para reter todo o grafo.</p>
+      <p>As fontes habituais são quatro: um <code>ThreadLocal</code> preenchido num <em>thread</em> de um <em>pool</em> partilhado que sobrevive ao <em>redeploy</em>; um <em>thread</em> criado pela aplicação e nunca terminado, cujo <code>contextClassLoader</code> aponta para o <em>loader</em> antigo; um <em>singleton</em> estático de uma biblioteca carregada pelo pai (drivers JDBC registados no <code>DriverManager</code>, <em>appenders</em> de <em>logging</em>, <em>caches</em> de MBeans no <em>registry</em> JMX) que guarda um objecto da aplicação; e proxies dinâmicos ou classes geradas em tempo de execução que continuam referenciadas.</p>
+      <p>O diagnóstico é directo: <code>jcmd &lt;pid&gt; VM.classloader_stats</code> mostra quantos <em>loaders</em> existem e quanto metaspace cada um retém — se houver dez <em>loaders</em> da aplicação depois de nove <em>redeploys</em>, está provado. A confirmação faz-se com um <em>heap dump</em> e o caminho para as raízes GC do <em>loader</em> antigo no Eclipse MAT. O <em>trade-off</em> operacional é conhecido e desagradável: corrigir cada fuga é caro e frágil, pelo que a esmagadora maioria das equipas abandonou o <em>redeploy</em> a quente e passou a substituir o processo — em contentores, o custo de reiniciar é de segundos e a classe de problema desaparece por construção. O <em>redeploy</em> a quente só se justifica quando o arranque custa minutos e não há forma de o reduzir.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Repete a definição de manual («checked obriga a tratar») sem regra de decisão; ou defende «unchecked sempre» por ser mais cómodo, sem admitir o que se perde.</td></tr>
-        <tr><td>Mid</td><td>Dá a heurística recuperável/não recuperável e sabe que o Spring usa <code>DataAccessException</code> unchecked, mas não fala de fronteira de tradução nem de migração de assinatura.</td></tr>
-        <tr><td>Sénior</td><td>Usa as duas condições cumulativas, coloca a tradução no adaptador, preserva a causa, propõe hierarquia selada e handler exaustivo, e diz quando a escolha contrária ganha (SDK público).</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o caminho de migração compatível para consumidores existentes, o custo de <code>fillInStackTrace</code> em caminhos quentes e a ligação ao contrato externo — códigos de erro estáveis e versionados, não classes Java.</td></tr>
+        <tr><td>Insuficiente</td><td>Enumera os três <em>loaders</em> sem delegação; atribui o crescimento a «falta de memória» e propõe aumentar <code>-XX:MaxMetaspaceSize</code>.</td></tr>
+        <tr><td>Mid</td><td>Explica a delegação parent-first correctamente e diz «é uma fuga de <em>classloader</em>», mas não sabe nomear o mecanismo de retenção nem como o provar.</td></tr>
+        <tr><td>Sénior</td><td>Liga identidade de tipo ao par (nome, <em>loader</em>), explica a cadeia objecto → classe → <em>loader</em>, nomeia pelo menos duas fontes concretas de retenção e o comando de diagnóstico.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o julgamento de engenharia: quantifica o custo de perseguir fugas contra o de eliminar o <em>redeploy</em> a quente, e define a política da equipa (processo novo por <em>deploy</em>, <em>MaxMetaspaceSize</em> como alarme e não como remédio).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E dentro de um <code>stream().map()</code>, como trata um método que atira checked?»</li>
-      <li>«Quanto custa criar uma excepção? Faz diferença num ciclo de um milhão de iterações?»</li>
-      <li>«Como é que garante que ninguém acrescenta uma subclasse sem a mapear para HTTP?»</li>
-      <li>«E se a biblioteca já tem 40 consumidores — como faz a migração sem parar equipas?»</li></ul></div>
+      <li>«Porque é que definir <code>-XX:MaxMetaspaceSize</code> não resolve a fuga — e mesmo assim vale a pena defini-lo?»</li>
+      <li>«O que é o <em>compressed class space</em> e como se esgota separadamente do metaspace?»</li>
+      <li>«Como isolaria duas versões da mesma biblioteca no mesmo processo?»</li>
+      <li>«Porque é que um <code>ThreadLocal</code> num <em>pool</em> retém mais do que o valor guardado?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor <code>throws Exception</code> na assinatura para «simplificar».</li>
-      <li>Recomendar <em>sneaky throws</em> como solução de desenho e não como último recurso local.</li>
-      <li>Não distinguir o local de tradução (adaptador) do local de tratamento (fronteira).</li>
-      <li>Afirmar que excepções são sempre lentas, sem saber que o custo está na captura da pilha.</li></ul></div>
+      <li>Dizer que o metaspace está no <em>heap</em> e que uma GC completa o liberta sempre.</li>
+      <li>Propor <code>System.gc()</code> periódico como mitigação.</li>
+      <li>Não distinguir descarregamento de classes de recolha de objectos.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-10-2" data-box="qa" data-area="java" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Apareceu isto num <em>code review</em>, dentro do <code>@KafkaListener</code> de liquidações: <code>catch (Exception e) { log.error("erro", e); }</code>. O que escreve no comentário do PR?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Escrevo que este bloco converte falha em silêncio: o <em>offset</em> é confirmado, a mensagem é dada como processada e o dinheiro não foi liquidado. O problema não é o <em>log</em> — é apanhar e continuar. Num consumidor, engolir a excepção transforma perda de dados numa linha de <em>log</em> que ninguém lê.</p>
-      <p>São três defeitos independentes. Primeiro, o âmbito: <code>Exception</code> apanha também <code>IllegalStateException</code> de <em>bugs</em> nossos e, se fosse <code>Throwable</code>, apanharia <code>OutOfMemoryError</code>. Segundo, a decisão implícita de <em>commit</em>: em Spring Kafka, uma excepção que sai do <em>listener</em> entrega o controlo ao <code>DefaultErrorHandler</code> — retentativas com <em>backoff</em> e, esgotadas as tentativas, publicação em <em>dead-letter topic</em> via <code>DeadLetterPublishingRecoverer</code>. Apanhar cá dentro desliga esse mecanismo inteiro. Terceiro, a mensagem: <code>"erro"</code> não tem chave de partição, <em>offset</em>, id do pedido nem tentativa, portanto o <em>log</em> não permite reprocessar.</p>
-      <p>A correcção que proponho no comentário: remover o <code>catch</code> e deixar a excepção sair; configurar <code>DefaultErrorHandler</code> com <code>ExponentialBackOff</code> (por exemplo, 500 ms inicial, multiplicador 2, máximo 30 s, 5 tentativas) e DLT; classificar as excepções não recuperáveis — validação, desserialização — como <code>addNotRetryableExceptions</code>, para irem directas ao DLT sem gastar cinco tentativas. Se houver mesmo um caso a ignorar, ele é apanhado pelo tipo exacto, com comentário a justificar, e conta uma métrica <code>liquidacao_ignorada_total</code> com etiqueta de motivo — não é um <code>log.error</code> anónimo.</p>
-      <p>Onde a escolha contrária é legítima: num ciclo que processa 10 000 linhas de um ficheiro em <em>batch</em>, apanhar por linha e acumular falhas é correcto, porque a alternativa é perder 9 999 linhas boas por causa de uma má. A diferença é que aí a falha é registada num resultado explícito e devolvida ao chamador, não desaparece.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«É má prática apanhar <code>Exception</code>», sem explicar a consequência concreta no consumidor.</td></tr>
-        <tr><td>Mid</td><td>Identifica o âmbito demasiado largo e a mensagem pobre; sugere apanhar o tipo específico e melhorar o log.</td></tr>
-        <tr><td>Sénior</td><td>Liga o catch ao commit do offset e à perda de dados, conhece o error handler e o DLT, distingue excepções retentáveis de não retentáveis e substitui log por métrica.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o custo operacional — política de reprocessamento do DLT, quem é alertado, e o caso em que apanhar por item é a decisão certa num processamento em lote.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se a excepção for de desserialização — vale a pena tentar cinco vezes?»</li>
-      <li>«Quem consome o dead-letter topic e ao fim de quanto tempo?»</li>
-      <li>«Como testaria que a mensagem vai mesmo parar ao DLT?»</li>
-      <li>«E se fosse <code>catch (Throwable t)</code> — muda alguma coisa?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor apenas «melhorar a mensagem de log» e considerar o problema resolvido.</li>
-      <li>Não perceber que apanhar dentro do listener confirma o offset.</li>
-      <li>Sugerir retentativa infinita no próprio listener, bloqueando a partição.</li>
-      <li>Apanhar <code>Throwable</code> para «ser mais seguro».</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-10-2" class="h2"><span class="secnum">10.2</span> Desenhar hierarquias de erro e mensagens úteis<a class="anchor" href="#sec-10-2" aria-label="ligação">#</a></h2>
-
-<p>Uma hierarquia de erro útil é rasa: uma classe base por contexto delimitado e três a seis subclasses concretas. Hierarquias com quatro níveis existem para satisfazer o instinto de taxonomia e não sobrevivem ao primeiro <em>handler</em>, porque ninguém apanha os níveis intermédios. Com Java 21, selar a base (<code>sealed ... permits</code>) transforma o <code>switch</code> de mapeamento num verificador de exaustividade: acrescentar uma subclasse sem a mapear deixa de compilar, o que devolve por outra via a garantia que se perdeu ao abandonar as <em>checked</em>.</p>
-
-<p>O contrato externo não é a classe Java, é o código de erro. A classe é refactorizável, o código é público e versionado — os clientes escrevem <code>if (codigo == "LIMITE_DIARIO_EXCEDIDO")</code> e essa <em>string</em> passa a fazer parte da API. Do lado HTTP, o formato normalizado é o <em>Problem Details</em> do RFC 9457 (que substituiu o RFC 7807), suportado nativamente pelo Spring desde a versão 6 através de <code>ProblemDetail</code> e <code>ErrorResponseException</code>. A regra de conteúdo: <code>title</code> e <code>type</code> estáveis e legíveis por máquina, <code>detail</code> para humanos, propriedades extra para os dados accionáveis (quanto falta, qual o limite, quando volta a poder tentar) — e zero <em>stack traces</em>, nomes de tabelas, SQL ou dados pessoais na resposta.</p>
-
-<p>A mensagem interna obedece a outra regra, porque o leitor é quem está de plantão: diz o que se tentou fazer, com que valores e qual o invariante violado. «Erro ao processar pedido» custa 20 minutos de investigação; «conta c-1: pedido 9000 cêntimos, disponível 5000, limite diário 10000 já gasto 9500» resolve o incidente sem abrir o depurador. Os valores entram por <code>String.formatted</code> ou por parâmetros estruturados do <em>logger</em>, nunca por concatenação dentro do <code>log.error</code>.</p>
-
-<p>O erro mais comum na fronteira é a perda da causa. <code>throw new ServiceException("erro ao guardar")</code> destrói a <em>stack trace</em> original e deixa o operador com uma mensagem e nada mais. <code>Throwable</code> tem construtor com causa desde a versão 1.4 e <code>getSuppressed()</code> desde a 7; usar ambos custa zero e é a diferença entre um incidente de cinco minutos e um de uma hora.</p>
-
-<figure class="listing java" id="lst-10-2"><div class="lhead"><span class="lnum">Listagem 10.2</span>
-<span class="lcap">Mapeamento exaustivo para ProblemDetail (RFC 9457) sobre a hierarquia selada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@RestControllerAdvice
-class PagamentoExceptionHandler {
-
-    private static final Logger log = LoggerFactory.getLogger(PagamentoExceptionHandler.class);
-
-    @ExceptionHandler(PagamentoException.class)
-    ProblemDetail tratar(PagamentoException e) {
-        // switch exaustivo sobre a hierarquia selada: uma subclasse nova não compila até ser mapeada.
-        ProblemDetail pd = switch (e) {
-            case SaldoInsuficiente s -&gt; {
-                var p = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY,
-                        "Saldo insuficiente para autorizar o pagamento.");
-                p.setProperty("emFaltaCentimos", s.emFalta());
-                yield p;
-            }
-            case LimiteDiarioExcedido l -&gt; {
-                var p = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY,
-                        "Limite diário atingido.");
-                p.setProperty("reiniciaEm", l.reiniciaEm());     // instante ISO-8601, accionável
-                yield p;
-            }
-            case AdquirenteIndisponivel a -&gt; ProblemDetail.forStatusAndDetail(
-                    HttpStatus.SERVICE_UNAVAILABLE, "Tente novamente dentro de instantes.");
-        };
-        pd.setType(URI.create("https://api.exemplo.pt/erros/" + e.codigo().toLowerCase()));
-        pd.setProperty("codigo", e.codigo());                    // contrato estável para o cliente
-
-        // A stack trace fica no log, com a causa; nunca no corpo da resposta.
-        log.warn("falha de pagamento codigo={}", e.codigo(), e);
-        return pd;
-    }
-}</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>throw new ServiceException("erro ao guardar")</code> dentro de um <code>catch (SQLException e)</code> apaga a informação que resolvia o incidente: o <code>SQLState</code>, a restrição violada e a linha de código do <em>driver</em>. O construtor com causa existe para isto. O mesmo se aplica a <code>e.getMessage()</code> passado como <em>string</em> — perde a pilha na mesma. Regra de revisão: qualquer <code>new ...Exception(</code> dentro de um bloco <code>catch</code> tem de referir a variável apanhada como último argumento.</p></aside>
-
-<div class="qa" id="q-10-3" data-box="qa" data-area="java" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Temos um alerta em produção disparado por «ServiceException: erro ao guardar», sem mais nada. Como desenharia esta hierarquia de erros e as mensagens para que o próximo turno de plantão não perca uma hora?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O defeito imediato é a causa perdida: o <code>catch (SQLException e)</code> criou uma excepção nova sem passar <code>e</code>. A primeira alteração é de uma linha — <code>new ServiceException("...", e)</code> — e devolve <em>SQLState</em>, nome da restrição violada e pilha do <em>driver</em>. Sem isso, nenhuma melhoria de hierarquia resolve o incidente.</p>
-      <p>A seguir vem a estrutura. Uma base selada por contexto delimitado, três a seis subclasses concretas, cada uma com um código estável em maiúsculas e os dados que o cliente pode usar para decidir. Rasa de propósito: se ninguém apanha um nível intermédio, esse nível não existe. Selada porque o <code>switch</code> exaustivo no <code>@RestControllerAdvice</code> passa a garantir, em tempo de compilação, que nenhuma subclasse nova sai como 500 genérico.</p>
-      <p>As mensagens seguem duas audiências distintas. Para fora, <code>ProblemDetail</code> do RFC 9457: <code>type</code> como URI estável, <code>title</code> e <code>detail</code> sem dados internos, e propriedades accionáveis — <code>emFaltaCentimos</code>, <code>reiniciaEm</code>. Para dentro, a mensagem traz o que se tentou, com que valores e o invariante violado: «conta c-1: pedido 9000, disponível 5000». Nunca o inverso: <em>stack trace</em> na resposta HTTP é fuga de informação e já foi origem de mais de um incidente de segurança.</p>
-      <p>Por fim, a correlação. Cada excepção que chega à fronteira leva o <code>traceId</code> do contexto de observabilidade, devolvido também ao cliente numa propriedade do <em>problem detail</em>. O suporte recebe «trace 4f2a…» e o operador salta directamente para o <em>span</em> com a consulta SQL. O <em>trade-off</em> é de disciplina: um código de erro é um contrato público, portanto renomear <code>SALDO_INSUFICIENTE</code> parte clientes tal como renomear um campo do JSON — a hierarquia interna é livre, os códigos são versionados.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe «mensagens melhores» sem detectar que a causa foi descartada; ou sugere devolver a stack trace ao cliente para facilitar o suporte.</td></tr>
-        <tr><td>Mid</td><td>Corrige a causa e propõe subclasses por caso de uso; mensagens com valores; não fala de contrato externo nem de exaustividade.</td></tr>
-        <tr><td>Sénior</td><td>Hierarquia rasa e selada, switch exaustivo, códigos estáveis, ProblemDetail para fora e mensagem rica para dentro, sem dados sensíveis na resposta.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais correlação por traceId, versionamento dos códigos como contrato público e a regra de revisão que impede a regressão (nenhum <code>new ...Exception</code> num catch sem causa).</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que nunca pode aparecer no corpo da resposta de erro?»</li>
-      <li>«Como impede que alguém acrescente uma subclasse e ela saia como 500?»</li>
-      <li>«Renomear um código de erro é <em>breaking change</em>? Porquê?»</li>
-      <li>«Onde é que o traceId entra e quem o vê?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Hierarquias de quatro ou cinco níveis «para ficar bem organizado».</li>
-      <li>Devolver <code>e.getMessage()</code> da excepção de base de dados directamente ao cliente.</li>
-      <li>Usar a mensagem de texto como discriminador — o cliente a fazer <code>contains("saldo")</code>.</li>
-      <li>Registar a mesma excepção em cada camada por onde passa, multiplicando o ruído no log.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-10-4" data-box="qa" data-area="java" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Num <code>try-with-resources</code>, o corpo lança e o <code>close()</code> também lança. O que é que o chamador recebe? E porque é que isso difere de fechar o recurso num <code>finally</code>?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O chamador recebe a excepção do corpo. A excepção do <code>close()</code> é anexada à primeira através de <code>addSuppressed()</code> e fica acessível em <code>getSuppressed()</code>. É exactamente o inverso do <code>finally</code> manual: aí, a excepção lançada dentro do <code>finally</code> substitui a do corpo, que desaparece sem deixar rasto — o modo de falha clássico em que o disco encheu e o que se vê no <em>log</em> é «stream closed».</p>
-      <p>Dois detalhes que separam a resposta completa. Primeiro, os recursos são fechados por ordem inversa de declaração, o que importa quando um recurso embrulha outro: o <code>CsvWriter</code> fecha antes do <code>BufferedWriter</code> que lhe serve de destino, e por isso o <em>flush</em> ainda encontra o destino aberto. Inverter a ordem produz perda silenciosa dos últimos <em>bytes</em>. Segundo, o <em>stack trace</em> impresso por defeito inclui as excepções suprimidas, com o prefixo <code>Suppressed:</code>, pelo que a informação não se perde nos <em>logs</em> — perde-se apenas se alguém registar só <code>e.getMessage()</code>.</p>
-      <p>Desde Java 9 a variável do recurso pode ser efectivamente final e declarada fora do <code>try</code>, o que resolve o caso de o recurso vir de um parâmetro. O que continua a não existir é fecho automático de recursos que não implementam <code>AutoCloseable</code>: para esses — um <em>lock</em>, um contexto de <em>tracing</em>, um <em>thread pool</em> — vale a pena um pequeno <code>AutoCloseable</code> próprio, porque o <code>try-with-resources</code> passa a garantir a libertação mesmo em caminhos de excepção.</p>
-      <p>Onde isto interessa numa entrevista de sénior: a pergunta seguinte é quase sempre «e como testa isso?». A resposta é asseverar as duas partes — o tipo e a mensagem da excepção principal, e o conteúdo de <code>getSuppressed()</code>. Um teste que só verifica o tipo passa mesmo quando alguém troca <code>try-with-resources</code> por <code>finally</code> e destrói a causa.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Diz que «o try-with-resources fecha sozinho» e não sabe qual das duas excepções chega ao chamador.</td></tr>
-        <tr><td>Mid</td><td>Sabe que a do corpo prevalece; menciona suppressed sem saber como se lê nem porque é que o finally é diferente.</td></tr>
-        <tr><td>Sénior</td><td>Explica suppressed, o comportamento inverso do finally, a ordem inversa de fecho e a razão pela qual ela importa em recursos encadeados.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o padrão de embrulhar recursos não-<code>AutoCloseable</code> e um teste que assevera o conteúdo de <code>getSuppressed()</code> para impedir regressão.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se só o <code>close()</code> lançar — o que chega ao chamador?»</li>
-      <li>«Porque é que a ordem de fecho é inversa?»</li>
-      <li>«Como escreve um teste que falha se alguém voltar ao <code>finally</code>?»</li>
-      <li>«Faria sentido um <code>AutoCloseable</code> para um <em>lock</em>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Afirmar que a excepção do <code>close()</code> substitui a do corpo.</li>
-      <li>Fechar manualmente dentro do <code>try-with-resources</code>, duplicando o <code>close()</code>.</li>
-      <li>Apanhar e ignorar a excepção do <code>close()</code> «porque não interessa».</li></ul></div>
-  </div>
-</div>
-
-<figure class="listing java" id="lst-10-3"><div class="lhead"><span class="lnum">Listagem 10.3</span>
-<span class="lcap">Teste que fixa o comportamento das excepções suprimidas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>static void exportar(Path destino, List&lt;Linha&gt; linhas) throws IOException {
-    try (var writer = Files.newBufferedWriter(destino);
-         var csv = new CsvWriter(writer)) {          // fechado primeiro: ordem inversa da declaração
-        for (var linha : linhas) {
-            csv.escrever(linha);
-        }
-    }
-}
-
-@Test
-void a_falha_do_close_nao_esconde_a_falha_do_corpo() {
-    var erro = catchThrowable(() -&gt; exportar(discoCheio(), TRES_LINHAS));
-
-    assertThat(erro)
-        .isInstanceOf(IOException.class)
-        .hasMessage("falha a escrever a linha 2");   // a excepção do corpo é a que sobe
-
-    assertThat(erro.getSuppressed())                 // a do close() fica anexada, não perdida
-        .singleElement()
-        .hasMessageContaining("No space left on device");
-}</code></pre></figure>
-
-<h2 id="sec-10-3" class="h2"><span class="secnum">10.3</span> Pirâmide de testes num serviço Spring<a class="anchor" href="#sec-10-3" aria-label="ligação">#</a></h2>
-
-<p>A pirâmide não é uma regra estética, é uma consequência de custos. Cada teste tem três custos — escrever, correr, manter — e a razão entre eles muda por ordem de grandeza consoante o nível. Num serviço de referência com 60 000 linhas, a distribuição que funciona é: cerca de 1 500 testes unitários a correr em 30-45 segundos, 120 a 150 testes de fatia (<em>slice</em>) em 90-120 segundos, e 20 a 30 testes de integração com contentores em 3 a 5 minutos. O orçamento total é o único número que interessa: o <em>feedback</em> de um <em>pull request</em> tem de caber em menos de 10 minutos, senão a equipa deixa de correr a bateria localmente e o custo migra para o CI e para os <em>rollbacks</em>.</p>
-
-<p>O critério de escolha do nível é a natureza do risco. Lógica de decisão — limites, arredondamentos, máquinas de estados, regras de elegibilidade — testa-se em unitário puro, sem Spring, em microssegundos por teste, e é aí que se cobrem os casos limite exaustivamente. Contratos de serialização, validação de <em>request</em>, códigos de estado e cabeçalhos testam-se em fatia web. Mapeamentos JPA, consultas nativas, migrações, restrições únicas e comportamento transaccional testam-se contra PostgreSQL real. E o percurso completo — dois ou três casos de negócio, não vinte — testa-se de ponta a ponta.</p>
-
-<p>O maior erro de custo numa base Spring é multiplicar configurações de contexto. O <em>framework</em> mantém uma <em>cache</em> de contextos por chave de configuração: cada combinação distinta de anotações, propriedades e <em>beans</em> substituídos produz um arranque novo. Uma bateria com oito configurações distintas a 8 segundos cada paga 64 segundos só de arranques, mesmo que cada teste individual demore 20 ms. A disciplina que resolve isto é ter duas ou três classes de configuração de teste partilhadas e herdar delas, em vez de decorar cada classe com o seu próprio conjunto de <code>@TestPropertySource</code>.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 10.1</span> Níveis de teste num serviço Spring Boot 3.5: o que cada um carrega, custa e apanha.</div>
-<div class="tscroll"><table><thead><tr><th>Nível</th><th>O que carrega</th><th>Custo típico</th><th>Apanha</th><th>Não apanha</th></tr></thead><tbody>
-<tr><td>JUnit puro (sem Spring)</td><td>Nada; construtores explícitos</td><td>&lt; 1 ms por teste</td><td>Regras de negócio, casos limite, invariantes, aritmética</td><td>Ligações, JSON, SQL, transacções</td></tr>
-<tr><td><code>@WebMvcTest</code></td><td>Camada web: controladores, conversores, validação, filtros de segurança</td><td>1,5-3 s de arranque, ~20 ms por teste</td><td>Estado HTTP, forma do JSON, validação de entrada, mapeamento de erros</td><td>SQL, transacções, integração real com serviços</td></tr>
-<tr><td><code>@DataJpaTest</code></td><td>JPA, repositórios, <code>DataSource</code>, migrações</td><td>2-4 s + arranque do contentor</td><td>Mapeamentos, consultas, restrições, migrações Flyway</td><td>Contrato HTTP, orquestração de serviços</td></tr>
-<tr><td><code>@SpringBootTest</code> + Testcontainers</td><td>Contexto completo da aplicação</td><td>6-12 s de arranque, 0,2-2 s por teste</td><td>Ligação real entre camadas, configuração, transacções ponta a ponta</td><td>Falhas de rede reais, comportamento sob carga</td></tr>
-</tbody></table></div></div>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>O <em>testing trophy</em> — mais testes de integração do que unitários — ganha quando a lógica do serviço é fina e o risco está nas ligações: um <em>gateway</em> de API, um <em>CRUD</em> com validação, um adaptador de mensagens. A pirâmide clássica ganha quando existe um domínio com regras densas: motores de preços, elegibilidade, cálculo fiscal, liquidação. O sinal para mudar de forma é empírico — se mais de 40% dos defeitos que chegam a produção passariam por qualquer teste unitário existente, o problema não é falta de unitários, é falta de integração; se os testes de integração falham por razões que um unitário apanharia em 2 ms, é o inverso.</p></aside>
-
-<div class="qa" id="q-10-5" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+<div class="qa" id="q-10-2" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Recebe um serviço novo: um <code>PagamentoService</code> que valida um pedido, consulta saldo em PostgreSQL, chama um adquirente por HTTP e publica um evento em Kafka. O que é que testa, a que nível, e o que decide deliberadamente não testar?</div>
+  <div class="qprompt">Um <em>benchmark</em> nosso corre a 180 ns por operação durante os primeiros dois minutos e depois estabiliza em 310 ns, sempre com a mesma carga. O que está a acontecer na JVM e como o confirmaria?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Reparto por risco, não por classe. Ao nível unitário, sem Spring, testo tudo o que é decisão: limites inclusivos ou exclusivos, arredondamento de cêntimos, transições de estado do pedido, o que acontece quando o saldo é exactamente igual ao valor. São dezenas de casos e custam menos de um milissegundo cada, portanto podem ser exaustivos — é aqui que uso <code>@ParameterizedTest</code> com a tabela da especificação.</p>
-      <p>Ao nível de fatia, testo o contrato: <code>@WebMvcTest</code> para os estados HTTP e a forma do JSON, incluindo o corpo de erro do RFC 9457, e <code>@DataJpaTest</code> contra PostgreSQL real para os mapeamentos, a restrição única de idempotência e as migrações. A restrição única é um caso que só existe na base de dados; testá-la com um <em>mock</em> de repositório é testar o <em>mock</em>.</p>
-      <p>Ao nível de integração, escolho três comportamentos e não mais: o percurso feliz que grava e publica; a idempotência sob reentrega da mesma mensagem, que é o defeito que efectivamente aparece em produção com Kafka <em>at-least-once</em>; e o comportamento transaccional quando o adquirente falha — o pedido tem de ficar pendente e nenhum evento pode sair. Este último é o mais valioso porque atravessa transacção, excepção e publicação, e nenhum unitário o cobre.</p>
-      <p>O que não testo, e digo-o explicitamente: não testo o adquirente real (mock na fronteira, mais um teste de contrato separado se houver acordo de esquema); não testo <em>getters</em>, construtores nem mapeadores gerados; não testo o Spring nem o Hibernate; e não escrevo um teste de ponta a ponta por cada regra de negócio — as regras vivem nos unitários. O critério de paragem é a matriz de risco: qualquer defeito que chegue a produção deve ser reproduzível pelo teste mais barato que o apanharia, e é esse teste que se acrescenta na correcção.</p></div>
+      <p>A degradação depois de um bom período inicial é o padrão clássico de desoptimização por perfil incompleto: o C2 compilou o caminho quente assumindo que um ponto de chamada era monomórfico, ou que um ramo nunca era tomado, e essa assunção deixou de ser verdadeira. Quando a segunda implementação da interface entra em uso, o código compilado é marcado <code>made not entrant</code>, a execução volta ao interpretador via armadilha rara e o método é recompilado — agora sem poder fazer <em>inlining</em> da chamada, que passa a ser bimórfica ou megamórfica. Os 180 ns eram uma medição de um mundo que não existe em produção; os 310 ns são o número verdadeiro.</p>
+      <p>Vale a pena separar isto das três causas alternativas, porque a resposta de nível sénior é o processo de eliminação, não o palpite. A primeira alternativa é o <em>code cache</em> cheio: com <em>tiered compilation</em> o espaço reservado é de 240 MB por omissão e, quando enche, a JVM desliga o compilador e tudo volta ao interpretador — a degradação aí é de um factor 5 a 20, não de 1,7, e o <em>log</em> escreve <code>CodeCache is full</code>. A segunda é o estado do GC: se o conjunto vivo cresce, as pausas e a fracção de CPU gasta em GC sobem e a latência média sobe com elas. A terceira é o próprio <em>benchmark</em> a medir menos trabalho no início — <em>caches</em> frias, tabelas vazias, um <code>HashMap</code> com dois elementos que ao fim de dois minutos tem duzentos mil.</p>
+      <p>A confirmação faz-se por observação, não por dedução. <code>-Xlog:deoptimization</code> e o registo de compilação mostram o método e a razão da armadilha; <code>-XX:+PrintInlining</code> mostra a decisão de <em>inlining</em> antes e depois; <code>jcmd &lt;pid&gt; Compiler.codecache</code> dá a ocupação do <em>code cache</em>; e um <em>flight recording</em> com <code>-XX:StartFlightRecording=settings=profile</code> separa tempo de GC de tempo aplicacional em minutos, sem instrumentação.</p>
+      <p>O <em>trade-off</em> de correcção é o que interessa ao entrevistador: forçar monomorfismo (uma implementação por ponto de chamada quente, <em>call sites</em> separados, classes finais) recupera o <em>inlining</em> mas acopla o desenho ao compilador e não sobrevive à evolução do código. Vale a pena quando o método está no caminho crítico e a diferença é de 40% ou mais; não vale quando o custo total do método é 3% do tempo de pedido. E o corolário metodológico: qualquer medição de latência tem de ser feita depois de aquecimento, com todas as implementações reais carregadas, ou está a medir uma JVM que nunca vai existir.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Testava tudo com <code>@SpringBootTest</code>» ou uma lista de classes sem critério de risco; fala em percentagem de cobertura como objectivo.</td></tr>
-        <tr><td>Mid</td><td>Distingue unitário de integração e sabe usar mocks nas fronteiras, mas testa regras de negócio ao nível de integração e não sabe o que deixar de fora.</td></tr>
-        <tr><td>Sénior</td><td>Reparte por risco, escolhe poucos testes de integração de alto valor (idempotência, rollback), justifica o que não testa e liga isso ao orçamento de tempo do CI.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais testes de contrato com o adquirente, política de acrescentar teste na correcção de cada defeito e critério empírico para mudar a forma da pirâmide.</td></tr>
+        <tr><td>Insuficiente</td><td>«É o JIT» sem mecanismo, ou atribui tudo ao GC sem verificar.</td></tr>
+        <tr><td>Mid</td><td>Descreve <em>tiered compilation</em> e aquecimento, mas explica só a subida de desempenho, não a descida posterior.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia desoptimização por armadilha rara, liga-a à perda de <em>inlining</em> monomórfico, enumera as alternativas e diz que flag ou comando usa para as excluir.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério de decisão sobre corrigir ou não, e reformula a prática de <em>benchmarking</em> da equipa (aquecimento, perfis realistas, medição em produção com JFR contínuo).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quanto tempo pode a bateria demorar antes de a equipa deixar de a correr?»</li>
-      <li>«Como testa a idempotência sob reentrega?»</li>
-      <li>«E se o adquirente muda o contrato sem avisar — que teste apanha isso?»</li>
-      <li>«Qual foi o último defeito de produção que a sua bateria não apanhou e o que mudou?»</li></ul></div>
+      <li>«Qual é a diferença entre C1 e C2 e quando é que vale a pena <code>-XX:TieredStopAtLevel=1</code>?»</li>
+      <li>«O que é substituição escalar e que condição a torna impossível?»</li>
+      <li>«Como mediria o custo real de aquecimento num serviço que reinicia dez vezes por dia?»</li>
+      <li>«Um <em>heap</em> maior pode piorar a latência? Porquê?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Definir o objectivo em percentagem de cobertura em vez de risco coberto.</li>
-      <li>Testar regras de negócio através de HTTP com contexto completo.</li>
-      <li>Não conseguir nomear uma única coisa que decide não testar.</li>
-      <li>Mockar o repositório e depois afirmar que a restrição única está testada.</li></ul></div>
+      <li>Confundir <em>interpretador</em> com «Java é lento porque é interpretado».</li>
+      <li>Medir latência sem aquecimento e apresentar o resultado como definitivo.</li>
+      <li>Propor flags de compilação sem antes olhar para o <em>log</em>.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-10-6" data-box="qa" data-area="spring" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">Spring e frameworks</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Qual é a diferença prática entre <code>@SpringBootTest</code>, <code>@WebMvcTest</code> e <code>@DataJpaTest</code>? E porque é que a bateria da nossa equipa passou de 4 para 14 minutos depois de acrescentarmos 30 testes?</div>
+<h2 id="sec-10-2" class="h2"><span class="secnum">10.2</span> Layout de memória: heap, metaspace, stack e off-heap<a class="anchor" href="#sec-10-2" aria-label="ligação">#</a></h2>
+
+<p>A memória residente de um processo Java é a soma de sete parcelas, e apenas uma delas se controla com <code>-Xmx</code>. O <em>heap</em> guarda os objectos. O metaspace, que é memória nativa e não <em>heap</em>, guarda metadados de classes; dentro dele, o <em>compressed class space</em> tem um limite próprio de 1 GB por omissão. Cada <em>thread</em> tem uma pilha com 1 MB reservado por omissão em Linux de 64 bits. O <em>code cache</em> guarda o código compilado. As estruturas do GC ocupam entre 1% e 15% do <em>heap</em>, consoante o recolector. Os <em>buffers</em> directos e os ficheiros mapeados vivem fora do <em>heap</em>. E o <em>allocator</em> nativo do sistema (a <em>glibc</em>, em imagens baseadas em Debian) reserva arenas por <em>thread</em> que podem crescer centenas de MB sem que nada em Java o veja.</p>
+
+<p>Dentro do <em>heap</em>, um objecto tem um cabeçalho de 12 <em>bytes</em> quando os ponteiros de classe estão comprimidos (8 de <em>mark word</em> mais 4 de <em>klass pointer</em>), alinhado a 8, pelo que a instância mais pequena ocupa 16 <em>bytes</em>. As referências ocupam 4 <em>bytes</em> em vez de 8 enquanto o <em>heap</em> couber abaixo de 32 GB — é por isso que subir de <code>-Xmx31g</code> para <code>-Xmx33g</code> pode reduzir a capacidade útil: perdem-se os <em>oops</em> comprimidos e todas as referências duplicam de tamanho. Um <code>Long</code> em caixa custa 16 <em>bytes</em> mais 4 ou 8 de referência contra 8 <em>bytes</em> de um <code>long</code> primitivo; um <code>HashMap</code> com um milhão de entradas <code>Long</code>→<code>Long</code> consome à volta de 80 MB, contra menos de 20 MB numa estrutura primitiva. Este é o cálculo que um sénior faz de cabeça quando alguém propõe guardar dez milhões de linhas «em memória».</p>
+
+<p>Para saber para onde foi a memória que não está no <em>heap</em>, a ferramenta é o <em>Native Memory Tracking</em>: arranca-se com <code>-XX:NativeMemoryTracking=summary</code> (custo de 5% a 10% em desempenho e alguns MB de metadados) e consulta-se com <code>jcmd</code>. A distinção entre <em>reserved</em> e <em>committed</em> é a parte que os candidatos falham: o que conta para a memória residente e para o limite do contentor é o <em>committed</em>, não o <em>reserved</em>.</p>
+
+<figure class="listing text" id="lst-10-2"><div class="lhead"><span class="lnum">Listagem 10.2</span>
+<span class="lcap">Resumo de <code>jcmd 1 VM.native_memory summary</code> num serviço com RSS de 1,9 GB e <code>-Xmx1200m</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>Native Memory Tracking:
+Total: reserved=3891MB, committed=1874MB
+
+-                 Java Heap (reserved=1200MB, committed=1200MB)
+-                     Class (reserved=1096MB, committed=  148MB)
+                            (classes #24817)
+                            (  instance classes #23204, array classes #1613)
+-                    Thread (reserved= 412MB, committed=  412MB)
+                            (thread #401)
+                            (stack: reserved=410MB, committed=410MB)
+-                      Code (reserved= 247MB, committed=   96MB)
+-                        GC (reserved=  78MB, committed=   78MB)
+-                  Compiler (reserved=   6MB, committed=    6MB)
+-                  Internal (reserved=   3MB, committed=    3MB)
+-                    Symbol (reserved=  28MB, committed=   28MB)
+-        Native Memory Tracking (reserved=   9MB, committed=    9MB)
+
+# 401 threads x 1MB de pilha = 412MB committed. O heap e as pilhas juntos
+# ja excedem 1,6GB; o limite do contentor era 2Gi -> OOMKilled iminente.</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Orçamento típico não-<em>heap</em> de um serviço Spring Boot 3.x com 200 <em>threads</em>: metaspace 110-180 MB, <em>code cache</em> committed 60-120 MB, pilhas 200 MB reservados (o <em>committed</em> real é muito menor porque só as páginas tocadas contam), estruturas do G1 ≈ 5% do <em>heap</em>, símbolos e internos 30-50 MB, arenas da <em>glibc</em> 50-300 MB. Regra de bolso: reservar 400 a 600 MB para tudo o que não é <em>heap</em>, e validar com NMT em vez de acreditar na regra.</p></aside>
+
+<div class="qa" id="q-10-3" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O contentor tem limite de 2 GiB, arrancamos com <code>-Xmx1200m</code>, o <em>heap</em> usado nunca passa de 700 MB e mesmo assim o <em>pod</em> é morto com <em>exit code</em> 137. Onde está a memória?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>As três anotações diferem no conjunto de <em>beans</em> que registam. <code>@SpringBootTest</code> arranca o contexto completo, incluindo tudo o que a aplicação carrega em produção; num serviço médio são 6 a 12 segundos por arranque. <code>@WebMvcTest</code> regista apenas a camada web — controladores, conversores de mensagens, validação, filtros de segurança — e substitui as colaborações por <em>mocks</em>, arrancando em 1,5 a 3 segundos. <code>@DataJpaTest</code> regista <code>DataSource</code>, entidades e repositórios, e por defeito envolve cada teste numa transacção que faz <em>rollback</em> no fim.</p>
-      <p>Sobre o salto de 4 para 14 minutos: o suspeito quase certo não são os 30 testes, é o número de <strong>configurações de contexto distintas</strong> que eles introduziram. O Spring guarda os contextos em <em>cache</em> por chave de configuração; qualquer diferença — uma anotação, uma propriedade em <code>@TestPropertySource</code>, um <code>@MockitoBean</code> a mais, um perfil activo — gera uma chave nova e portanto um arranque novo. Trinta testes com dez configurações diferentes a 10 segundos custam 100 segundos só de arranques, e o efeito compõe-se com o <em>pool</em> de ligações e as migrações Flyway a correrem outra vez.</p>
-      <p>O diagnóstico faz-se sem adivinhar: activa-se <code>logging.level.org.springframework.test.context.cache=DEBUG</code> e conta-se quantas vezes aparece a criação de contexto, ou lê-se o tamanho da <em>cache</em> no fim da execução. A correcção é normalizar: uma ou duas classes base abstractas com a configuração de teste comum, todas as classes de integração a herdarem delas, e <code>@MockitoBean</code> reduzido ao mínimo, porque cada substituição de <em>bean</em> é uma chave de <em>cache</em> nova.</p>
-      <p>O <em>trade-off</em> das fatias é conhecido: são rápidas porque não carregam o resto, e por isso não apanham erros de configuração entre camadas — um conversor registado que não existe no contexto real, uma regra de segurança diferente. Compensa-se com um número pequeno de testes de contexto completo, que existem sobretudo para provar que a aplicação arranca com a configuração de produção.</p></div>
+      <p><em>Exit code</em> 137 é <code>SIGKILL</code> dado pelo <em>kernel</em> ao exceder o limite do <em>cgroup</em>: não é um <code>OutOfMemoryError</code> da JVM e por isso não há <em>heap dump</em>, não há <em>stack trace</em> e o <em>heap</em> pode estar folgado. O que excedeu 2 GiB foi a memória residente total, e o <em>heap</em> é apenas uma das sete parcelas que a compõem.</p>
+      <p>A ordem de investigação começa pelas parcelas grandes e mensuráveis. Primeiro, o número de <em>threads</em>: 400 <em>threads</em> a 1 MB de pilha reservada são 400 MB, e com <em>pools</em> mal limitados chega-se lá sem esforço — <code>jcmd &lt;pid&gt; Thread.print | grep -c '^&quot;'</code> dá o número em segundos. Segundo, metaspace e <em>compressed class space</em>, que num serviço com muitos proxies dinâmicos passam facilmente de 200 MB. Terceiro, <em>buffers</em> directos e ficheiros mapeados: o Netty e os clientes HTTP modernos alocam <em>off-heap</em>, e <code>-XX:MaxDirectMemorySize</code> herda o valor de <code>-Xmx</code> se não for definido — ou seja, permite por omissão mais 1200 MB invisíveis no painel de <em>heap</em>. Quarto, o <em>code cache</em>. Quinto, as arenas da <em>glibc</em>, que abrem até oito por CPU e retêm memória libertada; <code>MALLOC_ARENA_MAX=2</code> ou a troca para <em>jemalloc</em> costuma cortar 100 a 300 MB.</p>
+      <p>O instrumento que fecha o diagnóstico é o NMT com <code>-XX:NativeMemoryTracking=summary</code> e <code>jcmd VM.native_memory summary</code>, comparando o total <em>committed</em> com o RSS lido em <code>/proc/self/status</code>. Se o NMT explica quase todo o RSS, a culpa está numa parcela da JVM e sabe-se qual. Se sobram várias centenas de MB que o NMT não vê, a origem é código nativo fora da JVM — JNI, compressão, drivers, ou as tais arenas.</p>
+      <p>A correcção não é «aumentar o limite». É escolher entre três coisas com custos diferentes: limitar o que cresce (tamanho dos <em>pools</em> de <em>threads</em>, <code>-XX:MaxDirectMemorySize</code> explícito, <code>-XX:MaxMetaspaceSize</code> como alarme), reduzir a reserva por <em>thread</em> com <code>-Xss512k</code> quando as pilhas são rasas, ou dar mais memória ao contentor porque o serviço legitimamente precisa dela. A decisão depende do número: se o NMT mostra 412 MB em pilhas com 400 <em>threads</em> e o serviço serve 200 pedidos por segundo, o problema é o modelo de concorrência, não o limite do <em>pod</em>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Descreve as anotações como equivalentes, ou diz que <code>@SpringBootTest</code> «é o mais completo, portanto o melhor».</td></tr>
-        <tr><td>Mid</td><td>Explica correctamente o que cada fatia carrega e que o contexto completo é lento; não conhece a cache de contextos.</td></tr>
-        <tr><td>Sénior</td><td>Atribui o custo às configurações distintas e à cache, sabe diagnosticá-lo com o log da cache e normaliza através de classes base; reconhece o que as fatias não apanham.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o efeito de <code>@MockitoBean</code> e dos perfis na chave de cache, a ordenação da bateria e um orçamento de tempo explícito para o feedback de PR.</td></tr>
+        <tr><td>Insuficiente</td><td>Confunde 137 com <code>OutOfMemoryError</code> e procura o <em>heap dump</em> que não existe; propõe subir o limite às cegas.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há memória fora do <em>heap</em> e menciona metaspace, mas não sabe medi-la nem enumerar as restantes parcelas.</td></tr>
+        <tr><td>Sénior</td><td>Distingue RSS de <em>heap</em>, enumera as parcelas com ordens de grandeza, usa NMT e <code>jcmd</code>, e escolhe a correcção com base no número medido.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a diferença entre <em>reserved</em> e <em>committed</em>, o efeito das arenas do <em>allocator</em> nativo, e define o orçamento de memória do serviço como contrato (limite = <em>heap</em> + não-<em>heap</em> medido + 15% de margem).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que faz parte da chave de cache do contexto?»</li>
-      <li>«<code>@DataJpaTest</code> faz rollback; que defeito é que isso pode esconder?»</li>
-      <li>«Como testaria a camada de segurança numa fatia web?»</li>
-      <li>«Quando é que vale mesmo a pena um teste de contexto completo?»</li></ul></div>
+      <li>«Porque é que o RSS pode ser maior do que o total <em>committed</em> do NMT?»</li>
+      <li>«Que efeito tem <code>-XX:+AlwaysPreTouch</code> no RSS e na latência?»</li>
+      <li>«Como limitaria a memória directa usada por um cliente HTTP baseado em Netty?»</li>
+      <li>«Com <em>virtual threads</em>, o que acontece a esta conta das pilhas?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar <code>@SpringBootTest</code> em todas as classes «para não ter surpresas».</li>
-      <li>Espalhar <code>@TestPropertySource</code> diferentes por dezenas de classes sem notar o custo.</li>
-      <li>Desconhecer que o <code>@Transactional</code> do teste faz rollback e não exercita o <em>commit</em>.</li></ul></div>
+      <li>Achar que <code>-Xmx</code> limita a memória do processo.</li>
+      <li>Não saber que <code>-XX:MaxDirectMemorySize</code> tem por omissão o valor de <code>-Xmx</code>.</li>
+      <li>Pedir um <em>heap dump</em> para diagnosticar um <em>OOMKilled</em>.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-10-4" class="h2"><span class="secnum">10.4</span> JUnit 5, AssertJ e testes que documentam<a class="anchor" href="#sec-10-4" aria-label="ligação">#</a></h2>
-
-<p>Um teste tem dois leitores: a máquina, que o corre, e o humano que investiga a falha três meses depois. O segundo é o que dita o estilo. O nome do teste descreve o comportamento e não o método — <code>rejeita_pagamento_quando_o_limite_diario_esta_esgotado</code> diz o que falhou logo na linha do relatório do CI; <code>testAutorizar2</code> obriga a abrir o ficheiro. <code>@DisplayName</code> e <code>@Nested</code> completam o resto: as classes aninhadas dão o contexto («quando o saldo não chega») e produzem um relatório que se lê como especificação.</p>
-
-<p>AssertJ ganha ao <code>assertEquals</code> por causa da mensagem de erro, não da sintaxe fluente. <code>assertThat(lista).containsExactly(a, b)</code> falha a dizer qual o elemento em falta e em que posição; <code>assertEquals</code> imprime dois <code>toString</code> e deixa a comparação para o leitor. As construções que rendem mais são <code>assertThatThrownBy</code> e <code>catchThrowableOfType</code> para excepções, <code>extracting</code> e <code>returns</code> para comparar campos sem depender de <code>equals</code>, <code>usingRecursiveComparison().ignoringFields("id", "criadoEm")</code> para objectos com campos gerados, e <code>SoftAssertions</code> quando interessa ver as cinco falhas de uma vez em vez de parar na primeira.</p>
-
-<p>A regra de uma asserção por teste é frequentemente mal citada: o que se quer é um <strong>comportamento</strong> por teste, que pode exigir três asserções sobre o mesmo resultado. O sinal de que um teste tem comportamentos a mais é ter dois blocos de acção — duas chamadas ao sistema sob teste separadas por asserções. Aí, dividir dá dois nomes que documentam duas regras.</p>
-
-<figure class="listing java" id="lst-10-4"><div class="lhead"><span class="lnum">Listagem 10.4</span>
-<span class="lcap">JUnit 5 e AssertJ: a tabela da especificação como teste parametrizado.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@DisplayName("Limite diário de pagamentos")
-class LimiteDiarioTest {
-
-    @ParameterizedTest(name = "gasto {0} + pedido {1} sobre limite {2} =&gt; permite {3}")
-    @CsvSource({
-        "    0, 10000, 10000, true",     // exactamente no limite: permitido
-        " 9999,     2, 10000, false",
-        "    0,     1,     0, false",    // limite zero bloqueia tudo
-        "10000,     0, 10000, true"      // pedido nulo não move o limite
-    })
-    void aplica_o_limite_de_forma_inclusiva(long gasto, long pedido, long limite, boolean esperado) {
-        var limiteDiario = new LimiteDiario(Centimos.of(limite), Centimos.of(gasto));
-
-        assertThat(limiteDiario.permite(Centimos.of(pedido))).isEqualTo(esperado);
-    }
-
-    @Nested
-    @DisplayName("quando o limite é ultrapassado")
-    class LimiteUltrapassado {
-
-        @Test
-        void lanca_com_o_valor_em_falta_e_o_codigo_estavel() {
-            var limite = new LimiteDiario(Centimos.of(10_000), Centimos.of(9_500));
-
-            var erro = catchThrowableOfType(
-                    () -&gt; limite.debitar(Centimos.of(800)), LimiteDiarioExcedido.class);
-
-            assertThat(erro).hasMessageContaining("300 cêntimos");
-            assertThat(erro.codigo()).isEqualTo("LIMITE_DIARIO_EXCEDIDO");
-        }
-    }
-}</code></pre></figure>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>JUnit 5 não é JUnit 4 com nomes novos: o modelo de extensões (<code>@ExtendWith</code>) substituiu <code>@Rule</code> e <code>@RunWith</code>, e uma classe de teste pode ter várias extensões, o que era impossível com um único <em>runner</em>. Numa migração faseada, o <em>vintage engine</em> corre as duas gerações no mesmo <em>build</em>; o sinal de que a migração está feita é poder retirar essa dependência. Numa entrevista, dizer «uso JUnit 5» e depois descrever <code>@Rule</code> é um sinal directo de <em>stack</em> desactualizada.</p></aside>
-
-<div class="qa" id="q-10-7" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Neste exercício quero ver os testes primeiro. Como aborda TDD aqui, em 45 minutos? E usa TDD no dia-a-dia ou só em entrevistas?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Em 45 minutos, o ciclo tem de ser curto e a ordem dos casos é a decisão mais importante. Começo pelo caso degenerado que fixa a assinatura — entrada vazia ou zero — porque dá um teste vermelho em dois minutos e obriga a acordar o contrato com o entrevistador antes de escrever lógica. Depois o caso nominal, depois um caso limite que force a estrutura de dados certa, e só então os casos de erro. O que não faço é escrever seis testes antes de qualquer implementação: isso é escrever uma especificação às cegas e perde-se metade do tempo.</p>
-      <p>O ritmo é vermelho-verde-refactorizar com passos de 3 a 5 minutos e uma regra explícita: a implementação mais simples que faz passar, mesmo que seja obviamente incompleta, porque é o teste seguinte que a obriga a generalizar. Digo em voz alta o que cada teste está a forçar — «este obriga-me a separar a acumulação do cálculo» — porque em entrevista o que é avaliado é o raciocínio, não a rapidez de digitação.</p>
-      <p>Na resposta honesta sobre o dia-a-dia: uso TDD onde ele rende, que é lógica de domínio com regras densas e correcções de defeitos, onde o primeiro passo é sempre um teste que reproduz a falha. Não uso TDD para desenhar integrações com sistemas externos cujo comportamento ainda estou a descobrir — aí escrevo primeiro um <em>spike</em> descartável contra o sistema real, percebo o contrato, deito fora o <em>spike</em> e depois escrevo os testes. Fingir TDD universal é um sinal fácil de detectar: o entrevistador pergunta como se faz TDD de um mapeamento JPA e a resposta não existe.</p>
-      <p>O <em>trade-off</em> real do TDD é a rigidez: testes escritos contra a implementação em vez do comportamento tornam-se um travão em cada refactorização. Por isso os meus testes de TDD atacam a API pública da unidade e nunca métodos privados, e quando um refactor parte vinte testes sem mudar comportamento, o defeito é dos testes.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Recita «vermelho, verde, refactorizar» e depois escreve toda a implementação antes do primeiro teste; ou escreve testes depois e chama-lhes TDD.</td></tr>
-        <tr><td>Mid</td><td>Segue o ciclo, mas escolhe mal a ordem dos casos e fica sem tempo; testa métodos privados ou detalhes de implementação.</td></tr>
-        <tr><td>Sénior</td><td>Ordem deliberada dos casos, passos curtos, narração do que cada teste força, uso honesto e delimitado no dia-a-dia, testes contra a API pública.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o custo de acoplamento dos testes à implementação, quando o spike descartável é melhor do que TDD e como isso se ensina numa equipa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que caso escolheria como primeiro teste e porquê esse?»</li>
-      <li>«Como faz TDD de um mapeamento JPA ou de um consumidor Kafka?»</li>
-      <li>«Um refactor partiu 20 testes sem mudar comportamento — de quem é a culpa?»</li>
-      <li>«Testa métodos privados? Porquê?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Defender TDD como obrigação universal sem um único caso em que não se aplica.</li>
-      <li>Tornar métodos privados visíveis só para os testar.</li>
-      <li>Escrever asserções sobre chamadas internas em vez do resultado observável.</li>
-      <li>Passar 20 dos 45 minutos a escrever testes antes de qualquer código executável.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-10-5" class="h2"><span class="secnum">10.5</span> Mockito: mock, stub, spy e o que nunca mockar<a class="anchor" href="#sec-10-5" aria-label="ligação">#</a></h2>
-
-<p>Os termos são frequentemente usados como sinónimos e a distinção é exactamente o que a pergunta procura. Um <em>stub</em> devolve respostas pré-programadas e não é objecto de verificação; um <em>mock</em> existe para se verificar a interacção — foi chamado, com que argumentos, quantas vezes; um <em>fake</em> é uma implementação simplificada mas funcional, escrita à mão, como um repositório em memória; um <em>spy</em> é o objecto real com algumas chamadas interceptadas; um <em>dummy</em> só existe para preencher um parâmetro. Mockito produz todos, o que é precisamente a razão pela qual as equipas os confundem.</p>
-
-<p>A regra que evita a maior parte dos problemas é «não mockar tipos que não são nossos». Mockar <code>RestClient</code>, <code>KafkaTemplate</code>, <code>EntityManager</code> ou o SDK da AWS congela uma versão da nossa suposição sobre o comportamento dessa biblioteca; quando a biblioteca muda, o teste continua verde e a produção parte. A alternativa é envolver o tipo externo num adaptador estreito escrito por nós — três ou quatro métodos com a linguagem do domínio — e mockar esse adaptador, testando o adaptador propriamente dito contra o sistema real com Testcontainers ou WireMock.</p>
-
-<p>O segundo problema é a sobre-especificação. Uma bateria em que cada teste verifica cinco interacções deixa de testar comportamento e passa a testar a implementação: qualquer reordenação de chamadas, mesmo sem mudar o resultado observável, produz dezenas de falhas. A verificação vale quando a interacção <strong>é</strong> o comportamento observável — publicar exactamente um evento, não chamar o adquirente quando o saldo não chega, debitar uma vez e não duas. Nos restantes casos, assevera-se o resultado. O <code>strictness</code> por defeito do <code>MockitoExtension</code> ajuda aqui: um <em>stub</em> nunca usado falha o teste, o que expõe expectativas mortas.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 10.2</span> Duplos de teste: o que cada um é e quando compensa.</div>
-<div class="tscroll"><table><thead><tr><th>Duplo</th><th>Definição</th><th>Verifica-se?</th><th>Quando compensa</th></tr></thead><tbody>
-<tr><td>Dummy</td><td>Preenche um parâmetro e nunca é usado</td><td>Não</td><td>Construtores com muitas dependências irrelevantes para o caso</td></tr>
-<tr><td>Stub</td><td>Devolve respostas fixas</td><td>Não</td><td>Fornecer entrada ao sistema sob teste sem tocar em I/O</td></tr>
-<tr><td>Mock</td><td>Stub com expectativa de interacção</td><td>Sim</td><td>Quando a chamada <em>é</em> o efeito observável (publicar, debitar, notificar)</td></tr>
-<tr><td>Spy</td><td>Objecto real com chamadas parcialmente interceptadas</td><td>Sim</td><td>Legado que não se consegue partir; sinal de desenho a melhorar</td></tr>
-<tr><td>Fake</td><td>Implementação simplificada e funcional</td><td>Não</td><td>Repositórios e relógios usados em muitos testes; evita 30 linhas de stubbing</td></tr>
-</tbody></table></div></div>
-
-<figure class="listing java" id="lst-10-5"><div class="lhead"><span class="lnum">Listagem 10.5</span>
-<span class="lcap">Mockito em estilo BDD: mock nas fronteiras, fake no repositório, verificação só do observável.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>@ExtendWith(MockitoExtension.class)          // strictness STRICT_STUBS por defeito
-class AutorizacaoServiceTest {
-
-    @Mock Adquirente adquirente;             // fronteira externa: mock do NOSSO adaptador
-    @Mock EventosPublisher eventos;
-
-    ContasEmMemoria contas = new ContasEmMemoria();                       // fake escrito à mão
-    Clock relogio = Clock.fixed(Instant.parse("2025-03-11T10:15:30Z"), ZoneOffset.UTC);
-
-    AutorizacaoService servico;
-
-    @BeforeEach
-    void preparar() {
-        contas.creditar("c-1", Centimos.of(5_000));
-        servico = new AutorizacaoService(contas, adquirente, eventos, relogio);
-    }
-
-    @Test
-    void publica_um_evento_com_o_id_devolvido_pelo_adquirente() {
-        given(adquirente.autorizar(any(Pedido.class))).willReturn(Resposta.aprovada("auth-77"));
-
-        servico.autorizar(new Pedido("c-1", Centimos.of(2_500)));
-
-        var captor = ArgumentCaptor.forClass(PagamentoAutorizado.class);
-        then(eventos).should().publicar(captor.capture());
-        assertThat(captor.getValue())
-            .returns("auth-77", PagamentoAutorizado::autorizacaoId)
-            .returns(Instant.parse("2025-03-11T10:15:30Z"), PagamentoAutorizado::momento);
-        then(eventos).shouldHaveNoMoreInteractions();
-    }
-
-    @Test
-    void nao_chama_o_adquirente_quando_o_saldo_nao_chega() {
-        assertThatThrownBy(() -&gt; servico.autorizar(new Pedido("c-1", Centimos.of(9_000))))
-            .isInstanceOf(SaldoInsuficiente.class);
-
-        then(adquirente).shouldHaveNoInteractions();   // aqui a interacção É o comportamento
-    }
-}</code></pre></figure>
-
-<div class="qa" id="q-10-8" data-box="qa" data-area="testes" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Distinga <em>mock</em>, <em>stub</em>, <em>spy</em> e <em>fake</em>. Dê-me um exemplo do nosso domínio de pagamentos em que escolheria cada um.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A distinção é pelo papel no teste, não pela ferramenta — Mockito produz todos. O <em>stub</em> fornece entrada: <code>given(taxas.paraPais("PT")).willReturn(new Taxa(0.014))</code> existe para o sistema sob teste ter um valor com que trabalhar, e nunca verifico se foi chamado, porque se o resultado estiver certo é porque foi. O <em>mock</em> existe para verificar a interacção: <code>then(eventos).should().publicar(...)</code>, porque publicar o evento é o efeito observável do caso de uso — não há estado devolvido que o prove.</p>
-      <p>O <em>fake</em> é código nosso, simplificado mas correcto: um <code>ContasEmMemoria</code> com um <code>Map</code> em vez do repositório JPA. Vale a pena quando o mesmo colaborador aparece em vinte testes e o <em>stubbing</em> repetido cresce para trinta linhas por classe; o fake tem lógica real (debitar reduz saldo), portanto apanha erros de sequência que uma pilha de <em>stubs</em> nunca apanha. O custo é mantê-lo fiel ao real, e a mitigação é escrever uma bateria de testes de contrato partilhada que corra contra o fake e contra a implementação verdadeira.</p>
-      <p>O <em>spy</em> é o objecto real com uma ou duas chamadas interceptadas — <code>willReturn</code> sobre um método e o resto a executar de verdade. Uso-o em código legado que não consigo partir, por exemplo um serviço de 800 linhas em que só quero neutralizar a chamada ao <em>scheduler</em>. É sempre um sinal de que o desenho precisa de extracção de dependência, e num serviço novo não devia aparecer. O <em>dummy</em> é o caso trivial: um objecto passado só para satisfazer o construtor.</p>
-      <p>A escolha entre <em>fake</em> e <em>stub</em> resume-se a quantos testes partilham o colaborador e a se a sequência de operações importa. Se importa — debitar, depois consultar o saldo actualizado — o <em>stub</em> mente e o <em>fake</em> não. E a escolha entre <em>mock</em> e asserção de estado resume-se a haver ou não estado observável: se há, assevera-se o estado e não se verifica a chamada, porque verificar chamadas acopla o teste à implementação.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Usa mock e stub como sinónimos; não sabe o que é um fake ou chama-lhe «mock manual».</td></tr>
-        <tr><td>Mid</td><td>Dá as quatro definições correctas com exemplos, mas verifica interacções em todo o lado e não pondera o fake.</td></tr>
-        <tr><td>Sénior</td><td>Escolhe por papel, prefere estado a verificação quando há estado, justifica o fake pela sequência e pelo volume de stubbing, vê o spy como sinal de desenho.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais a bateria de contrato partilhada entre fake e implementação real, e o custo de manutenção de cada opção ao longo do tempo.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quando é que um fake mente e como o impede?»</li>
-      <li>«Porque é que o <code>MockitoExtension</code> falha um teste com um stub não usado?»</li>
-      <li>«Verificaria a chamada ao repositório de leitura? Porquê?»</li>
-      <li>«Que problema tem <code>@InjectMocks</code> com injecção por campo?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Verificar todas as interacções de todos os colaboradores em todos os testes.</li>
-      <li>Usar <code>lenient()</code> por sistema para silenciar stubs não usados.</li>
-      <li>Não distinguir «a chamada é o comportamento» de «a chamada é um detalhe».</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-10-9" data-box="qa" data-area="testes" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+<div class="qa" id="q-10-4" data-box="qa" data-area="jvm" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Vejo aqui testes que fazem <code>mock(RestClient.class)</code> e <code>mock(EntityManager.class)</code>. Qual é o problema, e o que propõe em vez disso?</div>
+  <div class="qprompt">Este método aloca um objecto temporário por iteração e mesmo assim o perfil não mostra pressão de alocação. Explique-me o mecanismo e diga-me em que condições ele deixa de funcionar.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O problema é que o <em>mock</em> codifica a nossa suposição sobre o comportamento de código de terceiros, e essa suposição não é verificada por ninguém. O teste passa a afirmar «se o <code>RestClient</code> se comportar como eu imagino, o meu código funciona». Quando a biblioteca sobe de versão, muda o tratamento de <em>redirects</em>, o <em>timeout</em> por defeito ou a forma como sinaliza um 5xx, o teste continua verde e o serviço parte em produção. Mockar <code>EntityManager</code> é pior ainda, porque a semântica que interessa — <em>flush</em>, contexto de persistência, <em>dirty checking</em>, cascatas — é toda comportamento do Hibernate e nenhum <em>stub</em> a reproduz.</p>
-      <p>Há ainda um sintoma de leitura: mockar APIs fluentes gera cadeias de <code>RETURNS_DEEP_STUBS</code> ou cinco <em>stubs</em> encadeados para simular <code>get().uri().retrieve().body()</code>. Vinte linhas de configuração para testar três linhas de lógica é sinal de que o teste está no nível errado.</p>
-      <p>A proposta tem duas partes. Primeira, um adaptador nosso com a linguagem do domínio — <code>interface Adquirente { Resposta autorizar(Pedido p); }</code> — implementado por uma classe que usa o <code>RestClient</code>. Os testes de todos os casos de uso mockam essa interface, que tem três métodos e é estável porque é nossa. Segunda, o adaptador é testado contra a coisa real: WireMock ou o <code>MockWebServer</code> para o HTTP, com casos de 500, <em>timeout</em>, corpo malformado e 429; e Testcontainers com PostgreSQL para o repositório. Assim a suposição sobre a biblioteca é verificada num sítio, em cinco ou seis testes, em vez de replicada em duzentos.</p>
-      <p>Onde a regra cede: mockar um tipo externo é aceitável quando ele é uma interface pequena e verdadeiramente estável — <code>Clock</code> é o exemplo canónico, e mesmo aí prefiro <code>Clock.fixed</code>, que é a implementação real. E num serviço em que o adaptador seria uma <em>interface</em> com um único método delegado sem transformação, aceito o custo de mockar directamente, desde que exista pelo menos um teste de integração real por cada operação externa.</p></div>
+      <p>O mecanismo é análise de escape seguida de substituição escalar. Depois de o C2 fazer <em>inlining</em> do construtor e dos métodos usados, prova que a referência ao objecto não escapa ao âmbito do método compilado; nesse caso não aloca objecto nenhum — decompõe-o nos seus campos e mantém-nos em registos ou na pilha. O resultado é zero <em>bytes</em> alocados no <em>heap</em> e, por consequência, zero pressão no <em>eden</em>. Como efeito secundário, qualquer bloqueio sobre um objecto que não escapa é eliminado, porque nenhum outro <em>thread</em> o pode observar.</p>
+      <p>As condições que o quebram são todas práticas e todas testáveis. A primeira é o <em>inlining</em> falhar: se o construtor ou um método chamado excede o orçamento de <em>bytecodes</em> a inserir, ou se a chamada é megamórfica, a análise não tem o grafo completo e o objecto é alocado. A segunda é o objecto escapar de facto — guardado num campo, devolvido, passado a um método não inserido, colocado numa colecção, ou atribuído a um <code>static</code>. A terceira é o método nunca chegar ao nível 4: código morno interpretado ou compilado só por C1 aloca sempre. A quarta é o tamanho: <em>arrays</em> de dimensão não constante, ou objectos com muitos campos, deixam de ser candidatos viáveis.</p>
+      <p>A verificação é experimental, nunca por leitura de código. Um <em>benchmark</em> JMH com o perfilador de alocação (<code>-prof gc</code>) dá <em>bytes</em> alocados por operação: se o valor é 0 B/op, houve substituição escalar; se é 32 B/op, não houve. Em produção, o JFR com o evento de amostragem de alocação mostra o mesmo em agregado. Ambos são mais fiáveis do que ler o <em>log</em> de <em>inlining</em>, que diz o que o compilador tentou e não o que ficou.</p>
+      <p>O <em>trade-off</em> é sobre quanto desenho se sacrifica a esta optimização. Escrever código que ajuda a análise de escape — objectos pequenos e locais, evitar guardar referências temporárias, não passar <em>lambdas</em> por interfaces megamórficas no caminho quente — é gratuito quando é apenas disciplina. Deixa de valer a pena quando exige aplanar abstracções úteis: o ganho típico de eliminar 32 <em>bytes</em> por operação num serviço que aloca 300 MB/s é uma redução de alguns pontos percentuais na frequência de GC jovem, o que num sistema com pausas de 15 ms não paga a perda de legibilidade. Vale sempre a pena em ciclos internos de <em>parsing</em>, serialização e matemática, onde a mesma optimização corta 40% do tempo.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não vê problema; acha que mockar tudo é o objectivo do teste unitário.</td></tr>
-        <tr><td>Mid</td><td>Diz que «não se devem mockar tipos externos» como regra decorada, sem explicar o modo de falha nem propor o adaptador.</td></tr>
-        <tr><td>Sénior</td><td>Explica a suposição não verificada, propõe adaptador de domínio e testa-o contra WireMock/Testcontainers, com casos de 500, timeout e 429.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o sintoma dos deep stubs, o caso em que a regra cede (<code>Clock</code>) e o custo de manutenção comparado entre 200 testes com suposições e 6 testes de adaptador.</td></tr>
+        <tr><td>Insuficiente</td><td>«Os objectos pequenos são alocados na pilha» como se fosse uma regra da linguagem.</td></tr>
+        <tr><td>Mid</td><td>Nomeia a análise de escape e diz que depende do JIT, sem citar a dependência do <em>inlining</em> nem como verificar.</td></tr>
+        <tr><td>Sénior</td><td>Liga <em>inlining</em> → análise de escape → substituição escalar, enumera as condições que a quebram e mede com JMH ou JFR.</td></tr>
+        <tr><td>Staff</td><td>Quantifica o ganho contra a alocação total do serviço e diz explicitamente quando não vale a pena desenhar para o compilador.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o adaptador for só um delegador de uma linha — vale a pena?»</li>
-      <li>«Que casos testa contra o WireMock além do caminho feliz?»</li>
-      <li>«Como testa o comportamento sob timeout sem tornar o teste lento?»</li>
-      <li>«Mockaria <code>Clock</code>? E <code>ObjectMapper</code>?»</li></ul></div>
+      <li>«Como distingue eliminação de bloqueio de <em>biased locking</em>?»</li>
+      <li>«O que é um TLAB e porque é que alocar no <em>eden</em> custa poucos nanossegundos?»</li>
+      <li>«Porque é que a hipótese geracional fraca torna a colecção jovem barata?»</li>
+      <li>«Que evento do JFR usaria para medir a alocação por <em>call site</em>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar <code>RETURNS_DEEP_STUBS</code> para simular APIs fluentes de terceiros.</li>
-      <li>Mockar <code>EntityManager</code> ou <code>JdbcTemplate</code> e considerar a persistência testada.</li>
-      <li>Não ter um único teste que exercite a biblioteca externa a sério.</li>
-      <li>Mockar classes finais ou estáticas com agentes só para evitar refactorizar.</li></ul></div>
+      <li>Afirmar que a análise de escape é garantida pela especificação.</li>
+      <li>Optimizar alocação sem medir a taxa de alocação actual do serviço.</li>
+      <li>Ignorar que o custo dominante da alocação jovem é a promoção, não a alocação.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-10-6" class="h2"><span class="secnum">10.6</span> Testcontainers e testes de integração fiáveis<a class="anchor" href="#sec-10-6" aria-label="ligação">#</a></h2>
+<h2 id="sec-10-3" class="h2"><span class="secnum">10.3</span> Recolectores: G1, ZGC, Parallel e Serial<a class="anchor" href="#sec-10-3" aria-label="ligação">#</a></h2>
 
-<p>Substituir PostgreSQL por H2 nos testes troca fiabilidade por dois ou três segundos. A divergência não é teórica: <code>INSERT ... ON CONFLICT DO UPDATE</code>, tipos <code>jsonb</code> com operadores próprios, índices parciais, <code>SELECT ... FOR UPDATE SKIP LOCKED</code> (que é a base de quase todas as filas em base de dados), <code>generated always as identity</code>, colunas geradas, <em>arrays</em>, extensões e a própria semântica de isolamento <em>MVCC</em> comportam-se de forma diferente ou simplesmente não existem no H2, mesmo em modo de compatibilidade. O resultado prático é a categoria de defeito mais irritante: a bateria verde e a migração Flyway a falhar em <em>staging</em>.</p>
+<p>Todos os recolectores da HotSpot exploram a mesma observação empírica — a esmagadora maioria dos objectos morre jovem — e diferem no que sacrificam: latência de pausa, débito, ou memória. O Serial usa um único <em>thread</em> e é a escolha ergonómica quando a JVM detecta um CPU e pouca memória; num contentor de 256 MiB com um único núcleo é genuinamente o melhor, porque não paga sincronização entre <em>threads</em> de GC. O Parallel usa vários <em>threads</em> mas pára o mundo para tudo: dá o melhor débito por CPU e as piores pausas, que crescem linearmente com o conjunto vivo — num <em>heap</em> de 32 GB com 20 GB vivos, uma colecção completa é de vários segundos.</p>
 
-<p>Testcontainers elimina essa divergência arrancando a mesma imagem que corre em produção. O custo é medido e gerível: uma imagem <code>postgres:17-alpine</code> arranca em 1,5 a 3 segundos numa máquina de desenvolvimento e um pouco mais num agente de CI sem <em>cache</em> de imagem. Amortiza-se de duas formas — o padrão de contentor estático partilhado por toda a bateria (um arranque por JVM, não por classe) e a reutilização entre execuções locais com <code>testcontainers.reuse.enable=true</code> no ficheiro de configuração do utilizador, que mantém o contentor vivo entre corridas e reduz o arranque a zero a partir da segunda.</p>
+<p>O G1 é o recolector por omissão desde o JDK 9 e divide o <em>heap</em> em regiões de 1 a 32 MB (por omissão, aproximadamente <em>heap</em>/2048 arredondado a uma potência de dois). Marca concorrentemente e evacua em pausas <em>stop-the-world</em> cujo tamanho controla escolhendo quantas regiões coloca em cada colecção, guiado por <code>-XX:MaxGCPauseMillis</code> (200 ms por omissão). Objectos maiores do que metade de uma região são <em>humongous</em> e vão directamente para regiões contíguas na geração velha — com regiões de 4 MB, qualquer <em>array</em> acima de 2 MB. Excesso de objectos <em>humongous</em> fragmenta o <em>heap</em> e provoca colecções completas.</p>
 
-<p>Desde o Spring Boot 3.1, <code>@ServiceConnection</code> dispensa o <code>@DynamicPropertySource</code> com o URL, utilizador e palavra-passe: a anotação sobre o campo do contentor regista as propriedades de ligação automaticamente, e existe equivalente para Kafka, Redis e outros. A limpeza entre testes é a decisão que sobra: <code>@Transactional</code> com <em>rollback</em> é rápido mas não exercita o <em>commit</em> nem os <em>triggers</em> pós-<em>commit</em>; truncar as tabelas entre testes é mais lento (dezenas de milissegundos) mas testa o caminho real. Para serviços com lógica transaccional própria — que é o caso de qualquer coisa que publique eventos depois do <em>commit</em> — a truncagem é a escolha correcta.</p>
+<p>O ZGC é concorrente em quase tudo o que interessa: usa ponteiros coloridos e barreiras de leitura para mover objectos enquanto a aplicação corre, e as suas pausas são de dezenas a centenas de microssegundos, praticamente independentes do tamanho do <em>heap</em> — a mesma pausa em 8 GB e em 2 TB. Desde o JDK 21 tem modo geracional, que se tornou o comportamento por omissão nas versões seguintes e reduziu drasticamente o custo em CPU face à versão não geracional. O que se paga é débito (tipicamente 5% a 15% abaixo do G1 no mesmo trabalho, por causa das barreiras) e memória (precisa de folga para evacuar; abaixo de 20% a 25% de espaço livre começa a haver falhas de alocação).</p>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa bateria de 25 testes de integração: contentor por classe de teste (8 classes) custa 8 × 2 s = 16 s só de arranques; contentor estático partilhado custa 2 s uma vez. Com <code>reuse</code> activo em desenvolvimento local, a segunda execução custa 0 s. A limpeza por <code>TRUNCATE ... RESTART IDENTITY CASCADE</code> de 6 tabelas anda nos 10-30 ms por teste, contra ~1 ms de um <em>rollback</em> — 25 testes pagam menos de um segundo de diferença para ganhar a cobertura do <em>commit</em> real.</p></aside>
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 10.1</span> Escolha de recolector por perfil de serviço.</div>
+<div class="tscroll"><table><thead><tr><th>Recolector</th><th>Pausa típica</th><th>Custo</th><th>Quando é a escolha certa</th><th>Quando deixa de ser</th></tr></thead><tbody>
+<tr><td>Serial</td><td>10 ms a 1 s (cresce com o vivo)</td><td>Nenhum paralelismo</td><td>1 CPU, <em>heap</em> &lt; 512 MB, <em>jobs</em> curtos, <em>sidecars</em></td><td>Assim que houver 2+ CPUs e <em>heap</em> acima de 1 GB</td></tr>
+<tr><td>Parallel</td><td>100 ms a vários segundos</td><td>Latência</td><td>Lotes, ETL, <em>jobs</em> Spark: maximizar débito por CPU</td><td>Quando existe um SLO de latência p99 por pedido</td></tr>
+<tr><td>G1</td><td>20-200 ms, controlável</td><td>≈ 5-10% do <em>heap</em> em estruturas</td><td>Serviços com <em>heap</em> de 2-32 GB e p99 tolerante a 100-200 ms</td><td>Quando o SLO p99 desce abaixo de 20 ms ou o <em>heap</em> passa de 32 GB</td></tr>
+<tr><td>ZGC (geracional)</td><td>&lt; 1 ms, independente do <em>heap</em></td><td>5-15% de débito e 20-25% de folga</td><td><em>Heaps</em> grandes com p99 apertado: <em>trading</em>, <em>ad serving</em>, <em>caches</em> em processo</td><td>Lotes, CPU escassa, ou <em>heaps</em> pequenos onde o G1 já cumpre</td></tr>
+</tbody></table></div></div>
 
-<div class="qa" id="q-10-10" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Trocar G1 por ZGC num serviço com <em>heap</em> de 4 GB e p99 de 80 ms costuma ser negativo: as pausas do G1 já representam menos de 5 ms do p99, e o ZGC devolve 5% a 15% menos débito, o que se traduz em mais um ou dois <em>pods</em>. A troca compensa quando a componente de pausa do p99 é dominante — <em>heap</em> acima de 16 GB, ou pausas de evacuação acima de 50 ms visíveis no histograma de latência — e quando há CPU sobrante para a pagar.</p></aside>
+
+<div class="qa" id="q-10-5" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">A nossa bateria usa H2 em memória e corre em 90 segundos. Alguém propôs Testcontainers com PostgreSQL e a bateria passaria para 4 minutos. Como avalia essa troca?</div>
+  <div class="qprompt">Temos um serviço com <em>heap</em> de 24 GB, SLO de p99 abaixo de 25 ms e pausas do G1 a chegar aos 180 ms. Muda para ZGC? Justifique com números e diga-me o que perde.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Avalio pela classe de defeitos que cada opção deixa passar, não pelo tempo isolado. Com H2, tudo o que é específico do PostgreSQL fica por testar: <code>ON CONFLICT</code>, <code>jsonb</code>, índices parciais, <code>FOR UPDATE SKIP LOCKED</code>, colunas geradas, e o comportamento das migrações Flyway sobre o dialecto real. São exactamente as funcionalidades que se usam nas partes mais críticas — idempotência, filas em base de dados, concorrência optimista. Uma bateria verde que não exercita nada disso dá uma garantia falsa, e o custo do defeito não é 3 minutos de CI, é um <em>rollback</em> em produção.</p>
-      <p>Antes de aceitar os 4 minutos, contesto o número. A maior parte desse tempo costuma ser arranque repetido: um contentor por classe de teste. Com contentor estático partilhado por JVM, paga-se 2 a 3 segundos uma vez; com <code>testcontainers.reuse.enable=true</code>, o desenvolvimento local paga zero a partir da segunda execução; e com paralelização por <em>fork</em> do JUnit, os testes de integração distribuem-se. Na prática, uma bateria bem organizada fica em 2 a 2,5 minutos, não 4.</p>
-      <p>Depois separo as camadas. Os 1 500 testes unitários continuam a correr sem base de dados nenhuma e mantêm o ciclo curto de 30 segundos que a equipa corre a cada gravação. Só os 20 a 30 testes que precisam de SQL real usam contentor, e correm numa tarefa separada do <em>build</em>. Assim o <em>feedback</em> rápido não paga o custo da integração.</p>
-      <p>Onde a escolha contrária ainda faz sentido: se o serviço usa exclusivamente SQL padrão através de JPA, sem migrações complexas nem funcionalidades específicas do PostgreSQL, e se o ambiente de CI não permite Docker — alguns ambientes empresariais restritos ainda não permitem —, então H2 é o compromisso possível, desde que exista um conjunto pequeno de testes contra a base real em <em>staging</em>. O que não aceito é usar H2 <em>e</em> não ter nenhum teste contra PostgreSQL em lado nenhum.</p></div>
+      <p>Sim, este é o caso de manual para ZGC — mas só depois de confirmar que a pausa é a causa do p99, e não uma correlação. A verificação faz-se sobrepondo o histograma de latência de pedidos ao <em>log</em> de GC: se os pedidos acima de 25 ms coincidem com as janelas de pausa e desaparecem entre elas, a pausa é a causa. Se o p99 está a 25 ms em permanência e as pausas ocorrem 4 vezes por minuto, então quase nenhum pedido apanha uma pausa e o problema é outro — quase sempre uma dependência externa ou contenção de bloqueios.</p>
+      <p>Confirmada a causa, os números favorecem a mudança: com 24 GB de <em>heap</em>, as pausas de evacuação do G1 são proporcionais à quantidade de dados copiados e não descem abaixo de algumas dezenas de milissegundos sem reduzir tanto a geração jovem que a promoção dispara. O ZGC geracional traz pausas sub-milissegundo independentes do tamanho do <em>heap</em>, o que remove a componente de GC do p99 quase por completo.</p>
+      <p>O que se perde é concreto e mensurável: 5% a 15% de débito por causa das barreiras de leitura, o que a capacidade constante significa 5% a 15% mais instâncias; e memória, porque o ZGC precisa de folga para evacuar — com um conjunto vivo de 16 GB num <em>heap</em> de 24 GB (67% de ocupação) a margem é curta e as falhas de alocação aparecem sob picos. Na prática sobe-se o <em>heap</em> para 32 GB, o que atravessa a fronteira dos <em>oops</em> comprimidos e aumenta o consumo real de todos os objectos. Perde-se ainda familiaridade operacional: o <em>log</em>, as métricas e os <em>runbooks</em> do ZGC são diferentes dos do G1.</p>
+      <p>A alternativa que um sénior avalia antes de mudar de recolector é reduzir o que o GC tem de fazer. Um conjunto vivo de 16 GB num serviço de pedidos costuma ser uma <em>cache</em> em processo; movê-la para Redis, ou limitá-la por tamanho e não por contagem, encolhe o <em>heap</em> para 8 GB e faz o G1 cumprir 25 ms sem trocar nada. A ordem correcta é: medir o conjunto vivo, tentar reduzi-lo, e só depois pagar débito por latência.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Decide pelo tempo («90 s é melhor que 4 min») ou pela moda («Testcontainers é o standard»), sem nomear um defeito concreto.</td></tr>
-        <tr><td>Mid</td><td>Sabe que H2 diverge e dá um ou dois exemplos; aceita os 4 minutos sem questionar de onde vêm.</td></tr>
-        <tr><td>Sénior</td><td>Nomeia as divergências que importam ao domínio, ataca o custo com contentor estático/reuse/paralelização, separa camadas do build e dá o número corrigido.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais a decisão de limpeza (rollback vs truncate) ligada aos eventos pós-commit, e a condição em que H2 continua defensável.</td></tr>
+        <tr><td>Insuficiente</td><td>«ZGC é mais moderno, logo é melhor» sem custo nem verificação.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o ZGC tem pausas baixas e o G1 não, mas não nomeia o custo em débito nem a necessidade de folga.</td></tr>
+        <tr><td>Sénior</td><td>Verifica a causalidade pausa↔p99, quantifica o custo em débito e em memória, e menciona a fronteira dos 32 GB.</td></tr>
+        <tr><td>Staff</td><td>Propõe primeiro reduzir o conjunto vivo, define o critério de reversão e o plano de medição (uma semana em <em>canary</em> com o mesmo tráfego).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«De onde vêm os 4 minutos? Como os reduziria?»</li>
-      <li>«<code>@Transactional</code> com rollback ou truncar entre testes?»</li>
-      <li>«E se o agente de CI não tiver Docker?»</li>
-      <li>«Como garante que o contentor usa a mesma versão maior que produção?»</li></ul></div>
+      <li>«Porque é que o ZGC geracional é mais barato em CPU do que o não geracional?»</li>
+      <li>«O que é uma falha de alocação em ZGC e como aparece no <em>log</em>?»</li>
+      <li>«Como mediria o conjunto vivo sem provocar uma pausa em produção?»</li>
+      <li>«Em que caso preferiria Parallel a G1 hoje?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não conseguir nomear uma única divergência concreta entre H2 e PostgreSQL.</li>
-      <li>Propor Testcontainers para todos os testes, incluindo os de lógica pura.</li>
-      <li>Usar a etiqueta <code>latest</code> na imagem do contentor.</li>
-      <li>Ignorar que o rollback do teste não exercita o commit nem o que dele depende.</li></ul></div>
+      <li>Mudar de recolector sem primeiro correlacionar pausas com latência de pedidos.</li>
+      <li>Ignorar o custo em débito e prometer «latência melhor sem custo».</li>
+      <li>Não saber que aumentar o <em>heap</em> acima de 32 GB desliga os <em>oops</em> comprimidos.</li></ul></div>
   </div>
 </div>
 
-<div class="lab" id="lab-10-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 10.1 — Testar um serviço com dependência externa</span>
-    <div class="labpills"><span class="qpill">Mock + Testcontainers</span><span class="qpill">25 min</span></div></div>
+<div class="qa" id="q-10-6" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Explique-me porque é que uma colecção da geração jovem é barata mesmo num <em>heap</em> grande, e o que faz com que deixe de ser.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É barata porque o custo de uma colecção por cópia é proporcional ao que sobrevive, não ao que morreu. Se num <em>eden</em> de 2 GB sobrevivem 40 MB, copiam-se 40 MB e o resto do espaço é recuperado só por mudança de ponteiros — daí que a taxa de sobrevivência, e não o tamanho do <em>heap</em>, seja a variável que determina a pausa. A hipótese geracional fraca (a maioria dos objectos morre jovem) faz com que a taxa de sobrevivência típica de um serviço de pedidos ande nos 2% a 5%.</p>
+      <p>Para saber o que está vivo sem varrer o <em>heap</em> velho, o recolector precisa de saber que referências vêm da geração velha para a jovem. É isso que a barreira de escrita e as estruturas de <em>remembered set</em> ou <em>card table</em> registam: cada escrita de uma referência num objecto velho marca a zona correspondente como suja, e a colecção jovem examina apenas essas zonas em vez de toda a geração velha. Custa alguns nanossegundos por escrita de referência e alguns por cento do <em>heap</em> em memória, e é o que torna o resto possível.</p>
+      <p>Deixa de ser barata em três situações. A primeira é a taxa de sobrevivência subir: uma <em>cache</em> que retém tudo o que é alocado leva a taxa a 40% ou 60%, e então copia-se centenas de MB por colecção. A segunda é a promoção prematura — <em>survivor spaces</em> demasiado pequenos para o tamanho da geração jovem, ou <code>MaxTenuringThreshold</code> demasiado baixo, fazem com que objectos que morreriam na colecção seguinte sejam copiados para a geração velha, o que aumenta a pausa jovem e força colecções velhas mais frequentes. A terceira são referências velho→jovem em massa: uma estrutura de longa duração actualizada a alta frequência suja muitas zonas e a fase de <em>scan</em> deixa de ser barata.</p>
+      <p>Em termos operacionais, as duas medições que resolvem quase tudo são a taxa de alocação (tamanho do <em>eden</em> a dividir pelo intervalo entre colecções jovens — 512 MB a cada 2 s são 256 MB/s) e a taxa de promoção (crescimento da ocupação da geração velha por colecção). Uma taxa de promoção que sobe monotonamente é o sinal de fuga; uma taxa de alocação alta com promoção baixa é apenas lixo barato e não justifica intervenção.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Descreve eden/survivor/old como sequência de caixas, sem explicar porque é que a pausa é pequena.</td></tr>
+        <tr><td>Mid</td><td>Diz «copia só o que sobrevive», mas não sabe como o recolector encontra as referências da geração velha.</td></tr>
+        <tr><td>Sénior</td><td>Explica custo proporcional ao vivo, barreira de escrita e <em>card table</em>/<em>remembered set</em>, e nomeia promoção prematura como causa de degradação.</td></tr>
+        <tr><td>Staff</td><td>Traduz tudo em duas métricas operacionais (taxa de alocação e taxa de promoção) e diz que decisão toma consoante os valores.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como calcula a taxa de alocação a partir de um <em>log</em> de GC?»</li>
+      <li>«O que faz <code>-Xmn</code> num G1 e porque é que raramente se deve usar?»</li>
+      <li>«Que sintoma no <em>log</em> revela promoção prematura?»</li>
+      <li>«Porque é que o ZGC geracional recuperou esta ideia depois de a ter dispensado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Dizer que a colecção jovem varre todo o <em>heap</em>.</li>
+      <li>Não conhecer o custo da barreira de escrita.</li>
+      <li>Propor aumentar o <em>eden</em> sem olhar para a taxa de sobrevivência.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-10-4" class="h2"><span class="secnum">10.4</span> Ler uma pausa de GC e afinar sem adivinhar<a class="anchor" href="#sec-10-4" aria-label="ligação">#</a></h2>
+
+<p>Sem <em>log</em> de GC não há afinação, há adivinhação. O registo unificado do JDK moderno liga-se com <code>-Xlog:gc*,gc+heap=debug,safepoint:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=5,filesize=20M</code>: custa menos de 1% de desempenho, cabe em 100 MB de disco e é a única fonte que permite reconstruir um incidente depois de o <em>pod</em> ter sido substituído. Deve estar sempre ligado em produção, tal como <code>-XX:+HeapDumpOnOutOfMemoryError</code>.</p>
+
+<p>Ler o <em>log</em> é reconhecer quatro tipos de linha. <code>Pause Young (Normal)</code> é a colecção jovem de rotina. <code>Pause Young (Concurrent Start)</code> inicia a marcação concorrente da geração velha, disparada quando a ocupação atinge o limiar de arranque. <code>Pause Young (Mixed)</code> inclui regiões velhas escolhidas pela marcação anterior. <code>Pause Full (Allocation Failure)</code> é o modo de falha: o G1 não conseguiu evacuar e caiu para uma colecção completa. A linha <code>To-space exhausted</code> é o aviso imediatamente anterior — não havia regiões livres para copiar os sobreviventes.</p>
+
+<p>A pausa que não aparece no <em>log</em> de GC é o tempo até ao <em>safepoint</em>. Todas as pausas exigem que os <em>threads</em> aplicacionais parem em pontos seguros; se um <em>thread</em> está num ciclo contado sem <em>poll</em> de <em>safepoint</em>, numa chamada JNI longa, ou bloqueado à espera de páginas de memória, o «tempo para <em>safepoint</em>» pode ser dez vezes maior do que a pausa de GC propriamente dita. É por isso que <code>safepoint</code> vai no mesmo <code>-Xlog</code>: uma pausa reportada de 12 ms com 300 ms de tempo até ao <em>safepoint</em> é um problema completamente diferente e nenhuma flag de GC o resolve.</p>
+
+<figure class="listing text" id="lst-10-3"><div class="lhead"><span class="lnum">Listagem 10.3</span>
+<span class="lcap">Excerto de <em>log</em> G1 com esgotamento de <em>to-space</em> e colecção completa subsequente.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>[2025-08-14T02:41:07.118+0000][118.412s][info][gc] GC(214) Pause Young (Normal)
+    (G1 Evacuation Pause) 6144M-&gt;3980M(8192M) 38.204ms
+[2025-08-14T02:41:09.902+0000][121.196s][info][gc] GC(215) Pause Young (Concurrent Start)
+    (G1 Humongous Allocation) 6220M-&gt;4402M(8192M) 41.870ms
+[2025-08-14T02:42:31.664+0000][202.958s][info][gc] GC(238) To-space exhausted
+[2025-08-14T02:42:31.664+0000][202.958s][info][gc] GC(238) Pause Young (Normal)
+    (G1 Evacuation Pause) 8064M-&gt;7810M(8192M) 902.551ms
+[2025-08-14T02:42:32.570+0000][203.864s][info][gc] GC(239) Pause Full
+    (G1 Compaction Pause) 7810M-&gt;5904M(8192M) 3204.118ms
+[2025-08-14T02:42:36.001+0000][207.295s][info][safepoint] Safepoint "G1CollectFull",
+    Time since last: 906118 ns, Reaching safepoint: 284119 ns, At safepoint: 3204118 ns</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Baixar <code>-XX:MaxGCPauseMillis</code> de 200 para 50 não torna o GC mais rápido: o G1 encolhe a geração jovem para caber no alvo, as colecções passam a ser três a quatro vezes mais frequentes, a fracção de CPU gasta em GC sobe e objectos que morreriam no <em>eden</em> são promovidos, o que aumenta as colecções mistas e as completas. Em vários incidentes reais, o p99 piora depois desta alteração «de latência».</p></aside>
+
+<div class="qa" id="q-10-7" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Olhe para a Listagem 10.3 e diga-me, em voz alta, o que aconteceu a este serviço entre os 118 e os 207 segundos, e qual é a primeira coisa que muda.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A leitura é uma progressão de três passos. Aos 118 s, colecção jovem normal: 6144 MB antes, 3980 MB depois, num <em>heap</em> de 8192 MB, 38 ms — saudável, recupera 2,1 GB. Aos 121 s, arranca a marcação concorrente com a causa <code>G1 Humongous Allocation</code>: alguém está a alocar objectos maiores do que metade de uma região, que vão directos para a geração velha. Aos 202 s, o <em>heap</em> está a 8064 MB de 8192 MB e a colecção não tem para onde copiar — <code>To-space exhausted</code>, pausa de 902 ms que recupera 254 MB. Um segundo depois, colecção completa de 3,2 s que só devolve o <em>heap</em> a 5904 MB.</p>
+      <p>As duas conclusões são independentes. A primeira: o conjunto vivo cresceu de 3980 MB para 5904 MB em 85 segundos e o valor depois da colecção completa é o limite inferior real da ocupação — não há lixo escondido depois de uma compactação. Um crescimento de 22 MB/s no vivo é fuga ou <em>cache</em> sem limite, não pressão de alocação normal. A segunda: as alocações <em>humongous</em> estão a fragmentar a geração velha, o que explica o esgotamento de <em>to-space</em> antes de o <em>heap</em> estar realmente cheio.</p>
+      <p>A linha de <em>safepoint</em> fecha o diagnóstico: 284 µs para atingir o <em>safepoint</em> e 3,2 s dentro dele. Ou seja, o problema é o trabalho de GC e não a paragem dos <em>threads</em> — se fossem 200 ms para atingir o <em>safepoint</em>, a investigação seria outra (ciclos contados, JNI, memória a ser trocada para disco).</p>
+      <p>A primeira coisa que muda não é uma flag: é obter o <em>heap dump</em> e identificar o que está a crescer. Aumentar <code>-Xmx</code> compra tempo — de 85 segundos para talvez 200 — e nada mais, se for fuga. Se o <em>dump</em> mostrar que o vivo é legítimo, aí sim há duas alterações defensáveis: subir <code>-XX:G1HeapRegionSize</code> para 16 ou 32 MB para que os <em>arrays</em> grandes deixem de ser <em>humongous</em>, e baixar <code>-XX:InitiatingHeapOccupancyPercent</code> para que a marcação concorrente comece mais cedo e as colecções mistas tenham tempo de libertar espaço antes do esgotamento. As duas atacam sintomas diferentes e não se aplicam ao mesmo tempo sem medir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Está a fazer muito GC, é preciso mais <em>heap</em>»; não lê os valores antes/depois.</td></tr>
+        <tr><td>Mid</td><td>Lê os números correctamente e identifica a colecção completa, mas não repara na causa <em>humongous</em> nem no crescimento do vivo.</td></tr>
+        <tr><td>Sénior</td><td>Extrai o conjunto vivo pós-compactação, calcula a taxa de crescimento, liga <code>To-space exhausted</code> a fragmentação por <em>humongous</em> e lê a linha de <em>safepoint</em>.</td></tr>
+        <tr><td>Staff</td><td>Ordena as acções (prova antes de flags), distingue mitigação de correcção e diz qual das duas flags aplicaria e sob que evidência.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Com <em>heap</em> de 8 GB, qual é o tamanho de região por omissão e a partir de que dimensão um objecto é <em>humongous</em>?»</li>
+      <li>«Porque é que a colecção completa do G1 é o modo de falha e não uma operação normal?»</li>
+      <li>«Que métrica exportaria para alertar antes de isto acontecer?»</li>
+      <li>«O que muda nesta análise se o recolector fosse ZGC?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor flags antes de identificar o que ocupa o <em>heap</em>.</li>
+      <li>Ignorar a ocupação depois da colecção completa, que é o número mais informativo do excerto.</li>
+      <li>Confundir tempo até ao <em>safepoint</em> com duração da pausa.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-10-8" data-box="qa" data-area="jvm" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Que processo segue para afinar o GC de um serviço novo? Quero a sequência de passos e o critério de paragem, não uma lista de flags.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O processo tem cinco passos e começa por não afinar nada. Passo um: definir o objectivo em números — «p99 do <em>endpoint</em> de autorização abaixo de 40 ms com 1 800 pedidos por segundo, e menos de 5% de CPU em GC». Sem alvo, qualquer alteração parece boa. Passo dois: instrumentar — <code>-Xlog:gc*</code> com <em>safepoint</em>, JFR contínuo, e o histograma de latência do serviço na mesma janela temporal.</p>
+      <p>Passo três: extrair as quatro medidas que descrevem o serviço. Conjunto vivo, lido depois de uma colecção completa ou de um ciclo concorrente completo. Taxa de alocação, do tamanho do <em>eden</em> sobre o intervalo entre colecções jovens. Taxa de promoção, do crescimento da geração velha por ciclo. Distribuição de pausas (p50, p99, máximo), não a média. Com estes quatro números, o dimensionamento faz-se sem experimentar: um <em>heap</em> saudável fica entre 2,5 e 4 vezes o conjunto vivo — abaixo de 2 vezes, o GC trabalha permanentemente; acima de 5, desperdiça-se memória e as pausas de compactação crescem.</p>
+      <p>Passo quatro: alterar uma variável de cada vez, na ordem do maior efeito. Primeiro o tamanho do <em>heap</em> e <code>-Xms</code> igual a <code>-Xmx</code> para eliminar redimensionamentos. Depois o recolector, se o perfil o justificar. Só no fim flags finas como <code>InitiatingHeapOccupancyPercent</code> ou <code>G1HeapRegionSize</code>. Cada alteração corre pelo menos um ciclo de tráfego completo — se o pico é à sexta-feira, um teste de terça não conta.</p>
+      <p>Passo cinco, o critério de paragem: parar quando o GC deixa de estar no caminho crítico, e não quando os números «parecem bons». Operacionalmente, isso é a fracção de CPU em GC abaixo de 5% e a componente de pausa a explicar menos de 10% do orçamento de p99. A partir daí, o próximo milissegundo é mais barato de conquistar noutro sítio — menos alocação por pedido, menos uma chamada remota, um índice em falta. Vale a pena dizer explicitamente o que não se faz: copiar conjuntos de flags de outros serviços, e afinar em ambiente de teste com um décimo do tráfego e um perfil de dados diferente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Enumera flags favoritas; não define objectivo nem mede antes.</td></tr>
+        <tr><td>Mid</td><td>Sabe activar o <em>log</em> de GC e ler pausas, mas não extrai conjunto vivo nem taxas, e altera várias coisas ao mesmo tempo.</td></tr>
+        <tr><td>Sénior</td><td>Define alvo numérico, extrai as quatro medidas, dimensiona o <em>heap</em> a partir do conjunto vivo e altera uma variável de cada vez.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o critério de paragem e a análise de custo de oportunidade — onde está o milissegundo seguinte mais barato — e a política de não afinar em ambientes não representativos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como mede o conjunto vivo sem forçar uma colecção completa em produção?»</li>
+      <li>«Porque é que <code>-Xms</code> igual a <code>-Xmx</code> é quase sempre a escolha em contentores?»</li>
+      <li>«Que alarme define para detectar degradação de GC antes do utilizador?»</li>
+      <li>«Como testaria uma alteração de flags sem risco?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afinar sem <em>log</em> de GC activo.</li>
+      <li>Usar médias de pausa em vez de percentis e máximos.</li>
+      <li>Aplicar cinco flags de uma vez e declarar vitória.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-10-5" class="h2"><span class="secnum">10.5</span> OutOfMemoryError: diagnosticar cada variante<a class="anchor" href="#sec-10-5" aria-label="ligação">#</a></h2>
+
+<p><code>OutOfMemoryError</code> não é um erro, são oito erros diferentes que partilham o nome da classe. A mensagem depois dos dois pontos identifica a região de memória que se esgotou, e cada região tem um diagnóstico, uma ferramenta e uma correcção próprios. Confundir «Java heap space» com «Metaspace» leva a uma semana perdida a analisar <em>heap dumps</em> onde não há nada para ver.</p>
+
+<p>Um caso merece destaque porque é o mais comum e o menos compreendido: «Java heap space» pode significar fuga (o conjunto vivo cresce monotonamente), sub-dimensionamento (o conjunto vivo é legítimo e maior do que o <em>heap</em>) ou uma única alocação absurda (uma consulta sem <code>LIMIT</code> que traz três milhões de linhas). Distinguem-se pelo gráfico de ocupação após colecção: uma serra ascendente é fuga, um patamar alto e estável é sub-dimensionamento, um salto vertical isolado é a alocação única. A ferramenta é sempre a mesma — <em>heap dump</em> com <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code> e análise da árvore de dominadores no Eclipse MAT — mas o que se procura muda.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 10.2</span> Variantes de <code>OutOfMemoryError</code>, causa dominante e primeiro passo.</div>
+<div class="tscroll"><table><thead><tr><th>Mensagem</th><th>Região</th><th>Causa dominante</th><th>Primeiro passo</th></tr></thead><tbody>
+<tr><td>Java heap space</td><td><em>Heap</em></td><td>Fuga, sub-dimensionamento ou alocação única enorme</td><td><em>Heap dump</em> e árvore de dominadores</td></tr>
+<tr><td>GC overhead limit exceeded</td><td><em>Heap</em></td><td>Mais de 98% do tempo em GC a recuperar menos de 2%</td><td>Igual a «Java heap space»: é o mesmo problema, detectado mais cedo</td></tr>
+<tr><td>Metaspace</td><td>Nativa</td><td>Fuga de <em>class loader</em>, geração dinâmica de classes</td><td><code>jcmd VM.classloader_stats</code></td></tr>
+<tr><td>Compressed class space</td><td>Nativa</td><td>Mais de 1 GB de metadados comprimíveis; centenas de milhares de classes</td><td>Contar classes; considerar <code>-XX:-UseCompressedClassPointers</code></td></tr>
+<tr><td>Direct buffer memory</td><td><em>Off-heap</em></td><td><em>Buffers</em> Netty/NIO não libertados, <code>-XX:+DisableExplicitGC</code></td><td>NMT, métricas de <em>pool</em> de <em>buffers</em>, JFR</td></tr>
+<tr><td>unable to create native thread</td><td>Nativa/SO</td><td>Limite de <em>threads</em> do <em>cgroup</em> ou <code>ulimit</code>, pilhas grandes</td><td>Contar <em>threads</em>; rever dimensionamento de <em>pools</em></td></tr>
+<tr><td>Requested array size exceeds VM limit</td><td><em>Heap</em></td><td><em>Array</em> pedido acima do máximo endereçável</td><td>Ler o código: é sempre um <em>bug</em> de cálculo de tamanho</td></tr>
+<tr><td>Native memory allocation (mmap) failed</td><td>Nativa</td><td>RSS a bater no limite do <em>cgroup</em> ou no SO</td><td>NMT e memória do contentor; não é problema de <em>heap</em></td></tr>
+</tbody></table></div></div>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>jmap -histo:live</code> força uma colecção completa antes de contar — num <em>heap</em> de 16 GB com G1, isso é uma pausa de vários segundos em produção. Para inspecção segura usa-se <code>jcmd &lt;pid&gt; GC.class_histogram</code> sem a variante <em>live</em>, ou o JFR. E um <em>heap dump</em> de 8 GB demora dezenas de segundos a escrever, com o processo parado durante boa parte disso: em Kubernetes, retirar o <em>pod</em> do <em>load balancer</em> antes de o recolher evita transformar um diagnóstico numa interrupção.</p></aside>
+
+<div class="qa" id="q-10-9" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um serviço em produção lança <code>OutOfMemoryError: Java heap space</code> aproximadamente de doze em doze horas, sempre com o mesmo padrão. Descreva o que faz, por ordem, desde o alerta até à correcção.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro estabilizar, depois diagnosticar. Estabilizar é garantir que o processo morre de forma limpa e reproduzível: <code>-XX:+HeapDumpOnOutOfMemoryError</code> com um caminho num volume persistente, <code>-XX:+ExitOnOutOfMemoryError</code> para que a JVM não fique num estado zombie a servir erros durante horas, e reinício automático. Uma JVM que continua a correr depois de um OOM de <em>heap</em> é pior do que uma que morre: as <em>threads</em> falham umas a seguir às outras e o <em>load balancer</em> continua a enviar tráfego.</p>
+      <p>Depois, provar que é fuga e não sub-dimensionamento. O gráfico de ocupação do <em>heap</em> depois de cada colecção durante as doze horas responde: se o mínimo após colecção sobe de 1,2 GB para 3,4 GB monotonamente, é retenção. Se o mínimo é estável e a aplicação só falha em picos, é dimensionamento ou uma alocação pontual. A periodicidade de doze horas é ela própria uma pista forte — sugere uma tarefa agendada, uma rotação de <em>token</em> que reconstrói uma estrutura sem libertar a anterior, ou um ciclo de negócio.</p>
+      <p>Com o <em>heap dump</em> recolhido no momento do OOM, a análise é a árvore de dominadores: qual é o objecto único que, se fosse recolhido, libertaria a maior fracção do <em>heap</em>. Na prática, quatro suspeitos cobrem a maioria dos casos: uma <em>cache</em> em processo sem limite de tamanho ou sem expiração; uma colecção estática que acumula (listeners, métricas por chave de alta cardinalidade, um <code>Map</code> indexado por identificador de pedido); acumulação por <code>ThreadLocal</code> em <em>threads</em> de <em>pool</em>; e retenção indirecta, como uma <em>substring</em> ou um <em>stream</em> que mantém vivo o <em>buffer</em> completo de origem.</p>
+      <p>A correcção define-se pelo tipo. Fuga: limitar a estrutura (Caffeine com <code>maximumWeight</code> e expiração em vez de um <code>HashMap</code>), remover a acumulação, ou limpar o <code>ThreadLocal</code> no <code>finally</code>. Sub-dimensionamento: subir o <em>heap</em> — o que é uma correcção legítima quando o vivo é legítimo. Alocação única: paginar a consulta e impor um limite. O que fecha o incidente não é o <em>fix</em>, é o alarme que impede a repetição: ocupação após colecção acima de 70% durante 15 minutos consecutivos, que dispara horas antes do OOM e dá tempo para agir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aumentar <code>-Xmx</code> e reiniciar; sem <em>dump</em>, sem hipótese, sem alarme.</td></tr>
+        <tr><td>Mid</td><td>Recolhe <em>heap dump</em> e olha para o histograma de classes; conclui «há muitos <code>byte[]</code>» sem chegar ao retentor.</td></tr>
+        <tr><td>Sénior</td><td>Estabiliza primeiro, distingue fuga de dimensionamento pelo gráfico pós-colecção, usa a árvore de dominadores e nomeia os padrões de retenção habituais.</td></tr>
+        <tr><td>Staff</td><td>Usa a periodicidade como pista, escolhe a correcção pelo tipo de causa e fecha com um alarme antecipado e um limite explícito na estrutura culpada.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o histograma de classes engana e a árvore de dominadores não?»</li>
+      <li>«Como recolhe um <em>heap dump</em> de um <em>pod</em> que é morto e substituído em segundos?»</li>
+      <li>«Que diferença faz uma referência fraca ou <em>soft</em> neste cenário?»</li>
+      <li>«Como testaria a correcção antes de a pôr em produção?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar a JVM viva depois de um OOM de <em>heap</em>.</li>
+      <li>Recolher o <em>dump</em> depois do reinício, quando já não há evidência.</li>
+      <li>Não instalar alarme sobre a ocupação após colecção.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-10-10" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Recebemos <code>OutOfMemoryError: Direct buffer memory</code> num serviço com o <em>heap</em> a 30%. Explique-me como essa memória é libertada e o que pode ter corrido mal.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Um <code>ByteBuffer</code> directo aloca memória nativa e guarda no <em>heap</em> apenas um objecto pequeno com um <em>cleaner</em> associado. A memória nativa só é devolvida quando esse objecto pequeno é recolhido e o <em>cleaner</em> corre. Daí a inversão contra-intuitiva: com o <em>heap</em> a 30%, as colecções são raras, os objectos que representam os <em>buffers</em> permanecem vivos por inércia, e a memória nativa acumula-se até bater no limite. Quanto mais folgado está o <em>heap</em>, mais tarde a memória directa é libertada.</p>
+      <p>O limite é <code>-XX:MaxDirectMemorySize</code>, que por omissão herda o valor de <code>-Xmx</code>. Se o <em>heap</em> é de 4 GB, o processo pode legitimamente ter mais 4 GB de memória directa antes de a JVM se queixar — muito acima do que qualquer contentor bem dimensionado permite, pelo que o desfecho habitual não é sequer este erro mas um <em>OOMKilled</em>.</p>
+      <p>As causas concretas são quatro. Primeira: <code>-XX:+DisableExplicitGC</code>. O mecanismo de reserva do próprio <code>ByteBuffer</code> chama <code>System.gc()</code> quando não consegue reservar, precisamente para forçar a execução dos <em>cleaners</em>; desligar chamadas explícitas remove essa válvula de escape e transforma pressão temporária em erro. A alternativa correcta, quando se quer evitar pausas completas por <code>System.gc()</code>, é <code>-XX:+ExplicitGCInvokesConcurrent</code>. Segunda: <em>buffers</em> geridos por contagem de referências, como no Netty, com um caminho de erro que não liberta — é uma fuga real e nenhuma GC a resolve. Terceira: <em>pools</em> de <em>buffers</em> dimensionados por <em>thread</em>, que crescem com o número de <em>threads</em>. Quarta: um limite explícito demasiado baixo para o pico de tráfego.</p>
+      <p>O diagnóstico usa NMT (secção <em>Other</em>) e as métricas de <code>BufferPoolMXBean</code>, que dão contagem e <em>bytes</em> de <em>buffers</em> directos e mapeados — expor estas duas métricas é barato e resolve a ambiguidade em minutos. A correcção depende da causa: definir <code>-XX:MaxDirectMemorySize</code> explicitamente (nunca deixar o valor implícito num contentor), remover <code>DisableExplicitGC</code>, activar a detecção de fugas do <em>allocator</em> em <em>staging</em> e limitar os <em>pools</em>. O <em>trade-off</em> de fundo é o que se ganhou ao ir <em>off-heap</em>: menos cópias e menos pressão de GC, ao preço de gestão manual de tempo de vida — e a gestão manual falha nos caminhos de erro.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata como OOM de <em>heap</em> e propõe aumentar <code>-Xmx</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há memória directa fora do <em>heap</em>, mas não sabe como é libertada nem qual é o limite por omissão.</td></tr>
+        <tr><td>Sénior</td><td>Explica a libertação dependente de GC, diz que o limite herda <code>-Xmx</code>, e liga <code>DisableExplicitGC</code> ao problema.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta as métricas a expor, distingue fuga real de libertação tardia e enuncia o <em>trade-off</em> de usar memória directa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual a diferença entre um <em>buffer</em> directo e um ficheiro mapeado em memória, do ponto de vista do RSS?»</li>
+      <li>«Porque é que o Netty usa contagem de referências em vez de confiar no GC?»</li>
+      <li>«Que efeito tem <code>-XX:+ExplicitGCInvokesConcurrent</code> com G1?»</li>
+      <li>«Como reproduzia esta falha em <em>staging</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Acreditar que memória directa é libertada deterministicamente ao sair do âmbito.</li>
+      <li>Usar <code>-XX:+DisableExplicitGC</code> por omissão sem conhecer esta interacção.</li>
+      <li>Não definir <code>-XX:MaxDirectMemorySize</code> num contentor.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-10-1" data-box="lab" data-lang="shell">
+  <div class="labhead"><span class="labttl">Exercício 10.1 — Diagnóstico a partir de <em>log</em> de GC e <em>heap dump</em></span>
+    <div class="labpills"><span class="qpill">Diagnóstico escrito</span><span class="qpill">25 min</span></div></div>
   <div class="labbody">
-    <p>Existe um <code>LiquidacaoService</code> que recebe o id de um pedido, chama o adquirente por HTTP para obter um recibo, grava a liquidação em PostgreSQL e marca o pedido como liquidado — tudo numa transacção. O serviço é invocado por um consumidor Kafka com garantia <em>at-least-once</em>. Escreva a bateria de testes de integração que cobre: (a) o percurso feliz; (b) idempotência sob reentrega da mesma mensagem, com a garantia de que o adquirente só é chamado uma vez; (c) falha do adquirente, em que o pedido tem de continuar <code>PENDENTE</code> e nenhuma liquidação pode ficar gravada. Restrições: o adquirente real não pode ser contactado; a base de dados tem de ser PostgreSQL 17, porque a idempotência assenta numa restrição única e num <code>ON CONFLICT DO NOTHING</code>; o <em>rollback</em> tem de ser verificado na base de dados e não por confiança no <em>framework</em>.</p>
+    <p>Serviço de facturação em Java 21, Spring Boot 3.5, a correr com <code>-Xms8g -Xmx8g -XX:+UseG1GC -XX:G1HeapRegionSize=4m</code> num <em>pod</em> com limite de 10 GiB. O alerta disparou às 02:42; o serviço fez três colecções completas em cinco minutos e o p99 subiu de 55 ms para 4,1 s. O excerto de <em>log</em> é o da Listagem 10.3. A Listagem 10.4 traz o resumo da árvore de dominadores do <em>heap dump</em> recolhido no momento do incidente. Escreva o diagnóstico como o entregaria ao <em>post-mortem</em>: causa provável, evidência que a sustenta, uma hipótese alternativa que ainda não foi excluída, a acção imediata de mitigação e a correcção definitiva. Não são aceites respostas que comecem por alterar flags.</p>
+    <figure class="listing text" id="lst-10-4"><div class="lhead"><span class="lnum">Listagem 10.4</span>
+      <span class="lcap">Resumo da árvore de dominadores (<em>heap dump</em> de 8 GB, 5,9 GB retidos).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="text"><code>Class Name                                        | Objects | Shallow | Retained Heap
+--------------------------------------------------+---------+---------+--------------
+com.acme.billing.InvoiceRenderCache               |       1 |      32 |  4 812 664 320
+ |- java.util.concurrent.ConcurrentHashMap         |       1 |      64 |  4 812 663 984
+ |   |- ConcurrentHashMap$Node[]                   |       1 | 2097168 |  4 810 566 800
+ |       |- com.acme.billing.RenderedInvoice       | 1 284 → |     40  |  4 806 122 112
+ |           |- byte[] (PDF, media 3,7 MB)         | 1 284 → | 4806 MB |  4 806 118 400
+com.acme.billing.LedgerBatchJob                   |       1 |      48 |    412 998 144
+java.lang.Thread[] (http-nio-8080-exec-*)         |     400 |   16000 |    118 220 800
+--------------------------------------------------+---------+---------+--------------
+Total heap: 8 589 934 592   Live after full GC: 5 904 misc MB   Unreachable: 2,1 GB</code></pre></figure>
     <h4>A sua solução</h4>
     <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
     <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-10-6"><div class="lhead"><span class="lnum">Listagem 10.6</span>
-        <span class="lcap">Testcontainers com @ServiceConnection e mock do adaptador externo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-@Testcontainers
-class LiquidacaoServiceIT {
+      <p><strong>Causa provável.</strong> <code>InvoiceRenderCache</code> é uma <em>cache</em> em processo sem limite de tamanho que retém 4,81 GB — 82% do conjunto vivo — sob a forma de 1 284 PDFs em <code>byte[]</code> com média de 3,7 MB. Duas consequências independentes decorrem daí. Primeira, o conjunto vivo cresce monotonamente (3 980 MB → 5 904 MB em 85 s no <em>log</em>), o que esgota o <em>heap</em> de 8 GB. Segunda, cada <code>byte[]</code> de 3,7 MB excede metade da região de 4 MB e é, por definição, uma alocação <em>humongous</em>: vai directamente para regiões contíguas da geração velha, fragmenta-a, e explica tanto a causa <code>G1 Humongous Allocation</code> aos 121 s como o <code>To-space exhausted</code> aos 202 s com o <em>heap</em> ainda a 98%.</p>
+      <p><strong>Evidência.</strong> A ocupação após a colecção completa (5 904 MB) é o conjunto vivo real, porque uma compactação não deixa lixo por recolher; a árvore de dominadores atribui 4,81 GB a um único objecto raiz; a causa de GC nomeada no <em>log</em> é <em>humongous</em>; e a média de 3,7 MB por <em>array</em> está acima do limiar de 2 MB imposto por regiões de 4 MB.</p>
+      <p><strong>Hipótese alternativa não excluída.</strong> Os 400 <em>threads</em> de <em>worker</em> retêm 118 MB e o <code>LedgerBatchJob</code> retém 413 MB. Se o lote noturno correr às 02:40, pode ser ele a alimentar a <em>cache</em> a uma taxa anómala — nesse caso a <em>cache</em> é o mecanismo, mas o gatilho é o lote, e limitar a <em>cache</em> sem limitar o lote apenas move o problema para latência. Fica por confirmar com o registo de invocações do agendador.</p>
+      <p><strong>Mitigação imediata.</strong> Reiniciar de forma rotativa para recuperar o serviço, retirando cada <em>pod</em> do <em>load balancer</em> antes de recolher o <em>dump</em>; suspender o lote noturno se se confirmar a coincidência temporal. Subir o <em>heap</em> só compra tempo proporcional (8 → 12 GB adia o incidente de 85 s para cerca de 170 s de acumulação) e não é correcção.</p>
+      <p><strong>Correcção definitiva.</strong> Substituir o <code>ConcurrentHashMap</code> por uma <em>cache</em> limitada por peso — <code>maximumWeight</code> em <em>bytes</em>, não por número de entradas, porque a variável é o tamanho do PDF — com expiração após escrita e métricas de <em>hit rate</em> e de tamanho expostas. Um limite de 512 MB dá 130 a 140 PDFs em <em>cache</em> e, com o padrão de acesso típico de facturação, mantém uma taxa de acerto útil. Em paralelo, deixar de guardar PDFs no <em>heap</em>: escrever para armazenamento de objectos e guardar a chave, o que remove simultaneamente a fuga e as alocações <em>humongous</em>. A flag <code>-XX:G1HeapRegionSize=16m</code> é a única alteração de JVM defensável e é secundária — trata a fragmentação, não a retenção.</p>
+      <figure class="listing shell" id="lst-10-5"><div class="lhead"><span class="lnum">Listagem 10.5</span>
+        <span class="lcap">Sequência de comandos para confirmar o diagnóstico sem parar o serviço.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="shell"><code># 1. Confirmar o conjunto vivo e a ocupacao por regiao, sem forcar Full GC
+jcmd 1 GC.heap_info
+jcmd 1 VM.native_memory summary | head -30
 
-    @Container
-    @ServiceConnection                       // Spring Boot 3.1+: dispensa @DynamicPropertySource
-    static final PostgreSQLContainer&lt;?&gt; POSTGRES =
-            new PostgreSQLContainer&lt;&gt;("postgres:17-alpine");   // versão maior igual à de produção
+# 2. Histograma sem a variante :live (que dispararia uma Full GC de varios segundos)
+jcmd 1 GC.class_histogram | head -20
 
-    @MockitoBean Adquirente adquirente;      // Spring Boot 3.4+; o adaptador é NOSSO, logo mockável
+# 3. Gravar 120s de JFR com perfil de alocacao e eventos de GC
+jcmd 1 JFR.start name=diag settings=profile duration=120s filename=/dumps/diag.jfr
+jcmd 1 JFR.check name=diag
 
-    @Autowired LiquidacaoService servico;
-    @Autowired LiquidacaoRepository liquidacoes;
-    @Autowired PedidoRepository pedidos;
-    @Autowired JdbcTemplate jdbc;
+# 4. So depois de retirar o pod do balanceador: heap dump completo
+kubectl label pod billing-7d9f4 app.kubernetes.io/ready=false --overwrite
+jcmd 1 GC.heap_dump /dumps/billing-$(date +%s).hprof
 
-    @BeforeEach
-    void limpar() {
-        // Truncar, e não rollback: queremos exercitar o commit real e o que depende dele.
-        jdbc.execute("TRUNCATE liquidacao, pedido RESTART IDENTITY CASCADE");
-    }
-
-    @Test
-    void grava_a_liquidacao_e_marca_o_pedido_como_liquidado() {
-        var pedido = pedidos.save(Pedido.pendente("p-1", Centimos.of(2_500)));
-        given(adquirente.liquidar("p-1")).willReturn(Recibo.de("rec-9"));
-
-        servico.liquidar(pedido.id());
-
-        assertThat(liquidacoes.findByPedidoId("p-1"))
-            .singleElement()
-            .returns("rec-9", Liquidacao::recibo)
-            .returns(Centimos.of(2_500), Liquidacao::valor);
-        assertThat(pedidos.findById(pedido.id()))
-            .get().returns(Estado.LIQUIDADO, Pedido::estado);
-    }
-
-    @Test
-    void e_idempotente_sob_reentrega_da_mesma_mensagem() {
-        var pedido = pedidos.save(Pedido.pendente("p-2", Centimos.of(1_000)));
-        given(adquirente.liquidar("p-2")).willReturn(Recibo.de("rec-10"));
-
-        servico.liquidar(pedido.id());
-        servico.liquidar(pedido.id());       // reentrega at-least-once do consumidor Kafka
-
-        assertThat(liquidacoes.findByPedidoId("p-2")).hasSize(1);
-        then(adquirente).should(times(1)).liquidar("p-2");   // e não cobra duas vezes ao cliente
-    }
-
-    @Test
-    void deixa_o_pedido_pendente_quando_o_adquirente_falha() {
-        var pedido = pedidos.save(Pedido.pendente("p-3", Centimos.of(700)));
-        given(adquirente.liquidar("p-3"))
-            .willThrow(new AdquirenteIndisponivel("acme", Duration.ofMillis(2_000), null));
-
-        assertThatThrownBy(() -&gt; servico.liquidar(pedido.id()))
-            .isInstanceOf(AdquirenteIndisponivel.class);
-
-        // Rollback verificado na base de dados real, não por confiança no framework.
-        assertThat(liquidacoes.findByPedidoId("p-3")).isEmpty();
-        assertThat(pedidos.findById(pedido.id()))
-            .get().returns(Estado.PENDENTE, Pedido::estado);
-    }
-}</code></pre></figure>
+# 5. Confirmar quantas alocacoes humongous e de que dimensao
+grep -c "Humongous Allocation" /var/log/app/gc.log
+grep "humongous" /var/log/app/gc.log | tail -5</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>O contentor é <code>static final</code>: um arranque por JVM (1,5-3 s), não um por classe. Declará-lo como campo de instância multiplica o custo pelo número de classes de teste.</li>
-        <li>O mock é do <strong>nosso</strong> adaptador <code>Adquirente</code>, não do <code>RestClient</code>. O adaptador tem uma bateria própria contra WireMock com 500, <em>timeout</em>, 429 e corpo malformado.</li>
-        <li>A limpeza é por <code>TRUNCATE</code> e não por <code>@Transactional</code>: com <em>rollback</em>, o teste de idempotência nunca chegaria a violar a restrição única, porque o primeiro <code>INSERT</code> não seria confirmado.</li>
-        <li>O teste de idempotência assevera duas coisas independentes — uma linha na base de dados e uma chamada ao adquirente. A segunda é a que impede cobrança dupla e é a que os candidatos esquecem.</li>
-        <li>O teste de <em>rollback</em> verifica o estado na base de dados; asseverar apenas que a excepção subiu deixaria passar um <code>@Transactional</code> mal colocado ou uma chamada interna sem <em>proxy</em>.</li>
-        <li>Casos limite que valem a pena acrescentar: pedido inexistente, pedido já liquidado por outro caminho, e recibo devolvido com valor diferente do pedido — este último é fraude ou <em>bug</em> do adquirente e não deve gravar nada.</li>
-        <li>A imagem fixa a versão maior (<code>postgres:17-alpine</code>). Usar <code>latest</code> transforma a bateria numa fonte de falhas não reprodutíveis assim que a imagem for republicada.</li>
+        <li>A ordem importa mais do que a conclusão: evidência, hipótese, alternativa, mitigação, correcção. Quem começa por propor flags perde a ronda mesmo que a flag esteja certa.</li>
+        <li>O número mais informativo do <em>log</em> é a ocupação depois da colecção completa; quem o ignora não sabe distinguir fuga de pressão de alocação.</li>
+        <li>A ligação entre 3,7 MB por <em>array</em> e regiões de 4 MB é o detalhe que separa sénior de mid — exige saber o limiar de 50% da região.</li>
+        <li>Limitar a <em>cache</em> por número de entradas em vez de por peso é a armadilha plantada: 1 000 entradas de 3,7 MB continuam a ser 3,7 GB.</li>
+        <li>Casos limite a mencionar: a <em>cache</em> pode ser correcta e o <em>heap</em> estar sub-dimensionado — só o <em>hit rate</em> o decide; e um <em>dump</em> de 8 GB é ele próprio um evento de produção, não uma operação gratuita.</li>
+        <li>Resposta forte fecha com prevenção: alarme sobre ocupação após colecção acima de 70% durante 15 minutos, e teste de carga com o perfil de tamanho real dos PDFs.</li>
       </ul>
     </div>
   </div>
 </div>
 
-<h2 id="sec-10-7" class="h2"><span class="secnum">10.7</span> Cobertura, mutation testing e flakiness<a class="anchor" href="#sec-10-7" aria-label="ligação">#</a></h2>
+<h2 id="sec-10-6" class="h2"><span class="secnum">10.6</span> Flags que valem a pena e flags de culto<a class="anchor" href="#sec-10-6" aria-label="ligação">#</a></h2>
 
-<p>A cobertura de linhas mede execução, não verificação. Um teste que chama o método e não assevera nada produz exactamente a mesma percentagem que um teste rigoroso — e é por isso que 85% de cobertura convive com defeitos triviais em produção. A cobertura é útil como detector de zonas mortas (um pacote a 0% é informação) e inútil como objectivo, porque, imposta como meta, é trivialmente satisfeita com testes sem asserções ou com <code>toString</code> exercitado.</p>
+<p>A linha de comando de uma JVM em produção deve caber em dez linhas e cada uma tem de ter justificação. As que valem a pena dividem-se em três grupos: as que definem o orçamento de memória, as que garantem que existe evidência quando algo corre mal, e as que corrigem uma medição concreta. Tudo o resto é herança de outra época ou imitação.</p>
 
-<p>O <em>mutation testing</em> — PIT no mundo Java — mede outra coisa: introduz alterações no <em>bytecode</em> (trocar <code>&gt;</code> por <code>&gt;=</code>, negar condições, remover chamadas, substituir retornos) e conta quantas dessas mutações fazem a bateria falhar. Uma mutação que sobrevive é uma alteração de comportamento que nenhum teste detecta. A ordem de grandeza típica numa base madura é 85-90% de cobertura de linhas contra 55-70% de <em>mutation score</em>, e a diferença aponta directamente aos testes sem asserções úteis. O custo é tempo: o PIT corre a bateria muitas vezes, pelo que se aplica ao código alterado no <em>pull request</em> e não ao repositório inteiro em cada execução.</p>
+<p>Um conjunto defensável para um serviço em contentor tem: dimensão de <em>heap</em> fixa e igual nos dois extremos, ou percentagem da memória do contentor; <em>log</em> de GC rotativo; <em>heap dump</em> automático em OOM e saída imediata do processo; <em>Native Memory Tracking</em> em modo resumo se a margem de desempenho o permitir; e uma gravação JFR contínua. O <em>trade-off</em> de cada uma é baixo e conhecido — o <em>log</em> de GC custa menos de 1%, o NMT 5% a 10%, o JFR com o perfil por omissão cerca de 1% e com <code>settings=profile</code> 2% a 3%.</p>
 
-<p>A terceira métrica é a que destrói a confiança na bateria mais depressa do que qualquer outra: a taxa de <em>flakiness</em>. Um teste que falha uma vez em cinquenta parece inofensivo isoladamente, mas o efeito é multiplicativo sobre toda a bateria.</p>
+<figure class="listing shell" id="lst-10-6"><div class="lhead"><span class="lnum">Listagem 10.6</span>
+<span class="lcap">Linha de base defensável para um serviço Spring Boot em Kubernetes.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code>JAVA_TOOL_OPTIONS="\
+ -XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=70 \
+ -XX:MaxMetaspaceSize=256m -XX:MaxDirectMemorySize=256m \
+ -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps \
+ -XX:+ExitOnOutOfMemoryError \
+ -Xlog:gc*,gc+heap=debug,safepoint:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=5,filesize=20M \
+ -XX:StartFlightRecording=name=cont,settings=profile,maxsize=256m,maxage=6h,dumponexit=true,filename=/dumps/app.jfr \
+ -XX:NativeMemoryTracking=summary"
 
-<div class="formula">P(execução verde) = (1 − p)<sup>n</sup> → com n = 2 000 testes e p = 1/5 000, P ≈ 0,67</div>
+# Verificar o que a JVM decidiu, dentro do contentor, antes de discutir teorias:
+java -XX:+PrintFlagsFinal -version | grep -E "MaxHeapSize|MaxRAMPercentage|ActiveProcessor|UseG1GC|UseZGC"
+    size_t MaxHeapSize      = 1503657984      {product} {ergonomic}
+   double MaxRAMPercentage  = 70.000000       {product} {command line}
+      int ActiveProcessorCount = -1           {product} {default}
+     bool UseG1GC           = true            {product} {ergonomic}</code></pre></figure>
 
-<p>Ou seja, uma taxa de falha de 0,02% por teste faz um terço das execuções falhar sem qualquer defeito real. A partir daí a equipa aprende a carregar em «repetir» e a bateria deixa de ser um sinal. As causas são poucas e recorrentes: dependência do relógio da máquina, <code>Thread.sleep</code> a fazer de sincronização, dependência da ordem de execução por estado partilhado estático, portos fixos, aleatoriedade sem semente, e fuso horário ou <em>locale</em> herdados do ambiente. A correcção é sempre a mesma família: injectar <code>Clock</code>, esperar por condição em vez de por tempo, isolar o estado por teste e fixar <em>locale</em> e fuso na configuração do <em>build</em>.</p>
-
-<figure class="listing java" id="lst-10-7"><div class="lhead"><span class="lnum">Listagem 10.7</span>
-<span class="lcap">De teste flaky a determinista: relógio injectado e espera por condição.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// ANTES — falhava ~1 vez em 40 no CI: relógio da máquina e espera fixa.
-@Test
-void publica_o_evento() throws InterruptedException {
-    servico.autorizar(pedido);
-    Thread.sleep(200);                                   // sincronização por esperança
-    assertThat(eventos.publicados()).hasSize(1);
-    assertThat(eventos.publicados().get(0).momento()).isEqualTo(Instant.now());   // nunca igual
-}
-
-// DEPOIS — determinista: instante fixo e espera por condição com limite superior generoso.
-@Test
-void publica_o_evento_com_o_momento_da_autorizacao() {
-    var instante = Instant.parse("2025-03-11T10:15:30Z");
-    var servico = new AutorizacaoService(contas, adquirente, eventos,
-                                         Clock.fixed(instante, ZoneOffset.UTC));
-
-    servico.autorizar(pedido);
-
-    await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(20))
-        .untilAsserted(() -&gt; assertThat(eventos.publicados())
-            .singleElement()
-            .returns(instante, PagamentoAutorizado::momento));
-}</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Configurar retentativa automática de testes falhados no CI resolve o sintoma e apaga o sinal: a partir daí, o número de testes instáveis só cresce, porque nada os torna visíveis. A alternativa que funciona é medir — registar cada falha com o nome do teste e calcular a taxa por teste ao longo de 30 dias — e pôr em quarentena os que passam de um limiar (por exemplo, 1%), com dono e prazo. Um teste em quarentena que ninguém corrige em duas semanas é apagado: um teste instável e ignorado tem valor negativo, porque custa tempo de execução e ensina a equipa a desconfiar do vermelho.</p></aside>
-
-<div class="qa" id="q-10-11" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">A direcção quer impor 80% de cobertura como critério de merge. Concorda? E que métrica proporia em alternativa ou em complemento?</div>
+<div class="qa" id="q-10-11" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Se lhe dessem um serviço novo em produção e só pudesse acrescentar cinco flags à JVM, quais escolhia e porquê?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não concordo com a métrica como critério, e a razão é mecânica: a cobertura de linhas mede execução e não verificação. Um teste que invoca o método e não assevera nada conta exactamente o mesmo que um teste rigoroso. Imposta como meta, a métrica é satisfeita da forma mais barata — testes de <em>getters</em>, <code>toString</code> exercitado, chamadas sem asserção — e o resultado é uma bateria maior, mais lenta e igualmente cega. É o efeito de Goodhart aplicado a engenharia.</p>
-      <p>O que a cobertura faz bem é detectar zonas mortas. Um pacote de regras de negócio a 0% é informação accionável; a diferença entre 78% e 82% não é. Por isso proponho usá-la como relatório e como alarme para descidas bruscas — por exemplo, alertar quando a cobertura do código <strong>novo</strong> de um <em>pull request</em> fica abaixo de um limiar — em vez de um número global bloqueante.</p>
-      <p>Como complemento com sinal real, proponho <em>mutation testing</em> com PIT, aplicado só às classes alteradas no <em>pull request</em>. O <em>mutation score</em> mede se as asserções detectam alterações de comportamento; numa base madura, 85-90% de cobertura de linhas coexiste com 55-70% de <em>mutation score</em>, e é essa diferença que aponta os testes vazios. O custo é tempo de execução, e por isso restringe-se ao diferencial e corre-se a bateria completa uma vez por noite.</p>
-      <p>As duas métricas que na prática melhor prevêem incidentes não são de teste: taxa de <em>flakiness</em> por teste e tempo entre <em>commit</em> e <em>feedback</em>. Uma bateria com 2 000 testes e 0,02% de falha aleatória por teste falha em cerca de um terço das execuções sem defeito nenhum, e nesse ponto a equipa deixa de ler o vermelho — o que anula qualquer percentagem de cobertura. Se tivesse de escolher uma só regra de <em>merge</em>, seria «cada correcção de defeito traz o teste que o reproduz», que gera cobertura onde ela vale.</p></div>
+      <p>Escolhia cinco que produzem evidência ou fixam o orçamento de memória, nenhuma que tente ser mais esperta do que a ergonomia da JVM. Primeira, <code>-XX:MaxRAMPercentage</code> com um valor explícito entre 65 e 75: o valor por omissão de 25% desperdiça três quartos da memória do contentor e é a causa mais frequente de OOM de <em>heap</em> em Kubernetes. Segunda, <code>-XX:+HeapDumpOnOutOfMemoryError</code> com <code>-XX:HeapDumpPath</code> para um volume que sobreviva ao <em>pod</em> — sem isto, o primeiro incidente não deixa evidência e perde-se um ciclo inteiro de diagnóstico.</p>
+      <p>Terceira, <code>-XX:+ExitOnOutOfMemoryError</code>: uma JVM que sobrevive a um OOM de <em>heap</em> serve erros durante horas e continua a receber tráfego; morrer e ser substituída é o comportamento correcto num orquestrador. Quarta, o <code>-Xlog:gc*</code> com <em>safepoint</em>, ficheiro e rotação — menos de 1% de custo e a única forma de reconstruir o que aconteceu depois de o <em>pod</em> desaparecer. Quinta, <code>-XX:StartFlightRecording</code> contínuo com <code>maxage</code>, que dá perfis de CPU, alocação e bloqueios do período imediatamente anterior ao incidente sem ser preciso reproduzi-lo.</p>
+      <p>O que fica deliberadamente de fora é tão informativo quanto o que entra. Recolector: manter o G1 por omissão até haver uma medição que justifique a troca. <code>-Xmn</code>, <code>NewRatio</code>, <code>SurvivorRatio</code>: o G1 dimensiona a geração jovem dinamicamente e fixá-la desliga essa adaptação. <code>ParallelGCThreads</code> e <code>ConcGCThreads</code>: derivam do número de CPUs visíveis e só se mexem quando a detecção está errada. <code>-XX:+UseCompressedOops</code>: já é o comportamento por omissão abaixo de 32 GB.</p>
+      <p>O <em>trade-off</em> a explicitar é entre observabilidade e desempenho. O conjunto acima custa entre 1% e 3%, e vale a pena em qualquer serviço com plantão. Num <em>job</em> de lote de dez mil instâncias efémeras, onde 3% são dinheiro real e o custo de um incidente é apenas repetir o <em>job</em>, corta-se o JFR e o NMT e fica-se com o <em>log</em> de GC e o <em>heap dump</em>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Concorda sem reservas, ou rejeita sem alternativa; trata cobertura como sinónimo de qualidade.</td></tr>
-        <tr><td>Mid</td><td>Sabe que cobertura não garante asserções e dá o exemplo do teste sem assert; não propõe métrica de substituição concreta.</td></tr>
-        <tr><td>Sénior</td><td>Explica execução vs verificação, usa cobertura como detector de zonas mortas e de descidas, propõe mutation testing no diferencial com números de ordem de grandeza.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o efeito de Goodhart, as métricas de flakiness e tempo de feedback, e a regra cultural (teste por cada defeito corrigido) com o custo operacional de cada opção.</td></tr>
+        <tr><td>Insuficiente</td><td>Lista flags de afinação de GC de memória, incluindo flags removidas do JDK.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>-Xmx</code> e <em>heap dump</em>, mas não pensa em <em>log</em> de GC nem em comportamento pós-OOM.</td></tr>
+        <tr><td>Sénior</td><td>Prioriza evidência e orçamento de memória, justifica cada flag com o incidente que ela resolve e nomeia o custo em percentagem.</td></tr>
+        <tr><td>Staff</td><td>Explica o que fica de fora e porquê, e diferencia o conjunto para serviços com plantão e para lotes efémeros.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como se satisfaz 80% de cobertura sem melhorar nada?»</li>
-      <li>«Quanto custa correr o PIT na bateria toda e como o torna viável?»</li>
-      <li>«Que valor de mutation score consideraria bom, e para que código?»</li>
-      <li>«Se só pudesse impor uma regra no merge, qual seria?»</li></ul></div>
+      <li>«Quando prefere <code>-Xmx</code> absoluto a <code>MaxRAMPercentage</code>?»</li>
+      <li>«Como verifica, dentro do contentor, o que a JVM decidiu para o <em>heap</em>?»</li>
+      <li>«Que flags usaria só temporariamente durante um incidente?»</li>
+      <li>«O que muda nesta lista se o serviço for um <em>job</em> de lote?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Defender uma percentagem alvo sem discutir o que ela mede.</li>
-      <li>Escrever testes de <code>getters</code> e <code>equals</code> para subir o número.</li>
-      <li>Desconhecer a existência de mutation testing ou confundi-lo com <em>fuzzing</em>.</li>
-      <li>Excluir pacotes inteiros do relatório para atingir o limiar.</li></ul></div>
+      <li>Propor flags que já não existem no JDK actual.</li>
+      <li>Afinar GC antes de garantir que existe <em>log</em> de GC.</li>
+      <li>Não conseguir dizer o custo em desempenho de nenhuma das flags escolhidas.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-10-12" data-box="qa" data-area="testes" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">A nossa bateria de 2 000 testes falha aleatoriamente em cerca de um terço das execuções e a equipa já carrega em «repetir» por reflexo. Como é que ataca isto na primeira semana?</div>
+<div class="qa" id="q-10-12" data-box="qa" data-area="jvm" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Encontrou este conjunto herdado: <code>-XX:+UseParNewGC -XX:+AggressiveOpts -XX:+DisableExplicitGC -XX:PermSize=256m -XX:+UseCompressedOops -Xmn2g</code>. Faça a revisão, flag a flag.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Primeiro estabeleço a aritmética, porque ela define a meta. Com 2 000 testes, a probabilidade de execução verde é (1 − p)<sup>2000</sup>: uma taxa de falha de 1 em 5 000 por teste já dá cerca de 67% de execuções verdes, que é o que a equipa observa. Para chegar a 99% de execuções verdes, a taxa por teste tem de descer para cerca de 1 em 400 000. Não se chega lá corrigindo «os testes que falham hoje»; chega-se identificando os poucos testes responsáveis pela maior parte das falhas — a distribuição é sempre muito desigual, com uma dezena de testes a explicar a maioria.</p>
-      <p>Dia 1 e 2: instrumentação. Guardar o resultado de cada teste de cada execução — nome, duração, resultado, <em>commit</em>, agente — e calcular a taxa de falha por teste sobre as últimas 200 execuções. Sem estes dados a discussão é anedótica. Dias 3 a 5: quarentena dos que ultrapassam 1%, com etiqueta JUnit própria, retirados do caminho crítico de <em>merge</em> mas ainda a correr numa tarefa nocturna com o registo de falhas, e cada um com dono e prazo de duas semanas. Isto devolve imediatamente o significado ao vermelho.</p>
-      <p>Em paralelo, ataco por causa e não por teste, porque as causas repetem-se: relógio real (injectar <code>Clock</code>), <code>Thread.sleep</code> como sincronização (substituir por espera por condição com <code>Awaitility</code>), estado estático partilhado entre testes (isolar por instância, limpar em <code>@BeforeEach</code>), dependência de ordem (correr a bateria com ordem aleatória para expor), portos fixos (porto efémero ou Testcontainers), aleatoriedade sem semente, e fuso ou <em>locale</em> herdados do ambiente (fixar <code>-Duser.timezone=UTC</code> e o <em>locale</em> no <em>build</em>). Uma correcção de causa costuma resolver 5 a 15 testes de uma vez.</p>
-      <p>O que recuso é a retentativa automática como política permanente. Ela esconde o sinal e faz a taxa crescer sem limite, porque nada torna o problema visível. Aceito-a como medida temporária, com duas condições: cada nova tentativa fica registada e contabilizada na métrica, e existe um limiar acordado a partir do qual o teste entra em quarentena. E há uma decisão que muitas equipas evitam: um teste em quarentena que ninguém corrige no prazo é apagado — vale menos do que zero, porque consome tempo e credibilidade.</p></div>
+      <p>Metade destas flags já não existe e a JVM ou as ignora com aviso ou recusa arrancar, o que por si só é um sinal: ninguém validou esta linha de comando numa actualização de JDK. <code>-XX:+UseParNewGC</code> pertencia ao par ParNew/CMS e foi removido com o CMS; hoje não tem significado. <code>-XX:+AggressiveOpts</code> era um saco de optimizações experimentais, foi tornado obsoleto e removido, e nunca teve garantia de efeito. <code>-XX:PermSize</code> refere-se à geração permanente, que desapareceu no Java 8 quando o metaspace a substituiu — o equivalente moderno seria <code>-XX:MaxMetaspaceSize</code>, e mesmo esse serve de alarme e não de afinação. <code>-XX:+UseCompressedOops</code> está ligado por omissão em qualquer <em>heap</em> abaixo de 32 GB; escrevê-lo é ruído.</p>
+      <p>As duas restantes são activas e perigosas. <code>-XX:+DisableExplicitGC</code> transforma <code>System.gc()</code> em <em>no-op</em>, o que parece bom — evita que uma biblioteca provoque uma colecção completa — mas remove a válvula que o mecanismo de <code>ByteBuffer</code> directo usa para forçar a execução dos <em>cleaners</em> quando não consegue reservar memória nativa. Num serviço que use Netty ou NIO intensivamente, é uma causa directa de <code>OutOfMemoryError: Direct buffer memory</code>. Quando o objectivo é apenas evitar a pausa, a flag certa é <code>-XX:+ExplicitGCInvokesConcurrent</code>, que satisfaz o pedido com um ciclo concorrente.</p>
+      <p><code>-Xmn2g</code> é a mais subtil. Fixar a geração jovem desliga o dimensionamento adaptativo do G1: o recolector deixa de poder encolher o <em>eden</em> para cumprir <code>MaxGCPauseMillis</code> ou de o aumentar quando a taxa de sobrevivência é baixa. O resultado depende do serviço e é sempre pior do que a adaptação, excepto num caso — carga rigorosamente constante e um perfil já medido, onde fixar reduz a variância das pausas. Não é o caso de um serviço de pedidos com pico diário.</p>
+      <p>A recomendação é remover as seis e reintroduzir apenas o que uma medição justificar, com uma regra de higiene: cada flag na linha de comando leva um comentário com a data, o incidente que a motivou e o número que a valida. Flags sem dono são removidas na actualização de JDK seguinte. O risco de remover tudo de uma vez mitiga-se com <em>canary</em>: um <em>pod</em> com a linha nova, comparação de p99, taxa de erro e CPU de GC durante um ciclo de tráfego completo.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe activar retentativa automática ou «ir corrigindo à medida que falham».</td></tr>
-        <tr><td>Mid</td><td>Nomeia causas comuns (sleep, relógio, ordem) e corrige caso a caso, sem medição nem prioridade.</td></tr>
-        <tr><td>Sénior</td><td>Mede a taxa por teste, usa a aritmética composta para definir a meta, põe em quarentena com dono e prazo e corrige por causa em vez de por teste.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais a decisão de apagar testes abandonados, o uso da retentativa apenas como medida temporária instrumentada, e a ligação ao tempo de feedback e à confiança da equipa no vermelho.</td></tr>
+        <tr><td>Insuficiente</td><td>Aceita a lista como boa ou remove tudo sem saber o que cada flag fazia.</td></tr>
+        <tr><td>Mid</td><td>Identifica <code>PermSize</code> como obsoleta, mas não vê o perigo de <code>DisableExplicitGC</code> nem o efeito de <code>-Xmn</code> no G1.</td></tr>
+        <tr><td>Sénior</td><td>Classifica cada flag em removida, redundante ou activa, explica o mecanismo de <code>DisableExplicitGC</code> com memória directa e o custo de fixar a geração jovem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a política de higiene (dono, data, número por flag) e o plano de remoção com <em>canary</em> e critérios de comparação.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que taxa por teste é preciso atingir para 99% de execuções verdes?»</li>
-      <li>«Como expõe uma dependência de ordem entre testes?»</li>
-      <li>«Um teste em quarentena há três meses — o que faz com ele?»</li>
-      <li>«Como distingue um teste instável de um defeito real intermitente no código?»</li></ul></div>
+      <li>«Em que caso é legítimo fixar a geração jovem?»</li>
+      <li>«Como descobre se uma flag ainda existe no JDK que vai usar?»</li>
+      <li>«O que aconteceria a este serviço ao migrar de JDK 8 para 21 com esta linha de comando?»</li>
+      <li>«Que teste faria antes de remover <code>DisableExplicitGC</code>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Retentativa automática silenciosa como solução definitiva.</li>
-      <li>Aumentar os <code>Thread.sleep</code> até o teste passar.</li>
-      <li>Anotar testes com <code>@Disabled</code> sem dono, prazo nem registo.</li>
-      <li>Assumir que a falha intermitente é sempre do teste e nunca do código concorrente.</li></ul></div>
+      <li>Manter flags «porque sempre lá estiveram».</li>
+      <li>Não saber que a geração permanente desapareceu no Java 8.</li>
+      <li>Alterar a linha de comando directamente em produção sem <em>canary</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-10-7" class="h2"><span class="secnum">10.7</span> JVM em contentores e Kubernetes<a class="anchor" href="#sec-10-7" aria-label="ligação">#</a></h2>
+
+<p>Desde que o suporte a contentores passou a estar activo por omissão, a JVM lê os limites do <em>cgroup</em> em vez dos valores da máquina física. A consequência prática é que <code>-Xmx</code> deixou de ser obrigatório — mas o valor por omissão de <code>-XX:MaxRAMPercentage</code> é 25%, o que num <em>pod</em> de 2 GiB dá um <em>heap</em> de 512 MB e deixa 1,5 GiB por usar. Definir 65% a 75% explicitamente é a alteração de maior retorno em quase todas as plataformas Kubernetes que herdei.</p>
+
+<p>O CPU é o segundo eixo, e o mais mal compreendido. <code>Runtime.availableProcessors()</code> deriva da quota de CPU do <em>cgroup</em>, arredondada para cima: um <em>pod</em> com <code>limits.cpu: 4</code> vê 4 processadores independentemente do <code>requests</code>. Esse número determina o paralelismo do <em>pool</em> comum de <code>ForkJoinPool</code>, o número de <em>threads</em> de GC, o dimensionamento por omissão de <em>pools</em> de Netty e de clientes HTTP, e a escolha ergonómica do recolector. Um <em>pod</em> sem limite de CPU numa máquina de 64 núcleos vê 64 processadores e cria dezenas de <em>threads</em> de GC para um serviço que usa meio núcleo — memória e comutação de contexto desperdiçadas. <code>-XX:ActiveProcessorCount</code> corrige a detecção quando ela está errada.</p>
+
+<p>O terceiro eixo é a interacção com as sondas. Uma pausa de GC de 3 s com um <code>livenessProbe</code> de <code>timeoutSeconds: 1</code> e <code>failureThreshold: 3</code> mata o <em>pod</em> em plena colecção, o que transforma um problema de latência num ciclo de reinícios e agrava a carga nos <em>pods</em> restantes. A regra é dimensionar os limites das sondas acima da pausa máxima observada, e usar <em>readiness</em> — não <em>liveness</em> — para retirar tráfego de um <em>pod</em> em dificuldades.</p>
+
+<figure class="listing yaml" id="lst-10-7"><div class="lhead"><span class="lnum">Listagem 10.7</span>
+<span class="lcap">Orçamento de memória coerente entre <em>cgroup</em> e JVM, com sondas dimensionadas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>resources:
+  requests:
+    memory: "2Gi"          # request = limit: classe Guaranteed, sem despejo por pressao
+    cpu: "1"
+  limits:
+    memory: "2Gi"          # heap 70% = 1434Mi; sobram ~614Mi para metaspace,
+    cpu: "2"               # code cache, pilhas, GC e arenas nativas
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=70
+      -XX:MaxMetaspaceSize=256m -XX:MaxDirectMemorySize=128m
+      -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps
+      -XX:+ExitOnOutOfMemoryError
+  - name: MALLOC_ARENA_MAX
+    value: "2"             # trava o crescimento das arenas da glibc
+readinessProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+  timeoutSeconds: 2
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  timeoutSeconds: 5        # &gt; pausa maxima de GC observada (3,2s no incidente)
+  periodSeconds: 15
+  failureThreshold: 3      # 45s de tolerancia antes de matar o processo
+startupProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  failureThreshold: 30
+  periodSeconds: 5         # 150s para arrancar sem que o liveness interfira</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Num <em>pod</em> de 2 GiB: <code>MaxRAMPercentage=70</code> dá 1 434 MiB de <em>heap</em> e deixa 614 MiB. Desses, um serviço Spring Boot típico consome 150 MiB de metaspace, 90 MiB de <em>code cache</em> committed, 60 MiB de estruturas de GC, 40 MiB de símbolos e 100 a 250 MiB de arenas nativas — margem de 15% a 25%, que é o mínimo aceitável. Com <code>MaxRAMPercentage=85</code> a margem desaparece e o <em>pod</em> é morto sob pico; com o valor por omissão de 25%, o <em>heap</em> de 512 MiB provoca OOM aplicacional com 1,5 GiB por usar.</p></aside>
+
+<div class="qa" id="q-10-13" data-box="qa" data-area="devops" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como dimensiona a memória de um <em>pod</em> Java? Quero a conta, não uma regra de bolso — e diga-me o que faz se o número não fechar.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A conta parte do conjunto vivo medido, não do limite disponível. Mede-se o conjunto vivo em carga real (ocupação após ciclo completo de GC), multiplica-se por 2,5 a 4 para obter o <em>heap</em>, soma-se o não-<em>heap</em> medido com NMT e acrescenta-se 15% a 20% de margem. Com um conjunto vivo de 400 MB: <em>heap</em> de 1 200 MB, não-<em>heap</em> de 500 MB, total de 1 700 MB, margem de 20% dá um limite de aproximadamente 2 GiB. A partir daí calcula-se a percentagem em vez de a assumir: 1 200 sobre 2 048 são 59%, e é esse o valor de <code>MaxRAMPercentage</code>.</p>
+      <p>Duas decisões acompanham a conta. Primeira, <code>requests.memory</code> igual a <code>limits.memory</code>, o que coloca o <em>pod</em> na classe Guaranteed e o protege de despejo por pressão de memória do nó — a memória de uma JVM não é comprimível e sobrecomprometer memória em Java produz reinícios, não degradação suave. Segunda, <code>-XX:InitialRAMPercentage</code> igual a <code>MaxRAMPercentage</code>: o <em>heap</em> nasce com o tamanho final, evita redimensionamentos e torna a memória do <em>pod</em> previsível desde o primeiro segundo.</p>
+      <p>Se o número não fechar — o não-<em>heap</em> medido é de 900 MB para um serviço de 400 MB de vivo — a resposta não é aumentar o limite antes de perceber porquê. Os três suspeitos, por ordem de probabilidade, são o número de <em>threads</em> (400 <em>threads</em> a 1 MB reservado), memória directa sem limite explícito (herda <code>-Xmx</code>), e arenas da <em>glibc</em>. Cada um tem uma correcção barata: limitar os <em>pools</em> ou passar a <em>virtual threads</em> para trabalho bloqueante, definir <code>-XX:MaxDirectMemorySize</code>, e <code>MALLOC_ARENA_MAX=2</code>.</p>
+      <p>O <em>trade-off</em> final é entre densidade e resiliência. Encostar o limite ao consumo medido maximiza <em>pods</em> por nó e minimiza custo, mas qualquer pico de tráfego ou de tamanho de <em>payload</em> resulta em <em>OOMKilled</em>, que é a pior forma de falhar — sem <em>dump</em>, sem <em>trace</em>, e com o tráfego a ser redistribuído pelos <em>pods</em> que já estavam sob pressão. Uma margem de 20% custa 20% de infra-estrutura e compra a diferença entre degradação e falha em cascata; abaixo de 10% de margem, deixa de haver sistema resiliente e passa a haver sorte.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ponho 2 GB e <code>-Xmx1g</code>» sem medir nem justificar; não distingue <em>requests</em> de <em>limits</em>.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o <em>heap</em> não é tudo e usa <code>MaxRAMPercentage</code>, mas não mede o não-<em>heap</em> nem define margem.</td></tr>
+        <tr><td>Sénior</td><td>Parte do conjunto vivo, mede o não-<em>heap</em> com NMT, calcula a percentagem, iguala <em>requests</em> e <em>limits</em> e explica porquê.</td></tr>
+        <tr><td>Staff</td><td>Diagnostica um orçamento que não fecha com três suspeitos ordenados, e articula o <em>trade-off</em> densidade/resiliência com números.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que a memória, ao contrário do CPU, não deve ser sobrecomprometida em Java?»</li>
+      <li>«Que efeito tem <code>-XX:+AlwaysPreTouch</code> nesta conta e no arranque?»</li>
+      <li>«Como automatizaria esta medição para cinquenta serviços?»</li>
+      <li>«O que muda com <em>virtual threads</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Deixar <code>MaxRAMPercentage</code> no valor por omissão de 25% e queixar-se de OOM.</li>
+      <li>Definir <em>limits</em> muito acima de <em>requests</em> para memória.</li>
+      <li>Dimensionar por tentativa e erro sem medir o conjunto vivo.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-10-14" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O mesmo <em>build</em> corre bem na máquina do programador e usa três vezes mais CPU em Kubernetes com <code>limits.cpu: 2</code>. O que investigaria primeiro na JVM?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Investigaria primeiro quantos processadores a JVM julga ter, porque esse número propaga-se para meia dúzia de decisões automáticas. <code>Runtime.availableProcessors()</code> deriva da quota de CPU do <em>cgroup</em>; se o <em>pod</em> não tiver <code>limits.cpu</code> definido, ou se a plataforma usar apenas <em>shares</em>, a JVM pode ver os núcleos todos do nó — 64, por exemplo — e dimensionar em conformidade: <em>threads</em> de GC, paralelismo do <code>ForkJoinPool</code> comum, <em>pools</em> de Netty, <em>threads</em> de compilação e, em casos extremos, a escolha ergonómica do recolector.</p>
+      <p>O efeito é o pior dos dois mundos: dezenas de <em>threads</em> a competir por 2 núcleos de quota. Com a quota do <em>cgroup</em> esgotada dentro de cada período, o <em>kernel</em> aplica <em>throttling</em> — os <em>threads</em> ficam suspensos até ao período seguinte — e uma pausa de GC que devia demorar 30 ms passa a demorar centenas de milissegundos porque os <em>threads</em> de GC são interrompidos a meio. A métrica que o prova é o tempo de <em>throttling</em> do <em>cgroup</em>, e é a primeira coisa que olharia depois de contar os processadores.</p>
+      <p>A verificação é directa: correr <code>java -XX:+PrintFlagsFinal -version</code> dentro do contentor e ler <code>ActiveProcessorCount</code>, <code>ParallelGCThreads</code> e <code>MaxHeapSize</code>; ou expor <code>Runtime.getRuntime().availableProcessors()</code> numa métrica. Se o valor não corresponder à quota, define-se <code>-XX:ActiveProcessorCount=2</code> e reavalia-se.</p>
+      <p>A segunda hipótese, se o número de processadores estiver correcto, é o custo fixo do arranque a dominar: um <em>pod</em> que reinicia com frequência paga repetidamente carregamento de classes e compilação JIT, e uma quota de 2 núcleos torna esse período três a cinco vezes mais longo do que numa máquina de programador com 10 núcleos livres. Nesse caso a correcção é outra — arquivo de classes partilhado, <code>-XX:TieredStopAtLevel=1</code> para processos de vida curta, ou uma <code>startupProbe</code> generosa que evite reinícios durante o aquecimento. O <em>trade-off</em> de fixar <code>ActiveProcessorCount</code> é que passa a ser um valor manual que ninguém actualiza quando o <em>limit</em> muda: vale a pena gerá-lo a partir do mesmo valor no <em>chart</em>, não escrevê-lo à mão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Culpa «o Kubernetes ser mais lento» sem mecanismo.</td></tr>
+        <tr><td>Mid</td><td>Sabe que existe <em>throttling</em> de CPU, mas não liga o número de processadores visíveis ao dimensionamento interno da JVM.</td></tr>
+        <tr><td>Sénior</td><td>Explica a cadeia quota → <code>availableProcessors()</code> → <em>threads</em> de GC e <em>pools</em> → <em>throttling</em>, e verifica com <code>PrintFlagsFinal</code>.</td></tr>
+        <tr><td>Staff</td><td>Considera a hipótese alternativa do custo de arranque, escolhe a correcção adequada a cada uma e nota o risco de manutenção de <code>ActiveProcessorCount</code> fixo.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como é calculado o número de processadores a partir da quota do <em>cgroup</em>?»</li>
+      <li>«Porque é que <em>throttling</em> de CPU agrava desproporcionadamente as pausas de GC?»</li>
+      <li>«Que impacto tem isto no <code>ForkJoinPool.commonPool()</code> e nos <em>parallel streams</em>?»</li>
+      <li>«Como reduziria o tempo de arranque de 4 s para menos de 2 s?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não saber que a JVM lê os limites do <em>cgroup</em>.</li>
+      <li>Aumentar o limite de CPU sem olhar para o número de <em>threads</em> criadas.</li>
+      <li>Comparar desempenho de contentor com máquina local sem igualar a quota.</li></ul></div>
   </div>
 </div>
 
 <h2 id="sec-10-8" class="h2"><span class="secnum">10.8</span> Resumo e checklist<a class="anchor" href="#sec-10-8" aria-label="ligação">#</a></h2>
 
-<p>O que reter deste capítulo:</p>
+<p>O fio condutor deste capítulo é um só: numa ronda de JVM, a evidência precede a flag. Quem chega com um processo — medir, formular hipótese, excluir alternativas, alterar uma variável — passa mesmo sem saber de cor todos os limiares; quem chega com uma lista de flags falha à primeira pergunta de seguimento.</p>
 
 <ul class="lst">
-<li>Uma excepção só deve ser <em>checked</em> quando a falha é esperada em operação normal <strong>e</strong> o chamador imediato tem uma acção alternativa; se todos os chamadores fazem o mesmo — embrulhar e propagar — o compilador está a impor cerimónia sem gerar escolha.</li>
-<li>A tradução de excepções de terceiros faz-se uma vez, no adaptador; o tratamento faz-se numa fronteira única. A causa passa sempre no construtor, e a hierarquia rasa e selada torna o <code>switch</code> de mapeamento exaustivo em tempo de compilação.</li>
-<li>Apanhar <code>Exception</code> num consumidor confirma o <em>offset</em> e converte perda de dados numa linha de <em>log</em>; deixar a excepção sair é o que activa retentativas com <em>backoff</em> e <em>dead-letter topic</em>.</li>
-<li>Em <code>try-with-resources</code>, a excepção do corpo prevalece e a do <code>close()</code> fica em <code>getSuppressed()</code> — o inverso do <code>finally</code> manual, que destrói a causa original.</li>
-<li>A repartição de testes segue o risco: lógica de decisão em unitário puro (&lt; 1 ms), contratos em fatias, e três ou quatro comportamentos de alto valor em integração real — idempotência, <em>rollback</em>, migrações.</li>
-<li>O custo de uma bateria Spring está no número de <strong>configurações de contexto distintas</strong>, não no número de testes: cada chave nova é um arranque de 6 a 12 segundos.</li>
-<li>Não se mockam tipos que não são nossos; envolve-se a biblioteca externa num adaptador estreito, mocka-se o adaptador e testa-se o adaptador contra o sistema real com WireMock ou Testcontainers.</li>
-<li>H2 não é PostgreSQL: <code>ON CONFLICT</code>, <code>jsonb</code>, <code>FOR UPDATE SKIP LOCKED</code> e as migrações são exactamente onde estão os defeitos que interessam. Um contentor estático partilhado custa 1,5-3 s por JVM.</li>
-<li>Cobertura mede execução, <em>mutation score</em> mede verificação e a taxa de <em>flakiness</em> mede a confiança na bateria; com 2 000 testes, 1 falha aleatória em 5 000 já reprova um terço das execuções.</li>
+  <li>A identidade de uma classe é o par (nome, <em>class loader</em>); classes só são descarregadas quando o <em>loader</em> se torna inalcançável, e é daí que vem toda a fuga de metaspace.</li>
+  <li>O JIT é especulativo: <em>inlining</em> monomórfico, análise de escape e desdobramento assentam em perfis que podem ser invalidados, e a desoptimização explica degradações que aparecem depois de minutos de bom desempenho.</li>
+  <li><code>-Xmx</code> controla uma de sete parcelas de memória. RSS é <em>heap</em> + metaspace + <em>code cache</em> + pilhas + estruturas de GC + memória directa + arenas nativas, e só o NMT o desmonta.</li>
+  <li>Referências ocupam 4 <em>bytes</em> abaixo de 32 GB de <em>heap</em> e 8 acima; subir de 31 para 33 GB pode reduzir a capacidade útil.</li>
+  <li>O custo de uma colecção jovem é proporcional ao que sobrevive, não ao tamanho do <em>heap</em>; taxa de sobrevivência e promoção prematura são as variáveis que a estragam.</li>
+  <li>G1 para 2-32 GB com p99 tolerante a 100-200 ms; ZGC quando a pausa domina o p99 e há CPU para pagar 5% a 15% de débito; Parallel para lotes; Serial para um núcleo.</li>
+  <li>No <em>log</em> de GC, o número mais informativo é a ocupação depois de uma colecção completa: é o conjunto vivo real e distingue fuga de sub-dimensionamento.</li>
+  <li><code>OutOfMemoryError</code> são oito erros distintos, e <em>exit code</em> 137 não é nenhum deles — é o <em>kernel</em> a matar o processo por RSS, sem <em>dump</em> e sem <em>trace</em>.</li>
+  <li>Em Kubernetes, o valor por omissão de <code>MaxRAMPercentage</code> é 25% e o número de processadores visíveis deriva da quota de CPU: as duas causas mais frequentes de incidentes de JVM em contentores.</li>
 </ul>
 
-<p>Checklist accionável antes da entrevista:</p>
+<h3>Checklist accionável</h3>
 
 <ul class="lst">
-<li>Preparar a regra de decisão de <em>checked</em> vs <em>unchecked</em> em duas condições cumulativas, com um caso em que a escolha contrária é a certa (SDK público com falhas recuperáveis).</li>
-<li>Saber desenhar em papel, em dois minutos, uma hierarquia selada de três subclasses com códigos estáveis e o <code>@RestControllerAdvice</code> que a mapeia para <code>ProblemDetail</code>.</li>
-<li>Ter na ponta da língua a diferença entre <code>try-with-resources</code> e <code>finally</code> quanto a excepções suprimidas e a ordem inversa de fecho.</li>
-<li>Conseguir repartir um serviço concreto por níveis de teste e nomear três coisas que decide deliberadamente <strong>não</strong> testar.</li>
-<li>Explicar a <em>cache</em> de contextos do Spring, o que compõe a sua chave e como normalizar configurações com classes base.</li>
-<li>Distinguir <em>dummy</em>, <em>stub</em>, <em>mock</em>, <em>spy</em> e <em>fake</em> com um exemplo de domínio para cada e a regra de preferir estado a verificação de interacção.</li>
-<li>Ter dois exemplos concretos de divergência H2/PostgreSQL que partiram algo real, e as três formas de amortizar o custo dos contentores.</li>
-<li>Saber calcular (1 − p)<sup>n</sup> em voz alta e converter uma taxa de <em>flakiness</em> por teste em probabilidade de execução verde.</li>
-<li>Escrever de memória um teste com <code>@ParameterizedTest</code>, <code>catchThrowableOfType</code> e <code>ArgumentCaptor</code>, sem consultar documentação.</li>
+  <li>Confirmar que <code>-Xlog:gc*</code> com <em>safepoint</em>, ficheiro e rotação está activo em todos os serviços de produção, e que os ficheiros sobrevivem à substituição do <em>pod</em>.</li>
+  <li>Garantir <code>-XX:+HeapDumpOnOutOfMemoryError</code> com caminho em volume persistente e <code>-XX:+ExitOnOutOfMemoryError</code>.</li>
+  <li>Medir o conjunto vivo em carga real e dimensionar o <em>heap</em> entre 2,5 e 4 vezes esse valor; nunca dimensionar por tentativa e erro.</li>
+  <li>Correr <code>jcmd VM.native_memory summary</code> uma vez por serviço e registar o orçamento não-<em>heap</em> real em vez de estimar.</li>
+  <li>Definir <code>MaxRAMPercentage</code> entre 65% e 75%, <code>InitialRAMPercentage</code> igual, e <code>requests.memory</code> igual a <code>limits.memory</code>.</li>
+  <li>Definir explicitamente <code>-XX:MaxDirectMemorySize</code> e <code>-XX:MaxMetaspaceSize</code> em qualquer serviço em contentor.</li>
+  <li>Verificar dentro do contentor, com <code>-XX:+PrintFlagsFinal</code>, o que a JVM decidiu para <em>heap</em>, recolector e número de processadores.</li>
+  <li>Dimensionar <code>livenessProbe</code> acima da pausa máxima de GC observada e usar <code>readinessProbe</code> para retirar tráfego.</li>
+  <li>Auditar a linha de comando a cada actualização de JDK: remover flags removidas, redundantes ou sem dono documentado.</li>
+  <li>Instalar alarme sobre a ocupação após colecção acima de 70% durante 15 minutos e sobre a fracção de CPU em GC acima de 5%.</li>
+  <li>Ensaiar em voz alta a leitura de um <em>log</em> de GC real e um diagnóstico de OOM em cinco minutos: é o formato exacto da pergunta na ronda.</li>
 </ul>

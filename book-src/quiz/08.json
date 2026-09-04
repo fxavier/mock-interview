@@ -1,46 +1,51 @@
 {"chapter": 8, "questions": [
-  {"q": "Um serviço em Java 25 com threads virtuais activadas executa, dentro de cada pedido, um ciclo de cálculo de 400 ms sem qualquer chamada bloqueante. A máquina tem 8 núcleos. Com 500 pedidos em voo, o que se observa?",
+  {"q": "Um serviço tem `private volatile int[] contadores = new int[16];` e várias threads executam `contadores[i]++`. Que garantia existe?",
    "options": [
-    "A vazão fica limitada a cerca de 8 cálculos em paralelo, porque o escalonador não é preemptivo e a continuação só se desmonta em pontos de bloqueio.",
-    "O escalonador interrompe cada continuação ao fim de um quantum e reparte o tempo pelos 500 pedidos.",
-    "O número de transportadores cresce automaticamente até 500 para acompanhar a carga.",
-    "As continuações são desmontadas a cada iteração do ciclo, mantendo os 8 núcleos ocupados de forma justa."],
-   "answer": 0,
-   "explain": "O escalonador de threads virtuais é cooperativo: a desmontagem só acontece em operações que a plataforma intercepta (I/O, LockSupport.park). Código puramente de CPU ocupa o transportador até terminar, logo o paralelismo efectivo é o paralelismo do escalonador, por omissão o número de núcleos. Não há preempção por quantum nem crescimento do pool para acompanhar tarefas que não bloqueiam."},
-
-  {"q": "Depois de activar `spring.threads.virtual.enabled=true`, uma equipa subiu `maximum-pool-size` do HikariCP de 20 para 400 «porque agora há muito mais threads». O PostgreSQL 17 tem `max_connections` a 200 e o serviço corre em 12 réplicas. Qual é a consequência mais provável?",
-   "options": [
-    "A latência das consultas melhora proporcionalmente, porque desaparece a espera por ligação.",
-    "As réplicas passam a pedir até 4 800 ligações a um servidor que aceita 200: aparecem erros de recusa de ligação e a contenção no servidor degrada a latência de todos.",
-    "O Hikari limita-se automaticamente ao que o servidor aceita, pelo que o efeito é neutro.",
-    "O gargalo passa para o número de transportadores do escalonador de threads virtuais."],
+     "Cada `contadores[i]++` é atómico, porque o array é volátil.",
+     "Os incrementos podem perder-se: `volatile` aplica-se à referência do array, não aos elementos, e `++` nunca é atómico.",
+     "As escritas são visíveis e atómicas desde que só uma thread escreva em cada índice diferente.",
+     "É seguro porque `int` cabe numa palavra e a JVM garante atomicidade de escritas de 32 bits."
+   ],
    "answer": 1,
-   "explain": "O limite de ligações é uma propriedade do servidor de base de dados, não da aplicação: 12 réplicas × 400 excede largamente as 200 ligações aceites, produzindo recusas e contenção de buffers e locks no servidor. O Hikari não negoceia o limite com o servidor. Manter o pool pequeno e encurtar o connection-timeout trata a espera como sinal de sobrecarga, que é o comportamento desejado."},
+   "explain": "`volatile` numa referência de array torna volátil apenas a leitura e escrita da própria referência; os elementos são acedidos como campos normais, sem visibilidade nem barreira. Além disso `++` é ler-somar-escrever, três operações. A opção sobre atomicidade de 32 bits confunde ausência de tearing com atomicidade de operação composta. A solução é `AtomicIntegerArray` ou `LongAdder` por posição."},
 
-  {"q": "Em Java 25, qual destas situações continua a fixar (pin) uma thread virtual ao seu transportador?",
+  {"q": "Configurou `new ThreadPoolExecutor(4, 64, 60L, SECONDS, new LinkedBlockingQueue<>(), new AbortPolicy())` e o serviço recebe 800 pedidos/s de 200 ms. O que observa em produção?",
    "options": [
-    "Bloquear à espera de um monitor dentro de um bloco `synchronized`.",
-    "Esperar numa `ArrayBlockingQueue` com `take()`.",
-    "Bloquear com um frame nativo (JNI) no topo da pilha.",
-    "Esperar num `ReentrantLock` contendido."],
-   "answer": 2,
-   "explain": "Java 24 eliminou o pinning causado por monitores geridos pela JVM, pelo que `synchronized` deixou de fixar; `ReentrantLock` e as filas bloqueantes do java.util.concurrent sempre desmontaram porque assentam em LockSupport.park. O que a JVM não controla — um frame nativo de JNI ou FFM no topo da pilha — impede a captura da continuação e continua a fixar o transportador."},
-
-  {"q": "Numa cadeia Reactor, `fonte.flatMap(this::gravar)` é aplicado sobre um `Flux` de Kafka a 12 000 mensagens por segundo, sendo que cada gravação demora 8 ms. Não foi passado nenhum argumento de concorrência. O que acontece?",
-   "options": [
-    "O `flatMap` usa concorrência 1 e serializa as gravações, limitando o consumo a 125 por segundo.",
-    "O `flatMap` usa a concorrência máxima por omissão (256), pelo que podem ficar 256 gravações em voo sem que ninguém o tenha decidido, saturando o pool de ligações.",
-    "O `flatMap` deduz a concorrência a partir da capacidade do subscritor final.",
-    "O `flatMap` propaga `request(1)` à fonte, garantindo backpressure elemento a elemento."],
+     "O pool cresce até 64 threads e depois começa a rejeitar tarefas com `RejectedExecutionException`.",
+     "O pool fica em 4 threads, a fila cresce sem limite, a latência dispara e acaba em `OutOfMemoryError`; a política de rejeição nunca é aplicada.",
+     "O pool cresce até 64 threads e a fila mantém-se vazia porque as threads consomem mais depressa do que a fila enche.",
+     "O `keepAliveTime` de 60 s faz o pool oscilar entre 4 e 64 threads conforme a carga."
+   ],
    "answer": 1,
-   "explain": "A sobrecarga de `flatMap` sem argumento usa a concorrência máxima por omissão de 256, o mesmo valor de prefetch usado pela maioria dos operadores. Isso significa até 256 operações simultâneas contra a base de dados — um limite implícito que ninguém escolheu e que costuma exceder o pool de ligações. A forma correcta é passar explicitamente a concorrência que a dependência aguenta (32 × 1/0,008 = 4 000 por segundo)."},
+   "explain": "O `ThreadPoolExecutor` só cria threads acima de `corePoolSize` quando a fila recusa a tarefa. Com uma `LinkedBlockingQueue` sem capacidade a fila nunca recusa, logo `maximumPoolSize` e a política de rejeição ficam inertes. Pela lei de Little seriam precisos 160 pedidos em curso e há 4 threads: a fila cresce indefinidamente. A correcção é uma fila limitada, que reactiva o crescimento do pool e a rejeição."},
 
-  {"q": "Um filtro liga `ScopedValue.where(TENANT, t).run(...)` e, mais abaixo, um método guarda uma lambda numa fila para execução posterior por um executor de vida longa. Essa lambda chama `TENANT.get()`. O que acontece?",
+  {"q": "Num `ConcurrentHashMap<String, List<Evento>>` partilhado, qual destas linhas está correcta sob concorrência?",
    "options": [
-    "Lê o valor `t`, porque os ScopedValue são copiados para a lambda no momento da criação.",
-    "Lê `null`, tal como um `ThreadLocal` não inicializado.",
-    "Lança excepção quando executada fora do âmbito, porque um ScopedValue só existe enquanto o bloco que o ligou estiver activo.",
-    "Lê o valor do último tenant ligado em qualquer thread, por ser uma variável estática."],
+     "`if (!m.containsKey(k)) m.put(k, new ArrayList<>()); m.get(k).add(e);`",
+     "`List<Evento> l = m.get(k); if (l == null) { l = new ArrayList<>(); m.put(k, l); } l.add(e);`",
+     "`m.computeIfAbsent(k, x -> Collections.synchronizedList(new ArrayList<>())).add(e);`",
+     "`m.putIfAbsent(k, new ArrayList<>()); m.get(k).add(e);`"
+   ],
    "answer": 2,
-   "explain": "O tempo de vida de um ScopedValue é o do bloco que o ligou; a herança acontece por estrutura para as sub-tarefas de um StructuredTaskScope, não por cópia para lambdas que sobrevivem ao âmbito. Ler fora do âmbito falha com excepção em vez de devolver null, o que é uma vantagem de correcção: expõe o erro em vez de propagar um contexto vazio ou o de outro tenant. Trabalho diferido precisa de receber o tenant como parâmetro explícito."}
+   "explain": "As duas primeiras são check-then-act: duas threads podem criar listas diferentes e uma perde as suas escritas. A quarta cria a lista de forma atómica, mas o `add` continua a correr sobre um `ArrayList` não sincronizado, partilhado por várias threads, que pode corromper-se ao crescer. Só a terceira combina criação atómica com uma lista segura para escrita concorrente."},
+
+  {"q": "`CompletableFuture<Preco> f = catalogo.lerAsync(id).thenApply(a -> precos.consultarAsync(a));` — o que está errado?",
+   "options": [
+     "Nada: `thenApply` achata automaticamente o futuro devolvido pela função.",
+     "`thenApply` devolve `CompletableFuture<CompletableFuture<Preco>>`; é preciso `thenCompose` para achatar o resultado.",
+     "Falta `thenApplyAsync`, sem o qual a função nunca é executada.",
+     "`thenApply` bloqueia a thread chamadora até `lerAsync` completar."
+   ],
+   "answer": 1,
+   "explain": "`thenApply` é o `map` desta API: embrulha o que a função devolver, e como a função devolve um `CompletableFuture`, o resultado é um futuro dentro de um futuro. `thenCompose` é o `flatMap` e resolve isso. `thenApply` sem `Async` não bloqueia — executa na thread que completou o futuro anterior, ou na chamadora se ele já estiver completo."},
+
+  {"q": "Num serviço com um pool fixo de 200 threads, o contexto de tenant é guardado num `ThreadLocal` com `set()` no início de cada pedido. Porque é que a heap cresce indefinidamente?",
+   "options": [
+     "Porque o `ThreadLocal` é `static` e a JVM nunca liberta campos estáticos.",
+     "Porque as chaves do `ThreadLocalMap` são referências fortes e impedem a recolha do objecto `ThreadLocal`.",
+     "Porque os valores são referenciados fortemente pela thread e as threads do pool nunca morrem; falta `remove()` num `finally`.",
+     "Porque o `set()` acumula uma entrada nova por pedido no `ThreadLocalMap` de cada thread."
+   ],
+   "answer": 2,
+   "explain": "As chaves do `ThreadLocalMap` são referências fracas, mas os valores são fortes e vivem enquanto a thread viver — e as threads de um pool vivem tanto quanto o processo. Cada `set()` substitui a entrada anterior, por isso não há acumulação de entradas: o que fica retido é o último valor por thread, 200 contextos que o GC não pode recolher. A correcção é `remove()` num `finally`, no mesmo âmbito do `set()`."}
 ]}

@@ -1,533 +1,714 @@
-<p>A ronda de <em>code review</em> é a única do loop em que o candidato não escreve código: lê o de outra pessoa, decide o que diz, por que ordem e com que força. Mede três coisas ao mesmo tempo — se detecta defeitos reais (acesso concorrente, N+1, recursos por fechar, injecção de SQL), se distingue o que bloqueia uma entrega do que é preferência pessoal, e como escreve o comentário que outro engenheiro vai ler às seis da tarde de sexta-feira. É também a ronda onde a senioridade fica mais visível: um mid encontra nomes e formatação, um sénior encontra a <em>race condition</em> e o índice em falta, um staff diz qual dos cinco defeitos justifica travar o <em>merge</em> e qual entra no <em>backlog</em> com um número ao lado. Os candidatos caem por dois lados opostos: os que listam trinta <em>nits</em> e não vêem o defeito de concorrência, e os que respondem «reescrevia isto tudo» sem uma estratégia incremental nem uma estimativa. Este capítulo cobre a leitura rápida de código desconhecido, o catálogo de cheiros com o refactoring correspondente, a rede de segurança dos testes de caracterização e a conversa sobre dívida técnica feita com números.</p>
+<p>Numa entrevista de Java sénior, os padrões de desenho não são avaliados pela capacidade de recitar o catálogo GoF de 1994: são avaliados pela capacidade de nomear o eixo de variação que um padrão isola e de dizer quanto custa isolá-lo. O entrevistador quer ouvir «isto varia por país e vai continuar a variar, por isso vale uma estratégia» e também «isto nunca variou em quatro anos, uma fábrica aqui é indirecção paga sem retorno». Onde os candidatos caem é em três sítios: descrevem o padrão pela estrutura de classes e não pela intenção; ignoram que metade do catálogo foi absorvido pela linguagem (lambdas, <code>record</code>, <code>sealed</code>, <code>enum</code>) e pelo contentor de <em>beans</em>; e aplicam padrões defensivamente, produzindo camadas de interfaces com uma implementação cada. Este capítulo percorre os padrões que aparecem mesmo em código Java 21 e Spring Boot 3.5, com os exemplos do JDK que o entrevistador espera ouvir citados, e trata a crítica — quando o padrão é ruído — como parte obrigatória da resposta.</p>
 
-<h2 id="sec-19-1" class="h2"><span class="secnum">19.1</span> A ronda de code review: o que é avaliado<a class="anchor" href="#sec-19-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-19-1" class="h2"><span class="secnum">19.1</span> Criacionais: factory, builder, singleton e alternativas modernas<a class="anchor" href="#sec-19-1" aria-label="ligação">#</a></h2>
 
-<p>O formato é quase sempre o mesmo: 45 a 60 minutos, um excerto de 40 a 150 linhas de Java com Spring, ou um <em>pull request</em> real anonimizado, e um entrevistador com uma lista fechada de quatro a oito defeitos plantados. A pontuação não é o número de defeitos encontrados — é a ordem por que aparecem e a justificação de severidade. Encontrar oito de oito e não saber dizer qual trava a entrega pontua abaixo de encontrar cinco de oito com a prioridade certa, porque a decisão de aprovar ou bloquear é o que a equipa vai delegar na pessoa contratada a partir da segunda semana.</p>
+<p>Os padrões criacionais existem para separar <em>quem decide qual a implementação</em> de <em>quem a usa</em>, e para tornar a construção de objectos com muitos parâmetros legível e válida. Em código de aplicação moderno, a maior parte dessa responsabilidade já não é escrita à mão: o contentor de injecção de dependências é uma <em>abstract factory</em> configurável, e a interface <code>BeanFactory</code> chama-se assim precisamente por isso. Restam três casos em que o candidato ainda escreve estes padrões: quando a escolha da implementação depende de dados de <em>runtime</em> (um código de país, um tipo de evento), quando a construção tem de validar invariantes sobre 8 ou mais campos, e quando existe estado global genuíno — um relógio, um registo de métricas, uma <em>cache</em> de processo.</p>
 
-<p>A ordem de leitura de um sénior é por severidade do que pode acontecer em produção, não pela ordem das linhas no ficheiro. Primeiro correcção sob acesso concorrente e perda ou corrupção de dados; depois segurança (injecção, dados sensíveis em <em>logs</em>, autorização em falta ao nível do recurso); depois recursos não fechados e fugas; depois desempenho com efeito super-linear, tipicamente N+1 e alocação dentro de ciclos; depois tratamento de erros e observabilidade; só no fim desenho, testabilidade e nomes. Quem abre a revisão a comentar a indentação e a ordem dos <em>imports</em> assina que nunca esteve de plantão a olhar para um <em>dashboard</em> às três da manhã.</p>
+<p>A <em>static factory method</em> do <em>Effective Java</em> é a variante mais usada e a que menos candidatos nomeiam. Tem nome (<code>Money.ofMinor(1250, EUR)</code> lê-se melhor do que um construtor com dois inteiros), não obriga a criar uma instância nova em cada chamada, e pode devolver um subtipo escondido. O JDK está cheio de exemplos com consequências mensuráveis: <code>Integer.valueOf</code> devolve instâncias em <em>cache</em> para o intervalo −128 a 127, <code>List.of</code> devolve implementações especializadas para 0, 1 e 2 elementos antes de cair numa baseada em <em>array</em>, e <code>EnumSet.noneOf</code> escolhe entre uma implementação com um <code>long</code> de máscara de bits e outra com vários conforme o <em>enum</em> tenha até 64 constantes ou mais. Nenhuma dessas escolhas poderia ser feita por um construtor público.</p>
 
-<p>O comentário em si é avaliado como artefacto escrito. Um bom comentário tem quatro partes em duas ou três linhas: severidade explícita (bloqueante, pergunta, <em>nit</em>), o mecanismo do problema, o efeito observável em produção e uma sugestão concreta. «Isto está mal» não é um comentário; «bloqueante: este <code>HashMap</code> é partilhado por todos os pedidos num <em>bean</em> singleton — duas <em>threads</em> a inserir em simultâneo podem perder entradas ou entrar em ciclo no <em>resize</em>; trocar por <code>ConcurrentHashMap</code> com <code>computeIfAbsent</code>, ou por uma cache com TTL, já que a taxa de câmbio do dia não deve viver para sempre» é um comentário. A regra social: o comentário fala do código, nunca do autor, e usa pergunta em vez de imperativo sempre que falta contexto — «o que acontece se dois pedidos chegarem ao mesmo tempo aqui?» abre uma conversa e fecha o defeito na mesma.</p>
+<p>O <em>builder</em> é o padrão criacional com pior relação custo/benefício em Java 21, porque grande parte do que resolvia — legibilidade de listas longas de argumentos, imutabilidade, <code>equals</code> e <code>hashCode</code> — passou para os <code>record</code>. O que o <code>record</code> não resolve é a ausência de argumentos nomeados e opcionais: com 11 componentes, um construtor canónico é ilegível e dois componentes do mesmo tipo trocados compilam sem erro. É aí, e só aí, que o <em>builder</em> continua a pagar-se.</p>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Regra prática usada em quase todas as equipas maduras: revisões acima de 400 linhas numa só sessão perdem eficácia — a densidade de defeitos encontrados por linha cai visivelmente, e o revisor passa a aprovar por cansaço. Num orçamento de 60 minutos, 200 a 400 linhas é o tecto útil; acima disso pede-se a divisão do PR. Numa ronda de entrevista de 45 minutos com 100 linhas, um sénior tem os defeitos de severidade alta identificados nos primeiros 10 a 12 minutos e gasta os restantes 30 a discutir dois deles em profundidade.</p></aside>
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um <em>builder</em> escrito à mão para um agregado de 12 campos custa 60 a 80 linhas de código que ninguém testa, mais um objecto intermédio por construção. Um <code>record</code> equivalente custa 1 linha de declaração mais a validação no construtor compacto. A regra prática usada em revisão de código: menos de 5 componentes, construtor canónico; 5 a 8 com todos obrigatórios, construtor canónico mais fábricas estáticas com nome; mais de 8, ou 3 ou mais opcionais, <em>builder</em>.</p></aside>
 
 <div class="qa" id="q-19-1" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">SOLID e design patterns</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Vou partilhar um <code>pull request</code> de 380 linhas num serviço que não conhece. Tem 20 minutos. Como conduz a revisão e o que me diz no fim?</div>
+  <div class="qprompt">Implemente um singleton seguro em ambiente concorrente em Java. Depois diga-me se o usaria no código que escreve hoje.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Três passagens com orçamento fixo, e uma decisão explícita no fim. Passagem um, três minutos: ler apenas a descrição do PR, os nomes dos ficheiros alterados e os testes. Os testes dizem qual é a intenção declarada e, sobretudo, qual é a intenção que não foi testada — um PR que altera lógica de preço e só acrescenta testes de <em>mapper</em> já tem um comentário garantido.</p>
-      <p>Passagem dois, dez minutos: ler o caminho quente de fora para dentro — <em>controller</em> ou <em>listener</em>, serviço de aplicação, acesso a dados — com a lista de severidade na cabeça. Estado partilhado mutável em <em>beans</em> singleton, fronteiras de transacção (o que está dentro do <code>@Transactional</code> e, pior, que chamada de rede está lá dentro), concatenação de <em>strings</em> em SQL, ciclos que fazem I/O, recursos abertos sem <code>try</code>-com-recursos, <code>catch</code> que engole a excepção.</p>
-      <p>Passagem três, cinco minutos: escrever os comentários já ordenados por severidade, com prefixo. Dois minutos finais para a decisão, que é a parte que distingue o nível: «bloqueio por dois motivos — o acesso concorrente à cache e a injecção de SQL no filtro; os outros quatro são não-bloqueantes e proponho um <em>issue</em> para o N+1, que não é regressão deste PR, é anterior».</p>
-      <p>O <em>trade-off</em> está no número de comentários. Vinte comentários num PR produzem duas coisas: o autor perde a hierarquia e o próximo PR vem sem pedir revisão a essa pessoa. Um limite útil é cinco a sete comentários, com todos os bloqueantes primeiro; o resto vai para uma conversa síncrona de dez minutos ou para o <em>backlog</em>. Quando o PR é grande e o problema é estrutural, o comentário certo é um só: «isto mistura três alterações independentes, proponho dividir em três PRs — reviso o primeiro hoje».</p></div>
+      <p>Há duas formas correctas e uma que só se escreve para mostrar que se conhece o modelo de memória. A correcta e mais curta é o <code>enum</code> de constante única: a especificação da linguagem garante que a inicialização da classe acontece uma só vez, sob o bloqueio de inicialização da JVM, e resolve de graça a serialização e o ataque por reflexão que quebram o singleton clássico. A segunda é o <em>initialization-on-demand holder</em>: uma classe estática aninhada só é carregada e inicializada no primeiro acesso ao seu campo, o que dá inicialização preguiçosa sem uma única instrução de sincronização no caminho de leitura.</p>
+      <p>A terceira é o <em>double-checked locking</em>, e o ponto que o entrevistador procura é o <code>volatile</code>. Sem ele, o construtor e a atribuição da referência podem ser reordenados, e outra <em>thread</em> vê uma referência não nula a um objecto parcialmente construído. Com <code>volatile</code> é correcto desde o modelo de memória de Java 5, mas continua a ser mais código e mais fácil de errar do que o <em>holder</em>, para o mesmo resultado.</p>
+      <p>Quanto à segunda parte: em código de aplicação, não. O singleton no sentido GoF — a classe controla o seu próprio número de instâncias e expõe-se por um método estático global — é um anti-padrão em serviços porque cria estado global mutável, esconde a dependência (o construtor de quem o usa não a declara), impede substituir o <em>colaborador</em> num teste sem <em>bytecode</em> mágico e mantém-se vivo enquanto o <em>class loader</em> viver, o que em contentores de aplicação com recarregamento produz fugas de memória. O que se quer é instância única <em>gerida</em>: um <code>@Bean</code> de âmbito <em>singleton</em>, injectado pelo construtor. A unicidade passa a ser uma decisão de configuração, e não uma propriedade cravada na classe.</p>
+      <p>A distinção que separa um sénior: o âmbito <em>singleton</em> do Spring é único por contentor, não por JVM. Com dois <code>ApplicationContext</code> no mesmo processo — habitual em testes com contextos diferentes — existem duas instâncias. Se o requisito for mesmo unicidade por processo (um contador, um <em>lock</em> de ficheiro), isso tem de ser garantido explicitamente e não pela palavra «singleton» na configuração.</p>
+      <figure class="listing java" id="lst-19-1"><div class="lhead"><span class="lnum">Listagem 19.1</span>
+        <span class="lcap">As duas formas defensáveis e a forma que a aplicação deve mesmo usar.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// 1) enum: uma instância garantida pela inicialização de classe; imune a serialização e reflexão
+public enum MetricsRegistry {
+    INSTANCE;
+    private final ConcurrentHashMap&lt;String, LongAdder&gt; counters = new ConcurrentHashMap&lt;&gt;();
+    public void inc(String name) { counters.computeIfAbsent(name, k -&gt; new LongAdder()).increment(); }
+}
+
+// 2) initialization-on-demand holder: preguiçoso, sem sincronização no caminho de leitura
+public final class RuleCache {
+    private RuleCache() {}
+    private static final class Holder { static final RuleCache INSTANCE = new RuleCache(); }
+    public static RuleCache get() { return Holder.INSTANCE; }   // Holder só carrega aqui
+}
+
+// 3) double-checked locking: correcto SÓ com volatile (modelo de memória de Java 5+)
+public final class Legacy {
+    private static volatile Legacy instance;                    // sem volatile: publicação insegura
+    public static Legacy get() {
+        Legacy local = instance;                                // uma leitura volatile, não duas
+        if (local == null) {
+            synchronized (Legacy.class) {
+                local = instance;
+                if (local == null) { instance = local = new Legacy(); }
+            }
+        }
+        return local;
+    }
+}
+
+// 4) o que se escreve numa aplicação Spring Boot: unicidade é configuração, não é a classe
+@Service
+public class PricingService {
+    private final Clock clock;                                  // substituível no teste
+    private final RateSource rates;
+    PricingService(Clock clock, RateSource rates) { this.clock = clock; this.rates = rates; }
+}</code></pre></figure></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Começa na linha 1 e comenta estilo, nomes e chavetas; não chega ao acesso a dados dentro dos 20 minutos.</td></tr>
-        <tr><td>Mid</td><td>Encontra alguns defeitos reais, mas lista tudo com a mesma severidade e não toma decisão de aprovar ou bloquear.</td></tr>
-        <tr><td>Sénior</td><td>Ordem por severidade, mecanismo e efeito em produção em cada comentário, decisão explícita e limite ao número de comentários.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o que faz fora do PR: <em>lint</em> ou regra de análise estática que impede a reincidência, e distinção entre o que é regressão deste PR e o que é dívida pré-existente.</td></tr>
+        <tr><td>Insuficiente</td><td>Campo estático com <em>getter</em> e <code>synchronized</code> no método, sem perceber o custo; ou <em>double-checked locking</em> sem <code>volatile</code> apresentado como correcto.</td></tr>
+        <tr><td>Mid</td><td>Sabe o <em>enum</em> e o <em>holder</em>, explica <code>volatile</code>, mas defende o singleton como boa prática geral.</td></tr>
+        <tr><td>Sénior</td><td>As três formas com o mecanismo (inicialização de classe, reordenação), e a crítica: estado global, dependência escondida, testes; escolhe <em>bean</em> injectado.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o âmbito por contentor e não por JVM, fugas por <em>class loader</em>, e o caso raro em que a unicidade por processo é mesmo um requisito e como o garantir.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o PR for de um colega que sai de férias amanhã e a entrega for hoje?»</li>
-      <li>«Qual é o comentário que nunca escreve, mesmo tendo razão?»</li>
-      <li>«Como impede que o mesmo defeito volte no próximo PR?»</li>
-      <li>«Quantos dos seus comentários costumam ser bloqueantes?»</li></ul></div>
+      <li>«Porque é que o <em>enum</em> resiste à desserialização e o singleton com campo estático não?»</li>
+      <li>«O que acontece exactamente sem o <code>volatile</code>, ao nível do modelo de memória?»</li>
+      <li>«Tem dois <code>ApplicationContext</code> no mesmo teste. Quantas instâncias do <em>bean</em> existem?»</li>
+      <li>«E se o singleton guardar uma <em>cache</em> mutável partilhada por 200 <em>threads</em>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não distinguir bloqueante de preferência; tudo é «tem de mudar».</li>
-      <li>Reescrever o código do autor no comentário em vez de descrever o problema.</li>
-      <li>Aprovar sem ler os testes, ou não notar que não há testes novos.</li>
-      <li>Terminar sem uma decisão: «tem aqui umas coisas para pensar».</li></ul></div>
+      <li>Defender <code>getInstance()</code> espalhado pelo código de domínio como forma de «evitar passar dependências».</li>
+      <li>Confundir singleton com classe utilitária de métodos estáticos sem estado.</li>
+      <li>Não ver que estado mutável dentro do singleton é agora um problema de acesso concorrente.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-19-2" data-box="qa" data-area="comportamental" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Escreveu um comentário bloqueante e o autor — mais antigo na empresa do que o candidato — responde «sempre fizemos assim, não é problema». O que faz a seguir?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Trocar opinião por evidência e mudar de canal. Numa <em>thread</em> de PR, duas respostas escritas em desacordo já é o limite: à terceira, marca-se quinze minutos, porque o custo de escrever é assimétrico e o tom degrada-se sem intenção.</p>
-      <p>A evidência tem de ser reproduzível e pequena. Para um defeito de acesso concorrente, um teste com <code>CountDownLatch</code> e dois <em>pools</em> que falha em menos de um segundo vale mais do que qualquer argumento de autoridade; para um N+1, o <em>log</em> de SQL com a contagem de <em>statements</em> antes e depois; para uma injecção, o pedido concreto que devolve a linha que não devia. «Sempre fizemos assim» é uma afirmação empírica e responde-se com dados, não com princípios.</p>
-      <p>Se a evidência não convencer, a saída é escalar o critério, não a pessoa: propor a regra de equipa («daqui para a frente estado mutável em <em>beans</em> singleton é bloqueante») numa conversa com o resto da equipa e aceitar o resultado. Ceder num caso concreto com a regra escrita para o futuro é melhor resultado do que ganhar a discussão e perder o revisor.</p>
-      <p>O limite onde não se cede: perda ou corrupção de dados, exposição de dados pessoais e falha de segurança explorável. Nesses três, o comentário mantém-se bloqueante e envolve-se quem tem a responsabilidade formal — o dono do serviço ou a equipa de segurança — sem drama e por escrito.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Ou cede imediatamente por hierarquia, ou insiste na <em>thread</em> até alguém desistir.</td></tr>
-        <tr><td>Mid</td><td>Argumenta com boas práticas e nomes de princípios, sem produzir evidência do problema.</td></tr>
-        <tr><td>Sénior</td><td>Produz um teste ou um <em>log</em> que demonstra o defeito, muda para conversa síncrona, distingue o que é negociável do que não é.</td></tr>
-        <tr><td>Staff</td><td>Resolve o caso e institucionaliza o critério (regra de equipa, verificação automática) para que a discussão não se repita a cada PR.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o teste que escreveu passar na máquina dele e falhar na sua?»</li>
-      <li>«Já mudou de opinião numa revisão? Sobre o quê?»</li>
-      <li>«Que percentagem dos seus comentários acha que são desnecessários?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Falar do autor («ele nunca testa nada») em vez do código.</li>
-      <li>Tratar toda a discórdia como igual — sem uma linha vermelha definida.</li>
-      <li>Escalar para o gestor antes de tentar evidência e conversa directa.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-19-2" class="h2"><span class="secnum">19.2</span> Ler código desconhecido em dez minutos<a class="anchor" href="#sec-19-2" aria-label="ligação">#</a></h2>
-
-<p>Ler código desconhecido depressa é uma técnica com passos, não talento. O primeiro passo não é o código: é o modelo de dados. Num serviço Spring Boot com PostgreSQL, dez minutos gastos no esquema — tabelas, chaves estrangeiras, índices, colunas com <code>status</code> e <code>version</code> — dão mais compreensão do domínio do que uma hora a saltar entre classes, porque o esquema é o único artefacto que ninguém pode refactorizar em silêncio.</p>
-
-<p>O segundo passo é enumerar os pontos de entrada e escolher um. Os pontos de entrada de um serviço Java são finitos e fáceis de listar: <code>@RestController</code>, <code>@KafkaListener</code> ou <code>@RabbitListener</code>, <code>@Scheduled</code>, <em>health checks</em> e o <code>main</code>. Escolhe-se o fluxo mais representativo — normalmente o comando de escrita mais frequente — e segue-se em profundidade até ao SQL, marcando três coisas pelo caminho: onde começa e acaba a transacção, onde há chamadas de rede e onde há estado partilhado.</p>
-
-<p>O terceiro passo é usar a história do ficheiro. <code>git log</code> sobre um ficheiro diz mais sobre risco do que o próprio conteúdo: um ficheiro com 40 alterações em seis meses e 900 linhas é o <em>hotspot</em> onde os defeitos vivem, e é aí que vale a pena investir leitura. Os testes servem de documentação executável — o nome de um teste diz a regra de negócio que alguém achou importante fixar — e a ausência de testes num pacote é, em si, informação sobre o risco de lá mexer.</p>
-
-<p>O que não se faz: ler ficheiro a ficheiro por ordem alfabética, tentar perceber tudo antes de mexer em alguma coisa, ou pedir uma explicação completa a um colega antes de ter uma pergunta concreta. A pergunta certa depois de dez minutos é «o fluxo de criação de encomenda passa por <code>OrderService.place</code>, escreve em três tabelas na mesma transacção e publica em Kafka depois do <em>commit</em> — é isto, ou há um caminho alternativo que não vi?».</p>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Numa entrevista com excerto curto, a leitura tem uma diferença importante: o entrevistador plantou os defeitos, portanto tudo o que parece estranho é intencional. Um <code>HashMap</code> como campo de instância, um <code>catch (Exception e)</code>, uma concatenação dentro de uma <em>query</em> e um ciclo com acesso a uma associação <em>lazy</em> não são acidentes de escrita — são a própria pergunta. Comentar em voz alta enquanto se lê é obrigatório: o entrevistador pontua o raciocínio, não o silêncio seguido de uma lista.</p></aside>
-
-<div class="qa" id="q-19-3" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+<div class="qa" id="q-19-2" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Entra numa equipa e herda um serviço com 200 mil linhas que ninguém da equipa original mantém. Tem uma correcção urgente para fazer amanhã. Como aborda a primeira semana?</div>
+  <div class="qprompt">Tenho um objecto de domínio com 12 campos, 4 dos quais opcionais. <em>Builder</em>, <code>record</code>, ou outra coisa? Justifique com o custo de manutenção.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A ordem é: pôr a correr, medir, mapear o fluxo afectado, mudar com teste, e só depois generalizar. Pôr a correr localmente ou num ambiente de testes é a primeira prioridade absoluta — sem um ciclo de <em>feedback</em> de menos de dois minutos, qualquer alteração num sistema desconhecido é aposta.</p>
-      <p>Mapear faz-se pelo fluxo do defeito, não pelo sistema todo. Do <em>endpoint</em> ou do <em>consumer</em> até ao SQL, com o <em>log</em> de SQL ligado e uma execução real; o rasto distribuído, se existir, dá o mapa em segundos, e os <em>spans</em> mostram logo quantas <em>queries</em> uma operação faz. Em paralelo, <code>git log --since</code> nos ficheiros do caminho identifica quem mexeu por último — a pessoa certa para quinze minutos de contexto, com uma pergunta específica.</p>
-      <p>A correcção urgente entra com o menor raio possível e com um teste que falha antes e passa depois. Se o código não for testável no ponto onde é preciso mexer, cria-se um <em>seam</em> mínimo (extrair o método, injectar a dependência) em vez de refactorizar a classe; a regra é que a alteração de comportamento e o refactoring nunca vão no mesmo <em>commit</em>.</p>
-      <p>No fim da semana produz-se um artefacto que fica: um diagrama de uma página com os pontos de entrada, as tabelas quentes e as integrações externas, mais uma lista de cinco riscos ordenada. É o que transforma uma semana de leitura em propriedade de equipa, e é exactamente o sinal que o entrevistador procura para nível sénior ou acima.</p></div>
+      <p>As duas coisas não competem: o <code>record</code> é a representação, o <em>builder</em> é a forma de a construir. A resposta é <code>record</code> com construtor compacto a validar os invariantes, e um <em>builder</em> por cima apenas porque há 4 campos opcionais e 12 posições onde trocar dois <code>String</code> compila em silêncio. Com 12 campos todos obrigatórios e de tipos distintos, o <em>builder</em> seria custo puro.</p>
+      <p>O que se ganha com o <code>record</code>: imutabilidade real (campos <code>final</code>), <code>equals</code>, <code>hashCode</code> e <code>toString</code> derivados dos componentes — o que elimina a classe inteira de <em>bugs</em> em que alguém acrescenta um campo e esquece o <code>equals</code> — desconstrução por <em>record pattern</em> em <code>switch</code>, e serialização previsível. O que se perde: não há herança, não há campos não declarados como componentes, e as bibliotecas antigas que exigem construtor sem argumentos e <em>setters</em> não funcionam sem configuração (o Jackson liga-se a <code>record</code> desde a versão 2.12, mas JPA não: uma entidade não pode ser um <code>record</code>, só o pode ser um DTO ou um <em>value object</em> incorporado).</p>
+      <p>Sobre o custo do <em>builder</em>: o problema real não são as 70 linhas geradas, é que um <em>builder</em> clássico não garante em tempo de compilação que os obrigatórios foram preenchidos — falha em <code>build()</code>, em <em>runtime</em>, muitas vezes só no ambiente onde o campo é usado. Duas saídas: <em>staged builder</em>, em que cada passo devolve uma interface diferente e o compilador só deixa chamar <code>build()</code> no fim, ao custo de mais 4 interfaces; ou construtor canónico com os obrigatórios e um <em>builder</em> só para o bloco opcional. Em serviços grandes escolhe-se quase sempre a segunda, porque a primeira é ilegível para quem entra na equipa.</p>
+      <p>A alternativa que muitas equipas ignoram: não construir de fora. Se o objecto tem invariantes fortes, o que se expõe são fábricas estáticas com nomes de intenção — <code>TransferOrder.immediate(...)</code>, <code>TransferOrder.scheduled(...)</code> — em vez de um <em>builder</em> genérico que aceita qualquer combinação e depois a rejeita.</p>
+      <figure class="listing java" id="lst-19-2"><div class="lhead"><span class="lnum">Listagem 19.2</span>
+        <span class="lcap"><code>record</code> com validação central, cópia funcional e um <em>builder</em> só para o que é opcional.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public record TransferOrder(
+        OrderId id, Money amount, Iban from, Iban to, Instant requestedAt,
+        String reference, Priority priority, Optional&lt;Instant&gt; executeAt) {
+
+    public TransferOrder {                                   // construtor compacto: um só sítio de validação
+        Objects.requireNonNull(id, "id");
+        if (amount.isNotPositive()) throw new IllegalArgumentException("amount &lt;= 0");
+        if (from.equals(to))        throw new IllegalArgumentException("from == to");
+        reference = reference == null ? "" : reference.strip();   // normalização, não mutação
+        priority  = priority  == null ? Priority.NORMAL : priority;
+    }
+
+    // fábricas estáticas com nome de intenção: melhores do que um builder que aceita tudo
+    public static TransferOrder immediate(OrderId id, Money amount, Iban from, Iban to, Clock clock) {
+        return new TransferOrder(id, amount, from, to, clock.instant(), "", Priority.NORMAL, Optional.empty());
+    }
+
+    // "wither": cópia com um componente alterado, sem builder
+    public TransferOrder withPriority(Priority p) {
+        return new TransferOrder(id, amount, from, to, requestedAt, reference, p, executeAt);
+    }
+}</code></pre></figure></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Lia o código todo» ou «pedia a alguém que me explicasse»; nenhuma estratégia de execução ou medição.</td></tr>
-        <tr><td>Mid</td><td>Segue o fluxo no IDE e corrige, mas sem teste que falhe primeiro e sem se preocupar com o ciclo de <em>feedback</em>.</td></tr>
-        <tr><td>Sénior</td><td>Executa e mede primeiro, mapeia só o fluxo relevante, separa correcção de refactoring, deixa teste de regressão.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o artefacto partilhado (mapa, riscos ordenados) e negoceia com o gestor o que fica por fazer e porquê.</td></tr>
+        <tr><td>Insuficiente</td><td>«Uso sempre Lombok <code>@Builder</code>» sem saber o que gera nem o que acontece aos invariantes.</td></tr>
+        <tr><td>Mid</td><td>Escolhe <code>record</code> e sabe o que é gerado, mas não distingue representação de construção nem vê a falha em <em>runtime</em> do <code>build()</code>.</td></tr>
+        <tr><td>Sénior</td><td>Combina os dois, valida no construtor compacto, conhece o limite (JPA, herança) e justifica o <em>builder</em> pelos 4 opcionais e pelos tipos repetidos.</td></tr>
+        <tr><td>Staff</td><td>Propõe fábricas com nome de intenção em vez de construção livre, discute <em>staged builder</em> e o seu custo de legibilidade, e liga a decisão à evolução do esquema de serialização.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se não conseguir pôr o serviço a correr localmente em dois dias?»</li>
-      <li>«Que ferramentas usa para ver o SQL que uma operação faz?»</li>
-      <li>«Como escolhe o fluxo por onde começa?»</li></ul></div>
+      <li>«Como valida que os 4 opcionais não formam combinações impossíveis?»</li>
+      <li>«Este objecto vai para Kafka. O que muda quando acrescentar um 13.º campo?»</li>
+      <li>«Porque é que uma entidade JPA não pode ser um <code>record</code>?»</li>
+      <li>«Qual é o custo de alocação de um <em>builder</em> num caminho de 5 000 chamadas por segundo?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor reescrita antes de conseguir executar o sistema.</li>
-      <li>Misturar correcção urgente com limpeza no mesmo <em>commit</em>.</li>
-      <li>Não mencionar teste nenhum na alteração de um sistema que não conhece.</li></ul></div>
+      <li><em>Builder</em> mutável partilhado entre <em>threads</em> ou reutilizado entre construções.</li>
+      <li>Validação replicada no <em>builder</em> e no construtor, com regras que divergem ao fim de dois meses.</li>
+      <li>Usar <code>record</code> como entidade JPA e descobrir o problema em produção.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-19-4" data-box="qa" data-area="design" data-level="mid" data-freq="media">
+<div class="qa" id="q-19-3" data-box="qa" data-area="design" data-level="mid" data-freq="media">
   <div class="qhead"><span class="qtag">SOLID e design patterns</span>
     <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Na sua equipa, o que é que classifica um comentário de revisão como bloqueante e o que é um <code>nit</code>? Dê exemplos concretos dos dois.</div>
+  <div class="qprompt">Qual é a diferença entre <em>static factory method</em>, <em>factory method</em> e <em>abstract factory</em>, e qual deles ainda escreve numa aplicação Spring?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Bloqueante é o que causa dano irreversível ou difícil de detectar depois de entrar em produção. A lista é curta e estável:</p>
-      <ul class="lst">
-        <li>Perda ou corrupção de dados: escrita não idempotente num <em>consumer</em> com entrega pelo menos uma vez, actualização sem controlo de concorrência optimista.</li>
-        <li>Segurança: concatenação de entrada do utilizador em SQL, autorização verificada ao nível do <em>endpoint</em> mas não do recurso, segredo ou dado pessoal em <em>log</em>.</li>
-        <li>Correcção sob acesso concorrente: estado mutável partilhado num <em>bean</em> singleton, <em>check-then-act</em> sem atomicidade.</li>
-        <li>Fugas de recursos: ligações, ficheiros ou <code>InputStream</code> sem <code>try</code>-com-recursos; <em>pools</em> criadas por pedido.</li>
-        <li>Ausência de teste para lógica de negócio nova ou alterada.</li>
-      </ul>
-      <p>O <em>nit</em> é tudo o que um formatador ou um <em>linter</em> devia resolver sem intervenção humana: nomes, ordem de membros, <code>var</code> ou tipo explícito, comprimento de linha. A regra prática é que se um comentário se repete duas vezes em PRs diferentes, deixa de ser comentário e passa a ser regra automática — Spotless, Checkstyle, ArchUnit ou uma regra de SonarQube — porque revisão humana gasta em atenção o que a ferramenta faz por 200 milissegundos de <em>build</em>.</p>
-      <p>Entre os dois há uma categoria útil: a pergunta. Quando falta contexto, «isto é intencional? Se o pedido chegar duas vezes, o que acontece?» resolve mais depressa do que uma afirmação errada, e mantém a autoridade do revisor intacta para quando ela for precisa.</p></div>
+      <p>São três coisas diferentes com nomes parecidos. O <em>static factory method</em> nem sequer está no catálogo GoF: é um método estático que devolve uma instância, cujo valor está no nome, na possibilidade de devolver um subtipo e na de não criar nada — <code>Integer.valueOf</code>, <code>List.of</code>, <code>Optional.of</code>, <code>Duration.ofSeconds</code>. O <em>factory method</em> do GoF é polimorfismo: uma classe abstracta define um método que as subclasses implementam para decidir o tipo concreto; o esqueleto do algoritmo fica na classe base. A <em>abstract factory</em> é um objecto cuja função é produzir famílias coerentes de objectos relacionados, para que não se misture uma peça de uma família com outra.</p>
+      <p>Numa aplicação Spring, escreve-se o primeiro todos os dias e praticamente nunca os outros dois na forma clássica, porque o contentor é a <em>abstract factory</em>: <code>BeanFactory</code> é literalmente essa interface, e a escolha da família faz-se por <em>profiles</em>, <code>@Conditional</code> e configuração, não por hierarquia de classes. Escrever uma <code>AbstractRepositoryFactory</code> com duas subclasses para escolher entre PostgreSQL e um duplo em memória é reimplementar mal o que a configuração já faz.</p>
+      <p>Onde a fábrica escrita à mão continua a pagar-se é quando a escolha depende de um valor que só existe em <em>runtime</em>: o tipo de um evento Kafka, um código de país, um método de pagamento vindo do pedido. Aí o padrão idiomático não é uma hierarquia, é um <code>Map&lt;Chave, Estratégia&gt;</code> construído uma vez no arranque — e o Spring injecta esse mapa directamente se se declarar o parâmetro como <code>Map&lt;String, Handler&gt;</code>, preenchido com nome do <em>bean</em> para <em>bean</em>. Uma consulta a <code>HashMap</code> custa ~20 ns e não cresce com o número de casos, ao contrário de uma cadeia de <code>if</code>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não distingue categorias; considera estilo tão importante como correcção.</td></tr>
-        <tr><td>Mid</td><td>Distingue as duas categorias com exemplos genéricos («bugs bloqueiam, estilo não»).</td></tr>
-        <tr><td>Sénior</td><td>Lista fechada e justificada de bloqueantes, com a noção de dano irreversível, e automatiza o resto.</td></tr>
-        <tr><td>Staff</td><td>Trata o tempo de revisão como recurso escasso e desenha o processo (tamanho de PR, <em>lint</em>, regras arquitecturais) para o gastar bem.</td></tr>
+        <tr><td>Insuficiente</td><td>Trata os três como sinónimos; descreve «uma classe que cria objectos».</td></tr>
+        <tr><td>Mid</td><td>Distingue os três correctamente com exemplos do catálogo, mas não liga ao contentor de <em>beans</em>.</td></tr>
+        <tr><td>Sénior</td><td>Cita exemplos concretos do JDK, identifica <code>BeanFactory</code> como <em>abstract factory</em> e limita a fábrica manual a escolhas dependentes de dados de <em>runtime</em>.</td></tr>
+        <tr><td>Staff</td><td>Discute o registo por <code>Map</code> injectado, o custo de descoberta em arranque, e como garantir que um novo tipo de evento sem <em>handler</em> falha no arranque e não no primeiro pedido.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Onde é que uma regra de ArchUnit é melhor do que um comentário?»</li>
-      <li>«Quanto tempo deve um PR esperar por revisão?»</li>
-      <li>«E se o autor ignorar um <em>nit</em> e fizer <em>merge</em>?»</li></ul></div>
+      <li>«Como é que o <code>Map&lt;String, Handler&gt;</code> injectado sabe as chaves?»</li>
+      <li>«Chega um evento de tipo desconhecido em produção. Onde é que isso falha e como quer que falhe?»</li>
+      <li>«Porque é que <code>List.of()</code> devolve classes diferentes conforme o número de elementos?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Bloquear PRs por preferência pessoal de estilo.</li>
-      <li>Nunca bloquear nada — «aprovo e depois falamos».</li>
-      <li>Não ter nenhuma verificação automática no <em>pipeline</em>.</li></ul></div>
+      <li>Hierarquia de fábricas com uma subclasse por implementação que o <em>profile</em> já escolhia.</li>
+      <li>Fábrica que faz <code>new</code> de <em>beans</em> com dependências, saltando o contentor.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-2" class="h2"><span class="secnum">19.2</span> Estruturais: adapter, decorator, facade e proxy<a class="anchor" href="#sec-19-2" aria-label="ligação">#</a></h2>
+
+<p>Os quatro padrões estruturais mais perguntados têm estruturas de classes quase idênticas — todos envolvem um objecto que contém outro e delega — e distinguem-se apenas pela intenção. O <em>adapter</em> muda a interface sem mudar o comportamento: existe porque duas partes do sistema falam línguas diferentes. O <em>decorator</em> mantém a interface e acrescenta comportamento: existe porque se quer somar responsabilidades em <em>runtime</em>. O <em>facade</em> cria uma interface nova e mais estreita sobre um subsistema com muitas peças. O <em>proxy</em> mantém a interface e controla o acesso: <em>lazy loading</em>, controlo de permissões, remoto, transacções.</p>
+
+<p>Se o candidato só souber dizer «são todos <em>wrappers</em>», perde a pergunta. A forma de responder bem é pela consequência: se se remover um <em>adapter</em>, o código deixa de compilar; se se remover um <em>decorator</em>, compila e funciona, apenas sem métricas ou sem <em>cache</em>; se se remover um <em>facade</em>, o chamador passa a conhecer 6 classes em vez de 1; se se remover um <em>proxy</em> do Spring, a transacção deixa de existir e ninguém repara até haver escrita parcial.</p>
+
+<p>O JDK é o repositório canónico de exemplos, e cita-se de memória: <code>java.io</code> é decorador puro — <code>new BufferedInputStream(new GZIPInputStream(new FileInputStream(f)))</code> — e o mesmo modelo aparece em <code>Collections.unmodifiableList</code> e <code>synchronizedList</code>; <code>InputStreamReader</code> é adaptador de <em>bytes</em> para caracteres e <code>Arrays.asList</code> adapta um <em>array</em> à interface <code>List</code>; <code>java.lang.reflect.Proxy</code> é a fábrica de <em>proxies</em> dinâmicos sobre interfaces em que assenta metade do Spring AOP.</p>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Decorador contra herança: com <em>n</em> comportamentos opcionais combináveis, a herança exige até 2<sup><em>n</em></sup> subclasses e fixa a combinação em tempo de compilação; os decoradores exigem <em>n</em> classes e compõem-se em <em>runtime</em>. O que se paga: pilhas de chamada mais profundas (uma cadeia de 4 decoradores acrescenta 4 <em>frames</em> a cada invocação e torna os <em>stack traces</em> menos legíveis), perda de identidade (<code>equals</code> e <code>instanceof</code> sobre o invólucro não vêem o alvo) e impossibilidade de aceder a estado protegido do decorado.</p></aside>
+
+<div class="qa" id="q-19-4" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Preciso de acrescentar <em>cache</em>, métricas e <em>retry</em> a um cliente HTTP existente. Herança ou decorador? Mostre a estrutura e diga o que perde.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Decorador, porque os três comportamentos são independentes e a ordem entre eles é uma decisão de configuração, não de tipo. Com herança seriam necessárias, no limite, 8 combinações (2<sup>3</sup>) fixadas em tempo de compilação, e acrescentar um quarto comportamento duplicaria esse número. Com decoradores são 3 classes, cada uma com uma responsabilidade, montadas numa expressão.</p>
+      <p>A ordem importa mais do que os candidatos assumem, e é o ponto onde a resposta se distingue. Métricas por fora de tudo medem a latência que o chamador observa, incluindo os acertos de <em>cache</em>; métricas por dentro do <em>retry</em> medem a chamada real ao serviço remoto. <em>Cache</em> por fora do <em>retry</em> significa que um acerto nunca ativa retentativas — que é o que se quer; <em>retry</em> por fora da <em>cache</em> repetiria a consulta à <em>cache</em> sem sentido. A montagem defensável é métricas → <em>cache</em> → <em>retry</em> → cliente real, e diz-se porquê.</p>
+      <p>Em Java 21 os decoradores escrevem-se como <code>record</code> que implementam a interface e guardam o delegado como componente: obtém-se imutabilidade e <code>toString</code> útil para diagnóstico sem código extra. Cada decorador é testável isoladamente com um duplo do delegado.</p>
+      <p>O que se perde: profundidade de pilha e legibilidade dos <em>stack traces</em> — quatro <em>frames</em> extra por chamada, o que não é mensurável em custo (a JIT alinha chamadas monomórficas) mas é visível no diagnóstico; perda de identidade, porque <code>decorado instanceof HttpRateSource</code> é falso do lado de fora; e a impossibilidade de um decorador aceder a estado interno do alvo — se precisar, o desenho está errado e o que se queria era herança ou uma mudança na interface. A alternativa a considerar é não escrever decoradores nenhuns e usar o que a plataforma dá: <code>@Cacheable</code>, <code>@Retryable</code> e <code>@Timed</code> fazem o mesmo por <em>proxy</em>, ao custo de a composição deixar de ser visível no código e de a ordem passar a depender de <code>@Order</code>.</p>
+      <figure class="listing java" id="lst-19-3"><div class="lhead"><span class="lnum">Listagem 19.3</span>
+        <span class="lcap">Decoradores como <code>record</code>: composição explícita e ordem justificada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public interface RateSource { Rate find(String pair); }
+
+record HttpRateSource(RestClient client) implements RateSource {
+    public Rate find(String pair) {
+        return client.get().uri("/rates/{p}", pair).retrieve().body(Rate.class);
+    }
+}
+
+record RetryingRateSource(RateSource delegate, int attempts) implements RateSource {
+    public Rate find(String pair) {
+        RuntimeException last = null;
+        for (int i = 0; i &lt; attempts; i++) {
+            try { return delegate.find(pair); }
+            catch (TransientRateException e) { last = e; }        // só o que é retentável
+        }
+        throw last;
+    }
+}
+
+record CachingRateSource(RateSource delegate, Cache&lt;String, Rate&gt; cache) implements RateSource {
+    public Rate find(String pair) { return cache.get(pair, delegate::find); }
+}
+
+record TimedRateSource(RateSource delegate, Timer timer) implements RateSource {
+    public Rate find(String pair) { return timer.record(() -&gt; delegate.find(pair)); }
+}
+
+// métricas por fora (latência vista pelo chamador), cache antes do retry (acerto não faz retentativas)
+RateSource rates = new TimedRateSource(
+        new CachingRateSource(
+                new RetryingRateSource(new HttpRateSource(client), 3),
+                cache),
+        timer);</code></pre></figure></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Uma subclasse por combinação, ou tudo dentro da classe do cliente com <code>if (cacheEnabled)</code>.</td></tr>
+        <tr><td>Mid</td><td>Escolhe decorador e desenha-o correctamente, mas não discute a ordem nem o que se perde.</td></tr>
+        <tr><td>Sénior</td><td>Justifica a ordem pelo que cada métrica passa a significar, escreve decoradores imutáveis e nomeia as perdas (pilha, identidade, estado protegido).</td></tr>
+        <tr><td>Staff</td><td>Compara com a via de anotações e <em>proxy</em>, discute quando a composição explícita vale mais do que a implícita, e como testar a ordem em vez de a documentar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Se puser as métricas por dentro da <em>cache</em>, o que passa a medir o p99?»</li>
+      <li>«Como testa que a ordem está certa e não regride numa refactorização?»</li>
+      <li>«Um decorador precisa de um campo <code>protected</code> do alvo. O que faz?»</li>
+      <li>«Porque é que <code>java.io</code> escolheu decoradores e não uma classe com opções?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Decorador que faz <em>retry</em> sobre erros não transitórios (400, violação de restrição) e amplifica o problema.</li>
+      <li>Decoradores com estado mutável partilhado sem controlo de acesso concorrente.</li>
+      <li>Não notar que a ordem muda o significado das métricas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-5" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O Spring implementa <code>@Transactional</code> com <em>proxies</em>. Explique o mecanismo e diga-me porque é que um método anotado às vezes não abre transacção nenhuma.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O Spring AOP é o padrão <em>proxy</em> aplicado no arranque. Quando um <em>bean</em> tem um método com <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code> ou <code>@Retryable</code>, um pós-processador substitui a instância registada no contentor por um <em>proxy</em> que envolve o alvo. Há duas tecnologias: <em>proxy</em> dinâmico do JDK, gerado por <code>java.lang.reflect.Proxy</code>, que só implementa interfaces; e subclasse gerada por CGLIB, que herda da classe concreta. O Spring Boot usa a segunda por omissão, o que impõe duas condições práticas — a classe não pode ser <code>final</code>, os métodos interceptados também não, e tem de haver um construtor acessível. Uma classe <code>final</code> com <code>@Transactional</code> ou não arranca ou não é aconselhada, e é um erro comum ao converter classes para <code>record</code>, que são implicitamente <code>final</code>.</p>
+      <p>O caso em que a anotação não faz nada é a auto-invocação. Se um método público sem anotação chama <code>this.metodoTransaccional()</code>, a chamada é interna: não passa pelo <em>proxy</em>, e portanto nenhum interceptor corre. O mesmo vale para <code>@Cacheable</code> — a <em>cache</em> nunca é consultada — e para <code>@Async</code>, que passa a correr na <em>thread</em> do chamador sem qualquer aviso. É o <em>bug</em> mais caro desta família porque é silencioso: o código parece transaccional, os testes de unidade com um duplo passam, e só se descobre quando uma falha a meio deixa escrita parcial na base de dados.</p>
+      <p>As três saídas, por ordem de preferência: mover o método transaccional para outro <em>bean</em> e injectá-lo, o que normalmente revela que a fronteira transaccional estava no sítio errado; auto-injecção do próprio <em>bean</em> por interface e chamada através dessa referência; ou <code>AopContext.currentProxy()</code>, que exige <code>exposeProxy = true</code> e amarra o código ao Spring. A quarta via é abandonar os <em>proxies</em> e usar tecelagem AspectJ em tempo de compilação ou de carregamento, que intercepta mesmo chamadas internas e métodos <code>private</code>, ao custo de mais complexidade de <em>build</em> e de um modelo de execução que os colegas não conseguem depurar.</p>
+      <p>Outras armadilhas do mesmo mecanismo, que valem a menção: só métodos <code>public</code> são interceptados na configuração por omissão; a <code>RuntimeException</code> provoca <em>rollback</em> mas uma excepção verificada não, salvo <code>rollbackFor</code> explícito; e o <em>proxy</em> não existe durante <code>@PostConstruct</code>, pelo que uma transacção iniciada aí não é gerida.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«O Spring trata disso»; não sabe que existe um objecto intermédio.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é um <em>proxy</em> e conhece a auto-invocação como regra decorada, sem explicar porquê nem distinguir JDK de CGLIB.</td></tr>
+        <tr><td>Sénior</td><td>Explica os dois tipos de <em>proxy</em>, as restrições (<code>final</code>, <code>public</code>, construtor), a auto-invocação pelo mecanismo, e escolhe a extracção para outro <em>bean</em> como solução.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta AspectJ e o seu custo, o comportamento de <em>rollback</em> com excepções verificadas, a interacção com <code>@PostConstruct</code>, e como detectar o problema com um teste de integração em vez de por revisão.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O <em>bean</em> tem duas anotações, <code>@Transactional</code> e <code>@Retryable</code>. Qual corre primeiro e como controla isso?»</li>
+      <li>«Como escreveria um teste que falha se alguém introduzir uma auto-invocação?»</li>
+      <li>«Porque é que o CGLIB não consegue interceptar um método <code>private</code>?»</li>
+      <li>«Converteu a classe para <code>record</code> e o arranque partiu. Porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Pôr <code>@Transactional</code> no controlador para «garantir» consistência sobre chamadas HTTP externas.</li>
+      <li>Achar que <code>@Async</code> num método chamado internamente corre noutra <em>thread</em>.</li>
+      <li>Envolver o repositório inteiro numa transacção de leitura longa e culpar a base de dados pelas ligações esgotadas.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-6" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Vamos integrar um sistema externo de crédito com um SOAP horrível e 40 campos. <em>Adapter</em>, <em>facade</em>, ou os dois? Onde põe a fronteira?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Os dois, com papéis diferentes, e a fronteira desenha-se primeiro pela interface que o domínio quer, não pela que o sistema externo oferece. O domínio declara <code>CreditCheck.assess(Applicant) → Decision</code>, com os 4 conceitos que interessam. Um adaptador implementa essa interface traduzindo para os 40 campos do SOAP e de volta; um <em>facade</em> aparece se o mesmo caso de uso exigir três chamadas ao sistema externo em sequência, e a sua função é esconder essa coreografia.</p>
+      <p>Isto é o que o DDD chama camada anti-corrupção, e o valor mede-se por uma pergunta concreta: quando o fornecedor lançar a versão 3 da API, quantos ficheiros mudam? Com adaptador, um. Sem adaptador, todos os que tocam no tipo gerado pelo <em>stub</em> — que em sistemas reais são dezenas, porque os tipos gerados escorregam para dentro do domínio pela via mais fácil.</p>
+      <p>Três decisões que o entrevistador procura. Primeiro, os modos de falha traduzem-se: um <em>timeout</em>, um HTTP 500 e um código de erro «pedido inválido» do fornecedor não podem chegar ao domínio como <code>SoapFaultException</code>; convertem-se em tipos do domínio que distinguem «indisponível, tenta mais tarde» de «rejeitado definitivamente». Segundo, o adaptador é o sítio onde vivem <em>timeout</em>, <em>retry</em> e disjuntor, com um <em>timeout</em> orçamentado a partir do orçamento de latência do caso de uso (se o utilizador tem 800 ms, o adaptador não pode esperar 30 s). Terceiro, o adaptador é a única peça que precisa de testes de contrato contra um servidor simulado — o domínio testa-se com um duplo da interface, sem rede.</p>
+      <p>Quando <em>não</em> vale: se a integração for uma chamada REST a um serviço da mesma empresa, com um modelo já próximo do domínio e evolução coordenada, o adaptador é uma classe de reencaminhamento puro e a equipa paga indirecção por nada. A fronteira paga-se quando o modelo externo é estranho ao domínio ou quando a evolução é fora do controlo da equipa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Usa os tipos gerados pelo <em>stub</em> directamente nos serviços de domínio.</td></tr>
+        <tr><td>Mid</td><td>Cria um adaptador e mapeia campos, mas deixa passar as excepções e os tipos do fornecedor.</td></tr>
+        <tr><td>Sénior</td><td>Interface definida pelo domínio, tradução de erros, <em>timeout</em> orçamentado e testes de contrato só no adaptador; mede o valor pelo custo de uma mudança de versão.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta quando a camada não se justifica, como versionar o contrato interno, e o plano de migração para a v3 sem parar a entrega.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O fornecedor devolve 200 com um código de erro no corpo. Onde trata isso?»</li>
+      <li>«Quanto tempo é razoável esperar, e o que faz quando estoura?»</li>
+      <li>«Como testa o adaptador sem depender do ambiente do fornecedor?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Modelo do domínio desenhado a partir do WSDL do fornecedor.</li>
+      <li>Adaptador que não define <em>timeout</em> e herda o valor por omissão da biblioteca.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-3" class="h2"><span class="secnum">19.3</span> Comportamentais: strategy, template method, observer e state<a class="anchor" href="#sec-19-3" aria-label="ligação">#</a></h2>
+
+<p>Os padrões comportamentais são os que mais mudaram com Java 8 e Java 21. Uma <em>strategy</em> com uma única operação é hoje uma interface funcional e escreve-se como <em>lambda</em>: <code>Comparator</code> é a estratégia mais usada do JDK e ninguém lhe chama padrão. Um <em>state</em> com transições fechadas é uma <code>sealed interface</code> mais <code>switch</code> com correspondência de padrões, e a exaustividade passa a ser verificada pelo compilador — acrescentar um estado novo produz erro de compilação em todos os sítios que decidem sobre estados, que é exactamente a propriedade que a versão com classes não dava.</p>
+
+<p>O que não desapareceu foi a decisão. A pergunta não é «sabe o que é <em>strategy</em>», é «o que varia, com que frequência, e quem escolhe». Se o que varia é uma expressão de duas linhas usada num sítio, um <em>lambda</em> chega. Se o que varia é um conjunto fechado e conhecido no arranque, um <code>enum</code> com corpo por constante dá nome, ordem, <code>valueOf</code> e exaustividade em <code>switch</code>. Se o que varia é aberto — cada país acrescenta uma implementação, possivelmente noutro módulo — é uma interface com implementações registadas como <em>beans</em> num mapa.</p>
+
+<p>Há um custo de execução que quase nenhum candidato menciona e que impressiona quando é mencionado: pontos de chamada polimórficos. A JIT alinha chamadas de interface enquanto vê um ou dois tipos de receptor no mesmo local (monomórfico e bimórfico); a partir do terceiro, o local torna-se megamórfico e a chamada passa a fazer-se por tabela, sem alinhamento e sem as optimizações que dele dependem. Não é razão para evitar estratégias — a diferença é de nanossegundos por chamada — mas é razão para não pôr uma estratégia dentro de um ciclo de 10<sup>8</sup> iterações num caminho quente.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.1</span> Forma idiomática em Java 21 e quando a versão clássica ainda ganha.</div>
+<div class="tscroll"><table><thead><tr><th>Padrão</th><th>Forma clássica</th><th>Forma idiomática em Java 21</th><th>Quando o clássico ainda ganha</th></tr></thead><tbody>
+<tr><td>Strategy</td><td>Interface mais N classes</td><td><em>Lambda</em>, referência de método ou <code>enum</code> com corpo por constante</td><td>A estratégia tem estado, várias operações ou precisa de configuração injectada</td></tr>
+<tr><td>State</td><td>Interface mais uma classe por estado</td><td><code>sealed interface</code> mais <code>switch</code> com padrões (exaustivo)</td><td>Cada estado tem muito comportamento próprio e é estendido por outros módulos</td></tr>
+<tr><td>Template method</td><td>Classe abstracta com métodos <code>protected</code></td><td>Método que recebe <code>Function</code> ou <code>Consumer</code></td><td>São 5 ou mais pontos de extensão com ordem fixa e nomes de domínio</td></tr>
+<tr><td>Command</td><td>Interface <code>Command</code> com <code>execute()</code></td><td><code>Runnable</code>, <code>Callable</code> ou <code>record</code> de comando enviado a um <em>handler</em></td><td>É preciso desfazer, registar ou serializar o comando</td></tr>
+<tr><td>Observer</td><td><code>Observable</code> e <code>Observer</code> do JDK (obsoletos desde Java 9)</td><td><code>ApplicationEventPublisher</code>, <code>Flow.Subscriber</code>, tópico Kafka</td><td>Notificação puramente intraprocesso, síncrona e sem durabilidade</td></tr>
+<tr><td>Visitor</td><td>Dupla despacho com <code>accept</code>/<code>visit</code></td><td><code>sealed</code> mais <em>record patterns</em> em <code>switch</code></td><td>A hierarquia é aberta e as operações são estáveis</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-19-7" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Temos 7 políticas de comissão que variam por método de pagamento e mudam duas vezes por ano. Como as modela em Java 21? <em>Lambda</em>, <code>enum</code> ou interface com <em>beans</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A pergunta decide-se por duas propriedades: o conjunto é fechado ou aberto, e a estratégia tem ou não dependências. Sete políticas conhecidas no arranque, sem dependências externas, é um <code>enum</code> que implementa a interface da política, com corpo por constante. Ganha-se nome estável para persistir em base de dados, <code>valueOf</code> para desserializar, exaustividade em <code>switch</code>, e uma única instância por constante. Se cada política precisar de consultar tabelas de escalões ou de um cliente HTTP, o <code>enum</code> deixa de servir — não se injectam dependências em constantes — e passa-se a uma interface com implementações anotadas como <em>beans</em>, recolhidas pelo Spring num <code>Map&lt;String, FeePolicy&gt;</code>.</p>
+      <p><em>Lambdas</em> em campo estático são a opção certa para políticas triviais de uma expressão, mas perdem duas coisas: nome em <em>stack traces</em> (aparece <code>lambda$static$0</code>) e a possibilidade de as descobrir por reflexão ou por configuração. Para 7 políticas com regras de negócio, o custo em diagnóstico não compensa a poupança de linhas.</p>
+      <p>«Mudam duas vezes por ano» é a parte que muda a resposta e que a maioria ignora. Se as políticas mudam, precisam de vigência: a política aplicada a uma transacção de Março tem de continuar a ser reproduzível em Novembro, para reconciliação e para reprocessamento. Isso implica versionar — <code>PERCENT_V2</code> em vez de alterar <code>PERCENT</code> — e escolher a política pela data do evento, não pela data actual. Alterar o corpo de uma constante existente reescreve o passado silenciosamente.</p>
+      <p>O que se garante em ambos os casos: a selecção falha ruidosamente. Um método de pagamento novo sem política associada tem de rebentar no arranque, com uma verificação que compara as constantes do <code>enum</code> de métodos com as chaves do mapa de políticas, e não no primeiro pedido a essa hora de ponta.</p>
+      <figure class="listing java" id="lst-19-4"><div class="lhead"><span class="lnum">Listagem 19.4</span>
+        <span class="lcap">Estratégia fechada como <code>enum</code>, estratégia aberta como <em>beans</em> num mapa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public interface FeePolicy { Money fee(Money amount); }
+
+// conjunto fechado, sem dependências: enum com corpo por constante
+public enum SimpleFeePolicy implements FeePolicy {
+    FLAT       { public Money fee(Money a) { return Money.eur("0.35"); } },
+    PERCENT_V1 { public Money fee(Money a) { return a.times("0.0140"); } },
+    PERCENT_V2 { public Money fee(Money a) { return a.times("0.0125"); } },   // versão, não alteração
+    TIERED     { public Money fee(Money a) {
+                     return a.isLessThan(Money.eur("100")) ? Money.eur("0.35") : a.times("0.0090"); } };
+}
+
+// conjunto aberto, com dependências: implementações recolhidas pelo contentor
+@Service
+public class FeeCalculator {
+    private final Map&lt;String, FeePolicy&gt; policies;             // nome do bean -&gt; estratégia
+
+    FeeCalculator(Map&lt;String, FeePolicy&gt; policies, Set&lt;String&gt; supportedMethods) {
+        this.policies = Map.copyOf(policies);
+        var missing = supportedMethods.stream().filter(m -&gt; !policies.containsKey(m)).toList();
+        if (!missing.isEmpty())                                  // falha no arranque, não no pico
+            throw new IllegalStateException("sem política de comissão para " + missing);
+    }
+
+    public Money fee(String method, Money amount) { return policies.get(method).fee(amount); }
+}</code></pre></figure></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td><code>switch</code> sobre <code>String</code> dentro do serviço, com as 7 fórmulas em linha.</td></tr>
+        <tr><td>Mid</td><td>Interface mais 7 classes, escolhidas por <code>if</code> ou <code>switch</code> numa fábrica escrita à mão.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe entre <code>enum</code> e mapa de <em>beans</em> pelo critério fechado/aberto e por dependências; falha no arranque quando falta uma política.</td></tr>
+        <tr><td>Staff</td><td>Introduz vigência e versionamento das políticas, reprodutibilidade histórica, e discute o custo de despacho megamórfico se estiver num caminho quente.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Uma política nova tem de ser activada só para 5% dos comerciantes. Onde entra isso?»</li>
+      <li>«Como reprocessa transacções de há seis meses com a política que estava em vigor?»</li>
+      <li>«Porque não usa <em>lambdas</em> num <code>Map</code> estático?»</li>
+      <li>«Como testa as 7 políticas sem 7 testes quase iguais?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Alterar a fórmula de uma constante existente em vez de criar uma versão nova.</li>
+      <li>Guardar <code>ordinal()</code> do <code>enum</code> na base de dados.</li>
+      <li>Estratégia com estado mutável partilhada por todos os pedidos.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-8" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Herdámos uma classe abstracta com 6 métodos <code>protected</code> que as subclasses sobrepõem. Isto é <em>template method</em>. Mantinha ou substituía por composição?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Depende de duas medidas que se recolhem antes de decidir: quantas subclasses existem e quantos dos 6 pontos de extensão cada uma sobrepõe. Se houver 3 subclasses e cada uma sobrepuser 5 dos 6, a classe base está a fazer o seu trabalho — a ordem do algoritmo é o valor e mantém-se. Se houver 11 subclasses e cada uma sobrepuser 1 ou 2, o que existe é uma classe base a servir de armazém de código comum, e a composição é melhor.</p>
+      <p>O problema estrutural do <em>template method</em> é a classe base frágil: qualquer alteração ao esqueleto quebra subclasses que não são inspeccionadas, a herança consome a única extensão possível em Java, e o estado <code>protected</code> cria acoplamento em dois sentidos — a subclasse depende de campos da base e a base depende de a subclasse os manter coerentes. Em testes, testar uma subclasse exige exercitar o algoritmo inteiro da base.</p>
+      <p>A substituição por composição faz-se passando os pontos de variação como funções ou como um pequeno objecto de <em>callbacks</em>, mantendo o esqueleto num método único. O JDK e o Spring já mostram as duas formas lado a lado: <code>JdbcTemplate</code> chama-se «template» mas não é herança — é um esqueleto que recebe um <code>RowMapper</code>, ou seja, <em>template method</em> resolvido com estratégias passadas como argumento. Essa é a versão que se recomenda hoje em código novo, e é fácil de defender em entrevista porque tem precedente na biblioteca que todos usam.</p>
+      <p>O <em>trade-off</em> honesto: com 5 ou 6 pontos de variação, passar 6 <em>lambdas</em> a um método é pior do que sobrepor 6 métodos com nomes de domínio — perde-se legibilidade e a assinatura torna-se impossível de ler. Nesse caso mantém-se a herança, mas fecha-se: o método esqueleto passa a <code>final</code>, os pontos de extensão ficam documentados como contrato, e o resto dos métodos deixa de ser <code>protected</code>. Uma via intermédia é declarar uma interface com os 6 métodos e uma implementação por variante, injectada no esqueleto — mantém os nomes de domínio sem herança.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Herança é sempre má» ou «funciona, não mexo», sem medir nada.</td></tr>
+        <tr><td>Mid</td><td>Identifica o padrão e cita «composição sobre herança» como regra, sem critério de decisão.</td></tr>
+        <tr><td>Sénior</td><td>Mede subclasses e sobreposições, nomeia a fragilidade da classe base, e propõe <code>JdbcTemplate</code> com <code>RowMapper</code> como modelo de substituição.</td></tr>
+        <tr><td>Staff</td><td>Reconhece quando 6 pontos de variação tornam a composição ilegível, propõe a via intermédia com interface de <em>callbacks</em>, e um plano de migração incremental com as subclasses existentes a compilar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como migra sem parar a entrega, com 11 subclasses em produção?»</li>
+      <li>«Uma subclasse chama <code>super</code> a meio e depende da ordem. Como o detecta?»</li>
+      <li>«Porque é que o <code>JdbcTemplate</code> não usa herança?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Métodos <code>protected</code> abstractos com efeitos colaterais sobre campos partilhados da base.</li>
+      <li>Chamar um método sobreponível a partir do construtor da classe base.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-9" data-box="qa" data-area="design" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Uma encomenda tem 6 estados e 9 transições legais. Modele isso em Java 21 de forma a que acrescentar um estado não deixe passar um caso esquecido.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A propriedade pedida — «não deixar passar um caso esquecido» — é exaustividade verificada pelo compilador, e em Java 21 obtém-se com <code>sealed interface</code> mais <code>switch</code> com correspondência de padrões. Declara-se a hierarquia fechada de estados, cada estado como <code>record</code> com os dados que só fazem sentido nele (o código de autorização só existe em <code>Authorized</code>), e a função de transição como um <code>switch</code> sobre o par estado/evento sem ramo <code>default</code>. Sem <code>default</code>, acrescentar um sétimo estado transforma todos os <code>switch</code> incompletos em erros de compilação. Com <code>default</code>, o compilador cala-se e o erro passa a ser de <em>runtime</em> — por isso a regra é nunca escrever <code>default</code> num <code>switch</code> sobre um tipo selado.</p>
+      <p>A alternativa clássica GoF é o padrão <em>state</em>: uma interface e uma classe por estado, cada uma a implementar as transições que aceita e a lançar excepção nas restantes. Continua defensável quando cada estado tem muito comportamento próprio, mas não dá exaustividade: acrescentar um estado não obriga ninguém a rever nada. A variante <code>enum</code> com transições declaradas num <code>EnumMap</code> fica a meio caminho — dá nomes persistíveis e uma tabela de transições legível, mas o compilador também não verifica a cobertura.</p>
+      <p>O que separa a resposta de nível staff é o que está à volta da máquina de estados. Primeiro, a transição é uma função pura <code>(estado, evento) → novo estado</code>, sem efeitos colaterais, o que a torna testável com uma tabela de casos e permite reconstituir o estado por reprodução de eventos. Segundo, a persistência guarda o nome do estado como texto, nunca <code>ordinal()</code>, e a transição na base de dados faz-se com actualização condicional (<code>UPDATE ... WHERE status = 'AUTHORIZED'</code>) verificando as linhas afectadas — sem isso, dois consumidores concorrentes aplicam duas transições sobre o mesmo estado lido e uma perde-se. Terceiro, os efeitos (publicar evento, chamar o adquirente) ficam fora da função de transição e são despoletados a partir do estado resultante, o que dá idempotência.</p>
+      <figure class="listing java" id="lst-19-5"><div class="lhead"><span class="lnum">Listagem 19.5</span>
+        <span class="lcap">Estados selados: transição pura e exaustividade garantida pelo compilador.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public sealed interface OrderState
+        permits OrderState.New, OrderState.Authorized, OrderState.Captured,
+                OrderState.Cancelled, OrderState.Refunded, OrderState.Expired {
+
+    record New(Instant at) implements OrderState {}
+    record Authorized(String authCode, Instant at) implements OrderState {}
+    record Captured(String authCode, Money amount, Instant at) implements OrderState {}
+    record Cancelled(String reason, Instant at) implements OrderState {}
+    record Refunded(Money amount, Instant at) implements OrderState {}
+    record Expired(Instant at) implements OrderState {}
+}
+
+public sealed interface OrderEvent permits Authorize, Capture, Cancel, Refund, Expire {}
+
+// transição pura: sem I/O, sem default -> um estado novo parte a compilação aqui
+static OrderState next(OrderState state, OrderEvent event) {
+    return switch (state) {
+        case OrderState.New n -&gt; switch (event) {
+            case Authorize a -&gt; new OrderState.Authorized(a.code(), a.at());
+            case Cancel c    -&gt; new OrderState.Cancelled(c.reason(), c.at());
+            case Expire e    -&gt; new OrderState.Expired(e.at());
+            default -&gt; throw new IllegalTransition(state, event);   // eventos: conjunto aberto no tempo
+        };
+        case OrderState.Authorized a -&gt; switch (event) {
+            case Capture c -&gt; new OrderState.Captured(a.authCode(), c.amount(), c.at());
+            case Cancel  c -&gt; new OrderState.Cancelled(c.reason(), c.at());
+            case Expire  e -&gt; new OrderState.Expired(e.at());
+            default -&gt; throw new IllegalTransition(state, event);
+        };
+        case OrderState.Captured c -&gt; switch (event) {
+            case Refund r -&gt; new OrderState.Refunded(r.amount(), r.at());
+            default -&gt; throw new IllegalTransition(state, event);
+        };
+        case OrderState.Cancelled c -&gt; throw new IllegalTransition(state, event);
+        case OrderState.Refunded r  -&gt; throw new IllegalTransition(state, event);
+        case OrderState.Expired e   -&gt; throw new IllegalTransition(state, event);
+    };
+}</code></pre></figure></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Campo <code>String status</code> e <code>if</code> espalhados por três serviços.</td></tr>
+        <tr><td>Mid</td><td><code>enum</code> de estados com validação num método <code>canGoTo</code>, sem garantia de cobertura.</td></tr>
+        <tr><td>Sénior</td><td><code>sealed</code> mais <code>switch</code> exaustivo sem <code>default</code>, transição pura e testável, estado persistido por nome.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta actualização condicional para acesso concorrente, efeitos fora da transição, idempotência e reprodução de eventos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Dois consumidores processam o mesmo evento em paralelo. O que acontece?»</li>
+      <li>«Onde publica o evento de domínio, dentro ou fora da transacção?»</li>
+      <li>«Porque é que um <code>default</code> aqui é um erro de desenho?»</li>
+      <li>«Como migra as encomendas já persistidas quando acrescentar o sétimo estado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Transições que fazem chamadas HTTP ou escritas dentro do <code>switch</code>.</li>
+      <li>Persistir <code>ordinal()</code> e reordenar o <code>enum</code> seis meses depois.</li>
+      <li>Assumir que a leitura seguida de escrita é atómica sem condição na cláusula <code>WHERE</code>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-4" class="h2"><span class="secnum">19.4</span> Padrões que a linguagem e o Spring já resolvem<a class="anchor" href="#sec-19-4" aria-label="ligação">#</a></h2>
+
+<p>Metade do catálogo GoF resolvia limitações de C++ de 1994 que Java já não tem, e outra parte foi absorvida pelo JDK ou pelo Spring. Reimplementar essas peças é o erro mais visível numa revisão de código de um candidato: escrever um <em>iterator</em> à mão quando <code>Iterable</code> existe, um <em>command</em> quando <code>Runnable</code> serve, um <em>flyweight</em> de inteiros quando <code>Integer.valueOf</code> já tem a <em>cache</em> de −128 a 127, ou uma cadeia de responsabilidade quando o que se quer é um <code>Stream</code> sobre uma lista de validações.</p>
+
+<p>O <em>chain of responsibility</em> merece nota especial porque é o padrão que mais aparece disfarçado. A cadeia de <code>Filter</code> do Servlet e a cadeia de filtros do Spring Security são exactamente isso, e a decisão que se toma na prática nunca é «implemento a cadeia», é «entro na cadeia existente com que ordem». Escrever uma cadeia nova, com um campo <code>next</code> preenchido à mão, é quase sempre pior do que uma lista de funções percorrida com <code>Stream</code>: perde-se a possibilidade de reordenar por configuração e ganha-se um grafo de ligações difícil de inspeccionar.</p>
+
+<p>Saber citar os exemplos do JDK e do Spring vale pontos porque prova leitura de código de terceiros. Vale a pena ter meia dúzia na ponta da língua, com a variante correcta: <code>JdbcTemplate</code> não é herança, é esqueleto mais <em>callback</em>; <code>RestTemplate</code> é a mesma ideia sobre HTTP e está em modo de manutenção, substituído por <code>RestClient</code> na Spring Framework 6.1; <code>BeanFactory</code> é a fábrica abstracta do contentor; o carregamento preguiçoso do Hibernate é um <em>proxy</em> gerado que provoca <code>LazyInitializationException</code> fora da sessão.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.2</span> Padrões GoF vivos no JDK e no ecossistema Spring — exemplos para citar de memória.</div>
+<div class="tscroll"><table><thead><tr><th>Padrão</th><th>No JDK</th><th>No Spring</th><th>Consequência prática</th></tr></thead><tbody>
+<tr><td>Abstract factory</td><td><code>DocumentBuilderFactory</code></td><td><code>BeanFactory</code>, <code>FactoryBean</code></td><td>A escolha da família é configuração, não hierarquia de classes</td></tr>
+<tr><td>Builder</td><td><code>StringBuilder</code>, <code>HttpRequest.newBuilder()</code></td><td><code>UriComponentsBuilder</code>, <code>RestClient.builder()</code></td><td>Construção passo a passo com validação só no fim</td></tr>
+<tr><td>Decorator</td><td><code>BufferedInputStream</code>, <code>Collections.unmodifiableList</code></td><td><code>DelegatingFilterProxy</code>, <em>wrappers</em> de <code>DataSource</code></td><td>Comportamento somado em <em>runtime</em>; a ordem muda o significado</td></tr>
+<tr><td>Proxy</td><td><code>java.lang.reflect.Proxy</code></td><td>Spring AOP, <em>lazy loading</em> do Hibernate</td><td>Auto-invocação não é interceptada; classes <code>final</code> não são <em>proxiáveis</em></td></tr>
+<tr><td>Adapter</td><td><code>InputStreamReader</code>, <code>Arrays.asList</code></td><td><code>HandlerAdapter</code>, conversores de mensagens</td><td>A tradução vive num sítio só; o domínio não conhece o formato externo</td></tr>
+<tr><td>Template method mais estratégia</td><td>—</td><td><code>JdbcTemplate</code> com <code>RowMapper</code>, <code>TransactionTemplate</code></td><td>Esqueleto reutilizado sem herança</td></tr>
+<tr><td>Chain of responsibility</td><td><code>Filter</code> e <code>FilterChain</code> do Servlet</td><td>Cadeia de filtros do Spring Security, <code>HandlerInterceptor</code></td><td>Entra-se na cadeia existente e discute-se a ordem</td></tr>
+<tr><td>Observer</td><td><code>Flow.Subscriber</code>, ouvintes de eventos</td><td><code>ApplicationEventPublisher</code>, <code>@EventListener</code></td><td>Síncrono na mesma <em>thread</em> e na mesma transacção por omissão</td></tr>
+<tr><td>Flyweight</td><td><code>Integer.valueOf</code> (−128 a 127), <em>interning</em> de <code>String</code></td><td><em>Caches</em> de metadados de <em>beans</em></td><td>Comparação por <code>==</code> em <code>Integer</code> funciona por acidente e falha acima de 127</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-19-10" data-box="qa" data-area="design" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Dê-me quatro padrões GoF que use todos os dias sem escrever uma linha deles, com o exemplo concreto no JDK ou no Spring.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Quatro com consequência prática, não quatro nomes. Primeiro, <em>decorator</em>: <code>java.io</code> inteiro, e <code>Collections.unmodifiableList</code>, que é a armadilha clássica — devolve uma vista imutável, não uma cópia, pelo que alterações à lista original continuam visíveis através dela. Segundo, <em>proxy</em>: <code>java.lang.reflect.Proxy</code> e todo o Spring AOP, com a consequência de a auto-invocação não ser interceptada e de o Hibernate devolver <em>proxies</em> que rebentam com <code>LazyInitializationException</code> quando a sessão já fechou.</p>
+      <p>Terceiro, <em>template method</em> com estratégia passada como argumento: <code>JdbcTemplate</code> executa o esqueleto — obter ligação, preparar, executar, iterar, fechar, traduzir a excepção — e delega a única parte variável no <code>RowMapper</code>. É o exemplo que se dá quando alguém defende herança para reutilizar algoritmos. Quarto, <em>abstract factory</em>: <code>BeanFactory</code>, com a consequência de que escrever fábricas para escolher implementações é duplicar o que <code>@Profile</code> e <code>@ConditionalOnProperty</code> já fazem por configuração.</p>
+      <p>Um quinto que vale a menção por ser o mais mal compreendido: <em>flyweight</em> na <em>cache</em> de <code>Integer.valueOf</code> entre −128 e 127. É a razão pela qual comparar dois <code>Integer</code> com <code>==</code> funciona para 100 e falha para 1000 — um dos <em>bugs</em> mais reproduzíveis em código Java antigo, e a razão pela qual a resposta correcta é usar sempre os tipos primitivos ou <code>equals</code>.</p>
+      <p>O que se deve acrescentar sem ser perguntado, porque é o que separa recitação de compreensão: em todos estes casos o valor não está em conhecer o nome, está em saber a consequência operacional — a ordem dos decoradores muda o que as métricas medem, o <em>proxy</em> tem uma fronteira que a chamada interna não atravessa, o esqueleto do <em>template</em> é quem faz a tradução de excepções que a aplicação depois apanha.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Recita nomes do catálogo sem conseguir apontar um exemplo real.</td></tr>
+        <tr><td>Mid</td><td>Dá exemplos correctos (<code>java.io</code>, <code>BeanFactory</code>) mas sem consequência prática associada.</td></tr>
+        <tr><td>Sénior</td><td>Cada exemplo vem com o efeito observável: vista contra cópia, auto-invocação, tradução de excepções, <em>cache</em> de <code>Integer</code>.</td></tr>
+        <tr><td>Staff</td><td>Usa os exemplos para argumentar contra reimplementações no código da equipa e cita a alternativa moderna (<code>RestClient</code> em vez de <code>RestTemplate</code>).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«<code>Collections.unmodifiableList</code> devolve cópia ou vista? Que <em>bug</em> resulta disso?»</li>
+      <li>«Porque é que <code>==</code> entre <code>Integer</code> funciona para 100 e não para 1000?»</li>
+      <li>«O que faz exactamente o <code>JdbcTemplate</code> entre a sua consulta e o <code>RowMapper</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Descrever padrões apenas pela estrutura de classes, sem uma única consequência observável.</li>
+      <li>Não reconhecer os padrões nas bibliotecas que usa diariamente.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-11" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando uma encomenda é paga, três coisas têm de acontecer: e-mail, actualizar o inventário, enviar para a facturação. <em>Observer</em> com eventos do Spring, ou Kafka? Como decide?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A decisão faz-se por três eixos: fronteira de processo, durabilidade e acoplamento transaccional. Eventos do Spring (<code>ApplicationEventPublisher</code> mais <code>@EventListener</code>) são <em>observer</em> intraprocesso: por omissão são síncronos, correm na <em>thread</em> do publicador e dentro da mesma transacção. Isso tem uma consequência que muitos candidatos desconhecem — se o ouvinte lançar excepção, a transacção do publicador reverte. É útil quando se quer exactamente isso, e desastroso quando o envio de e-mail faz reverter um pagamento já confirmado.</p>
+      <p>Se os três consumidores estiverem no mesmo processo e a operação for curta, os eventos do Spring chegam, com uma condição: usar <code>@TransactionalEventListener</code> na fase posterior à confirmação, para que o e-mail só seja enviado depois de a transacção fechar. O que ainda falta é durabilidade — se o processo morrer entre a confirmação e a execução do ouvinte, o evento perde-se e não há retentativa. Para inventário e facturação isso é inaceitável.</p>
+      <p>A resposta defensável para o caso descrito é mensageria com o padrão <em>outbox</em>: na mesma transacção que confirma o pagamento, insere-se uma linha numa tabela de saída; um processo separado lê essa tabela e publica em Kafka. Ganha-se atomicidade entre a mudança de estado e a publicação, durabilidade, retentativas e consumidores independentes com ritmos próprios. Paga-se latência adicional (o intervalo de sondagem da tabela, tipicamente 100 ms a 1 s), consistência eventual visível ao utilizador, e a obrigação de os consumidores serem idempotentes, porque a entrega é pelo menos uma vez.</p>
+      <p>A regra prática que se dá ao entrevistador: eventos de aplicação para desacoplar módulos dentro do mesmo processo, sem requisito de durabilidade; mensageria quando o consumidor está noutro processo, quando é preciso sobreviver a reinícios, ou quando o consumidor pode estar em baixo. E um aviso: eventos do Spring usados como forma de esconder chamadas entre serviços tornam o fluxo impossível de seguir num <em>stack trace</em> — quem publica não sabe quem escuta, e um ouvinte novo introduzido por outra equipa muda o comportamento sem alterar o código do publicador.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Três chamadas directas em sequência dentro do método de pagamento, sem tratamento de falha parcial.</td></tr>
+        <tr><td>Mid</td><td>Usa eventos do Spring por «desacoplamento», sem saber que são síncronos e transaccionais por omissão.</td></tr>
+        <tr><td>Sénior</td><td>Distingue os dois mecanismos pelos três eixos, usa <code>@TransactionalEventListener</code> na fase posterior à confirmação, e escolhe mensageria pela durabilidade.</td></tr>
+        <tr><td>Staff</td><td>Propõe <em>outbox</em> com números (intervalo de sondagem, latência acrescentada), exige idempotência nos consumidores e discute o custo de legibilidade do desacoplamento por eventos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O ouvinte do e-mail falha. O que acontece ao pagamento?»</li>
+      <li>«Como garante que o evento é publicado se o processo morrer logo após a confirmação?»</li>
+      <li>«O consumidor de inventário recebe o mesmo evento duas vezes. Que desenho o protege?»</li>
+      <li>«Quanto tempo demora o utilizador a ver o inventário actualizado, e isso é aceitável?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Publicar no <em>broker</em> dentro da transacção e assumir atomicidade entre base de dados e Kafka.</li>
+      <li>Ouvintes com efeitos externos irreversíveis a correr antes da confirmação da transacção.</li>
+      <li>Não distinguir «desacoplado» de «invisível» ao depurar um incidente.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-5" class="h2"><span class="secnum">19.5</span> Anti-padrões: god object, anemic domain, service locator<a class="anchor" href="#sec-19-5" aria-label="ligação">#</a></h2>
+
+<p>Nomear anti-padrões é fácil; a pergunta de entrevista é sempre a seguinte — como se mede, e quando é que a alternativa não vale a pena. Um <em>god object</em> mede-se: número de dependências injectadas no construtor, número de linhas, e sobretudo número de razões distintas para mudar. Acima de 7 colaboradores injectados, a classe está quase sempre a servir três casos de uso diferentes que podiam ser três classes. Mas cortar por cortar produz o problema inverso: dezenas de classes com um método cada, e um fluxo que exige abrir seis ficheiros para ser entendido.</p>
+
+<p>O <em>anemic domain model</em> — entidades só com <em>getters</em> e <em>setters</em>, e toda a lógica em classes de serviço — é o anti-padrão mais discutido e o que exige a resposta mais matizada. É genuinamente mau quando os invariantes de uma entidade ficam espalhados por cinco serviços que a manipulam por <em>setters</em>: nenhum deles pode garantir que a encomenda nunca fica com total negativo, porque qualquer um pode chamar <code>setTotal</code>. Mas é perfeitamente adequado num serviço maioritariamente CRUD, onde não há invariantes para proteger e onde um modelo rico só acrescenta cerimónia.</p>
+
+<p>O <em>service locator</em> — obter dependências chamando <code>context.getBean(X.class)</code> ou um registo estático — é a única das três sem defesa razoável em código novo. Esconde as dependências (a assinatura do construtor deixa de as declarar), transforma erros de configuração de falhas no arranque em falhas no primeiro pedido, e obriga a montar um contentor para testar uma unidade. Aparece quase sempre por um motivo: alguém tinha uma dependência circular e resolveu-a adiando a resolução, em vez de partir o ciclo.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Injecção por campo com <code>@Autowired</code> é <em>service locator</em> disfarçado: o objecto não pode ser construído sem um contentor, dependências circulares deixam de ser detectadas na construção, e os campos não podem ser <code>final</code>. A injecção por construtor torna a dependência circular um erro de arranque — o que é a resposta certa, porque um ciclo entre dois serviços é um problema de fronteiras que se resolve extraindo o que ambos partilham.</p></aside>
+
+<div class="qa" id="q-19-12" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">As nossas entidades JPA só têm <em>getters</em> e <em>setters</em> e a lógica toda está em classes <code>...Service</code>. Isso é um problema? Convença-me numa direcção ou noutra.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Só é problema se houver invariantes a proteger. O teste que aplico é este: existe alguma regra que tenha de ser verdadeira para todas as instâncias, em todos os momentos? «O total da encomenda é a soma das linhas», «uma encomenda expedida não aceita linhas novas», «o saldo nunca desce abaixo do limite de crédito». Se existem regras dessas e a entidade expõe <em>setters</em> públicos para os campos envolvidos, o modelo anémico é um problema real, porque a regra passa a estar replicada em todos os serviços que mexem na entidade e a próxima pessoa a escrever um serviço novo não sabe que ela existe.</p>
+      <p>A correcção não é reescrever tudo: é fechar os <em>setters</em> dos campos que participam em invariantes e substituí-los por métodos com nome de operação de domínio — <code>encomenda.adicionarLinha(produto, quantidade)</code> em vez de <code>encomenda.getLinhas().add(...)</code> seguido de <code>encomenda.setTotal(...)</code>. O invariante fica num sítio, verificado no fim de cada operação. O serviço mantém-se, mas passa a orquestrar (carregar, chamar o método de domínio, gravar, publicar evento) em vez de calcular.</p>
+      <p>Se não houver invariantes — um serviço que recebe um formulário, valida formato e grava — o modelo rico é cerimónia pura. Um CRUD com 40 tabelas e nenhuma regra ganha zero em ter 40 agregados com métodos de domínio. Defender modelo rico universalmente é tão mau sinal como não conhecer o problema.</p>
+      <p>Duas restrições práticas com JPA que se devem mencionar. O Hibernate exige construtor sem argumentos e acede aos campos, o que impede a imutabilidade total; a saída é ter o construtor sem argumentos com visibilidade reduzida e não expor <em>setters</em>. E colecções devolvidas por <em>getters</em> devem sair como vista imutável (<code>List.copyOf</code> ou <code>Collections.unmodifiableList</code>), senão o encapsulamento é aparente: qualquer chamador altera a colecção gerida por trás do agregado.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É assim que se faz em Spring» ou «modelo anémico é sempre errado», sem critério.</td></tr>
+        <tr><td>Mid</td><td>Cita Fowler e defende modelo rico em abstracto, sem exemplo de invariante nem plano de migração.</td></tr>
+        <tr><td>Sénior</td><td>Decide pelo teste dos invariantes, fecha <em>setters</em> selectivamente, mantém os serviços como orquestradores e reconhece o caso CRUD.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta as restrições do Hibernate, colecções expostas como vista, fronteiras de agregado e um plano incremental que não bloqueia a entrega.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Dê-me um invariante do seu sistema actual e diga onde está garantido hoje.»</li>
+      <li>«Com Hibernate, como consegue uma entidade sem <em>setters</em> públicos?»</li>
+      <li>«Onde põe a validação que precisa de consultar a base de dados?»</li>
+      <li>«Qual é a fronteira do agregado e porque é que a escolheu aí?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><em>Getter</em> de colecção que devolve a lista gerida, permitindo alterações fora do agregado.</li>
+      <li>Regras de negócio duplicadas em serviço e em <em>trigger</em> de base de dados, divergentes.</li>
+      <li>Propor reescrever o domínio inteiro como condição para melhorar seja o que for.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-19-13" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Encontra uma classe <code>OrderService</code> com 1 800 linhas e 12 dependências injectadas, e uma classe utilitária estática que faz <code>context.getBean()</code>. Qual ataca primeiro e como?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro o <em>service locator</em>, porque é mais barato de corrigir e porque bloqueia a correcção do outro. Enquanto houver uma classe estática a ir buscar <em>beans</em> ao contentor, qualquer parte do <code>OrderService</code> pode ter dependências invisíveis que não aparecem no construtor, e partir a classe em três torna-se adivinhação. Substituir <code>getBean()</code> por injecção por construtor é mecânico, e o próprio compilador mostra o grafo real de dependências à medida que se avança.</p>
+      <p>Depois o <em>god object</em>, e a divisão não se faz por camadas nem por tipo de operação: faz-se por razão de mudança. Listam-se os métodos públicos, agrupam-se por caso de uso e vê-se que dependências cada grupo usa. O padrão típico é claro — 4 métodos usam o <em>gateway</em> de pagamento e o repositório de encomendas, 3 usam o cliente de expedição e o de inventário, 5 são leituras que só usam o repositório. São três classes com 3 a 5 dependências cada, e nenhuma delas usa 12.</p>
+      <p>A sequência que se defende em entrevista tem uma condição de segurança à cabeça: testes de caracterização antes de mexer. Se os 1 800 linhas não tiverem cobertura, escrevem-se testes ao comportamento observável dos casos de uso principais (não à implementação), e só depois se extrai. Extrai-se uma classe de cada vez, mantendo o <code>OrderService</code> a delegar, para que os chamadores não mudem no mesmo <em>commit</em> — cada passo é revisível e reversível.</p>
+      <p>O critério de paragem é tão importante como o de arranque, e é o que distingue um sénior de quem gosta de refactorizar: para-se quando cada classe tem uma razão para mudar e menos de 5 ou 6 colaboradores. Não se continua até uma classe por método, porque isso troca um problema de acoplamento por um problema de navegabilidade — e a métrica que interessa ao negócio é o tempo que um colega demora a alterar o cálculo de comissão com confiança, não a contagem de linhas por ficheiro.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe reescrever de raiz, ou não vê problema nenhum nas 12 dependências.</td></tr>
+        <tr><td>Mid</td><td>Fala em «princípio da responsabilidade única» e divide por camadas técnicas, sem rede de testes.</td></tr>
+        <tr><td>Sénior</td><td>Ordena as duas correcções com justificação, divide por razão de mudança usando as dependências como sinal, e exige testes de caracterização antes.</td></tr>
+        <tr><td>Staff</td><td>Define critério de paragem, mantém compatibilidade por delegação para não bloquear a equipa, e liga a decisão ao custo de alteração medido em tempo de entrega.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escreve testes de caracterização para código que chama três sistemas externos?»</li>
+      <li>«A extracção cria uma dependência circular entre duas das novas classes. O que faz?»</li>
+      <li>«Como convence o gestor de produto a pagar duas semanas disto?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Refactorizar sem testes e a garantir que «o comportamento é o mesmo».</li>
+      <li>Resolver a dependência circular com <code>@Lazy</code> em vez de rever as fronteiras.</li>
+      <li>Dividir por sufixos técnicos (<code>Helper</code>, <code>Manager</code>, <code>Util</code>) em vez de por caso de uso.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-19-6" class="h2"><span class="secnum">19.6</span> Reconhecer padrões no código do entrevistador<a class="anchor" href="#sec-19-6" aria-label="ligação">#</a></h2>
+
+<p>Numa ronda de leitura de código, o entrevistador mostra 40 a 60 linhas e pergunta o que ali está. O erro típico é responder com o nome e parar. A resposta que pontua tem quatro tempos, e cabe em noventa segundos: qual é a intenção (o que varia e o que se mantém fixo), qual é o nome do padrão se houver, se está bem aplicado neste contexto, e o que se mudaria. Um candidato que diz «é uma cadeia de responsabilidade, mas com um único elo e sem forma de reordenar — o que aqui está é uma lista de validações escrita com o vocabulário errado» demonstra mais do que quem acerta no nome e não vê o problema.</p>
+
+<p>Há três sinais de padrão desnecessário que se procuram de imediato. Interfaces com uma única implementação e nome derivado dela (<code>OrderServiceImpl</code>) não isolam nada: se não existe uma segunda implementação nem uma fronteira de módulo, a interface é indirecção paga sem retorno — o argumento de «facilita os testes» deixou de valer com bibliotecas que simulam classes concretas. Fábricas que fazem apenas <code>new</code> sem escolher entre alternativas. E hierarquias abstractas com um filho, criadas «para o futuro», que quase sempre têm de ser desfeitas quando o segundo caso finalmente aparece e não encaixa na abstracção adivinhada.</p>
+
+<p>Vale também praticar a leitura no sentido inverso: dada uma cadeia de <code>if</code>/<code>else</code>, qual é o padrão que a substitui e qual é o custo. Nem toda a cadeia de <code>if</code> merece ser substituída — três ramos estáveis num sítio só são mais legíveis do que três classes espalhadas por três ficheiros. O critério é o mesmo de sempre: frequência de mudança, número de sítios onde a mesma decisão se repete, e se quem acrescenta um caso novo pertence à mesma equipa.</p>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Uma resposta de alto sinal quando o candidato não reconhece o padrão: descrever o mecanismo em vez de adivinhar o nome. «Este objecto recebe outro do mesmo tipo e acrescenta comportamento antes de delegar» está correcto mesmo sem dizer «decorator»; adivinhar «é <em>facade</em>» quando é <em>adapter</em> custa mais do que não nomear.</p></aside>
+
+<div class="qa" id="q-19-14" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Este código valida um pagamento percorrendo uma lista de verificações, cada uma a decidir se continua ou pára. Que padrão é, está bem aplicado, e o que mudava em Java 21?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É uma cadeia de responsabilidade. A intenção é permitir que um pedido percorra um conjunto de tratadores independentes até um deles decidir, sem que o chamador saiba quantos são nem quais. O que varia é o conjunto e a ordem dos tratadores; o que se mantém é o percurso e a regra de paragem.</p>
+      <p>Se estiver implementada da forma clássica — cada verificação com um campo <code>next</code> e a responsabilidade de chamar o seguinte — está mal aplicada, e diz-se porquê: cada elo tem duas responsabilidades (decidir e encaminhar), a ordem fica dispersa por seis classes em vez de estar num sítio, esquecer a chamada ao seguinte trunca a cadeia em silêncio, e não há forma de acrescentar uma verificação por configuração sem editar código existente.</p>
+      <p>Em Java 21 a mesma intenção escreve-se como uma lista de funções percorrida com um <code>Stream</code>: cada verificação é uma <code>Function&lt;Payment, Optional&lt;Rejection&gt;&gt;</code> que não conhece as outras, a ordem está declarada num único sítio, e a paragem no primeiro erro sai de graça da avaliação preguiçosa do <em>stream</em> — <code>findFirst</code> não avalia as verificações seguintes. Acrescentar uma verificação passa a ser acrescentar um elemento à lista, e testá-la é chamar uma função pura.</p>
+      <p>A crítica tem de ter limite: a versão clássica continua a ganhar quando um elo precisa de decidir <em>como</em> chamar o seguinte — envolver a chamada num <em>timeout</em>, num contexto transaccional, ou saltar dois elos. É por isso que a cadeia de <code>Filter</code> do Servlet passa o <code>FilterChain</code> ao filtro em vez de o executar por fora: um filtro tem de poder correr código antes e depois do resto da cadeia, e isso a versão com <code>Stream</code> não permite. Reconhecer essa diferença é o que distingue crítica informada de preferência de estilo.</p>
+      <figure class="listing java" id="lst-19-6"><div class="lhead"><span class="lnum">Listagem 19.6</span>
+        <span class="lcap">Cadeia de responsabilidade sem elos: ordem num sítio, paragem preguiçosa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@FunctionalInterface
+public interface Check extends Function&lt;Payment, Optional&lt;Rejection&gt;&gt; {}
+
+@Configuration
+class ChecksConfig {
+    @Bean List&lt;Check&gt; paymentChecks(Blacklist bl, LimitService limits) {
+        return List.of(                                   // a ordem vive aqui, e só aqui
+                p -&gt; p.amount().isPositive() ? Optional.empty() : Optional.of(Rejection.AMOUNT),
+                p -&gt; bl.contains(p.card())   ? Optional.of(Rejection.BLACKLISTED) : Optional.empty(),
+                p -&gt; limits.exceeds(p)       ? Optional.of(Rejection.LIMIT) : Optional.empty());
+    }
+}
+
+// paragem no primeiro erro: findFirst não avalia as verificações seguintes
+Optional&lt;Rejection&gt; firstFailure(Payment p, List&lt;Check&gt; checks) {
+    return checks.stream().map(c -&gt; c.apply(p)).flatMap(Optional::stream).findFirst();
+}</code></pre></figure></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não reconhece nada, ou nomeia um padrão errado com confiança.</td></tr>
+        <tr><td>Mid</td><td>Nomeia a cadeia de responsabilidade correctamente e pára aí.</td></tr>
+        <tr><td>Sénior</td><td>Nomeia, critica o encaminhamento manual e a ordem dispersa, e reescreve com lista de funções explicando a paragem preguiçosa.</td></tr>
+        <tr><td>Staff</td><td>Diz quando a versão clássica ganha (comportamento à volta da chamada seguinte, como nos <code>Filter</code>) e como testar a ordem.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quero recolher todos os erros em vez de parar no primeiro. O que muda?»</li>
+      <li>«Uma verificação precisa de chamar um serviço com 200 ms de latência. Reordena?»</li>
+      <li>«Como garante em teste que a ordem das verificações não muda por acidente?»</li>
+      <li>«Porque é que a cadeia de filtros do Servlet não podia usar esta forma?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não notar que a versão clássica falha em silêncio quando um elo esquece a chamada ao seguinte.</li>
+      <li>Aplicar a crítica de forma absoluta, sem reconhecer o caso em que envolver a chamada seguinte é o objectivo.</li></ul></div>
   </div>
 </div>
 
 <div class="lab" id="lab-19-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 19.1 — Rever um excerto com cinco defeitos e escrever os comentários</span>
-    <div class="labpills"><span class="qpill">5 defeitos</span><span class="qpill">25 min</span></div></div>
+  <div class="labhead"><span class="labttl">Exercício 19.1 — Da cadeia de <code>if</code>/<code>else</code> a estratégia com registo</span>
+    <div class="labpills"><span class="qpill">Alvo O(1) por despacho</span><span class="qpill">25 min</span></div></div>
   <div class="labbody">
-    <p>Enunciado, tal como o entrevistador o dá: «Este serviço corre em produção num Spring Boot 3.5, é chamado por um <em>endpoint</em> HTTP e por um <em>job</em> nocturno, com até 40 pedidos simultâneos. <code>Order</code> é uma entidade JPA e <code>getLines()</code> é uma associação <code>LAZY</code>. Tem 25 minutos: encontre os defeitos, ordene-os por severidade e escreva o comentário de revisão que deixaria no PR.» Há exactamente cinco defeitos reais — um de acesso concorrente, um de N+1, um de tratamento de erros, um de segurança e um de recurso não fechado. Restrições: não reescrever a classe, escrever comentários; para cada um indicar a linha, o mecanismo, o efeito observável em produção e a correcção. Saída esperada: cinco comentários, dos quais no máximo três bloqueantes, com decisão final de aprovar ou bloquear.</p>
-    <figure class="listing java" id="lst-19-1"><div class="lhead"><span class="lnum">Listagem 19.1</span>
-      <span class="lcap">Excerto sob revisão, com numeração de linhas para os comentários.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-      <pre class="code" data-lang="java"><code> 1  @Service
- 2  public class DailyPayoutExporter {
- 3
- 4      private static final Logger log = LoggerFactory.getLogger(DailyPayoutExporter.class);
- 5
- 6      private final OrderRepository orders;
- 7      private final JdbcTemplate jdbc;
- 8      private final FxClient fx;
- 9      private final Map&lt;String, BigDecimal&gt; rateCache = new HashMap&lt;&gt;();
-10
-11      DailyPayoutExporter(OrderRepository orders, JdbcTemplate jdbc, FxClient fx) {
-12          this.orders = orders;
-13          this.jdbc = jdbc;
-14          this.fx = fx;
-15      }
-16
-17      public File export(String merchantId, LocalDate day) {
-18          try {
-19              List&lt;Order&gt; batch = orders.findByMerchantIdAndDay(merchantId, day);
-20              String path = &quot;/var/exports/&quot; + merchantId + &quot;-&quot; + day + &quot;.csv&quot;;
-21              FileWriter out = new FileWriter(path);
-22              BigDecimal total = BigDecimal.ZERO;
-23
-24              for (Order order : batch) {
-25                  for (OrderLine line : order.getLines()) {
-26                      BigDecimal rate = rateCache.get(line.getCurrency());
-27                      if (rate == null) {
-28                          rate = fx.rateFor(line.getCurrency(), day);
-29                          rateCache.put(line.getCurrency(), rate);
-30                      }
-31                      total = total.add(line.getAmount().multiply(rate));
-32                  }
-33                  out.write(order.getId() + &quot;;&quot; + order.getTotal() + &quot;\n&quot;);
-34              }
-35              out.flush();
-36
-37              jdbc.update(&quot;UPDATE payout SET amount = &quot; + total
-38                      + &quot; WHERE merchant_id = '&quot; + merchantId + &quot;'&quot;);
-39              return new File(path);
-40
-41          } catch (Exception e) {
-42              log.warn(&quot;falhou o export de {}&quot;, merchantId);
-43              return null;
-44          }
-45      }
-46  }</code></pre></figure>
-    <h4>A sua solução</h4>
-    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
-    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
-      <button class="btn" type="button" data-clear>Limpar</button></div>
-    <div class="labsol" hidden>
-      <h4>Solução de referência</h4>
-      <figure class="listing text" id="lst-19-2"><div class="lhead"><span class="lnum">Listagem 19.2</span>
-        <span class="lcap">Os cinco comentários de revisão, por ordem de severidade.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="text"><code>[BLOQUEANTE] linha 38 — injecção de SQL em merchant_id
-    merchantId vem do pedido HTTP e é concatenado na query. Um valor como
-    x' OR '1'='1 actualiza o montante de todos os comerciantes; a coluna amount
-    também entra por concatenação, o que quebra com locale decimal diferente.
-    Correcção: jdbc.update("UPDATE payout SET amount = ? WHERE merchant_id = ?",
-    total, merchantId). Se algum dia for preciso ordenar por coluna dinâmica,
-    essa parte não é parametrizável: valida-se contra uma lista branca.
+    <p>O método abaixo calcula a comissão de uma transacção e cresceu para 6 ramos em 18 meses; dois deles foram acrescentados por equipas diferentes e um está duplicado noutro serviço. O exercício: refactorizar para uma estratégia com selecção em tempo constante, garantindo que (1) um método de pagamento sem política falha no arranque da aplicação e não no primeiro pedido, (2) o código chamador não muda, (3) as políticas continuam testáveis sem contexto de Spring. No fim, argumentar quando <em>não</em> valeria a pena fazer esta refactorização. Entrada: <code>method = "CARD_CREDIT"</code>, <code>amount = 250,00 EUR</code>; saída esperada: <code>3,13 EUR</code> (1,25%).</p>
+    <figure class="listing java" id="lst-19-7"><div class="lhead"><span class="lnum">Listagem 19.7</span>
+      <span class="lcap">Código de partida: a decisão repete-se e cresce a cada método de pagamento novo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="java"><code>@Service
+public class FeeService {
 
-[BLOQUEANTE] linha 9 (uso nas 26-29) — HashMap partilhado num bean singleton
-    O serviço é singleton e é chamado por HTTP e pelo job nocturno em paralelo
-    (até 40 threads). HashMap não é seguro para acesso concorrente: entradas
-    perdidas, leituras de estado meio-construído e, em rehash simultâneo,
-    ciclos infinitos que aparecem como uma thread a 100% de CPU sem stack
-    de erro. Além disso a cache não tem expiração — a taxa de câmbio de
-    ontem serve o export de hoje. Correcção: cache por invocação (variável
-    local), ou ConcurrentHashMap com chave (moeda, dia) e computeIfAbsent,
-    ou Caffeine com TTL de algumas horas e limite de tamanho.
-
-[BLOQUEANTE] linhas 41-43 — catch(Exception) que engole e devolve null
-    Apanha tudo — IOException, DataAccessException, NullPointerException —,
-    perde a stack (o log não recebe a excepção) e devolve null, que rebenta
-    no chamador com um NPE a 20 quadros de distância do problema real.
-    Também apanha o que não devia ser apanhado aqui, e um export parcial
-    é dado como falha silenciosa: o ficheiro fica meio escrito no disco.
-    Correcção: log.error("falhou o export de {} em {}", merchantId, day, e)
-    e propagar uma ExportFailedException com a causa, ou não apanhar de todo
-    e deixar o @ControllerAdvice/o job tratar a falha e reagendar.
-
-[não-bloqueante] linha 21 — FileWriter nunca fechado
-    Só há flush(); o descritor fica aberto até o GC correr o finalizador, se
-    correr. Num job diário com centenas de comerciantes chega-se a "Too many
-    open files" e o processo deixa de aceitar ligações. Se houver excepção
-    a meio, nem o flush acontece. Correcção: try-com-recursos com
-    BufferedWriter e charset explícito — Files.newBufferedWriter(Path.of(path),
-    StandardCharsets.UTF_8) — e escrever para ficheiro temporário com
-    move atómico no fim, para não deixar CSV truncado visível.
-
-[não-bloqueante] linha 25 — N+1 na associação LAZY
-    findByMerchantIdAndDay traz N encomendas; order.getLines() dispara uma
-    query por encomenda. Com 5 000 encomendas são 5 001 idas à base de dados;
-    a 0,4 ms de ida e volta são ~2 s só de latência de rede, e o job cresce
-    linearmente com o comerciante. Correcção: @EntityGraph ou
-    "select distinct o from Order o join fetch o.lines where ..." numa só
-    query, ou @BatchSize(size = 100) se a projecção completa for pesada.
-    Nota: isto é anterior a este PR — proponho issue separado, não bloqueia.
-
-Decisão: bloqueio o PR pelos três primeiros. Os outros dois entram como
-follow-up, sendo que o do FileWriter só não é bloqueante porque o job corre
-uma vez por dia; se este caminho passar a ser chamado por HTTP, sobe.</code></pre></figure>
-      <figure class="listing java" id="lst-19-3"><div class="lhead"><span class="lnum">Listagem 19.3</span>
-        <span class="lcap">Versão corrigida: cache local, uma query, recurso fechado, erro propagado com causa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>@Service
-public class DailyPayoutExporter {
-
-    private static final Logger log = LoggerFactory.getLogger(DailyPayoutExporter.class);
-
-    private final OrderRepository orders;
-    private final JdbcTemplate jdbc;
-    private final FxClient fx;
-
-    DailyPayoutExporter(OrderRepository orders, JdbcTemplate jdbc, FxClient fx) {
-        this.orders = orders;
-        this.jdbc = jdbc;
-        this.fx = fx;
-    }
-
-    public Path export(String merchantId, LocalDate day) {
-        // sem estado partilhado: a cache vive na invocação
-        Map&lt;String, BigDecimal&gt; rates = new HashMap&lt;&gt;();
-        // uma só query: @EntityGraph(attributePaths = &quot;lines&quot;) no repositório
-        List&lt;Order&gt; batch = orders.findByMerchantIdAndDayWithLines(merchantId, day);
-
-        Path target = Path.of(&quot;/var/exports&quot;, merchantId + &quot;-&quot; + day + &quot;.csv&quot;);
-        Path tmp = target.resolveSibling(target.getFileName() + &quot;.tmp&quot;);
-        BigDecimal total = BigDecimal.ZERO;
-
-        try (BufferedWriter out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
-            for (Order order : batch) {
-                for (OrderLine line : order.getLines()) {
-                    BigDecimal rate = rates.computeIfAbsent(
-                            line.getCurrency(), c -&gt; fx.rateFor(c, day));
-                    total = total.add(line.getAmount().multiply(rate));
-                }
-                out.write(order.getId() + &quot;;&quot; + order.getTotal());
-                out.newLine();
-            }
-        } catch (IOException e) {
-            throw new ExportFailedException(merchantId, day, e);   // com causa
+    public Money fee(String method, Money amount) {
+        if (method.equals("CARD_DEBIT")) {
+            return Money.eur("0.35");
+        } else if (method.equals("CARD_CREDIT")) {
+            return amount.times("0.0125");
+        } else if (method.equals("SEPA_CT")) {
+            return Money.eur("0.20");
+        } else if (method.equals("SEPA_DD")) {
+            return amount.times("0.0040").plus(Money.eur("0.10"));
+        } else if (method.equals("WALLET")) {
+            return amount.times("0.0180");
+        } else if (method.equals("VOUCHER")) {
+            return Money.ZERO_EUR;
         }
-
-        jdbc.update(&quot;UPDATE payout SET amount = ? WHERE merchant_id = ?&quot;,
-                total.setScale(2, RoundingMode.HALF_UP), merchantId);
-
-        try {
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            throw new ExportFailedException(merchantId, day, e);
-        }
-        log.info(&quot;export de {} em {}: {} encomendas, total {}&quot;,
-                merchantId, day, batch.size(), total);
-        return target;
-    }
-}</code></pre></figure>
-      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
-      <ul class="lst">
-        <li>Custo antes e depois: de 1 + N <em>queries</em> para 1; com 5 000 encomendas e 0,4 ms de ida e volta, cerca de 2 s de latência de rede desaparecem do <em>job</em>.</li>
-        <li>A ordem dos comentários é metade da nota. Injecção de SQL, corrupção de estado e falha silenciosa antes de recursos e desempenho.</li>
-        <li>O candidato tem de dizer o efeito observável, não a categoria: «uma <em>thread</em> a 100% de CPU sem <em>stack</em>» pontua muito acima de «não é <em>thread-safe</em>».</li>
-        <li>Ponto de bónus, não é um dos cinco: o método escreve o ficheiro e actualiza a base de dados sem atomicidade entre os dois. Se o <code>UPDATE</code> falhar, o CSV já existe. A escrita para ficheiro temporário com <code>ATOMIC_MOVE</code> reduz a janela, mas a observação correcta é que a operação precisa de ser idempotente e repetível.</li>
-        <li>Casos limite a mencionar: <code>batch</code> vazio (ficheiro com zero linhas ainda deve ser produzido?), moeda sem taxa (o <code>computeIfAbsent</code> propaga a excepção do <code>FxClient</code>), <em>charset</em> por omissão do sistema a corromper acentos, e escala decimal antes de escrever no <code>payout</code>.</li>
-        <li>Sinal negativo forte: sugerir <code>synchronized</code> no método <code>export</code> para resolver a cache — serializa o <em>job</em> inteiro e mantém a cache sem expiração.</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-<h2 id="sec-19-3" class="h2"><span class="secnum">19.3</span> Cheiros de código e o refactoring correspondente<a class="anchor" href="#sec-19-3" aria-label="ligação">#</a></h2>
-
-<p>Um cheiro de código não é um defeito: é um sintoma que sugere um problema de desenho e que tem, quase sempre, um refactoring canónico associado. O valor de conhecer o catálogo em entrevista está na precisão do vocabulário — dizer «isto é inveja de dados: o método usa cinco <em>getters</em> de <code>Invoice</code> e nenhum campo próprio, o cálculo pertence a <code>Invoice</code>» é uma frase de sénior; «isto está confuso» não é.</p>
-
-<p>Os cheiros que aparecem com mais frequência em código Java empresarial são cinco. Método longo e classe-deus, quase sempre um serviço de aplicação que cresceu por acreção. Domínio anémico com <em>script</em> de transacção, em que as entidades são estruturas de dados e toda a regra vive em <code>XxxServiceImpl</code>. Obsessão por primitivos, com <code>String</code> a representar identificadores, moedas e estados. Argumento-bandeira, o <code>boolean</code> que muda o comportamento do método. E acoplamento temporal, quando <code>b()</code> só funciona se <code>a()</code> tiver sido chamado antes, o que nenhuma assinatura revela.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.1</span> Cheiros frequentes em serviços Java, sinal mensurável e refactoring canónico.</div>
-<div class="tscroll"><table><thead><tr><th>Cheiro</th><th>Sinal mensurável</th><th>Refactoring</th><th>Quando não vale a pena</th></tr></thead><tbody>
-<tr><td>Método longo</td><td>&gt; 50 linhas, complexidade ciclomática &gt; 10</td><td>Extrair método com nome de intenção; substituir condicional por polimorfismo</td><td>Método gerado ou <em>mapper</em> linear sem ramos</td></tr>
-<tr><td>Classe-deus</td><td>&gt; 700 linhas, &gt; 12 dependências injectadas</td><td>Extrair classe por caso de uso; separar leitura de escrita</td><td>Classe estável há dois anos e sem alterações previstas</td></tr>
-<tr><td>Domínio anémico</td><td>Entidades só com <em>getters</em>/<em>setters</em>; regras repetidas em 3+ serviços</td><td>Mover comportamento para a entidade; objectos-valor</td><td>Serviço que é só CRUD sobre um formulário</td></tr>
-<tr><td>Obsessão por primitivos</td><td><code>String</code> ou <code>BigDecimal</code> nu em assinaturas de negócio</td><td><code>record</code> como objecto-valor com validação no construtor compacto</td><td>Fronteira de API onde o tipo primitivo é o contrato</td></tr>
-<tr><td>Argumento-bandeira</td><td><code>boolean</code> em parâmetro; <code>if (flag)</code> logo na primeira linha</td><td>Dois métodos com nomes de intenção, ou <em>enum</em> de estratégia</td><td>Bandeira de compatibilidade temporária com data de remoção</td></tr>
-<tr><td>Acoplamento temporal</td><td>Ordem obrigatória de chamadas não expressa em tipos</td><td>Construtor completo, <em>builder</em>, ou tipos de estado distintos</td><td>Protocolo imposto por biblioteca externa</td></tr>
-<tr><td>Cirurgia com caçadeira</td><td>1 alteração de regra toca em 6+ ficheiros</td><td>Reunir a regra num só módulo; inverter a dependência</td><td>Alteração transversal genuína (versão de biblioteca)</td></tr>
-</tbody></table></div></div>
-
-<p>O argumento-bandeira merece o exemplo, porque é o mais fácil de reconhecer numa entrevista e o mais barato de corrigir. Um <code>boolean</code> no meio da lista de parâmetros é ilegível no local de chamada — <code>process(order, true, false)</code> não diz nada — e obriga o corpo a conter dois métodos entrelaçados.</p>
-
-<figure class="listing java" id="lst-19-4"><div class="lhead"><span class="lnum">Listagem 19.4</span>
-<span class="lcap">Argumento-bandeira substituído por intenção explícita; a lógica comum fica privada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// antes: o local de chamada não se lê — refunds.issue(order, true, false)
-public Refund issue(Order order, boolean partial, boolean notifyCustomer) { ... }
-
-// depois: dois nomes de intenção e um objecto-valor para o montante
-public Refund issueFull(OrderId orderId)                    { return issue(orderId, Money.of(order.total())); }
-public Refund issuePartial(OrderId orderId, Money amount)   { return issue(orderId, amount); }
-
-private Refund issue(OrderId orderId, Money amount) { ... }   // regra única, testada uma vez
-
-// a notificação sai do parâmetro e passa a consequência de um facto de negócio
-// (RefundIssued publicado depois do commit; quem quer notificar, subscreve)</code></pre></figure>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Refactorizar em PRs separados dos de funcionalidade dá revisões limpas e histórico legível, mas produz PRs que ninguém tem urgência em rever e que apodrecem em conflito de <em>merge</em> — um refactoring de 600 linhas parado três dias contra um ficheiro activo custa mais a reconciliar do que valeu. Refactorizar no mesmo PR da funcionalidade garante que entra, mas esconde a alteração de comportamento dentro do ruído e torna o <em>revert</em> impossível de fazer cirurgicamente. A convenção que funciona: refactoring primeiro, em PR próprio, pequeno (&lt; 200 linhas), fundido no mesmo dia; a funcionalidade segue em cima. Quando o refactoring só se torna evidente a meio da funcionalidade, faz-se o <em>commit</em> separado dentro do mesmo PR e assinala-se na descrição qual é qual.</p></aside>
-
-<div class="qa" id="q-19-5" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Herda um <code>OrderServiceImpl</code> com 1 400 linhas, 14 dependências injectadas e um método <code>process</code> de 300. Como o desmonta sem parar as entregas da equipa?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não se desmonta a classe: desmontam-se os casos de uso que a atravessam, e só os que estão a ser tocados. A ordem é medir, isolar, extrair por caso de uso, e deixar a classe original a delegar até ficar vazia.</p>
-      <p>Medir primeiro significa saber que partes do método são realmente exercitadas e alteradas. <code>git log</code> por <em>hunk</em> mostra que, tipicamente, 80% das alterações dos últimos seis meses concentram-se em duas ou três regiões do método; essas são as que valem refactoring, o resto pode ficar como está durante anos sem custo. Refactorizar código estável é trabalho sem retorno.</p>
-      <p>Isolar é criar a rede: testes de caracterização sobre o comportamento observável de <code>process</code>, escritos a partir da execução real (ver a secção seguinte), antes de mexer numa linha. Sem eles, qualquer extracção é uma aposta, porque uma classe destas tem sempre um efeito lateral que ninguém documentou.</p>
-      <p>Extrair faz-se por caso de uso e não por camada: <code>PlaceOrder</code>, <code>CancelOrder</code>, <code>ApplyDiscount</code>, cada um com as duas ou três dependências de que precisa — o que resolve as 14 injecções, porque nenhum caso de uso precisa de todas. A classe antiga passa a fachada que delega, e é removida quando o último chamador migrar. Esta é a forma local do <em>strangler fig</em>: os dois caminhos coexistem, o novo cresce, o antigo é apagado quando estiver morto.</p>
-      <p>Quanto ao ritmo: um orçamento fixo (por exemplo, 15% da capacidade do <em>sprint</em>, ou a regra do escuteiro — o ficheiro que se toca sai melhor do que entrou) sustenta-se durante meses; um «<em>sprint</em> de limpeza» é aprovado uma vez, produz um PR gigante e nunca mais é aprovado.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Reescrevia a classe do zero» sem testes, sem migração e sem estimativa.</td></tr>
-        <tr><td>Mid</td><td>Extrai métodos privados dentro da mesma classe; o ficheiro continua com 1 400 linhas e 14 dependências.</td></tr>
-        <tr><td>Sénior</td><td>Testes de caracterização primeiro, extracção por caso de uso, fachada a delegar, orçamento contínuo em vez de <em>sprint</em> dedicado.</td></tr>
-        <tr><td>Staff</td><td>Usa dados de alteração para escolher onde investir, define a condição de fim («classe removida quando o último chamador migrar») e mede o efeito (tempo de <em>lead</em>, defeitos naquele módulo).</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como sabe que a extracção não mudou comportamento?»</li>
-      <li>«Que faz com a região do método que ninguém toca há três anos?»</li>
-      <li>«Quem revê um PR de refactoring de 800 linhas?»</li>
-      <li>«E se a classe for chamada por outro serviço através de uma biblioteca partilhada?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Refactorizar sem rede de testes e chamar-lhe «limpeza segura».</li>
-      <li>Extrair por camada técnica (<code>Validator</code>, <code>Helper</code>, <code>Utils</code>) em vez de por caso de uso.</li>
-      <li>Não ter critério de fim: o refactoring fica a meio e a base fica com dois estilos.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-19-6" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Explique o padrão <em>strangler fig</em> aplicado a um monólito de facturação e diga em que condições reescrever de raiz passa a ser a decisão certa.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O <em>strangler fig</em> põe uma fachada à frente do sistema antigo e desvia funcionalidade para o novo, uma fatia de cada vez, até o antigo poder ser desligado. Em facturação, a fachada é normalmente o <em>gateway</em> HTTP ou um <em>router</em> aplicacional que decide por rota e por atributo: «emissão de facturas de subscrições novas vai para o serviço novo; tudo o resto continua no monólito». Cada fatia tem três fases — escrita paralela (o novo processa e compara sem publicar resultado), leitura desviada, e remoção do caminho antigo — e cada fase tem um interruptor de retorno em segundos.</p>
-      <p>A vantagem não é técnica, é económica: entrega valor ao fim de semanas em vez de trimestres, e o risco de cada passo é limitado ao que se desviou. O custo é real e tem de ser dito: durante meses existem dois sistemas, dois modelos de dados a sincronizar, testes de comparação e regras duplicadas — a equipa paga uma sobrecarga de coordenação que pode chegar a 20 ou 30% da capacidade enquanto durar.</p>
-      <p>A reescrita de raiz passa a ser a escolha certa em condições estreitas e verificáveis: quando o sistema antigo não pode ser executado nem testado (sem construção reprodutível, dependências extintas), quando a plataforma está fora de suporte com risco de segurança e sem caminho de actualização, quando o domínio mudou tanto que menos de um terço das regras antigas sobrevive, ou quando o sistema é pequeno o suficiente para caber em semanas — a fronteira empírica anda pelas poucas dezenas de milhares de linhas com um comportamento bem especificado.</p>
-      <p>A condição que torna qualquer reescrita defensável é a existência de uma especificação executável: ou testes de caracterização sobre o antigo, ou tráfego real que se possa repetir contra os dois em paralelo. Sem isso, a reescrita reimplanta os defeitos conhecidos e perde os comportamentos não documentados de que alguém depende — e é assim que se chega ao segundo ano de um projecto de seis meses.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Defende reescrita porque «o código é mau»; sem plano de migração de dados nem de retorno.</td></tr>
-        <tr><td>Mid</td><td>Descreve o padrão correctamente mas não menciona o custo dos dois sistemas em paralelo nem o critério de fim.</td></tr>
-        <tr><td>Sénior</td><td>Fatia por fluxo com fachada, escrita paralela e comparação, interruptor de retorno, e reconhece a sobrecarga de coordenação.</td></tr>
-        <tr><td>Staff</td><td>Enuncia as condições verificáveis em que a reescrita ganha, quantifica o custo das duas opções e define quem decide e com que dados.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como sincroniza os dados enquanto os dois sistemas coexistem?»</li>
-      <li>«Como compara os resultados dos dois sem duplicar efeitos externos?»</li>
-      <li>«O que faz quando 90% está migrado e os últimos 10% são o mais difícil?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não ter critério de desligar o sistema antigo — a migração fica permanente.</li>
-      <li>Ignorar que a escrita paralela pode duplicar efeitos externos (emails, cobranças).</li>
-      <li>Justificar a reescrita com preferência de <em>stack</em> em vez de risco ou custo.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-19-4" class="h2"><span class="secnum">19.4</span> Refactorizar com rede: testes de caracterização<a class="anchor" href="#sec-19-4" aria-label="ligação">#</a></h2>
-
-<p>Um teste de caracterização não verifica o que o código <em>devia</em> fazer: regista o que ele <em>faz</em>, defeitos incluídos. Escreve-se ao contrário de um teste normal — invoca-se o código com uma entrada, observa-se o resultado, e escreve-se a asserção com esse valor. Se a asserção falhar mais tarde, o refactoring mudou comportamento; se o comportamento registado for errado, corrige-se depois, num <em>commit</em> separado e visível, que é precisamente o valor do método: torna cada alteração de comportamento numa decisão explícita em vez de um acidente.</p>
-
-<p>A cobertura destes testes constrói-se pelo espaço de entrada, não pelas linhas. Numa função com dois países, dois escalões de peso, dois níveis de serviço e duas categorias de cliente, o produto cartesiano são 16 casos, aos quais se acrescentam os valores de fronteira (exactamente 2 000 g, exactamente 50,00 €) e os degenerados (nulo, zero, negativo). Gerar a tabela uma vez com o código antigo, fixá-la no repositório e passar a compará-la é a técnica de <em>golden master</em>; para saídas grandes — um CSV, um JSON, um PDF — compara-se um resumo estável, por exemplo o <em>hash</em> da saída normalizada, com as partes voláteis (datas, identificadores gerados) substituídas.</p>
-
-<p>A cobertura de linhas não é medida suficiente para confiar na rede. O que valida um teste de caracterização é o teste de mutação: uma ferramenta como o PIT altera operadores e condições no código antigo e verifica se algum teste falha. Uma rede com 90% de cobertura de linhas e 40% de mutantes mortos não protege o refactoring; abaixo de 70 a 80% de mutantes mortos nas regiões que se vão tocar, vale mais gastar meia hora a acrescentar casos do que começar a mexer.</p>
-
-<p>Quando o código não é testável no ponto em que é preciso mexer — <code>new</code> a meio do método, <code>static</code>, <code>LocalDate.now()</code>, leitura directa do sistema de ficheiros — cria-se um <em>seam</em>, o ponto mínimo onde se pode substituir comportamento sem alterar a lógica: extrair o método e sobrepô-lo numa subclasse de teste, promover o objecto criado a parâmetro, injectar um <code>Clock</code> em vez de chamar <code>now()</code>. A regra é que a criação do <em>seam</em> vai num <em>commit</em> só, sem qualquer alteração de comportamento, e é revista como tal.</p>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Testes de caracterização escritos com <em>mocks</em> de tudo deixam de testar comportamento e passam a testar a implementação: verificam que <code>repository.save()</code> foi chamado duas vezes, e depois falham em massa no primeiro refactoring, que é exactamente quando deviam ajudar. A rede tem de ser feita sobre entradas e saídas observáveis — valor devolvido, linhas na base de dados, mensagem publicada, ficheiro escrito — com o mínimo de duplos possível, tipicamente só nas fronteiras externas de rede. Um teste que só quebra quando o comportamento muda é rede; um que quebra sempre que a estrutura muda é lastro.</p></aside>
-
-<div class="qa" id="q-19-7" data-box="qa" data-area="testes" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O que é um teste de caracterização e em que difere de um teste unitário normal? Quando é que o apaga?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A diferença está na origem da asserção. Num teste unitário, o valor esperado vem da especificação: sabe-se qual é a regra e escreve-se o resultado correcto. Num teste de caracterização, o valor esperado vem da execução do código actual: regista-se o que o sistema faz hoje, incluindo comportamentos que ninguém queria, porque alguém a jusante pode já depender deles.</p>
-      <p>Consequências práticas. Primeira: um teste de caracterização que falha durante um refactoring não significa que o código novo está errado — significa que o comportamento mudou, e é preciso decidir se a mudança é intencional. Segunda: quando se descobre que o comportamento registado é um defeito, corrige-se com dois <em>commits</em>, um que muda a asserção com justificação e outro que muda o código; assim o histórico mostra a decisão. Terceira: estes testes documentam-se como tal, com nome explícito, para que ninguém os leia como especificação de negócio.</p>
-      <p>Apagam-se em dois momentos. Quando a região que protegiam foi refactorizada e passou a ter testes escritos a partir da regra real de negócio — aí a rede é substituída, não acumulada. E quando o comportamento registado foi deliberadamente removido, por exemplo porque se decidiu que arredondar para baixo era um defeito. O que não se faz é manter para sempre duzentos casos gerados que ninguém entende e que travam qualquer alteração legítima: isso troca dívida de código por dívida de testes, e a segunda é mais difícil de eliminar porque parece qualidade.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Confunde com teste de integração ou com teste de regressão genérico.</td></tr>
-        <tr><td>Mid</td><td>Define correctamente mas não distingue a origem da asserção nem o que fazer quando o comportamento registado é um defeito.</td></tr>
-        <tr><td>Sénior</td><td>Explica a inversão (asserção vinda da execução), o fluxo de dois <em>commits</em> e o critério de remoção.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta como valida a rede (teste de mutação, produto cartesiano de entradas) e trata os testes como activo com custo de manutenção.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como caracteriza um método que devolve <code>void</code> e escreve na base de dados?»</li>
-      <li>«E se a saída contiver a data actual ou um UUID gerado?»</li>
-      <li>«Como sabe que a rede é suficiente antes de começar?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Escrever a asserção com o valor que «devia» sair e ficar com o teste vermelho desde o início.</li>
-      <li>Caracterizar com <em>mocks</em> de tudo, verificando chamadas em vez de resultados.</li>
-      <li>Nunca remover a rede, deixando testes que impedem alterações legítimas.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-19-8" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Testes e qualidade</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O método que tem de alterar cria dependências com <code>new</code> lá dentro, chama um <em>singleton</em> estático e usa <code>LocalDate.now()</code>. Como o põe sob teste sem o refactorizar primeiro?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Cria-se um <em>seam</em>: o ponto mínimo onde se substitui comportamento sem alterar lógica. Há três formas, por ordem crescente de invasividade.</p>
-      <ul class="lst">
-        <li><em>Seam</em> de objecto: extrair a criação para um método protegido — <code>protected PdfRenderer newRenderer()</code> — e sobrepô-lo numa subclasse usada só no teste. Não muda uma linha de lógica e permite testar o método imediatamente.</li>
-        <li><em>Seam</em> de parâmetro: acrescentar uma sobrecarga que recebe a dependência, mantendo o método original a delegar com o valor por omissão. Compatível com todos os chamadores existentes.</li>
-        <li>Injecção verdadeira: passar a dependência ao construtor. É o destino final, mas obriga a tocar em todos os pontos de construção — faz-se depois de haver testes, não antes.</li>
-      </ul>
-      <p>Para o tempo, o caminho é <code>java.time.Clock</code>: substituir <code>LocalDate.now()</code> por <code>LocalDate.now(clock)</code> e injectar <code>Clock.systemUTC()</code> em produção e <code>Clock.fixed(...)</code> no teste. É a única forma de testar regras de fim de mês, mudança de ano e fusos sem depender do calendário da máquina de <em>build</em> — e evita o teste que só falha a 31 de Dezembro.</p>
-      <p>Para o estático, a ordem de preferência é: envolver numa interface fina e injectá-la; se não for possível hoje, usar o mecanismo de substituição de estáticos do Mockito, aceitando que é uma solução temporária que fixa a implementação. Nunca é a primeira escolha, porque um teste que mocka estáticos morre no próximo refactoring.</p>
-      <p>A disciplina que o entrevistador procura: cada um destes passos vai num <em>commit</em> próprio, sem alteração de comportamento, revisto como «criação de <em>seam</em>». A alteração funcional entra a seguir, com o teste já lá.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Não dá para testar»; ou mocka tudo com substituição de estáticos como primeira opção.</td></tr>
-        <tr><td>Mid</td><td>Propõe injecção por construtor sem notar que isso obriga a mexer em todos os chamadores antes de ter rede.</td></tr>
-        <tr><td>Sénior</td><td>Conhece os vários tipos de <em>seam</em>, escolhe o menos invasivo primeiro, usa <code>Clock</code> para o tempo, separa <em>commits</em>.</td></tr>
-        <tr><td>Staff</td><td>Enquadra os <em>seams</em> como passo temporário com plano de remoção e discute o custo de manter testes acoplados à implementação.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se a classe for <code>final</code> e os métodos também?»</li>
-      <li>«Como testa código que depende do sistema de ficheiros?»</li>
-      <li>«Quando é que um teste de integração com Testcontainers é a resposta mais barata?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tornar campos públicos ou métodos <code>public</code> só para o teste lhes aceder.</li>
-      <li>Depender da data do sistema no teste e chamar-lhe intermitência.</li>
-      <li>Misturar criação de <em>seam</em> e alteração funcional no mesmo <em>commit</em>.</li></ul></div>
-  </div>
-</div>
-
-<div class="lab" id="lab-19-2" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 19.2 — Refactorizar com testes de caracterização</span>
-    <div class="labpills"><span class="qpill">Comportamento invariante</span><span class="qpill">30 min</span></div></div>
-  <div class="labbody">
-    <p>Enunciado: o cálculo de portes abaixo está em produção há quatro anos, é chamado em quatro sítios e não tem um único teste. É preciso acrescentar uma terceira zona de envio na semana que vem. Em 30 minutos: (1) escrever os testes de caracterização que fixam o comportamento actual, incluindo as fronteiras e as combinações que parecem erradas; (2) refactorizar para uma estrutura que aceite uma nova zona sem tocar na lógica existente, sem alterar nenhum resultado. Restrições: nenhuma saída pode mudar, nem sequer as que parecem defeitos; o refactoring e a correcção de comportamento não podem ir no mesmo <em>commit</em>. Exemplo de entrada e saída a preservar: encomenda de 1 800 g para PT, expresso, cliente aderente, total 60,00 € — o resultado actual é 8,58 € e não zero, porque a regra de portes grátis só se aplica a envio normal.</p>
-    <figure class="listing java" id="lst-19-5"><div class="lhead"><span class="lnum">Listagem 19.5</span>
-      <span class="lcap">Código legado a refactorizar: bandeiras booleanas e regras por ordem implícita.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-      <pre class="code" data-lang="java"><code>public class ShippingCalculator {
-
-    public BigDecimal calculate(Order order, String country,
-                                boolean express, boolean member) {
-        BigDecimal price;
-        if (country.equals(&quot;PT&quot;) || country.equals(&quot;ES&quot;)) {
-            price = new BigDecimal(&quot;4.90&quot;);
-            if (order.weightGrams() &gt; 2000) price = price.add(new BigDecimal(&quot;3.10&quot;));
-            if (express) price = price.multiply(new BigDecimal(&quot;1.75&quot;));
-        } else {
-            price = new BigDecimal(&quot;12.50&quot;);
-            if (order.weightGrams() &gt; 2000) price = price.add(new BigDecimal(&quot;6.40&quot;));
-            if (express) price = price.multiply(new BigDecimal(&quot;2.10&quot;));
-        }
-        if (member &amp;&amp; !express) price = price.subtract(new BigDecimal(&quot;1.00&quot;));
-        if (!express &amp;&amp; order.total().compareTo(new BigDecimal(&quot;50.00&quot;)) &gt;= 0) {
-            price = BigDecimal.ZERO;
-        }
-        if (price.compareTo(BigDecimal.ZERO) &lt; 0) price = BigDecimal.ZERO;
-        return price.setScale(2, RoundingMode.HALF_UP);
+        return amount.times("0.0200");   // e este ramo silencioso cobra 2% ao que ninguém previu
     }
 }</code></pre></figure>
     <h4>A sua solução</h4>
@@ -536,241 +717,108 @@ private Refund issue(OrderId orderId, Money amount) { ... }   // regra única, t
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-19-6"><div class="lhead"><span class="lnum">Listagem 19.6</span>
-        <span class="lcap">Rede primeiro: produto cartesiano gerado, tabela fixada e comparada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>class ShippingCalculatorCharacterizationTest {
-
-    private final ShippingCalculator calc = new ShippingCalculator();
-
-    // 1) gerar uma vez com o código legado e colar o resultado como tabela fixa.
-    //    Depois disto o gerador NÃO volta a correr: a tabela é a especificação.
-    static Stream&lt;Arguments&gt; cases() {
-        return Stream.of(
-            //        país   gramas  expresso  aderente  total     esperado
-            arguments(&quot;PT&quot;,  1000,   false,    false,    &quot;10.00&quot;,  &quot;4.90&quot;),
-            arguments(&quot;PT&quot;,  1000,   false,    true,     &quot;10.00&quot;,  &quot;3.90&quot;),
-            arguments(&quot;PT&quot;,  2000,   false,    false,    &quot;10.00&quot;,  &quot;4.90&quot;),  // fronteira: &gt; 2000
-            arguments(&quot;PT&quot;,  2001,   false,    false,    &quot;10.00&quot;,  &quot;8.00&quot;),
-            arguments(&quot;PT&quot;,  1800,   true,     true,     &quot;60.00&quot;,  &quot;8.58&quot;),  // grátis não se aplica
-            arguments(&quot;PT&quot;,  1800,   false,    true,     &quot;50.00&quot;,  &quot;0.00&quot;),  // fronteira: &gt;= 50
-            arguments(&quot;PT&quot;,  1800,   false,    true,     &quot;49.99&quot;,  &quot;3.90&quot;),
-            arguments(&quot;ES&quot;,  3000,   true,     false,    &quot;10.00&quot;,  &quot;14.00&quot;),
-            arguments(&quot;FR&quot;,  1000,   false,    false,    &quot;10.00&quot;,  &quot;12.50&quot;),
-            arguments(&quot;FR&quot;,  2500,   true,     true,     &quot;10.00&quot;,  &quot;39.69&quot;),
-            arguments(&quot;US&quot;,  500,    false,    true,     &quot;100.00&quot;, &quot;0.00&quot;));
-    }
-
-    @ParameterizedTest(name = &quot;{0} {1}g expresso={2} aderente={3} total={4} -&gt; {5}&quot;)
-    @MethodSource(&quot;cases&quot;)
-    void caracteriza(String country, int grams, boolean express,
-                     boolean member, String total, String expected) {
-        Order order = new Order(grams, new BigDecimal(total));
-
-        BigDecimal actual = calc.calculate(order, country, express, member);
-
-        assertThat(actual).isEqualByComparingTo(new BigDecimal(expected));
-        assertThat(actual.scale()).isEqualTo(2);           // a escala faz parte do contrato
-    }
-
-    // 2) invariante que sobrevive ao refactoring e apanha o que a tabela não cobre
-    @Property(tries = 500)
-    void nuncaNegativoENuncaMaisDeDuasCasas(@ForAll @IntRange(min = 0, max = 30_000) int grams,
-                                            @ForAll boolean express, @ForAll boolean member) {
-        BigDecimal p = calc.calculate(new Order(grams, new BigDecimal(&quot;10.00&quot;)),
-                                      &quot;PT&quot;, express, member);
-        assertThat(p).isGreaterThanOrEqualTo(BigDecimal.ZERO);
-        assertThat(p.scale()).isEqualTo(2);
-    }
-}</code></pre></figure>
-      <figure class="listing java" id="lst-19-7"><div class="lhead"><span class="lnum">Listagem 19.7</span>
-        <span class="lcap">Refactoring com comportamento idêntico: zona como dado, bandeiras substituídas por tipos, ordem das regras explícita.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>public enum ShippingZone {
-    DOMESTIC(new BigDecimal(&quot;4.90&quot;), new BigDecimal(&quot;3.10&quot;), new BigDecimal(&quot;1.75&quot;)),
-    INTERNATIONAL(new BigDecimal(&quot;12.50&quot;), new BigDecimal(&quot;6.40&quot;), new BigDecimal(&quot;2.10&quot;));
-    // acrescentar uma zona é uma linha aqui + uma entrada no mapa de países
-
-    private static final Set&lt;String&gt; DOMESTIC_COUNTRIES = Set.of(&quot;PT&quot;, &quot;ES&quot;);
-
-    final BigDecimal base, heavySurcharge, expressFactor;
-
-    ShippingZone(BigDecimal base, BigDecimal heavySurcharge, BigDecimal expressFactor) {
-        this.base = base; this.heavySurcharge = heavySurcharge; this.expressFactor = expressFactor;
-    }
-
-    static ShippingZone of(String country) {
-        return DOMESTIC_COUNTRIES.contains(country) ? DOMESTIC : INTERNATIONAL;
-    }
+      <figure class="listing java" id="lst-19-8"><div class="lhead"><span class="lnum">Listagem 19.8</span>
+        <span class="lcap">Estratégia com registo imutável, validação de cobertura no arranque e fallback explícito.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public interface FeePolicy {
+    PaymentMethod method();
+    Money fee(Money amount);
 }
 
-public enum ShippingSpeed { STANDARD, EXPRESS }
-
-public record ShippingRequest(String country, int weightGrams, BigDecimal orderTotal,
-                              ShippingSpeed speed, boolean loyaltyMember) {
-
-    boolean isExpress()  { return speed == ShippingSpeed.EXPRESS; }
-    boolean isHeavy()    { return weightGrams &gt; HEAVY_THRESHOLD_GRAMS; }
+// políticas simples: sem dependências, testáveis com new, uma linha cada
+public record FlatFee(PaymentMethod method, Money flat) implements FeePolicy {
+    public Money fee(Money amount) { return flat; }
 }
 
-public class ShippingCalculator {
+public record PercentFee(PaymentMethod method, BigDecimal rate) implements FeePolicy {
+    public PercentFee {                                   // invariante no sítio certo
+        if (rate.signum() &lt; 0 || rate.compareTo(new BigDecimal("0.05")) &gt; 0)
+            throw new IllegalArgumentException("taxa fora de 0..5%: " + rate);
+    }
+    public Money fee(Money amount) { return amount.times(rate); }
+}
 
-    private static final int HEAVY_THRESHOLD_GRAMS = 2000;
-    private static final BigDecimal MEMBER_DISCOUNT = new BigDecimal(&quot;1.00&quot;);
-    private static final BigDecimal FREE_FROM = new BigDecimal(&quot;50.00&quot;);
+public record PercentPlusFlat(PaymentMethod method, BigDecimal rate, Money flat) implements FeePolicy {
+    public Money fee(Money amount) { return amount.times(rate).plus(flat); }
+}
 
-    public BigDecimal price(ShippingRequest request) {
-        ShippingZone zone = ShippingZone.of(request.country());
+// registo: EnumMap dá O(1) por indexação de array, sem hashing
+@Service
+public class FeeService {
 
-        BigDecimal price = zone.base;
-        if (request.isHeavy())   price = price.add(zone.heavySurcharge);
-        if (request.isExpress()) price = price.multiply(zone.expressFactor);
+    private final Map&lt;PaymentMethod, FeePolicy&gt; registry;
 
-        // ordem preservada do legado: desconto de aderente antes de portes grátis,
-        // e nenhum dos dois se aplica a envio expresso (comportamento actual, não intenção)
-        if (request.loyaltyMember() &amp;&amp; !request.isExpress()) price = price.subtract(MEMBER_DISCOUNT);
-        if (!request.isExpress() &amp;&amp; request.orderTotal().compareTo(FREE_FROM) &gt;= 0) {
-            price = BigDecimal.ZERO;
+    FeeService(List&lt;FeePolicy&gt; policies) {
+        var map = new EnumMap&lt;PaymentMethod, FeePolicy&gt;(PaymentMethod.class);
+        for (FeePolicy p : policies) {
+            FeePolicy previous = map.put(p.method(), p);
+            if (previous != null)                          // duas políticas para o mesmo método: erro
+                throw new IllegalStateException("política duplicada para " + p.method());
         }
-        return price.max(BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
+        var missing = EnumSet.allOf(PaymentMethod.class);
+        missing.removeAll(map.keySet());
+        if (!missing.isEmpty())                            // falha no arranque, não no primeiro pedido
+            throw new IllegalStateException("sem política de comissão para " + missing);
+        this.registry = Collections.unmodifiableMap(map);
     }
 
-    /** Assinatura antiga mantida enquanto os quatro chamadores migram. */
-    @Deprecated(since = &quot;2026.9&quot;, forRemoval = true)
-    public BigDecimal calculate(Order order, String country, boolean express, boolean member) {
-        return price(new ShippingRequest(country, order.weightGrams(), order.total(),
-                express ? ShippingSpeed.EXPRESS : ShippingSpeed.STANDARD, member));
+    // assinatura mantida: o chamador não muda
+    public Money fee(String method, Money amount) {
+        return fee(PaymentMethod.valueOf(method), amount);
     }
+
+    public Money fee(PaymentMethod method, Money amount) {
+        return registry.get(method).fee(amount);           // sem null: cobertura garantida no arranque
+    }
+}
+
+@Configuration
+class FeePolicies {
+    @Bean FeePolicy debit()   { return new FlatFee(PaymentMethod.CARD_DEBIT, Money.eur("0.35")); }
+    @Bean FeePolicy credit()  { return new PercentFee(PaymentMethod.CARD_CREDIT, new BigDecimal("0.0125")); }
+    @Bean FeePolicy sepaCt()  { return new FlatFee(PaymentMethod.SEPA_CT, Money.eur("0.20")); }
+    @Bean FeePolicy sepaDd()  { return new PercentPlusFlat(PaymentMethod.SEPA_DD,
+                                        new BigDecimal("0.0040"), Money.eur("0.10")); }
+    @Bean FeePolicy wallet()  { return new PercentFee(PaymentMethod.WALLET, new BigDecimal("0.0180")); }
+    @Bean FeePolicy voucher() { return new FlatFee(PaymentMethod.VOUCHER, Money.ZERO_EUR); }
 }</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>A rede vem antes de tudo. Escrever o refactoring primeiro e os testes depois é a falha mais comum e mais penalizada: os testes escritos no fim descrevem o código novo, não o antigo, e não provam nada.</li>
-        <li>A tabela tem de incluir fronteiras exactas (2 000 g e 2 001 g; 49,99 € e 50,00 €), porque é aí que vivem os erros de comparação, e casos que parecem errados — 8,58 € num pedido de 60 € com envio expresso — precisamente para os congelar.</li>
-        <li>Preservar a ordem das regras é obrigatório: aplicar portes grátis antes do desconto de aderente muda o resultado de vários casos. Comentar no código que a ordem é herdada, não desenhada, evita que alguém a «arrume» no PR seguinte.</li>
-        <li>A assinatura antiga fica como adaptador marcado com <code>@Deprecated(forRemoval = true)</code> até os quatro chamadores migrarem; remover no mesmo PR transforma um refactoring de 60 linhas num PR de 400 que ninguém revê.</li>
-        <li>Validar a rede com teste de mutação: nesta função, mutantes que trocam <code>&gt;</code> por <code>&gt;=</code> nos dois limiares e que removem o <code>!express</code> têm de morrer. Se sobreviverem, faltam casos e o refactoring está a ser feito no escuro.</li>
-        <li>Complexidade irrelevante aqui — tudo é O(1). O que é avaliado é disciplina de sequência, escolha de fronteiras e capacidade de não «corrigir» comportamento a meio.</li>
+        <li>Despacho em O(1): <code>EnumMap</code> indexa um <em>array</em> pelo <code>ordinal()</code> internamente, sem cálculo de dispersão nem colisões; a cadeia de <code>if</code> era O(n) com n a crescer a cada método novo, e o pior caso caía sempre no ramo silencioso.</li>
+        <li>O ramo <code>return amount.times("0.0200")</code> do código de partida é o defeito mais grave: cobra 2% a qualquer valor não reconhecido, incluindo erros de escrita no método de pagamento. A solução troca isso por falha no arranque — o custo de um método novo passa a ser uma aplicação que não sobe em <em>staging</em>, e não uma cobrança errada em produção.</li>
+        <li><code>PaymentMethod</code> como <code>enum</code> em vez de <code>String</code> traz a verificação de cobertura de graça com <code>EnumSet.allOf</code>. Com <code>String</code> não há forma de saber o conjunto completo, e a garantia (1) do enunciado torna-se impossível.</li>
+        <li>Casos limite a mencionar sem ser perguntado: duas políticas para o mesmo método (detectado no construtor), <code>valueOf</code> com um texto inválido vindo de uma API externa (converte-se na fronteira, com erro 400, e não no <code>FeeService</code>), arredondamento monetário — a multiplicação por 0,0125 tem de ter modo de arredondamento e escala definidos no tipo <code>Money</code>, nunca <code>double</code>.</li>
+        <li>Testes: cada política testa-se com <code>new</code>, sem contexto de Spring nem duplos; o <code>FeeService</code> testa-se com uma lista construída à mão, e escreve-se um teste que verifica que falta uma política provoca excepção. Um teste de contexto vazio confirma a garantia (1) em CI.</li>
+        <li>Quando <em>não</em> vale a pena: com 2 ou 3 ramos estáveis há dois anos, usados num único sítio, esta refactorização troca 8 linhas legíveis por 6 ficheiros e uma configuração. O ganho aparece com a repetição da decisão em mais do que um sítio, com a frequência de novos casos, e quando quem acrescenta um caso é de outra equipa.</li>
+        <li>Alternativa a defender se o entrevistador empurrar: <code>enum</code> com corpo por constante elimina a configuração e o registo por completo, e é melhor enquanto nenhuma política precisar de dependências injectadas. A versão acima é a que sobrevive à primeira política que tenha de consultar uma tabela de escalões.</li>
       </ul>
     </div>
   </div>
 </div>
 
-<h2 id="sec-19-5" class="h2"><span class="secnum">19.5</span> Argumentar dívida técnica com números<a class="anchor" href="#sec-19-5" aria-label="ligação">#</a></h2>
+<h2 id="sec-19-7" class="h2"><span class="secnum">19.7</span> Resumo e checklist<a class="anchor" href="#sec-19-7" aria-label="ligação">#</a></h2>
 
-<p>Dívida técnica argumentada em vocabulário de engenharia — «o código está mau, tem acoplamento a mais» — perde sempre contra uma funcionalidade com receita estimada. Argumentada em custo mensal e risco, ganha com frequência. A tradução faz-se com três termos: quanto custa hoje viver com ela, quanto custa pagá-la, e o que acontece se o custo continuar a crescer.</p>
-
-<div class="formula">custo_mensal ≈ alterações_por_mês × sobrecusto_por_alteração + incidentes_por_mês × custo_médio_do_incidente</div>
-
-<p>Um exemplo com números que se defendem numa sala: o módulo de facturação recebe 12 alterações por mês; cada uma leva em média 3 dias em vez de 1 por causa do acoplamento e da ausência de testes, o que dá 24 dias-pessoa perdidos por mês. A esse valor somam-se dois incidentes por trimestre naquele módulo, cada um com 4 horas de dois engenheiros mais o custo de suporte. Contra isso, a estimativa de pagamento: 20 dias-pessoa para pôr o módulo sob testes de caracterização e extrair os três casos de uso. O retorno é inferior a um mês — e é essa a frase que um gestor consegue repetir na reunião seguinte, ao contrário de «temos dívida técnica».</p>
-
-<p>Escolher onde investir faz-se com dados, não com desagrado. O critério mais fiável é o cruzamento de <em>churn</em> com complexidade: ficheiros muito alterados <em>e</em> complexos são onde o custo se materializa; ficheiros complexos que ninguém toca há dois anos são museu, não dívida. Os quatro indicadores DORA — frequência de entrega, tempo de <em>lead</em> da alteração, taxa de falha de alteração e tempo de reposição — dão o efeito agregado e são a linguagem que a gestão já reconhece.</p>
-
-<figure class="listing shell" id="lst-19-8"><div class="lhead"><span class="lnum">Listagem 19.8</span>
-<span class="lcap">Os ficheiros mais alterados nos últimos 12 meses: o eixo de <em>churn</em> do mapa de <em>hotspots</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="shell"><code># churn: número de commits que tocaram cada ficheiro no último ano
-git log --since=&quot;12 months ago&quot; --format=&quot;&quot; --name-only -- &quot;*.java&quot; \
-  | grep -v &quot;^$&quot; | sort | uniq -c | sort -rn | head -20
-
-# complexidade aproximada por linhas (cruzar as duas listas manualmente,
-# ou usar uma ferramenta de hotspots que já faz o produto churn x complexidade)
-git ls-files &quot;*.java&quot; | xargs wc -l | sort -rn | head -20
-
-# quem tem contexto sobre o ficheiro mais quente (para a conversa de 15 minutos)
-git shortlog -sne --since=&quot;12 months ago&quot; -- src/main/java/.../BillingService.java</code></pre></figure>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 19.2</span> Grelha de priorização de dívida: o que se leva a uma conversa com o gestor de produto.</div>
-<div class="tscroll"><table><thead><tr><th>Item</th><th>Custo mensal actual</th><th>Custo de pagar</th><th>Risco se nada for feito</th><th>Decisão</th></tr></thead><tbody>
-<tr><td>Facturação sem testes (12 alterações/mês)</td><td>24 dias-pessoa</td><td>20 dias-pessoa</td><td>Cresce com cada regra fiscal nova</td><td>Fazer já, em 3 fatias</td></tr>
-<tr><td>Spring Boot 2.7 fora de suporte</td><td>0 hoje</td><td>15 dias-pessoa</td><td>CVE sem correcção disponível</td><td>Fazer já, é risco e não custo</td></tr>
-<tr><td>Duplicação em 3 <em>mappers</em></td><td>~1 dia-pessoa</td><td>4 dias-pessoa</td><td>Baixo, estável há 18 meses</td><td>Regra do escuteiro, sem projecto</td></tr>
-<tr><td>Módulo legado de relatórios</td><td>0,5 dia-pessoa</td><td>30 dias-pessoa</td><td>Nenhum; sai do produto em 2027</td><td>Não fazer, documentar decisão</td></tr>
-</tbody></table></div></div>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Pedir «um <em>sprint</em> de dívida técnica» é a forma mais eficaz de nunca mais o receber: concentra o custo num bloco visível, produz um PR gigante impossível de rever, e no <em>sprint</em> seguinte a pressão de entrega volta ao mesmo sítio. O que se sustenta durante um ano é um orçamento contínuo — 15 a 20% da capacidade, decidido pela equipa, gasto nos <em>hotspots</em> que a semana já obrigou a tocar — mais a regra de que qualquer funcionalidade nova naquele módulo paga a fatia de dívida que atravessa. A excepção legítima ao orçamento contínuo é a actualização de plataforma com fim de suporte marcado: essa tem data externa e trata-se como projecto, com estimativa e responsável.</p></aside>
-
-<div class="qa" id="q-19-9" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Convença-me, como gestor de produto com uma data de lançamento em seis semanas, a dar-lhe capacidade de equipa para dívida técnica.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não se pede capacidade para «dívida técnica»: pede-se para reduzir o custo de entregar aquilo que o gestor já quer entregar. A conversa começa pelo objectivo dele, não pelo código.</p>
-      <p>A estrutura tem quatro tempos. Primeiro, o custo actual em unidades que ele controla: «as últimas seis alterações no módulo de preços levaram 3 dias em média; duas voltaram atrás com defeito em produção; a estimativa de seis semanas que acabámos de dar tem 1,5 semanas dentro que são só o custo deste módulo». Segundo, a proposta com dimensão e limite: 20 dias-pessoa, em três fatias de uma semana, intercaladas com as funcionalidades — não um bloco. Terceiro, o retorno medido com um indicador que já existe: tempo de <em>lead</em> daquele módulo, ou número de reversões, comparado antes e depois. Quarto, a alternativa honesta: se não houver capacidade agora, o que se faz é limitar o alcance às duas regiões que a nova funcionalidade toca, e regista-se a decisão com a data em que se revê.</p>
-      <p>O erro que custa a conversa é apresentar a dívida como questão de qualidade abstracta ou de orgulho profissional. O gestor não recusa qualidade — recusa um pedido sem número, sem fim definido e sem forma de verificar que resultou. Um pedido de três semanas «para arrumar o código» é indistinguível de risco puro do lado dele.</p>
-      <p>A alavanca mais forte, quando existe, é ligar a dívida a um incidente recente com impacto visível para o cliente: «o incidente de 12 de Agosto, 40 minutos de pagamentos em falha, veio de uma alteração neste módulo que nenhum teste apanhou». Um facto desses vale mais do que qualquer métrica agregada, e vale a pena guardá-lo para a conversa em que é preciso.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Argumenta com qualidade, limpeza e boas práticas; sem números e sem fim definido.</td></tr>
-        <tr><td>Mid</td><td>Traz um exemplo de lentidão mas não quantifica nem propõe fatias com limite.</td></tr>
-        <tr><td>Sénior</td><td>Custo actual em dias, proposta dimensionada e fatiada, indicador de verificação, alternativa se a resposta for não.</td></tr>
-        <tr><td>Staff</td><td>Liga a dívida a resultados de negócio e a incidentes concretos, negoceia um orçamento permanente e regista a decisão de não fazer.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se eu disser que não? O que faz na semana seguinte?»</li>
-      <li>«Como me prova, três meses depois, que valeu a pena?»</li>
-      <li>«De onde vêm esses 3 dias por alteração — mediu ou estimou?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Fazer a limpeza em segredo, sem acordo, e chamar-lhe estimativa inflacionada.</li>
-      <li>Ameaçar com catástrofe sem probabilidade nem impacto quantificados.</li>
-      <li>Não aceitar um «não» com registo e data de revisão.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-19-10" data-box="qa" data-area="design" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Que métricas de saúde de código seguiria numa equipa de oito pessoas, e quais recusaria seguir mesmo que a direcção as peça?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Seguem-se métricas de efeito, não de esforço. As quatro que valem a pena são os indicadores DORA — frequência de entrega, tempo de <em>lead</em> da alteração, taxa de falha de alteração e tempo de reposição — porque medem o que a dívida técnica realmente estraga: a velocidade e a fiabilidade com que a equipa muda o sistema. A elas junto três locais: tempo de <em>build</em> e de execução da bateria de testes (acima de 10 minutos, as pessoas deixam de a correr localmente), percentagem de testes intermitentes (acima de 1% destrói a confiança na bateria inteira), e a lista dos dez <em>hotspots</em> por <em>churn</em> × complexidade, revista todos os trimestres.</p>
-      <p>Recuso três, mesmo pedidas. Linhas de código escritas ou <em>commits</em> por pessoa: mede-se produção de texto e incentiva-se exactamente o contrário do que se quer. Cobertura de testes como alvo contratual: 80% imposto produz testes sem asserções e testes de <em>getters</em>; a cobertura é útil como sinal de alerta (uma região crítica com 20% merece uma conversa), nunca como objectivo. E qualquer métrica individual comparada entre pessoas — número de comentários de revisão, defeitos atribuídos — porque converte a revisão de código num sistema de pontos e mata a colaboração em menos de um trimestre.</p>
-      <p>O princípio por trás é a lei de Goodhart: quando uma medida se torna alvo, deixa de ser boa medida. A protecção prática é seguir métricas ao nível da equipa e do sistema, nunca da pessoa, e emparelhar sempre duas que se opõem — velocidade de entrega com taxa de falha, para que optimizar uma à custa da outra fique visível.</p></div>
-      <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe cobertura de testes e número de <em>bugs</em> como métricas principais, sem crítica.</td></tr>
-        <tr><td>Mid</td><td>Conhece os indicadores DORA mas não explica que efeito medem nem como se manipulam.</td></tr>
-        <tr><td>Sénior</td><td>Métricas de efeito ao nível da equipa, com limiares concretos, e recusa fundamentada das métricas individuais.</td></tr>
-        <tr><td>Staff</td><td>Emparelha métricas opostas, invoca a lei de Goodhart com exemplo concreto, e define a cadência de revisão e quem age sobre cada indicador.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se a direcção insistir em cobertura de 80%?»</li>
-      <li>«Como mede o tempo de <em>lead</em> sem instrumentar tudo?»</li>
-      <li>«Que faz quando a taxa de testes intermitentes chega a 5%?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Aceitar qualquer métrica pedida sem discutir o comportamento que induz.</li>
-      <li>Medir pessoas em vez de sistema e processo.</li>
-      <li>Recolher métricas que ninguém revê nem usa para decidir.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-19-6" class="h2"><span class="secnum">19.6</span> Resumo e checklist<a class="anchor" href="#sec-19-6" aria-label="ligação">#</a></h2>
-
-<p>O que reter deste capítulo, por ordem de valor numa entrevista de <em>code review</em> e refactoring:</p>
+<p>O que uma ronda de padrões mede é a capacidade de justificar indirecção. Cada padrão introduz uma camada; a resposta de nível sénior diz sempre o que essa camada isola, quanto custa em legibilidade e execução, e em que condição a decisão se inverteria.</p>
 
 <ul class="lst">
-  <li>A ronda de revisão avalia a ordem por severidade e a decisão final, não a contagem de defeitos: cinco defeitos bem priorizados valem mais do que oito soltos.</li>
-  <li>A sequência de leitura é fixa: acesso concorrente e integridade de dados, segurança, recursos, desempenho super-linear, erros e observabilidade, desenho, estilo. Estilo automatiza-se, não se comenta.</li>
-  <li>Cada comentário tem severidade explícita, mecanismo, efeito observável em produção e sugestão concreta; um comentário que se repete duas vezes vira regra automática no <em>pipeline</em>.</li>
-  <li>Em código desconhecido: esquema da base de dados primeiro, um ponto de entrada, o fluxo até ao SQL, e <code>git log</code> para saber onde vive o risco.</li>
-  <li>Refactoring sem testes de caracterização é aposta. A asserção vem da execução do código actual, defeitos incluídos; a rede valida-se com teste de mutação, não com cobertura de linhas.</li>
-  <li>Alteração de comportamento e refactoring nunca vão no mesmo <em>commit</em>; a criação de <em>seams</em> é um <em>commit</em> próprio, sem lógica alterada.</li>
-  <li>Reescrever de raiz só ganha em condições verificáveis (sistema inexecutável, plataforma sem suporte, domínio mudado, dimensão pequena); a opção por omissão é o <em>strangler fig</em> com fatias e interruptor de retorno.</li>
-  <li>Dívida técnica argumenta-se em dias-pessoa por mês e risco, com proposta fatiada, indicador de verificação e alternativa se a resposta for não. Orçamento contínuo de 15 a 20% sustenta-se; <em>sprint</em> de limpeza não.</li>
-  <li>Métricas ao nível da equipa e emparelhadas (velocidade com taxa de falha); nunca métricas por pessoa nem cobertura como alvo contratual.</li>
+  <li>Um padrão isola um eixo de variação. Se não se consegue nomear o que varia e com que frequência, o padrão é indirecção paga sem retorno.</li>
+  <li>Java 21 absorveu metade do catálogo: <em>strategy</em> e <em>command</em> são interfaces funcionais, <em>state</em> e <em>visitor</em> são <code>sealed</code> com correspondência de padrões, <em>builder</em> perde para <code>record</code> abaixo de 8 componentes.</li>
+  <li>O singleton GoF é estado global com dependência escondida; o que se quer é âmbito <em>singleton</em> no contentor, único por <code>ApplicationContext</code> e não por JVM.</li>
+  <li>Adapter, decorator, facade e proxy têm a mesma estrutura e intenções diferentes; explicam-se pela consequência de os remover, não pelo diagrama de classes.</li>
+  <li>Spring AOP é <em>proxy</em> aplicado no arranque: auto-invocação não é interceptada, classes e métodos <code>final</code> não são <em>proxiáveis</em>, e o silêncio é o modo de falha.</li>
+  <li>Eventos do Spring são síncronos e transaccionais por omissão; durabilidade e consumidores noutro processo exigem mensageria com <em>outbox</em> e consumidores idempotentes.</li>
+  <li>Modelo anémico só é anti-padrão onde há invariantes a proteger; num CRUD sem regras, um modelo rico é cerimónia.</li>
+  <li><em>Service locator</em> e injecção por campo escondem dependências e adiam falhas de arranque para o primeiro pedido; injecção por construtor torna o ciclo um erro visível.</li>
+  <li>Numa ronda de leitura de código, responde-se em quatro tempos: intenção, nome, se está bem aplicado aqui, o que se mudaria.</li>
 </ul>
 
-<p>Checklist accionável antes da ronda de revisão e refactoring:</p>
+<p>Checklist accionável antes de uma ronda de desenho orientada a objectos:</p>
 
 <ul class="lst">
-  <li>Treinar a leitura de um excerto de 100 linhas em 10 minutos, dizendo em voz alta o que se procura e por que ordem.</li>
-  <li>Ter a lista de bloqueantes decorada: corrupção de dados, segurança, acesso concorrente, fuga de recursos, ausência de teste para lógica nova.</li>
-  <li>Preparar três frases de comentário-modelo com a estrutura severidade + mecanismo + efeito + sugestão, prontas a adaptar.</li>
-  <li>Saber escrever, sem consultar nada, um teste de caracterização parametrizado em JUnit 5 com <code>@MethodSource</code> e valores de fronteira.</li>
-  <li>Saber criar os três tipos de <em>seam</em> (objecto, parâmetro, construtor) e injectar um <code>Clock</code> para o tempo.</li>
-  <li>Levar dois números do sistema actual: custo em dias por alteração num módulo com dívida e resultado medido depois de o pagar.</li>
-  <li>Ter uma história de <em>strangler fig</em> com fatias, critério de desligar o antigo e o que correu mal a meio.</li>
-  <li>Ter uma história de desacordo em revisão resolvido com evidência, e uma em que o candidato mudou de opinião.</li>
-  <li>Verificar antes de bloquear: o defeito apontado é regressão deste PR ou dívida pré-existente? A resposta muda a decisão e é sinal de senioridade.</li>
+  <li>Ter três exemplos do JDK prontos a citar por padrão discutido (decorator em <code>java.io</code>, proxy em <code>java.lang.reflect.Proxy</code>, template com <em>callback</em> em <code>JdbcTemplate</code>).</li>
+  <li>Preparar uma história real em que se <em>removeu</em> um padrão, com o antes e o depois medidos em tempo de alteração ou em número de ficheiros tocados.</li>
+  <li>Saber explicar em 60 segundos porque é que a auto-invocação anula <code>@Transactional</code> e quais são as três saídas por ordem de preferência.</li>
+  <li>Treinar a passagem de uma cadeia de <code>if</code>/<code>else</code> para estratégia com registo, incluindo a validação de cobertura no arranque, em menos de 20 minutos.</li>
+  <li>Ter um invariante concreto do sistema actual e saber dizer onde está garantido hoje e onde deveria estar.</li>
+  <li>Praticar a crítica: para cada padrão que se propõe, dizer sem ser perguntado em que condição não valeria a pena.</li>
+  <li>Verificar o vocabulário de <code>sealed</code>, <em>record patterns</em> e <code>switch</code> exaustivo — é o que separa uma resposta de 2015 de uma resposta de Java 21.</li>
 </ul>

@@ -1,571 +1,724 @@
-<p>Uma ronda sobre lambdas e streams parece inofensiva e é das que mais separa mid de sénior, porque quase toda a gente escreve streams e quase ninguém sabe explicar o que a máquina faz com eles. O entrevistador não quer saber se o candidato conhece <code>Collectors.groupingBy</code>: quer saber se percebe que um <em>pipeline</em> é uma descrição preguiçosa que só corre no operador terminal, que <code>Stream&lt;Integer&gt;</code> paga <em>boxing</em> em cada elemento, que <code>parallelStream()</code> partilha o <code>ForkJoinPool.commonPool()</code> com o resto do processo, e que há casos em que um <code>for</code> de cinco linhas é a resposta certa. Onde os candidatos caem é em três sítios: descrevem <code>map</code>/<code>filter</code>/<code>collect</code> como açúcar sintáctico sem mecanismo, usam <code>peek</code> e efeitos secundários como se fossem gratuitos, e recomendam paralelismo por reflexo em código de servidor onde já existem 200 pedidos concorrentes. Este capítulo cobre o modelo de execução, os colectores que valem a pena, o custo real do paralelismo e o critério para não usar streams.</p>
+<p>Esta é a ronda em que o entrevistador descobre se o candidato escreve Java 21 ou escreve Java 8 num compilador de Java 21. As perguntas de linguagem moderna medem três coisas ao mesmo tempo: se o candidato conhece o mecanismo por baixo do açúcar sintáctico (apagamento, construtor canónico, exaustividade verificada em compilação), se sabe onde a funcionalidade <em>não</em> se aplica, e se consegue justificar uma migração de <em>codebase</em> com números em vez de entusiasmo. Onde os candidatos caem é sempre no mesmo sítio: recitam «os <em>records</em> são imutáveis e poupam <em>boilerplate</em>» e depois não sabem dizer por que razão um <em>record</em> não serve como entidade JPA, ou usam <code>Optional</code> como parâmetro de método sem perceber que acabaram de duplicar o número de caminhos que o chamador tem de testar. Este capítulo trata cada funcionalidade como uma decisão de <em>design</em> de API com custo, não como um truque de sintaxe.</p>
 
-<h2 id="sec-6-1" class="h2"><span class="secnum">6.1</span> Interfaces funcionais e referências de método<a class="anchor" href="#sec-6-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-6-1" class="h2"><span class="secnum">6.1</span> Genéricos e apagamento de tipos<a class="anchor" href="#sec-6-1" aria-label="ligação">#</a></h2>
 
-<p>Uma interface funcional é uma interface com um único método abstracto; a anotação <code>@FunctionalInterface</code> não cria a propriedade, apenas faz o compilador falhar se ela se perder. O pacote <code>java.util.function</code> traz cerca de quarenta interfaces, mas o núcleo são seis: <code>Function&lt;T,R&gt;</code>, <code>BiFunction&lt;T,U,R&gt;</code>, <code>Predicate&lt;T&gt;</code>, <code>Consumer&lt;T&gt;</code>, <code>Supplier&lt;T&gt;</code> e <code>UnaryOperator&lt;T&gt;</code>. Tudo o resto são especializações primitivas — <code>IntPredicate</code>, <code>ToLongFunction&lt;T&gt;</code>, <code>ObjIntConsumer&lt;T&gt;</code> — que existem por uma razão única e mensurável: evitar <em>boxing</em>.</p>
+<p>Os genéricos em Java são uma funcionalidade exclusivamente de compilação. O compilador verifica os tipos, insere as conversões (<em>casts</em>) necessárias e depois apaga (<em>erasure</em>) os parâmetros de tipo: <code>List&lt;String&gt;</code> e <code>List&lt;Integer&gt;</code> partilham um único objecto <code>Class</code> em <em>runtime</em>. Um parâmetro de tipo sem limite é substituído por <code>Object</code>; um parâmetro limitado, <code>&lt;T extends Number&gt;</code>, é substituído por <code>Number</code>. Esta decisão de 2004 foi de compatibilidade binária: código compilado para Java 1.4 continuou a correr sem recompilação, ao contrário do que aconteceu em C#, que reificou os genéricos ao custo de partir a compatibilidade da <em>runtime</em>.</p>
 
-<p>Um lambda não é uma classe anónima. O compilador emite uma instrução <code>invokedynamic</code> cujo <em>bootstrap</em> é o <code>LambdaMetafactory</code>, que na primeira execução do <em>call site</em> gera em memória a classe que implementa a interface funcional. Consequências práticas: não há um ficheiro <code>Outer$1.class</code> por lambda (o que reduz o número de classes carregadas e o tempo de arranque em aplicações com milhares de lambdas), e um lambda que não captura nada é instanciado uma vez e reutilizado — a JVM guarda a instância no <em>call site</em>. Um lambda que captura variáveis aloca um objecto por avaliação, embora a análise de fuga o elimine com frequência quando o lambda não escapa do método.</p>
+<p>A consequência prática é uma lista fechada de operações ilegais que aparece em quase todas as entrevistas: não se pode fazer <code>new T()</code> nem <code>new T[n]</code>, não se pode testar <code>o instanceof T</code>, não se pode declarar um campo <code>static T</code>, não se pode apanhar nem lançar um subtipo genérico de <code>Throwable</code>, e não se podem sobrecarregar dois métodos cuja assinatura só difira no argumento de tipo — depois do apagamento têm a mesma assinatura e o ficheiro não compila. A solução idiomática é passar um <em>type token</em>, <code>Class&lt;T&gt;</code>, ou capturar o tipo através de uma subclasse anónima, que é o truque por trás de <code>TypeReference</code> do Jackson e de <code>ParameterizedTypeReference</code> do Spring.</p>
 
-<p>A captura obedece a uma regra que se explica em cinco segundos e se percebe mal em entrevista: capturam-se valores, não variáveis. A variável local tem de ser <em>final</em> ou efectivamente final porque o lambda pode sobreviver ao <em>frame</em> da pilha que a criou; copiar o valor é a única forma barata de o garantir sem <em>heap allocation</em> de uma célula partilhada, como faz o Groovy ou o C#. Campos de instância não sofrem esta restrição — <code>this.contador++</code> compila dentro de um lambda — e é precisamente por isso que capturar <code>this</code> implicitamente é uma fuga de memória frequente em <em>listeners</em> registados num barramento estático.</p>
+<p>Há um detalhe que separa quem leu a especificação de quem só usou a funcionalidade: os métodos-ponte (<em>bridge methods</em>). Quando uma classe implementa <code>Comparable&lt;Money&gt;</code>, o compilador gera, além de <code>compareTo(Money)</code>, um método sintético <code>compareTo(Object)</code> que faz o <em>cast</em> e delega. É por isso que uma chamada por reflexão a <code>getDeclaredMethods()</code> devolve mais métodos do que os escritos no ficheiro, e é por isso que uma biblioteca de <em>proxy</em> mal configurada pode chamar o método-ponte e falhar com <code>ClassCastException</code> num sítio onde não há nenhum <em>cast</em> visível no código-fonte.</p>
 
 <figure class="listing java" id="lst-6-1"><div class="lhead"><span class="lnum">Listagem 6.1</span>
-<span class="lcap">Boxing invisível: o mesmo cálculo com e sem especialização primitiva.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// 1) Stream&lt;Integer&gt;: cada elemento é um objecto no heap
-long somaBoxed = pedidos.stream()                 // Stream&lt;Pedido&gt;
-        .map(Pedido::centimos)                    // Stream&lt;Long&gt;  -&gt; boxing
-        .reduce(0L, Long::sum);                   // unboxing + boxing por passo
+<span class="lcap">O que o apagamento torna ilegal e como se contorna.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>final class Cache&lt;T&gt; {
 
-// 2) LongStream: o valor viaja em long, sem alocação
-long soma = pedidos.stream()
-        .mapToLong(Pedido::centimos)              // LongStream
-        .sum();
+    // ILEGAL: private static T partilhado;      -> T não existe fora da instância
+    private final Class&lt;T&gt; token;                // solução: type token explícito
+    private final T[] ranhuras;
 
-// 3) A armadilha do Integer cache: só -128..127 são interned
-Integer a = 127, b = 127;   // a == b  -&gt; true  (mesma instância em cache)
-Integer c = 128, d = 128;   // c == d  -&gt; false (duas instâncias distintas)
-// num Stream&lt;Integer&gt; com .distinct() ou .contains(), equals() salva;
-// num filtro escrito com == o bug só aparece acima de 127.</code></pre></figure>
+    @SuppressWarnings("unchecked")
+    Cache(Class&lt;T&gt; token, int n) {
+        this.token = token;
+        // ILEGAL: this.ranhuras = new T[n];
+        this.ranhuras = (T[]) java.lang.reflect.Array.newInstance(token, n);
+    }
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa soma sobre 10 milhões de elementos, <code>Stream&lt;Integer&gt;.reduce(0, Integer::sum)</code> costuma ficar entre 3x e 8x mais lento do que <code>IntStream.sum()</code> sobre um <code>int[]</code>, e aloca na ordem de 10<sup>7</sup> objectos de 16 bytes — cerca de 160 MB de lixo que a colecção jovem tem de varrer. A diferença não está na abstracção do stream: está no <em>boxing</em>. O mesmo <code>for</code> sobre <code>Integer[]</code> sofre exactamente o mesmo custo.</p></aside>
+    boolean contem(Object o) {
+        // ILEGAL: return o instanceof T;
+        return token.isInstance(o);
+    }
+}
+
+// ILEGAL: as duas assinaturas colidem depois do apagamento -> void put(List)
+// void put(List&lt;String&gt;  l) { }
+// void put(List&lt;Integer&gt; l) { }
+
+List&lt;String&gt;  s = new ArrayList&lt;&gt;();
+List&lt;Integer&gt; i = new ArrayList&lt;&gt;();
+assert s.getClass() == i.getClass();             // true: uma só Class&lt;ArrayList&gt;</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>O apagamento não elimina a verificação, adia-a. <code>List&lt;String&gt; l = (List&lt;String&gt;) (List&lt;?&gt;) listaDeInteiros;</code> compila com aviso e só rebenta com <code>ClassCastException</code> na primeira leitura, num <em>stack trace</em> que aponta para uma linha onde não há <em>cast</em> nenhum — a conversão foi inserida pelo compilador no ponto de uso. Em código de fronteira (desserialização, cache genérica, JDBC) vale a pena usar <code>Collections.checkedList(l, String.class)</code> em testes: a falha passa a ocorrer no <code>add</code> que a causou.</p></aside>
 
 <div class="qa" id="q-6-1" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Java e a linguagem</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Um lambda é açúcar sintáctico para uma classe anónima? Explique o que o compilador e a JVM fazem realmente, e em que é que isso se nota.</div>
+  <div class="qprompt">Explique o apagamento de tipos e diga-me três coisas concretas que ele torna impossíveis em Java. Depois diga-me o que se perde e o que se ganha em relação a uma <em>runtime</em> com genéricos reificados.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não é. Uma classe anónima produz um ficheiro <code>.class</code> em tempo de compilação e um <code>new</code> em tempo de execução. Um lambda produz um método privado sintético na própria classe e um <em>call site</em> <code>invokedynamic</code>; a ligação a uma implementação da interface funcional é feita na primeira execução pelo <code>LambdaMetafactory</code>, que gera a classe dinamicamente.</p>
-      <p>Isso nota-se em quatro sítios. Primeiro, no número de classes: uma aplicação Spring com 3 000 lambdas não carrega 3 000 classes extra do <em>jar</em>, o que reduz o tamanho do artefacto e o trabalho do <em>class loader</em>. Segundo, no arranque: a estratégia inverte-se, porque a geração acontece em <em>runtime</em>, e é por isso que compilação nativa com GraalVM tem de resolver os lambdas em tempo de construção. Terceiro, na alocação: um lambda sem captura é criado uma vez e o <em>call site</em> devolve sempre a mesma instância; um lambda com captura aloca por avaliação, embora a análise de fuga frequentemente elimine essa alocação. Quarto, na semântica de <code>this</code>: dentro de um lambda, <code>this</code> é o objecto envolvente, ao passo que numa classe anónima é a instância anónima — diferença que muda o significado de <code>this.equals(x)</code> e que explica fugas de memória em <em>callbacks</em>.</p>
-      <p>O trade-off relevante é entre lambdas e classes anónimas: quando é preciso estado mutável próprio, vários métodos, ou um nome no <em>stack trace</em> que diga alguma coisa ao operador de plantão, uma classe nomeada ganha. Um <em>stack trace</em> com <code>lambda$processar$3</code> a meio de um <em>pipeline</em> paralelo é significativamente mais difícil de ler do que um com <code>ValidadorDeIban.validar</code>.</p></div>
+      <p>Os genéricos são verificados no compilador e apagados no <em>bytecode</em>: um parâmetro de tipo sem limite torna-se <code>Object</code>, um parâmetro limitado torna-se o seu limite, e o compilador insere os <em>casts</em> nos pontos de leitura. Em <em>runtime</em> existe uma única classe <code>ArrayList</code>; <code>new ArrayList&lt;String&gt;().getClass() == new ArrayList&lt;Integer&gt;().getClass()</code> devolve <code>true</code>.</p>
+      <p>Três impossibilidades concretas: primeiro, <code>new T()</code> e <code>new T[n]</code> — não há informação de tipo para invocar o construtor nem para o <em>array store check</em> da JVM, e por isso os <em>arrays</em> genéricos se criam por <code>Array.newInstance(Class&lt;T&gt;, n)</code> com <em>cast</em> não verificado. Segundo, <code>o instanceof T</code> e <code>catch (T e)</code> — o teste de tipo em <em>runtime</em> não tem alvo, e daí a proibição de subtipos genéricos de <code>Throwable</code>. Terceiro, sobrecarregar por argumento de tipo: <code>put(List&lt;String&gt;)</code> e <code>put(List&lt;Integer&gt;)</code> apagam para a mesma assinatura e o ficheiro não compila.</p>
+      <p>O que se ganha é compatibilidade binária: em 2004, todo o código compilado para 1.4 continuou a correr sem recompilação e as bibliotecas puderam ser generificadas de forma incremental. O que se perde tem três faces. Não há especialização por tipo primitivo — <code>List&lt;Integer&gt;</code> guarda referências para objectos <em>boxed</em>, com 16 bytes de cabeçalho por elemento além dos 4 ou 8 bytes da referência, contra 4 bytes num <code>int[]</code>; é essa a razão de existirem <code>IntStream</code>, <code>LongStream</code> e as colecções primitivas de Eclipse Collections ou fastutil. Não há despacho por tipo genérico em <em>runtime</em>. E a fronteira com <em>frameworks</em> obriga a <em>type tokens</em>: <code>ParameterizedTypeReference&lt;List&lt;Pagamento&gt;&gt;</code> no <code>RestClient</code> existe só para transportar a informação que o apagamento deitou fora.</p>
+      <p>O <em>trade-off</em> inverte-se quando o projecto Valhalla entregar tipos-valor e genéricos especializados: aí <code>List&lt;int&gt;</code> passará a ser possível sem <em>boxing</em>. Até lá, a decisão de <em>design</em> num sistema com colecções de milhões de elementos é evitar o genérico e usar <em>arrays</em> primitivos ou <em>streams</em> primitivas nos caminhos quentes — 40 milhões de <code>Integer</code> em <em>heap</em> custam facilmente 640 MB contra 160 MB num <code>int[]</code>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«É o mesmo que uma classe anónima, só mais curto.» Nenhuma noção de <code>invokedynamic</code> nem de diferenças observáveis.</td></tr>
-        <tr><td>Mid</td><td>Sabe que há <code>invokedynamic</code> mas não consegue nomear uma consequência prática; confunde a semântica de <code>this</code>.</td></tr>
-        <tr><td>Sénior</td><td>Descreve o mecanismo, dá pelo menos duas consequências medíveis (classes carregadas, alocação com/sem captura, <code>this</code>) e sabe quando prefere uma classe nomeada.</td></tr>
-        <tr><td>Staff</td><td>Liga ao arranque e à imagem nativa, à qualidade dos <em>stack traces</em> em produção, e ao efeito de <em>call sites</em> megamórficos na <em>inlining</em> do JIT.</td></tr>
+        <tr><td>Insuficiente</td><td>«Os genéricos servem para não fazer <em>cast</em>.» Não sabe que a informação desaparece em <em>runtime</em>.</td></tr>
+        <tr><td>Mid</td><td>Define apagamento correctamente e dá um exemplo (<code>new T[]</code>), mas não explica porquê nem conhece a motivação de compatibilidade.</td></tr>
+        <tr><td>Sénior</td><td>Mecanismo, três impossibilidades com a razão de cada uma, <em>type tokens</em> como contorno, e o custo do <em>boxing</em> com ordem de grandeza.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta métodos-ponte, o impacto em bibliotecas de <em>proxy</em> e reflexão, e sabe dizer em que condições Valhalla altera a decisão de <em>design</em>.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque é que a variável capturada tem de ser efectivamente final?»</li>
-      <li>«<code>lista::add</code> e <code>x -&gt; lista.add(x)</code> são equivalentes? E <code>obterLista()::add</code>?»</li>
-      <li>«Um lambda sem captura aloca? Como o confirmaria?»</li>
-      <li>«O que muda para o GraalVM em imagem nativa?»</li></ul></div>
+      <li>«Porque é que não se pode declarar <code>class MinhaExcepcao&lt;T&gt; extends Exception</code>?»</li>
+      <li>«O que é um método-ponte e quando é que o candidato o viu num <em>stack trace</em>?»</li>
+      <li>«Como é que o Jackson desserializa para <code>List&lt;Pagamento&gt;</code> se o tipo foi apagado?»</li>
+      <li>«Quanta memória poupa passar de <code>List&lt;Long&gt;</code> para <code>long[]</code> em 10 milhões de elementos?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Afirmar que lambdas são sempre mais rápidos do que classes anónimas, sem qualificar.</li>
-      <li>Julgar que <code>@FunctionalInterface</code> é obrigatória para o lambda compilar.</li>
-      <li>Não distinguir captura de variável local de captura de campo de instância.</li></ul></div>
+      <li>Afirmar que <code>List&lt;String&gt;.class</code> existe ou que a JVM conhece o argumento de tipo.</li>
+      <li>Dizer que o apagamento «não tem impacto em performance» sem mencionar <em>boxing</em>.</li>
+      <li>Propor reflexão sobre <code>getGenericSuperclass()</code> sem saber que só funciona para tipos escritos na declaração, não para variáveis locais.</li></ul></div>
   </div>
 </div>
 
 <div class="qa" id="q-6-2" data-box="qa" data-area="java" data-level="senior" data-freq="media">
   <div class="qhead"><span class="qtag">Java e a linguagem</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Temos <code>repositorio.obterCache()::get</code> guardado num campo <code>Function</code> criado no arranque. Um colega diz que é equivalente a <code>k -&gt; repositorio.obterCache().get(k)</code>. Concorda?</div>
+  <div class="qprompt">Este método compila com um aviso: <code>static &lt;T&gt; List&lt;T&gt; de(T... itens)</code>. O que é poluição do <em>heap</em>, porque é que o compilador avisa aqui, e quando é legítimo pôr <code>@SafeVarargs</code>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não são equivalentes, e a diferença é uma fonte real de incidentes. Numa referência de método sobre uma expressão — <code>expr::metodo</code> — a expressão <code>expr</code> é avaliada <strong>uma vez</strong>, no momento em que a referência é criada, e o receptor fica capturado. No lambda, <code>repositorio.obterCache()</code> é avaliado em <strong>cada</strong> invocação.</p>
-      <p>Se <code>obterCache()</code> devolver sempre a mesma instância imutável, os dois comportam-se igual. Se devolver uma instância que é substituída — invalidação periódica, recarga de configuração, <em>failover</em> para um segundo Redis — a referência de método fica presa à instância antiga para sempre, e o sintoma em produção é um serviço que serve dados obsoletos indefinidamente sem um único erro nos <em>logs</em>. É o mesmo mecanismo por que <code>System.out::println</code> capturado ao arranque continua a escrever no <code>PrintStream</code> antigo depois de um <code>System.setOut</code>.</p>
-      <p>Há ainda um caso limite: se <code>expr</code> for <code>null</code>, <code>expr::metodo</code> lança <code>NullPointerException</code> na criação da referência, ao passo que o lambda só falha na primeira invocação. Isto é ocasionalmente desejável — falhar cedo no arranque em vez de falhar no primeiro pedido do cliente.</p>
-      <p>A regra prática: usar <code>Tipo::metodo</code> e <code>this::metodo</code> à vontade, porque o receptor é estável; suspeitar sempre de <code>chamada()::metodo</code> e de referências guardadas em campos de vida longa. Quando é preciso indirecção estável, guarda-se o <code>Supplier</code> da instância, não a referência ao método.</p></div>
+      <p>Poluição do <em>heap</em> (<em>heap pollution</em>) é o estado em que uma variável de um tipo parametrizado aponta para um objecto que não é desse tipo. Como o apagamento removeu a verificação, o problema só se manifesta mais tarde, num <code>ClassCastException</code> gerado por um <em>cast</em> que o compilador inseriu.</p>
+      <p>Com <em>varargs</em> genéricos o compilador tem de criar um <em>array</em> para transportar os argumentos, mas <em>arrays</em> genéricos não existem: cria um <code>Object[]</code> — um <em>array</em> do tipo apagado. Esse <em>array</em> é covariante e verificável em <em>runtime</em>, ao contrário das colecções genéricas, e portanto pode ser exposto. Se o método devolver ou guardar <code>itens</code> num campo, o chamador recebe um <code>Object[]</code> disfarçado de <code>T[]</code> e pode escrever lá dentro um <code>String</code> onde o outro lado espera <code>Pagamento</code>. Daí o aviso <em>possible heap pollution from parameterized vararg type</em>.</p>
+      <p><code>@SafeVarargs</code> é uma promessa do autor, não uma verificação: só a deve pôr quem garante que o método (a) nunca guarda nem devolve o <em>array</em> de <em>varargs</em>, e (b) nunca o passa a código que o possa expor. <code>List.of(...)</code> e <code>Arrays.asList(...)</code> qualificam-se porque copiam o conteúdo. A anotação só é aplicável a métodos que não possam ser sobrepostos — <code>static</code>, <code>final</code>, e desde o Java 9 também <code>private</code> — precisamente porque uma subclasse podia quebrar a promessa.</p>
+      <p>O <em>trade-off</em>: silenciar o aviso com <code>@SuppressWarnings("unchecked")</code> esconde o problema no local de definição <em>e</em> no de chamada, enquanto <code>@SafeVarargs</code> documenta a garantia e cala o aviso apenas onde é devido. Quando a garantia não se consegue dar, a alternativa correcta é mudar a assinatura para <code>List&lt;T&gt;</code> e obrigar o chamador a <code>List.of(...)</code>: custa uma alocação por chamada, uns 40 bytes, e elimina a classe de bugs inteira.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«São a mesma coisa, o IDE até sugere a conversão.»</td></tr>
-        <tr><td>Mid</td><td>Suspeita que há diferença mas não consegue dizer qual, ou inverte o momento da avaliação.</td></tr>
-        <tr><td>Sénior</td><td>Identifica a avaliação única do receptor, dá um cenário de falha concreto e a correcção com <code>Supplier</code>.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o <code>NullPointerException</code> antecipado, discute a diferença como escolha deliberada de «falhar no arranque vs. falhar no pedido» e sugere um teste que fixa o comportamento.</td></tr>
+        <tr><td>Insuficiente</td><td>Não sabe o que é poluição do <em>heap</em>; propõe <code>@SuppressWarnings</code> para «tirar o aviso».</td></tr>
+        <tr><td>Mid</td><td>Sabe que o aviso existe e que <code>@SafeVarargs</code> o remove, mas não explica o <code>Object[]</code> nem as condições da promessa.</td></tr>
+        <tr><td>Sénior</td><td>Explica a criação do <em>array</em> apagado, a covariância dos <em>arrays</em>, as duas condições para a anotação e as restrições de aplicabilidade.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a alternativa de <em>design</em> (assinatura com <code>List&lt;T&gt;</code>), com o custo de alocação, e cita casos reais na JDK.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se o campo for <code>volatile</code> — resolve?»</li>
-      <li>«Como é que escreveria um teste que apanhasse isto?»</li>
-      <li>«Quando é que a avaliação antecipada é a que se quer?»</li>
-      <li>«O que muda se a referência for a um método estático?»</li></ul></div>
+      <li>«Escreva um método com <code>@SafeVarargs</code> que, apesar disso, provoca <code>ClassCastException</code> no chamador.»</li>
+      <li>«Porque é que <code>@SafeVarargs</code> não se pode pôr num método de instância não-final?»</li>
+      <li>«Porque é que os <em>arrays</em> são covariantes e as colecções genéricas não?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Aplicar «referência de método é sempre mais limpo» como regra sem excepção.</li>
-      <li>Não reconhecer que o problema é de tempo de vida do receptor, não de sintaxe.</li></ul></div>
+      <li>Tratar <code>@SafeVarargs</code> como equivalente a <code>@SuppressWarnings</code>.</li>
+      <li>Não saber que os <em>varargs</em> criam um <em>array</em>, e que esse <em>array</em> é alocado a cada chamada.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-6-2" class="h2"><span class="secnum">6.2</span> Streams: pipeline, lazy evaluation e short-circuit<a class="anchor" href="#sec-6-2" aria-label="ligação">#</a></h2>
+<h2 id="sec-6-2" class="h2"><span class="secnum">6.2</span> Wildcards, variância e PECS<a class="anchor" href="#sec-6-2" aria-label="ligação">#</a></h2>
 
-<p>Um <em>pipeline</em> tem três partes: uma fonte (colecção, array, gerador, <code>Files.lines</code>), zero ou mais operações intermédias e exactamente uma operação terminal. As intermédias — <code>map</code>, <code>filter</code>, <code>sorted</code>, <code>limit</code>, <code>flatMap</code>, <code>distinct</code>, <code>peek</code> — devolvem um novo <code>Stream</code> e não executam nada: apenas acrescentam um estágio a uma lista ligada de estágios. A terminal — <code>collect</code>, <code>forEach</code>, <code>reduce</code>, <code>count</code>, <code>findFirst</code>, <code>anyMatch</code>, <code>toList</code> — é que percorre a fonte através do <code>Spliterator</code> e empurra cada elemento por toda a cadeia de <code>Sink</code>. Sem operação terminal, o <em>pipeline</em> nunca corre: é o erro mais comum em revisões de código, um <code>stream().map(this::guardar)</code> que não guarda nada.</p>
+<p>Os tipos genéricos em Java são invariantes: <code>List&lt;Integer&gt;</code> não é subtipo de <code>List&lt;Number&gt;</code>, embora <code>Integer</code> seja subtipo de <code>Number</code>. Sem esta regra, seria possível colocar um <code>Double</code> numa <code>List&lt;Integer&gt;</code> através de uma referência <code>List&lt;Number&gt;</code>. Os <em>arrays</em>, por herança do Java 1.0, são covariantes e pagam a factura em <em>runtime</em>: escrever num <code>Object[]</code> que na verdade é um <code>String[]</code> lança <code>ArrayStoreException</code>.</p>
 
-<p>Isto tem uma consequência que muitos candidatos não conseguem prever no quadro: a execução é por elemento, não por estágio. Numa lista de um milhão de registos com <code>filter(...).map(...).findFirst()</code>, o primeiro elemento atravessa o filtro e o <code>map</code> antes de o segundo ser tocado, e se passar no filtro o <em>pipeline</em> pára ali. Não há um milhão de <code>filter</code> seguidos de um milhão de <code>map</code>. É esta fusão de estágios (<em>loop fusion</em>) que torna os streams competitivos com um ciclo escrito à mão.</p>
+<p>Os <em>wildcards</em> reintroduzem a variância onde ela é segura. <code>? extends T</code> dá covariância de leitura: lê-se <code>T</code>, não se escreve nada além de <code>null</code>. <code>? super T</code> dá contravariância de escrita: escreve-se <code>T</code>, lê-se <code>Object</code>. A regra mnemónica é PECS — <em>Producer Extends, Consumer Super</em>: se o parâmetro é a fonte dos dados, <code>extends</code>; se é o destino, <code>super</code>; se é ambos, nenhum dos dois.</p>
 
-<p>As operações que cortam cedo são <code>limit</code>, <code>takeWhile</code>, <code>findFirst</code>, <code>findAny</code>, <code>anyMatch</code>, <code>allMatch</code> e <code>noneMatch</code>. As que são <em>barreiras com estado</em> — <code>sorted</code> e <code>distinct</code> — obrigam a materializar todos os elementos antes de emitir o primeiro, e por isso anulam o benefício de um <code>limit</code> colocado a seguir a elas em fontes infinitas ou muito grandes. Ordenar um milhão de registos para levar os dez maiores custa O(n log n) e vários megabytes de <em>array</em> intermédio; a alternativa correcta é um <em>heap</em> limitado de tamanho 10 ou uma cláusula <code>ORDER BY … LIMIT 10</code> na base de dados, que faz o mesmo trabalho com um índice.</p>
+<p>Na prática de entrevista, o sinal de senioridade não é recitar PECS mas identificar o custo de <em>não</em> o aplicar numa API pública. Uma assinatura <code>void publicar(List&lt;Evento&gt; eventos)</code> obriga todos os chamadores a construir exactamente <code>List&lt;Evento&gt;</code>; <code>List&lt;EventoCriado&gt;</code> não serve. Alargar depois para <code>List&lt;? extends Evento&gt;</code> é compatível com o binário existente mas obriga a recompilar quem sobrepõe o método — por isso a decisão tem de ser tomada na primeira versão da API, não na terceira.</p>
 
 <figure class="listing java" id="lst-6-2"><div class="lhead"><span class="lnum">Listagem 6.2</span>
-<span class="lcap">Lazy evaluation e short-circuit: a ordem em que as mensagens aparecem.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>List&lt;String&gt; nomes = List.of("ana", "bruno", "carla", "duarte");
+<span class="lcap">PECS aplicado: produtor com <code>extends</code>, consumidor com <code>super</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// Produtor -&gt; extends ; Consumidor -&gt; super
+static &lt;T&gt; void copiar(List&lt;? super T&gt; destino, List&lt;? extends T&gt; origem) {
+    for (int i = 0; i &lt; origem.size(); i++) destino.set(i, origem.get(i));
+}
 
-Optional&lt;String&gt; r = nomes.stream()
-        .filter(n -&gt; { System.out.println("filtro: " + n); return n.length() &gt; 4; })
-        .map(n -&gt;   { System.out.println("  map: " + n); return n.toUpperCase(); })
-        .findFirst();
+// Sem wildcard a API é inutilizável para subtipos:
+static double somaRigida(List&lt;Number&gt; ns) { ... }        // recusa List&lt;Integer&gt;
 
-// Saída:
-// filtro: ana
-// filtro: bruno
-//   map: bruno
-// -&gt; 3 chamadas no total, não 4 + 2. "carla" e "duarte" nunca são tocados.
+static double soma(List&lt;? extends Number&gt; ns) {          // aceita List&lt;Integer&gt;, List&lt;Double&gt;
+    double t = 0;
+    for (Number n : ns) t += n.doubleValue();
+    return t;                                            // mas ns.add(1) é ilegal
+}
 
-// Sem terminal, nada corre:
-nomes.stream().map(n -&gt; { System.out.println("nunca"); return n; });   // silêncio
+// Porque é que sort aceita um Comparator do supertipo:
+Comparator&lt;Object&gt; porHash = Comparator.comparingInt(Object::hashCode);
+List&lt;String&gt; nomes = new ArrayList&lt;&gt;(List.of("b", "a"));
+nomes.sort(porHash);   // compila: List.sort(Comparator&lt;? super E&gt;)
 
-// Barreira com estado: sorted() consome tudo antes de emitir o primeiro
-long n = Stream.iterate(1L, x -&gt; x + 1)
-        .limit(1_000_000)
-        .sorted()          // materializa 1e6 elementos em memória
-        .limit(10)         // o limit chega tarde de mais
-        .count();</code></pre></figure>
+// Captura do wildcard: o truque para escrever num List&lt;?&gt;
+static void inverter(List&lt;?&gt; l) { inverterAux(l); }
+private static &lt;T&gt; void inverterAux(List&lt;T&gt; l) { Collections.reverse(l); }</code></pre></figure>
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>Files.lines(caminho)</code> e <code>Files.walk</code> devolvem streams que seguram um descritor de ficheiro. Sem <code>try (var s = Files.lines(p))</code>, o descritor só é libertado pelo colector de lixo — num serviço que lê 500 ficheiros por minuto, o limite de <code>ulimit -n</code> (tipicamente 1024 num contentor por omissão) esgota-se em poucos minutos com <code>Too many open files</code>. Streams de colecções não precisam de fecho; streams de I/O precisam sempre.</p></aside>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Wildcards</em> tornam a API flexível e a implementação rígida. Cada <code>? extends</code> fecha a porta à escrita e obriga, em métodos que precisam de ambas as direcções, ao padrão de captura com um método auxiliar genérico privado. A regra prática: aplicar PECS em parâmetros de métodos públicos, nunca em tipos de retorno — <code>List&lt;? extends Evento&gt;</code> devolvido contamina o chamador, que fica sem poder escrever na lista que recebeu e sem perceber porquê.</p></aside>
 
 <div class="qa" id="q-6-3" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Java e a linguagem</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Distinga operações intermédias de terminais e diga-me, para <code>lista.stream().filter(f).map(m).findFirst()</code> sobre um milhão de elementos, quantas vezes <code>f</code> e <code>m</code> são chamados e porquê.</div>
+  <div class="qprompt">Tenho <code>void processar(List&lt;Evento&gt; eventos)</code> e um chamador com <code>List&lt;EventoDePagamento&gt;</code> que não compila. Explique porquê e corrija a assinatura. Quando é que a correcção deixa de ser possível?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>As intermédias devolvem um <code>Stream</code> e são preguiçosas: apenas registam um estágio. A terminal desencadeia o percurso e produz um valor, uma colecção ou um efeito. Em <code>filter(f).map(m).findFirst()</code>, <code>f</code> é chamado até ao primeiro elemento que passe — se for o k-ésimo, são k chamadas — e <code>m</code> é chamado exactamente uma vez. Se nenhum elemento passar, são um milhão de chamadas a <code>f</code>, zero a <code>m</code>, e o resultado é <code>Optional.empty()</code>.</p>
-      <p>O mecanismo é a fusão de estágios: a terminal pede elementos ao <code>Spliterator</code> da fonte e empurra cada um pela cadeia de <code>Sink</code>; cada elemento atravessa o <em>pipeline</em> inteiro antes de o seguinte ser lido. As operações que cortam cedo sinalizam isso ao percurso, e o <code>forEachRemaining</code> é interrompido. Por isso a ordem das operações importa em termos de custo real: pôr o <code>filter</code> mais selectivo primeiro reduz o número de invocações de tudo o que vem depois, e um <code>map</code> caro colocado antes de um <code>filter</code> é dinheiro deitado fora — o compilador não reordena estágios por nós.</p>
-      <p>A excepção são as barreiras com estado. <code>sorted()</code> e <code>distinct()</code> têm de ver todos os elementos antes de emitir o primeiro, portanto anulam o corte antecipado para tudo o que esteja a montante e obrigam a materializar a fonte. Um <code>limit(10)</code> depois de um <code>sorted()</code> não evita ordenar um milhão de registos.</p>
-      <p>O trade-off que interessa referir: esta preguiça é o que permite trabalhar com fontes infinitas (<code>Stream.iterate</code>, <code>Stream.generate</code>) e é também o que torna os efeitos secundários dentro do <em>pipeline</em> imprevisíveis — o número de vezes que um <code>peek</code> corre depende de optimizações que não fazem parte do contrato.</p></div>
+      <p>Não compila porque os genéricos são invariantes: <code>List&lt;EventoDePagamento&gt;</code> não é subtipo de <code>List&lt;Evento&gt;</code>. A invariância existe para impedir que, através da referência ao supertipo, alguém insira um <code>EventoDeFactura</code> numa lista que o resto do sistema trata como sendo só de pagamentos.</p>
+      <p>Se <code>processar</code> apenas lê da lista, a lista é produtora e a assinatura correcta é <code>void processar(List&lt;? extends Evento&gt; eventos)</code>. Se tiver de acrescentar elementos, a lista é consumidora e a assinatura é <code>List&lt;? super EventoDePagamento&gt;</code>. Se fizer as duas coisas, nenhum <em>wildcard</em> serve e o parâmetro tem de ficar invariante — sinal, quase sempre, de que o método está a fazer duas coisas e devia ser dividido em duas.</p>
+      <p>A correcção deixa de ser possível — ou deixa de ser barata — em três situações. Primeira, quando o método é <code>public</code> numa biblioteca com consumidores externos: alargar o parâmetro mantém a compatibilidade de código-fonte para quem chama, mas quebra a compatibilidade de código-fonte para quem sobrepõe o método, porque a assinatura sobreposta deixa de corresponder. Segunda, quando o método é parte de uma interface funcional já usada em referências de método — a inferência muda e algumas expressões deixam de compilar. Terceira, quando o parâmetro é usado tanto como fonte como destino, e nesse caso a resposta correcta é reformular a API, por exemplo devolvendo uma nova lista em vez de mutar a recebida.</p>
+      <p>Um número para fechar: numa <em>codebase</em> de 400 mil linhas, a diferença entre aplicar PECS de raiz e corrigir depois é medida em <em>call sites</em> — a alteração compila para os chamadores mas obriga a rever cada implementação da interface, e é isso que transforma uma alteração de uma linha numa migração de várias equipas.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Filtra um milhão e depois mapeia um milhão.» Não conhece a preguiça.</td></tr>
-        <tr><td>Mid</td><td>Diz «é lazy» e acerta no resultado, mas não explica a fusão nem sabe o caso em que nada passa no filtro.</td></tr>
-        <tr><td>Sénior</td><td>Dá k chamadas a <code>f</code> e uma a <code>m</code>, explica <code>Spliterator</code>/<code>Sink</code>, e usa isso para justificar a ordem das operações.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta as barreiras com estado, o efeito no consumo de memória, e liga ao desenho de APIs que devolvem <code>Stream</code> em vez de <code>List</code> para não materializar.</td></tr>
+        <tr><td>Insuficiente</td><td>Propõe <code>List&lt;Object&gt;</code> ou um <em>cast</em> não verificado; não sabe o que é invariância.</td></tr>
+        <tr><td>Mid</td><td>Aplica <code>? extends</code> correctamente mas não sabe explicar porque é que a escrita fica proibida.</td></tr>
+        <tr><td>Sénior</td><td>Invariância com a razão de segurança, PECS aplicado às duas direcções, e a regra de não usar <em>wildcards</em> em tipos de retorno.</td></tr>
+        <tr><td>Staff</td><td>Fala de compatibilidade de código-fonte para quem sobrepõe, e trata o caso «lê e escreve» como sintoma de má separação de responsabilidades.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se puser um <code>sorted()</code> antes do <code>findFirst()</code>?»</li>
-      <li>«Quando é que faz sentido uma API devolver <code>Stream&lt;T&gt;</code> em vez de <code>List&lt;T&gt;</code>?»</li>
-      <li>«<code>anyMatch(p)</code> e <code>filter(p).findFirst().isPresent()</code> custam o mesmo?»</li>
-      <li>«Como é que isto muda em paralelo?»</li></ul></div>
+      <li>«Porque é que <code>List&lt;? extends Evento&gt;</code> aceita <code>add(null)</code> mas não <code>add(evento)</code>?»</li>
+      <li>«Como é que se escreve num <code>List&lt;?&gt;</code>? Escreva a captura do <em>wildcard</em>.»</li>
+      <li>«Porque é que a assinatura de <code>Collections.max</code> é tão complicada?»</li>
+      <li>«Devolveria <code>List&lt;? extends Evento&gt;</code>? Justifique.»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Acreditar que a JVM reordena <code>filter</code> e <code>map</code> por si.</li>
-      <li>Descrever streams como «for elegante» sem nenhuma noção de execução.</li>
-      <li>Ignorar que <code>sorted()</code> materializa e mata o corte antecipado.</li></ul></div>
+      <li>Confundir <code>? extends</code> com <code>? super</code> e não conseguir derivar a regra a partir do sentido do fluxo de dados.</li>
+      <li>Dizer que «<em>wildcards</em> são para casos avançados» e evitá-los sistematicamente em APIs públicas.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-6-4" data-box="qa" data-area="java" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Tenho <code>List&lt;Encomenda&gt;</code> e cada encomenda tem <code>List&lt;Linha&gt;</code>. Quero o total facturado por SKU. Escreva a diferença entre <code>map</code> e <code>flatMap</code> aqui e diga quando usaria <code>mapMulti</code>.</div>
+<div class="qa" id="q-6-4" data-box="qa" data-area="design" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Está a desenhar um <code>Repositorio&lt;T, ID&gt;</code> partilhado por 30 serviços. Que restrições de tipo põe, e como evita que os genéricos transformem a interface numa assinatura ilegível como a de <code>Collections.max</code>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>map</code> é uma transformação 1 para 1: <code>encomendas.stream().map(Encomenda::linhas)</code> dá <code>Stream&lt;List&lt;Linha&gt;&gt;</code>, um elemento por encomenda. <code>flatMap</code> é 1 para N com achatamento: recebe uma função que devolve um <code>Stream</code> por elemento e concatena os resultados, dando <code>Stream&lt;Linha&gt;</code>. Para agrupar por SKU precisa-se do segundo.</p>
-      <p>A implementação escreve-se numa linha: <code>encomendas.stream().flatMap(e -&gt; e.linhas().stream()).collect(groupingBy(Linha::sku, summingLong(Linha::centimos)))</code>. Se cada encomenda tem em média 8 linhas e há 50 000 encomendas, o <em>pipeline</em> vê 400 000 elementos e produz um mapa com tantas entradas quantos os SKU distintos.</p>
-      <p>O detalhe de nível sénior é o custo: <code>flatMap</code> consome cada sub-stream até ao fim antes de passar ao seguinte, e por isso o corte antecipado a jusante é imperfeito — um <code>findFirst()</code> depois de um <code>flatMap</code> pode processar a sub-colecção inteira do primeiro elemento. Além disso, cada chamada aloca um <code>Stream</code> temporário; sobre 400 000 encomendas com listas pequenas, essa alocação domina o custo.</p>
-      <p>É aí que entra <code>mapMulti</code>: em vez de devolver um <code>Stream</code>, recebe um <code>Consumer</code> e o código empurra zero, um ou vários resultados directamente para o estágio seguinte. Elimina o stream intermédio. A regra é simples: usa-se <code>flatMap</code> por omissão, porque é mais legível; passa-se a <code>mapMulti</code> quando o factor de expansão é pequeno (0 a 2 elementos), o <em>pipeline</em> é quente e a medição mostra que a alocação dos streams intermédios é significativa. Trocar legibilidade por <code>mapMulti</code> sem medir é optimização prematura.</p></div>
+      <p>A regra de partida é minimizar os graus de liberdade: cada parâmetro de tipo tem de justificar-se por uma relação real entre a entrada e a saída, não por «pode vir a ser útil». <code>Repositorio&lt;T extends Entidade&lt;ID&gt;, ID extends Comparable&lt;ID&gt;&gt;</code> impõe duas restrições que geram mensagens de erro de dez linhas; <code>Repositorio&lt;T, ID&gt;</code> sem limites gera zero e não perde quase nada, porque a segurança real vem do contrato de cada implementação e não do compilador.</p>
+      <p>A segunda regra é preferir métodos genéricos a tipos genéricos. Um método genérico infere os argumentos de tipo a partir dos parâmetros e não obriga o utilizador a escrevê-los; um tipo genérico obriga a escrever a declaração em cada campo e em cada variável. Assinaturas como <code>&lt;T extends Object &amp; Comparable&lt;? super T&gt;&gt; T max(Collection&lt;? extends T&gt;)</code> existem por compatibilidade retroactiva com código pré-genéricos, não como modelo a seguir.</p>
+      <p>A terceira é encapsular a complexidade num tipo com nome. Em vez de expor <code>Map&lt;String, List&lt;Function&lt;Pagamento, Optional&lt;Decisao&gt;&gt;&gt;&gt;</code>, define-se <code>record TabelaDeRegras(Map&lt;String, List&lt;Regra&gt;&gt; porCanal)</code> com <code>interface Regra extends Function&lt;Pagamento, Optional&lt;Decisao&gt;&gt;</code>. O tipo com nome aparece no <em>stack trace</em>, na documentação e nas mensagens de erro; a expressão aninhada só aparece nas três.</p>
+      <p>O <em>trade-off</em>: menos restrições de tipo significa que erros que o compilador poderia apanhar passam para testes. Vale a pena aceitar isso numa interface usada por 30 serviços, onde o custo de uma assinatura ilegível é pago 30 vezes por cada leitura; não vale numa biblioteca de baixo nível com poucos utilizadores e invariantes que não podem ser violados, como uma API de unidades físicas, em que o tipo é a única defesa.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não sabe achatar; propõe ciclos aninhados com uma lista temporária e um <code>addAll</code>.</td></tr>
-        <tr><td>Mid</td><td>Usa <code>flatMap</code> correctamente e escreve o <code>groupingBy</code>, sem falar de custo.</td></tr>
-        <tr><td>Sénior</td><td>Explica o achatamento, o <code>summingLong</code> como <em>downstream</em>, e conhece o custo do stream intermédio e o corte antecipado imperfeito.</td></tr>
-        <tr><td>Staff</td><td>Traz <code>mapMulti</code> com o critério de quando compensa, e questiona se a agregação não deveria ser feita em SQL com <code>GROUP BY</code> para não trazer 400 000 linhas para a JVM.</td></tr>
+        <tr><td>Insuficiente</td><td>Enche a assinatura de limites porque «é mais seguro», sem avaliar o custo para os utilizadores.</td></tr>
+        <tr><td>Mid</td><td>Escreve uma interface genérica funcional mas não discute legibilidade nem inferência.</td></tr>
+        <tr><td>Sénior</td><td>Justifica cada parâmetro de tipo, prefere métodos genéricos, e nomeia tipos intermédios em vez de aninhar genéricos.</td></tr>
+        <tr><td>Staff</td><td>Formula a decisão como custo distribuído por 30 equipas e identifica o caso oposto em que os limites de tipo são obrigatórios.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se uma encomenda tiver <code>linhas()</code> a <code>null</code>?»</li>
-      <li>«Como devolve também a contagem de linhas por SKU no mesmo percurso?»</li>
-      <li>«Faria isto em Java ou em SQL? Com que critério?»</li>
-      <li>«O que muda se as encomendas vierem de um cursor de base de dados?»</li></ul></div>
+      <li>«Como é que expõe consultas paginadas sem inventar um segundo tipo genérico?»</li>
+      <li>«O que faria diferente se metade dos consumidores fosse Kotlin?»</li>
+      <li>«Quando é que um <em>type token</em> em <em>runtime</em> é preferível a um parâmetro de tipo?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Fazer <code>collect(toList())</code> a meio só para voltar a abrir outro stream.</li>
-      <li>Somar valores monetários em <code>double</code> em vez de <code>long</code> de cêntimos ou <code>BigDecimal</code>.</li>
-      <li>Não notar que o achatamento multiplica o número de elementos processados.</li></ul></div>
+      <li>Copiar a assinatura do Spring Data sem saber explicar nenhum dos seus parâmetros de tipo.</li>
+      <li>Considerar que legibilidade de assinaturas é uma preocupação estética e não de custo de manutenção.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-6-5" data-box="qa" data-area="java" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Este código lança <code>IllegalStateException: stream has already been operated upon or closed</code> em produção uma vez por dia. Guardamos o stream num campo e usamo-lo em dois métodos. Como explica e como corrige?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um <code>Stream</code> é de utilização única. Internamente há um estado <code>linkedOrConsumed</code>; assim que uma operação intermédia é encadeada ou uma terminal é executada, o <em>pipeline</em> fica marcado e qualquer nova utilização lança <code>IllegalStateException</code>. Não é um <em>bug</em> da biblioteca: é o preço de o stream ser uma vista preguiçosa sobre uma fonte, possivelmente infinita ou de I/O, que não pode ser rebobinada.</p>
-      <p>Guardar um <code>Stream</code> num campo é quase sempre um erro de desenho, e o facto de falhar «uma vez por dia» sugere que o segundo consumo é raro — um caminho de erro, um <em>retry</em>, um <em>endpoint</em> secundário. Há três correcções, por ordem de preferência. Primeira: guardar a fonte, não o stream — um <code>List&lt;T&gt;</code> imutável, e abrir <code>list.stream()</code> em cada uso; custa memória proporcional ao tamanho, mas é trivialmente correcto. Segunda: guardar um <code>Supplier&lt;Stream&lt;T&gt;&gt;</code> e invocá-lo em cada consumo, que é o padrão certo quando a fonte é cara de materializar mas barata de reabrir. Terceira: se a fonte for I/O e só puder ser lida uma vez (um <code>InputStream</code>, um cursor de base de dados), então o consumo único é a semântica correcta e o que tem de mudar é o desenho — quem consome recebe o stream como parâmetro e fecha-o num <code>try-with-resources</code>.</p>
-      <p>Vale a pena distinguir do erro parecido: <code>Optional</code>, <code>Iterator</code> e <code>Spliterator</code> também são de consumo único; <code>Iterable</code> e <code>Collection</code> não. Uma API interna que devolve <code>Stream&lt;T&gt;</code> transfere para o chamador a obrigação de o consumir uma só vez e de o fechar, o que é uma boa escolha para resultados grandes e uma má escolha para um DTO que vai ser lido em três sítios.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Propõe apanhar a excepção e repetir, ou culpa a concorrência sem evidência.</td></tr>
-        <tr><td>Mid</td><td>Sabe que o stream é de uso único e materializa numa lista, sem discutir o custo nem o caso de I/O.</td></tr>
-        <tr><td>Sénior</td><td>Explica <code>linkedOrConsumed</code> e o porquê semântico, oferece <code>Supplier&lt;Stream&lt;T&gt;&gt;</code> e distingue fonte reabrível de fonte de I/O.</td></tr>
-        <tr><td>Staff</td><td>Reenquadra como decisão de API: quem é dono do ciclo de vida, o que se promete no contrato do método, e como um teste que consome duas vezes fixa a regressão.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se dois <em>threads</em> consumirem o mesmo stream ao mesmo tempo?»</li>
-      <li>«Quando devolveria <code>Stream&lt;T&gt;</code> numa API pública?»</li>
-      <li>«Como garante que um stream de <code>Files.lines</code> é fechado?»</li>
-      <li>«Que teste teria apanhado isto antes do <em>deploy</em>?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Sugerir <code>stream.onClose</code> ou <code>parallel()</code> como solução.</li>
-      <li>Não perceber que o problema é de posse e ciclo de vida, não de sintaxe.</li></ul></div>
-  </div>
-</div>
+<h2 id="sec-6-3" class="h2"><span class="secnum">6.3</span> Records: quando substituem uma classe e quando não<a class="anchor" href="#sec-6-3" aria-label="ligação">#</a></h2>
 
-<h2 id="sec-6-3" class="h2"><span class="secnum">6.3</span> Colectores, agrupamentos e reduções<a class="anchor" href="#sec-6-3" aria-label="ligação">#</a></h2>
+<p>Um <em>record</em>, final desde o Java 16, é um portador de dados transparente: os componentes declarados são campos <code>private final</code>, existe um construtor canónico com todos eles, acessores com o nome do componente (sem prefixo <code>get</code>), e <code>equals</code>, <code>hashCode</code> e <code>toString</code> derivados de todos os componentes. A classe é implicitamente <code>final</code> e não pode estender outra classe, mas pode implementar interfaces e ter métodos, campos estáticos e construtores adicionais.</p>
 
-<p>Um <code>Collector&lt;T,A,R&gt;</code> são cinco peças: <code>supplier</code> cria o contentor mutável, <code>accumulator</code> junta um elemento, <code>combiner</code> funde dois contentores (só usado em paralelo), <code>finisher</code> converte o contentor no resultado e <code>characteristics</code> declara propriedades como <code>UNORDERED</code>, <code>CONCURRENT</code> e <code>IDENTITY_FINISH</code>. Perceber estas cinco peças é o que permite responder a metade das perguntas desta secção sem decorar a API.</p>
+<p>A parte que separa uso de compreensão é o construtor compacto. Escrever <code>public Money { ... }</code> — sem lista de parâmetros — dá acesso aos parâmetros do construtor canónico antes de serem atribuídos aos campos, e é aí que se validam e normalizam os valores. Reatribuir <code>amount</code> dentro do construtor compacto altera o que é gravado no campo. Isto é o que permite que um <em>record</em> tenha invariantes fortes, ao contrário da crença de que só serve para DTO anémicos.</p>
 
-<p>A distinção entre <code>reduce</code> e <code>collect</code> deriva daí. <code>reduce</code> é redução imutável: cada passo produz um valor novo. <code>collect</code> é redução mutável: cada passo altera um contentor existente. Para <code>long</code> e <code>int</code>, <code>reduce</code> é ideal, porque criar um novo <code>long</code> não custa nada. Para <code>String</code> ou <code>List</code>, <code>reduce</code> é uma armadilha de complexidade: concatenar n cadeias com <code>reduce(&quot;&quot;, String::concat)</code> aloca uma cadeia nova por passo e é O(n²) em cópias de bytes — com 100 000 elementos de 20 caracteres, são cerca de 10<sup>11</sup> bytes copiados, o que na prática significa que o serviço deixa de responder. <code>Collectors.joining()</code> usa um único <code>StringBuilder</code> e é O(n).</p>
+<p>A imutabilidade é superficial: um componente <code>List&lt;Linha&gt;</code> é uma referência final para uma lista possivelmente mutável. Um <em>record</em> com invariantes a sério copia no construtor compacto — <code>linhas = List.copyOf(linhas)</code> — ao custo de uma alocação por instância. Vale a pena em objectos de domínio partilhados entre <em>threads</em>; não vale em DTO de fronteira criados e descartados por pedido, onde 5 000 cópias por segundo aparecem no perfil de alocação.</p>
 
-<p>Os colectores que aparecem em entrevista são poucos e vale a pena dominá-los a fundo: <code>toList</code> (e o <code>Stream.toList()</code> desde o Java 16, que devolve uma lista imutável e aceita <code>null</code>), <code>toMap</code> com e sem função de fusão, <code>groupingBy</code> com <em>downstream</em>, <code>partitioningBy</code>, <code>counting</code>, <code>summingLong</code>, <code>averagingDouble</code>, <code>summarizingLong</code>, <code>mapping</code>, <code>filtering</code>, <code>flatMapping</code>, <code>collectingAndThen</code> e <code>teeing</code>. As três armadilhas clássicas: <code>toMap</code> lança <code>IllegalStateException</code> em chave duplicada (<code>groupingBy</code> não), <code>toMap</code> lança <code>NullPointerException</code> se o valor for <code>null</code> (porque usa <code>merge</code>), e <code>groupingBy</code> devolve um <code>HashMap</code> sem ordem — se a ordem importa, passa-se <code>TreeMap::new</code> ou <code>LinkedHashMap::new</code> como fábrica.</p>
+<figure class="listing java" id="lst-6-3"><div class="lhead"><span class="lnum">Listagem 6.3</span>
+<span class="lcap">Construtor compacto: validação e normalização antes da atribuição.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public record Money(BigDecimal amount, Currency currency) implements Comparable&lt;Money&gt; {
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 6.1</span> Colectores por objectivo, com o que falha se for o escolhido errado.</div>
-<div class="tscroll"><table><thead><tr><th>Objectivo</th><th>Colector</th><th>Falha típica da alternativa</th></tr></thead><tbody>
-<tr><td>Somar um campo</td><td><code>summingLong</code> / <code>mapToLong().sum()</code></td><td><code>reduce</code> sobre <code>Stream&lt;Long&gt;</code>: boxing por elemento</td></tr>
-<tr><td>Concatenar texto</td><td><code>joining(", ")</code></td><td><code>reduce("", String::concat)</code>: O(n²)</td></tr>
-<tr><td>Índice por chave única</td><td><code>toMap(k, v)</code></td><td><code>groupingBy</code>: dá <code>Map&lt;K,List&lt;V&gt;&gt;</code> com listas de um elemento</td></tr>
-<tr><td>Índice com chaves repetidas</td><td><code>toMap(k, v, (a,b) -&gt; b)</code></td><td><code>toMap</code> sem fusão: <code>IllegalStateException</code> em produção</td></tr>
-<tr><td>Contar por categoria</td><td><code>groupingBy(f, counting())</code></td><td><code>groupingBy(f)</code> + <code>size()</code>: materializa listas inteiras</td></tr>
-<tr><td>Duas agregações num percurso</td><td><code>teeing(c1, c2, fusão)</code></td><td>Dois <code>stream()</code> sobre a mesma fonte: 2x o percurso</td></tr>
-<tr><td>Mapa imutável no fim</td><td><code>collectingAndThen(toMap(...), Map::copyOf)</code></td><td>Devolver o <code>HashMap</code> interno: mutável por quem o receber</td></tr>
+    public Money {                                    // construtor compacto
+        Objects.requireNonNull(amount, "amount");
+        Objects.requireNonNull(currency, "currency");
+        // normalização: a reatribuição afecta o campo final
+        amount = amount.setScale(currency.getDefaultFractionDigits(), RoundingMode.UNNECESSARY);
+    }
+
+    public static Money eur(String v) {
+        return new Money(new BigDecimal(v), Currency.getInstance("EUR"));
+    }
+
+    public Money plus(Money outro) {
+        if (!currency.equals(outro.currency))
+            throw new IllegalArgumentException("moedas diferentes: " + currency + " / " + outro.currency);
+        return new Money(amount.add(outro.amount), currency);
+    }
+
+    @Override public int compareTo(Money o) { return amount.compareTo(o.amount); }
+}
+
+// Componente mutável: cópia defensiva ou o record não é imutável
+public record Encomenda(String id, List&lt;Linha&gt; linhas) {
+    public Encomenda {
+        linhas = List.copyOf(linhas);                 // lança NPE se houver null na lista
+    }
+}</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 6.1</span> Portador de dados: <em>record</em>, Lombok e classe escrita à mão.</div>
+<div class="tscroll"><table><thead><tr><th>Critério</th><th><em>Record</em></th><th>Lombok <code>@Value</code></th><th>Classe à mão</th></tr></thead><tbody>
+<tr><td>Linhas para 5 campos</td><td>1</td><td>3 a 5</td><td>60 a 80</td></tr>
+<tr><td>Dependência externa</td><td>Nenhuma</td><td><em>Annotation processor</em>, quebra em cada JDK novo</td><td>Nenhuma</td></tr>
+<tr><td>Herança de classe</td><td>Impossível</td><td>Possível</td><td>Possível</td></tr>
+<tr><td>Mutabilidade parcial</td><td>Impossível</td><td>Possível (<code>@Data</code>)</td><td>Possível</td></tr>
+<tr><td><em>Pattern matching</em> por desconstrução</td><td>Sim</td><td>Não</td><td>Não</td></tr>
+<tr><td>Entidade JPA</td><td>Não (falta construtor sem argumentos e campos não-finais)</td><td>Não com <code>@Value</code></td><td>Sim</td></tr>
+<tr><td>Desserialização com invariantes</td><td>Passa pelo construtor canónico</td><td>Depende do <em>framework</em></td><td>Depende do <em>framework</em></td></tr>
 </tbody></table></div></div>
 
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><code>groupingBy(f, counting())</code> guarda um <code>Long</code> por grupo; <code>groupingBy(f)</code> guarda a lista completa de elementos de cada grupo. Para 2 milhões de eventos em 50 categorias, o primeiro ocupa uns poucos kilobytes e o segundo mantém referências aos 2 milhões de objectos vivos até o mapa ser descartado — diferença entre um <em>heap</em> plano e uma pausa de GC. Guardar as listas só se justifica se as listas forem realmente usadas a seguir; caso contrário, escolhe-se sempre o <em>downstream</em> agregador.</p></aside>
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Na serialização Java nativa, um <em>record</em> é desserializado através do construtor canónico, o que faz com que as validações do construtor compacto corram sempre. Uma classe serializável comum é reconstruída sem passar por construtor nenhum, e por isso um objecto com invariantes pode nascer inválido a partir de um fluxo malicioso. É um argumento de segurança a favor de <em>records</em> que quase nenhum candidato traz e que impressiona quando aparece.</p></aside>
 
-<div class="qa" id="q-6-6" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+<div class="qa" id="q-6-5" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Java e a linguagem</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Quando é que usa <code>reduce</code> e quando é que usa <code>collect</code>? Dê-me um caso em que <code>reduce</code> é claramente a escolha errada e explique o custo.</div>
+  <div class="qprompt">A equipa usa Lombok em todo o lado. Vale a pena migrar os DTO para <em>records</em>? Diga-me o que ganha, o que perde e onde é que o <em>record</em> simplesmente não serve.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><code>reduce</code> faz redução imutável — cada passo devolve um valor novo — e exige que o acumulador seja associativo e sem estado, e que a identidade seja neutra. <code>collect</code> faz redução mutável: acumula num contentor que é alterado no lugar. A regra é o custo de criar o valor intermédio: barato para primitivos, caro para estruturas.</p>
-      <p>O caso errado clássico é a concatenação. <code>strings.stream().reduce(&quot;&quot;, String::concat)</code> aloca uma <code>String</code> nova em cada passo e copia tudo o que já lá estava: com n elementos de comprimento médio m, são O(n²·m) bytes copiados. Com 100 000 elementos de 20 caracteres, isso são dezenas de milhares de milhões de bytes copiados e uma pressão de alocação que enche a geração jovem repetidamente. <code>Collectors.joining()</code> resolve o mesmo problema com um <code>StringBuilder</code> em O(n·m). O mesmo padrão aplica-se a <code>reduce</code> com <code>List</code>: <code>(a, b) -&gt; { var l = new ArrayList&lt;&gt;(a); l.add(b); return l; }</code> é O(n²) e aparece em código real.</p>
-      <p>Há um segundo erro, mais subtil, que é usar <code>reduce</code> com um acumulador que muta o argumento — <code>(lista, x) -&gt; { lista.add(x); return lista; }</code>. Funciona em série e produz resultados errados em paralelo, porque a identidade é partilhada entre ramos e o contrato de associatividade é violado. É exactamente esse caso de uso que <code>collect</code> existe para servir, com <code>supplier</code>, <code>accumulator</code> e <code>combiner</code> separados.</p>
-      <p>Quando é que <code>reduce</code> ganha, então? Em agregações escalares: soma, máximo, mínimo, <em>hash</em> combinado, produto de matrizes pequenas — e sobretudo em <code>IntStream</code>/<code>LongStream</code>, onde não há alocação nenhuma e a versão com <code>collect</code> seria mais verbosa sem qualquer ganho. Para tudo o que seja construir uma estrutura, <code>collect</code>.</p></div>
+      <p>Vale a pena para DTO e objectos-valor, e não vale para entidades JPA nem para hierarquias que precisem de herança. A regra de decisão é: o objecto é definido pelo conjunto dos seus componentes e não tem identidade própria? Então é <em>record</em>.</p>
+      <p>Ganha-se três coisas concretas. Primeiro, elimina-se uma dependência de <em>annotation processor</em> que manipula a árvore de sintaxe interna do compilador e que historicamente é o item que bloqueia a actualização do JDK durante semanas em cada versão nova. Segundo, ganha-se desconstrução em <em>pattern matching</em>: <code>case Cartao(var pan, var validade, var valor, var tok)</code> só funciona com <em>records</em>, e é isso que torna o <code>switch</code> exaustivo utilizável em código de domínio. Terceiro, ganha-se semântica garantida pela linguagem: <code>equals</code> compara todos os componentes, sempre, sem <code>@EqualsAndHashCode(exclude = ...)</code> a divergir entre classes.</p>
+      <p>Perde-se três coisas. A herança de classe deixa de existir — mitigável com interfaces <code>sealed</code>, que são geralmente melhor modelação. Os acessores mudam de <code>getValor()</code> para <code>valor()</code>, o que quebra código que dependa da convenção JavaBeans: EL em <em>templates</em>, alguma validação por reflexão, bibliotecas de <em>mapping</em> antigas. E a mutabilidade parcial desaparece, o que é bom até se encontrar o construtor de 14 componentes que ninguém consegue chamar sem trocar dois <code>String</code> de posição — nesse caso, ou se agrupam componentes em <em>records</em> aninhados, ou se mantém um <em>builder</em> escrito à mão.</p>
+      <p>Onde não serve: entidade JPA, porque o Hibernate exige construtor sem argumentos e campos não-finais para <em>proxies</em> e <em>dirty checking</em>; para projecções de leitura, pelo contrário, o <em>record</em> é a escolha certa e o Hibernate 6 e o Spring Data suportam-no directamente através do construtor. Também não serve quando o objecto tem ciclo de vida e identidade — uma <code>Sessao</code> que muda de estado não é um portador de dados, é uma entidade.</p>
+      <p>Estratégia de migração: fazer módulo a módulo, começando pela camada de API (DTO de pedido e resposta), onde a superfície de acoplamento é pequena e o Jackson já suporta <em>records</em> nativamente. Não converter entidades. Não converter numa única <em>pull request</em> de 300 ficheiros: a mudança de <code>getX()</code> para <code>x()</code> gera conflitos em tudo o que estiver em curso.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«São a mesma coisa, <code>collect</code> é para listas.» Sem noção de custo.</td></tr>
-        <tr><td>Mid</td><td>Sabe que <code>joining</code> é melhor do que <code>reduce</code> para texto, mas não sabe dizer porquê nem quantifica.</td></tr>
-        <tr><td>Sénior</td><td>Imutável vs. mutável, O(n²) contra O(n), associatividade, e o exemplo do acumulador que muta o argumento.</td></tr>
-        <tr><td>Staff</td><td>Descreve as cinco peças do <code>Collector</code>, explica porque é que o <code>combiner</code> só é chamado em paralelo e como testaria a associatividade de um colector próprio.</td></tr>
+        <tr><td>Insuficiente</td><td>«<em>Records</em> são mais modernos.» Ou recusa a migração por hábito, sem argumentos.</td></tr>
+        <tr><td>Mid</td><td>Cita menos <em>boilerplate</em> e imutabilidade; não conhece a restrição de JPA nem o impacto nos acessores.</td></tr>
+        <tr><td>Sénior</td><td>Regra de decisão explícita, três ganhos e três perdas concretas, e o limite JPA com a razão técnica.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o plano de migração incremental, o risco de conflitos e o argumento do <em>annotation processor</em> como custo de actualização do JDK.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Escreva a assinatura do <code>reduce</code> de três argumentos e diga para que serve o terceiro.»</li>
-      <li>«O <code>combiner</code> é chamado num stream sequencial?»</li>
-      <li>«Como escreveria um <code>Collector</code> para um histograma de latências?»</li>
-      <li>«O que acontece se o acumulador não for associativo em paralelo?»</li></ul></div>
+      <li>«Como é que valida um componente de um <em>record</em>? Escreva o construtor compacto.»</li>
+      <li>«Um <em>record</em> com um <code>List</code> é imutável? Prove o contrário.»</li>
+      <li>«O que acontece ao <code>hashCode</code> se um componente for um <em>array</em>?»</li>
+      <li>«Como suporta evolução de esquema num <em>record</em> usado em mensagens Kafka?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar <code>reduce</code> com acumulador que muta o argumento e chamar-lhe correcto.</li>
-      <li>Não conseguir explicar o que a identidade tem de garantir.</li>
-      <li>Afirmar que <code>collect</code> é sempre mais lento por «criar objectos».</li></ul></div>
+      <li>Propor <em>records</em> como entidades JPA e insistir depois de lhe ser dito que o Hibernate precisa de construtor sem argumentos.</li>
+      <li>Afirmar que um <em>record</em> é «profundamente imutável».</li>
+      <li>Não distinguir objecto-valor de entidade com identidade.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-6-7" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Preciso, por comerciante, do número de transacções e da soma só das aprovadas, num único percurso e sem materializar listas. Como escreve o <code>groupingBy</code> e que armadilhas tem o <em>downstream</em>?</div>
+<div class="qa" id="q-6-6" data-box="qa" data-area="api" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Estes <em>records</em> são o contrato de mensagens que publicamos em Kafka e consumidas por outras quatro equipas. Que problemas antevê e o que muda no <em>design</em>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Um <code>groupingBy</code> com <em>downstream</em> composto resolve-o. O <em>downstream</em> por omissão é <code>toList()</code>; substituí-lo por um agregador evita guardar os elementos. Para duas agregações no mesmo percurso usa-se <code>teeing</code>, que corre dois colectores em paralelo sobre o mesmo fluxo e funde os resultados no fim: <code>groupingBy(Tx::comerciante, teeing(counting(), filtering(t -&gt; t.aprovada(), summingLong(Tx::centimos)), Resumo::new))</code>.</p>
-      <p>A armadilha número um é <code>filter</code> antes do <code>groupingBy</code> em vez de <code>filtering</code> dentro dele. <code>stream().filter(Tx::aprovada).collect(groupingBy(...))</code> faz desaparecer do mapa os comerciantes que só tiveram transacções recusadas — e num relatório de risco são precisamente esses que interessam. <code>Collectors.filtering</code> aplica o filtro depois do agrupamento, mantendo o grupo com contagem zero.</p>
-      <p>A número dois é a ordem e o tipo do mapa: <code>groupingBy</code> devolve um <code>HashMap</code> e a ordem de iteração não é a de inserção. Se o relatório é lido por um humano ou comparado em testes, passa-se a fábrica: <code>groupingBy(f, TreeMap::new, downstream)</code>. A número três é <code>summarizingLong</code> sobre grupos possivelmente vazios: <code>getMax()</code> devolve <code>Long.MIN_VALUE</code> e <code>getAverage()</code> devolve 0,0 quando a contagem é zero — publicar isso num painel dá números absurdos, portanto o <code>finisher</code> tem de tratar o caso.</p>
-      <p>Sobre custo: um percurso com <code>teeing</code> sobre 2 milhões de transacções e 5 000 comerciantes faz uma passagem, aloca 5 000 entradas e dois acumuladores por entrada. A alternativa ingénua — dois <code>stream()</code> sobre a mesma lista — duplica o percurso e, se a fonte for um cursor de base de dados, é impossível. O trade-off do <code>teeing</code> é a legibilidade: aninhar mais do que dois níveis torna-se ilegível, e nesse ponto compensa escrever um <code>Collector</code> próprio ou um acumulador mutável com <code>collect(supplier, accumulator, combiner)</code>.</p></div>
+      <p>O problema central é que um <em>record</em> é um contrato posicional e um tópico Kafka é um contrato de longa duração entre versões que não são libertadas ao mesmo tempo. Um consumidor com a versão antiga do <em>record</em> tem de conseguir ler mensagens produzidas pela versão nova, e vice-versa.</p>
+      <p>Isto tem três consequências. Primeira: acrescentar um componente altera o construtor canónico, e portanto qualquer código que use o construtor posicionalmente parte na recompilação — é uma alteração de código-fonte incompatível, mesmo quando o formato de série (JSON, Avro) é compatível. Segunda: remover ou renomear um componente é sempre incompatível, porque o nome do componente é o nome do campo no JSON. Terceira: a validação no construtor compacto corre na desserialização, o que é bom para invariantes e mau para compatibilidade — uma regra nova rejeita mensagens antigas válidas e enche a <em>dead letter queue</em>.</p>
+      <p>O que muda no <em>design</em>: separar o <em>record</em> de transporte do <em>record</em> de domínio. O de transporte só cresce por adição, com campos <em>nullable</em>, sem validação forte, e é gerado a partir do esquema (Avro ou Protobuf com registo de esquemas e regra de compatibilidade <em>backward</em>). O de domínio, esse, tem invariantes fortes e vive dentro do serviço; a conversão entre os dois é o sítio onde a regra nova é aplicada, e onde uma mensagem antiga pode ser rejeitada com contexto em vez de com um <code>NullPointerException</code> no construtor.</p>
+      <p>O <em>trade-off</em>: manter dois modelos custa uma classe de conversão por tipo de mensagem, e em 20 tipos são 20 conversores e testes. Compensa quando há consumidores externos à equipa. Com um único consumidor interno, publicado no mesmo <em>pipeline</em>, o modelo partilhado é mais barato — até ao dia em que aparece o quinto consumidor, e aí o custo da separação é pago de uma vez só com uma migração de tópico.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Faz dois percursos, ou agrupa em listas e depois itera o mapa para somar.</td></tr>
-        <tr><td>Mid</td><td>Usa <code>groupingBy</code> com <code>counting()</code>, mas filtra antes de agrupar e perde grupos.</td></tr>
-        <tr><td>Sénior</td><td>Usa <code>teeing</code> + <code>filtering</code>, justifica o percurso único e conhece o tipo de mapa devolvido.</td></tr>
-        <tr><td>Staff</td><td>Discute o caso do grupo vazio em <code>summarizing*</code>, quando passar a <code>Collector</code> próprio, e se a agregação não devia estar em SQL.</td></tr>
+        <tr><td>Insuficiente</td><td>Não distingue o modelo de transporte do modelo de domínio; assume que serializar o objecto de domínio é normal.</td></tr>
+        <tr><td>Mid</td><td>Fala de versionamento de esquema em geral, sem ligar às propriedades específicas do <em>record</em> (construtor canónico, nomes dos componentes).</td></tr>
+        <tr><td>Sénior</td><td>Identifica compatibilidade de código-fonte vs de série, o risco da validação na desserialização, e propõe a separação com registo de esquemas.</td></tr>
+        <tr><td>Staff</td><td>Quantifica o custo dos conversores, define a regra de compatibilidade a impor no registo e o critério para quando não separar.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se quisesse também o percentil 95 do valor por comerciante?»</li>
-      <li>«Como é que garante que o mapa devolvido é imutável?»</li>
-      <li>«Este <em>pipeline</em> é seguro em <code>parallelStream()</code>? Porquê?»</li>
-      <li>«Quando é que passa a <code>groupingByConcurrent</code>?»</li></ul></div>
+      <li>«Que regra de compatibilidade configura no registo de esquemas e porquê?»</li>
+      <li>«Como faz uma alteração incompatível sem parar os consumidores?»</li>
+      <li>«Onde põe o <code>@JsonIgnoreProperties(ignoreUnknown = true)</code> e que risco isso traz?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Filtrar antes de agrupar sem reparar nos grupos que desaparecem.</li>
-      <li>Acumular num <code>HashMap</code> partilhado dentro de um <code>forEach</code>.</li>
-      <li>Devolver o <code>HashMap</code> interno como se fosse imutável.</li></ul></div>
+      <li>Serializar o objecto de domínio directamente para o tópico e chamar-lhe «menos duplicação».</li>
+      <li>Assumir que acrescentar um campo é sempre compatível, sem distinguir série de código-fonte.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-6-4" class="h2"><span class="secnum">6.4</span> Sealed types e modelação de domínio fechado<a class="anchor" href="#sec-6-4" aria-label="ligação">#</a></h2>
+
+<p>Uma interface ou classe <code>sealed</code>, final desde o Java 17, declara explicitamente quais os subtipos permitidos. Cada subtipo permitido tem de ser <code>final</code>, <code>sealed</code> ou <code>non-sealed</code>, e tem de estar no mesmo módulo — ou, em código sem módulos, no mesmo pacote. Se todos os subtipos estiverem no mesmo ficheiro, a cláusula <code>permits</code> pode ser omitida e o compilador infere-a.</p>
+
+<p>O valor não está na restrição em si, está no que ela desbloqueia: o compilador passa a saber a lista completa de alternativas e pode verificar a exaustividade de um <code>switch</code>. É a forma de Java exprimir um tipo-soma — o que noutras linguagens se chama <code>enum</code> com dados associados ou união etiquetada. A alternativa clássica em Java era o padrão <em>visitor</em>: uma interface <code>Visitor</code> com um método por subtipo e um <code>accept</code> em cada subtipo, que dá a mesma garantia de exaustividade ao custo de duas dezenas de linhas por tipo e de uma indirecção que dificulta a leitura.</p>
+
+<p>A distinção operacional face a um <code>enum</code> é simples: um <code>enum</code> tem um conjunto fixo de <em>instâncias</em>, uma interface <code>sealed</code> tem um conjunto fixo de <em>tipos</em>, cada um com os seus dados. Um estado de pagamento sem dados associados é um <code>enum</code>; um estado que carrega o montante reservado ou o motivo da recusa é uma interface <code>sealed</code> com <em>records</em>.</p>
+
+<figure class="listing java" id="lst-6-4"><div class="lhead"><span class="lnum">Listagem 6.4</span>
+<span class="lcap">Domínio fechado: interface <code>sealed</code> com <em>records</em> como alternativas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public sealed interface MetodoPagamento
+        permits Cartao, TransferenciaSepa, Carteira {
+
+    Money total();
+}
+
+public record Cartao(String ultimos4, YearMonth validade, Money valor, boolean tokenizado)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor; }
+}
+
+public record TransferenciaSepa(String iban, Money valor, LocalDate dataValor)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor; }
+}
+
+public record Carteira(String fornecedor, Money valor, Money comissao)
+        implements MetodoPagamento {
+    @Override public Money total() { return valor.plus(comissao); }
+}</code></pre></figure>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O mesmo domínio de quatro alternativas: com <em>visitor</em> são cerca de 90 linhas (interface do visitante, quatro <code>accept</code>, uma implementação por operação); com interface <code>sealed</code> mais <em>records</em> e <code>switch</code> exaustivo são cerca de 25. Mais importante do que a contagem: acrescentar uma quinta alternativa quebra a compilação em <em>todos</em> os <code>switch</code> exaustivos do projecto, com localização exacta, enquanto com um <code>switch</code> que tenha <code>default</code> a quinta alternativa passa despercebida até chegar a produção.</p></aside>
+
+<div class="qa" id="q-6-7" data-box="qa" data-area="design" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos um <em>visitor</em> com 6 tipos e 4 operações. Substituía-o por <code>sealed</code> mais <code>switch</code>? E o que responde a quem diz que isso viola o princípio aberto-fechado?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Substituía, e a resposta ao princípio aberto-fechado é que ele se aplica ao eixo errado. Qualquer modelação com tipos e operações escolhe qual dos dois eixos fica aberto: o polimorfismo clássico deixa aberto o conjunto de tipos e fechado o de operações (acrescentar um método à interface obriga a mexer em todos os tipos); os tipos <code>sealed</code> com <code>switch</code> deixam aberto o conjunto de operações e fechado o de tipos. É o problema da expressão, e nenhuma das soluções é livre.</p>
+      <p>Com 6 tipos e 4 operações, a pergunta empírica é qual dos eixos muda mais. Num domínio de pagamentos, os métodos de pagamento mudam uma ou duas vezes por ano e as operações — autorizar, calcular comissão, exportar para contabilidade, mascarar para <em>logs</em> — mudam todos os meses. Nesse caso o conjunto de tipos <em>deve</em> ser fechado, e fechá-lo explicitamente transforma cada alternativa nova num erro de compilação em vez de num <code>default</code> silencioso.</p>
+      <p>Há um ganho adicional que o <em>visitor</em> não dá: os dados ficam onde se lêem. Com desconstrução de <em>records</em>, <code>case Cartao(var ult4, var val, Money v, boolean tok) when !tok -&gt; ...</code> exprime numa linha um teste de tipo, quatro extracções e uma guarda. O <em>visitor</em> obriga a espalhar a mesma lógica por quatro métodos em classes diferentes, o que é precisamente o que torna difícil rever uma regra de negócio.</p>
+      <p>Quando não substituir: se o conjunto de tipos tiver mesmo de ser extensível por terceiros — <em>plugins</em>, módulos de clientes, subtipos noutro módulo Maven — <code>sealed</code> é impossível, porque os subtipos permitidos têm de viver no mesmo módulo. Nesse caso mantém-se o polimorfismo, ou usa-se <code>non-sealed</code> num ramo específico, aceitando que esse ramo deixa de ser verificável em exaustividade e precisa de um <code>default</code>. E, na prática, migrar 6 tipos e 4 operações é uma tarefa de meio dia com testes de caracterização a proteger cada operação.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«<code>switch</code> sobre tipos é código mau, polimorfismo é sempre melhor.» Sem análise dos eixos de mudança.</td></tr>
+        <tr><td>Mid</td><td>Sabe usar <code>sealed</code> e <code>switch</code>, mas responde ao aberto-fechado com uma citação em vez de uma análise.</td></tr>
+        <tr><td>Sénior</td><td>Formula o problema da expressão, escolhe o eixo com base na frequência de mudança observada, e conhece a restrição de módulo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o custo da migração, os testes de caracterização, e a solução híbrida com <code>non-sealed</code> para o ramo extensível.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que é o problema da expressão? Dê um exemplo em que a escolha é a inversa.»</li>
+      <li>«Onde é que os subtipos permitidos têm de estar e porquê?»</li>
+      <li>«Como testa que não ficou nenhum caso por tratar?»</li>
+      <li>«O que muda se o domínio for um <code>enum</code> em vez de uma interface <code>sealed</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Invocar SOLID como regra absoluta sem identificar qual é o eixo que muda no sistema em causa.</li>
+      <li>Não saber que <code>permits</code> exige o mesmo módulo ou pacote.</li>
+      <li>Manter <code>default</code> no <code>switch</code> e continuar a chamar-lhe exaustivo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-6-5" class="h2"><span class="secnum">6.5</span> Pattern matching e switch exaustivo<a class="anchor" href="#sec-6-5" aria-label="ligação">#</a></h2>
+
+<p>O <em>pattern matching</em> chegou em três andares: para <code>instanceof</code> no Java 16, para <code>switch</code> e com desconstrução de <em>records</em> no Java 21. Um <em>type pattern</em> testa o tipo e liga uma variável no mesmo gesto; um <em>record pattern</em> vai mais longe e extrai os componentes recursivamente, permitindo padrões aninhados como <code>case Cartao(var ult4, var val, Money(var montante, var moeda), var tok)</code>.</p>
+
+<p>Duas regras do compilador contam em entrevista. A primeira é a dominância: um rótulo que aceite tudo o que um rótulo posterior aceitaria torna o segundo inalcançável e é erro de compilação — <code>case Cartao c</code> antes de <code>case Cartao c when ...</code> não compila. A segunda é a exaustividade: num <code>switch</code> sobre um tipo <code>sealed</code>, se todos os subtipos permitidos estiverem cobertos não é preciso <code>default</code>, e escrever um <code>default</code> desliga a verificação. Um <code>switch</code> com padrões também trata o <code>null</code> de forma diferente do <code>switch</code> clássico: sem um <code>case null</code> explícito, lança <code>NullPointerException</code> em vez de saltar para o <code>default</code>.</p>
+
+<p>Há um detalhe que quase ninguém conhece e que vale a pena ter na algibeira: a exaustividade é verificada em compilação, mas as classes podem ser recompiladas separadamente. Se alguém acrescentar um subtipo permitido e não recompilar o consumidor, o <code>switch</code> compilado deixa de ser exaustivo em <em>runtime</em> e a JVM lança <code>MatchException</code> em vez de cair silenciosamente. Em produção, isso implica tratar mudanças de hierarquia <code>sealed</code> como alterações que exigem recompilação de todos os módulos que a consomem — não é seguro substituir um único JAR.</p>
+
+<figure class="listing java" id="lst-6-5"><div class="lhead"><span class="lnum">Listagem 6.5</span>
+<span class="lcap">Switch exaustivo com desconstrução e guardas, sem <code>default</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>static String encaminhar(MetodoPagamento m) {
+    return switch (m) {
+        // guardas primeiro: o rótulo sem guarda dominaria os seguintes
+        case Cartao(String ult4, YearMonth v, Money valor, boolean tok) when !tok
+                -&gt; "recusa:nao-tokenizado:" + ult4;
+        case Cartao c when c.valor().compareTo(Money.eur("30.00")) &lt;= 0
+                -&gt; "contactless:" + c.ultimos4();
+        case Cartao c
+                -&gt; "3ds:" + c.ultimos4();
+        case TransferenciaSepa(String iban, Money valor, LocalDate data)
+                -&gt; "sct-inst:" + iban;
+        case Carteira w
+                -&gt; "wallet:" + w.fornecedor() + ":" + w.total();
+        // sem default: o compilador verifica a exaustividade sobre os 3 permits
+    };
+}
+
+// switch com padrões e null: sem "case null" lança NullPointerException
+static String seguro(MetodoPagamento m) {
+    return switch (m) {
+        case null -&gt; "desconhecido";
+        case MetodoPagamento p -&gt; encaminhar(p);
+    };
+}</code></pre></figure>
+
+<div class="qa" id="q-6-8" data-box="qa" data-area="java" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um colega acrescentou <code>default -&gt; throw new IllegalStateException()</code> a todos os <code>switch</code> sobre tipos <code>sealed</code>, «por segurança». Concorda? O que responde na revisão de código?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não concordo, e o argumento é que esse <code>default</code> troca um erro de compilação por um erro de produção. A única razão para usar <code>sealed</code> é que o compilador conheça a lista completa de alternativas; ao acrescentar <code>default</code>, o <code>switch</code> deixa de estar sujeito à verificação de exaustividade, e o dia em que alguém acrescentar um quarto método de pagamento o projecto compila sem uma única advertência e falha na primeira transacção desse tipo.</p>
+      <p>O valor quantifica-se assim: numa <em>codebase</em> com 40 <code>switch</code> sobre a mesma hierarquia, acrescentar uma alternativa produz 40 erros de compilação com ficheiro e linha, todos resolvidos antes do <em>commit</em>. Com <code>default</code>, produz zero erros e um número desconhecido de caminhos silenciosamente errados — dos quais os que lançam excepção são os felizes; os que devolvem um valor por omissão são os que geram incidentes de reconciliação semanas depois.</p>
+      <p>Há um caso legítimo em que uma cláusula de recurso é necessária: quando o <code>switch</code> é sobre um tipo <code>non-sealed</code> ou sobre <code>Object</code>, onde a exaustividade não pode ser provada. Aí escreve-se <code>case MetodoPagamento outro -&gt; ...</code> ou <code>case Object o -&gt; ...</code>, que é um rótulo total e explícito e continua a ser verificado quanto a dominância — não um <code>default</code> anónimo.</p>
+      <p>Na revisão, a formulação prática é: «o compilador já garante isto; o <code>default</code> desliga a garantia. Se o receio for a recompilação separada, o mecanismo correcto é a <code>MatchException</code> que a JVM lança nesse caso, e a mitigação é a política de <em>build</em> — recompilar todos os módulos que consomem a hierarquia — e não um <code>default</code> em cada ficheiro.»</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Concorda com o <code>default</code>: «é mais defensivo».</td></tr>
+        <tr><td>Mid</td><td>Sabe que o <code>default</code> não é preciso, mas não explica que desliga a verificação nem o que se perde com isso.</td></tr>
+        <tr><td>Sénior</td><td>Erro de compilação vs erro de produção, quantifica em número de <em>call sites</em>, e conhece o rótulo total como alternativa legítima.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>MatchException</code> e recompilação separada, e transforma a discussão em política de <em>build</em> em vez de preferência pessoal.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece se um subtipo for acrescentado e o módulo consumidor não for recompilado?»</li>
+      <li>«Qual é a diferença entre <code>default</code> e <code>case Object o</code>?»</li>
+      <li>«Como é que o <code>switch</code> com padrões é compilado? O que é <code>invokedynamic</code> aqui?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Não perceber que <code>default</code> anula a verificação de exaustividade.</li>
+      <li>Achar que uma excepção em produção é equivalente a um erro de compilação.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-6-9" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Java e a linguagem</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Explique a diferença entre uma guarda <code>when</code> e um <code>if</code> dentro do corpo do <code>case</code>. E o que acontece a este <code>switch</code> se lhe passar <code>null</code>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A guarda faz parte do rótulo; o <code>if</code> faz parte do corpo. A consequência é que uma guarda falsa faz o <code>switch</code> continuar a avaliar os rótulos seguintes, enquanto um <code>if</code> falso dentro do corpo já não pode voltar atrás — o <code>case</code> foi seleccionado e é preciso decidir ali mesmo o que devolver, normalmente com um <code>else</code> a duplicar lógica que já existe noutro ramo.</p>
+      <p>A segunda consequência é a análise do compilador. Um rótulo com guarda nunca é considerado exaustivo nem dominante, porque o compilador não avalia a condição — por isso <code>case Cartao c when x</code> não cobre <code>Cartao</code> e é obrigatório existir depois um rótulo não guardado para <code>Cartao</code>, ou o <code>switch</code> não compila. A ordem também é imposta: o rótulo sem guarda tem de vir depois dos guardados do mesmo tipo, senão o compilador acusa dominância.</p>
+      <p>Quanto a <code>null</code>: num <code>switch</code> com padrões, o comportamento por omissão é lançar <code>NullPointerException</code> antes de avaliar qualquer rótulo — igual ao <code>switch</code> clássico sobre <code>String</code> ou <code>enum</code>, e deliberadamente compatível com ele. Se existir <code>case null</code>, o <code>null</code> passa a ser tratado por esse rótulo. É possível combinar <code>case null, default -&gt; ...</code> para dar o mesmo tratamento aos dois. Um <code>case Object o</code> sozinho não apanha <code>null</code>: nenhum <em>type pattern</em> apanha, porque o teste é <code>instanceof</code>, que é falso para <code>null</code>.</p>
+      <p>A implicação de <em>design</em>: se o valor pode ser <code>null</code>, isso tem de ser explícito no <code>switch</code> ou tratado antes de lá chegar. Em código de domínio a preferência é eliminar o <code>null</code> na fronteira — construtor compacto com <code>requireNonNull</code> — e deixar o <code>switch</code> falhar ruidosamente se um <code>null</code> chegar, porque nesse ponto o <code>NullPointerException</code> aponta para o construtor que devia ter validado e não para o consumidor.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Acha que guarda e <code>if</code> são equivalentes; não sabe o que acontece com <code>null</code>.</td></tr>
+        <tr><td>Mid</td><td>Sabe a sintaxe da guarda mas não a diferença de retrocesso nem o efeito na exaustividade.</td></tr>
+        <tr><td>Sénior</td><td>Explica que a guarda faz parte do rótulo, o efeito na exaustividade e na dominância, e o comportamento com <code>null</code> e <code>case null</code>.</td></tr>
+        <tr><td>Staff</td><td>Liga à decisão de <em>design</em> de eliminar <code>null</code> na fronteira e justifica a compatibilidade com o <code>switch</code> clássico.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Reordene estes <code>case</code> para que compilem.»</li>
+      <li>«Um <code>case Object o</code> apanha <code>null</code>? Porquê?»</li>
+      <li>«Como escreve o mesmo tratamento para <code>null</code> e para o caso por omissão?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Afirmar que um rótulo guardado contribui para a exaustividade.</li>
+      <li>Assumir que <code>null</code> cai no <code>default</code>, como acontecia no <code>switch</code> clássico sobre <code>String</code>.</li></ul></div>
   </div>
 </div>
 
 <div class="lab" id="lab-6-1" data-box="lab" data-lang="java">
-  <div class="labhead"><span class="labttl">Exercício 6.1 — Relatório por comerciante num só percurso</span>
+  <div class="labhead"><span class="labttl">Exercício 6.1 — Máquina de estados de pagamento com tipos fechados</span>
     <div class="labpills"><span class="qpill">Alvo O(n)</span><span class="qpill">25 min</span></div></div>
   <div class="labbody">
-    <p>Dada <code>List&lt;Transacao&gt;</code> com <code>record Transacao(String comerciante, long centimos, Estado estado)</code> e <code>enum Estado { APROVADA, RECUSADA }</code>, produza <code>Map&lt;String, Resumo&gt;</code> em que <code>record Resumo(long total, long aprovadas, long recusadas, long maiorAprovada, double mediaAprovada)</code>. Restrições: um único percurso da lista (a fonte pode ser um cursor), sem ordenar, sem materializar as listas de cada grupo, e comerciantes com zero aprovadas têm de aparecer no mapa com <code>maiorAprovada = 0</code> e <code>mediaAprovada = 0.0</code>. Exemplo: com <code>[("A",1000,APROVADA), ("A",500,RECUSADA), ("B",300,RECUSADA)]</code> o resultado é <code>{A=Resumo[2,1,1,1000,1000.0], B=Resumo[1,0,1,0,0.0]}</code>. Escreva a versão funcional e depois a imperativa equivalente, e diga qual defenderia numa revisão de código.</p>
+    <p>Modele o ciclo de vida de um pagamento a partir de eventos. Há quatro eventos — autorização, captura, reembolso e recusa — e quatro estados — novo, autorizado, capturado e fechado. Escreva <code>Estado reduzir(List&lt;Evento&gt; eventos)</code> que aplica os eventos por ordem e devolve o estado final. Restrições: sem <code>enum</code> (os eventos transportam dados), sem <code>instanceof</code> encadeado, sem <code>default</code> em nenhum <code>switch</code>, uma só passagem pela lista. Transições ilegais lançam <code>IllegalStateException</code>; uma captura superior ao valor autorizado e um reembolso que exceda o capturado também. Exemplo: <code>[Autorizada(50 EUR), Capturada(30 EUR), Reembolsada(10 EUR)]</code> devolve <code>Capturado(30 EUR, 10 EUR)</code>; <code>[Capturada(30 EUR)]</code> lança excepção.</p>
     <h4>A sua solução</h4>
     <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
     <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
       <button class="btn" type="button" data-clear>Limpar</button></div>
     <div class="labsol" hidden>
       <h4>Solução de referência</h4>
-      <figure class="listing java" id="lst-6-3"><div class="lhead"><span class="lnum">Listagem 6.3</span>
-        <span class="lcap">Versão funcional: groupingBy + teeing + filtering, um percurso.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>import java.util.*;
-import java.util.stream.*;
-import static java.util.stream.Collectors.*;
+      <figure class="listing java" id="lst-6-6"><div class="lhead"><span class="lnum">Listagem 6.6</span>
+        <span class="lcap">Interfaces <code>sealed</code>, <em>records</em> e <code>switch</code> aninhado sem <code>default</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>public sealed interface Evento {
+    Instant em();
 
-enum Estado { APROVADA, RECUSADA }
-record Transacao(String comerciante, long centimos, Estado estado) {}
-record Resumo(long total, long aprovadas, long recusadas,
-              long maiorAprovada, double mediaAprovada) {}
-
-static Map&lt;String, Resumo&gt; relatorio(List&lt;Transacao&gt; txs) {
-    return txs.stream().collect(groupingBy(
-            Transacao::comerciante,
-            TreeMap::new,                       // ordem estável para relatório e testes
-            teeing(
-                counting(),                     // ramo 1: total do grupo
-                filtering(t -&gt; t.estado() == Estado.APROVADA,
-                          summarizingLong(Transacao::centimos)),   // ramo 2: só aprovadas
-                (total, ap) -&gt; new Resumo(
-                        total,
-                        ap.getCount(),
-                        total - ap.getCount(),
-                        ap.getCount() == 0 ? 0L : ap.getMax(),      // MIN_VALUE se vazio
-                        ap.getCount() == 0 ? 0.0 : ap.getAverage()))));
+    record Autorizada(Instant em, Money valor, String codigo) implements Evento { }
+    record Capturada(Instant em, Money valor)                 implements Evento { }
+    record Reembolsada(Instant em, Money valor)               implements Evento { }
+    record Recusada(Instant em, String motivo)                implements Evento { }
 }
 
-// Variante imutável, se o mapa sair da fronteira do serviço:
-static Map&lt;String, Resumo&gt; relatorioImutavel(List&lt;Transacao&gt; txs) {
-    return Collections.unmodifiableMap(relatorio(txs));
-}</code></pre></figure>
-      <figure class="listing java" id="lst-6-4"><div class="lhead"><span class="lnum">Listagem 6.4</span>
-        <span class="lcap">Versão imperativa equivalente: acumulador mutável e um único ciclo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-        <pre class="code" data-lang="java"><code>static Map&lt;String, Resumo&gt; relatorioImperativo(List&lt;Transacao&gt; txs) {
-    final class Acc { long total, aprovadas, soma, maior; }
-    Map&lt;String, Acc&gt; acc = new TreeMap&lt;&gt;();
+public sealed interface Estado {
+    record Nova()                                       implements Estado { }
+    record Autorizado(Money reservado)                   implements Estado { }
+    record Capturado(Money capturado, Money reembolsado) implements Estado { }
+    record Fechado(String motivo)                        implements Estado { }
+}
 
-    for (Transacao t : txs) {                       // um percurso, sem alocação por elemento
-        Acc a = acc.computeIfAbsent(t.comerciante(), k -&gt; new Acc());
-        a.total++;
-        if (t.estado() == Estado.APROVADA) {
-            a.aprovadas++;
-            a.soma += t.centimos();
-            if (t.centimos() &gt; a.maior) a.maior = t.centimos();
-        }
+public final class Pagamentos {
+
+    private Pagamentos() { }
+
+    public static Estado reduzir(List&lt;Evento&gt; eventos) {      // O(n), sem cópias
+        Estado s = new Estado.Nova();
+        for (Evento e : eventos) s = aplicar(s, e);
+        return s;
     }
 
-    Map&lt;String, Resumo&gt; out = new TreeMap&lt;&gt;();
-    acc.forEach((nome, a) -&gt; out.put(nome, new Resumo(
-            a.total, a.aprovadas, a.total - a.aprovadas, a.maior,
-            a.aprovadas == 0 ? 0.0 : (double) a.soma / a.aprovadas)));
-    return out;
+    static Estado aplicar(Estado s, Evento e) {
+        return switch (s) {
+            case Estado.Nova ignorado -&gt; switch (e) {
+                case Evento.Autorizada(Instant em, Money v, String cod) -&gt; new Estado.Autorizado(v);
+                case Evento.Recusada(Instant em, String motivo)         -&gt; new Estado.Fechado(motivo);
+                case Evento.Capturada c                                 -&gt; throw ilegal(s, e);
+                case Evento.Reembolsada r                               -&gt; throw ilegal(s, e);
+            };
+            case Estado.Autorizado(Money reservado) -&gt; switch (e) {
+                case Evento.Capturada(Instant em, Money v) when v.compareTo(reservado) &lt;= 0
+                        -&gt; new Estado.Capturado(v, new Money(BigDecimal.ZERO, v.currency()));
+                case Evento.Capturada c -&gt; throw new IllegalStateException(
+                        "captura " + c.valor() + " acima do reservado " + reservado);
+                case Evento.Recusada(Instant em, String motivo) -&gt; new Estado.Fechado(motivo);
+                case Evento.Autorizada a                        -&gt; throw ilegal(s, e);
+                case Evento.Reembolsada r                       -&gt; throw ilegal(s, e);
+            };
+            case Estado.Capturado(Money capturado, Money reembolsado) -&gt; switch (e) {
+                case Evento.Reembolsada(Instant em, Money v)
+                        when reembolsado.plus(v).compareTo(capturado) &lt;= 0
+                        -&gt; new Estado.Capturado(capturado, reembolsado.plus(v));
+                case Evento.Reembolsada r -&gt; throw new IllegalStateException(
+                        "reembolso acumulado excede a captura " + capturado);
+                case Evento.Autorizada a -&gt; throw ilegal(s, e);
+                case Evento.Capturada c  -&gt; throw ilegal(s, e);
+                case Evento.Recusada r   -&gt; throw ilegal(s, e);
+            };
+            case Estado.Fechado f -&gt; throw ilegal(s, e);
+        };
+    }
+
+    private static IllegalStateException ilegal(Estado s, Evento e) {
+        return new IllegalStateException(
+                e.getClass().getSimpleName() + " ilegal em " + s.getClass().getSimpleName());
+    }
 }</code></pre></figure>
       <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
       <ul class="lst">
-        <li>Ambas são O(n) em tempo e O(g) em memória, com g = número de comerciantes distintos. A funcional aloca dois acumuladores por grupo (o <code>LongSummaryStatistics</code> e o contador do <code>teeing</code>); a imperativa aloca um objecto <code>Acc</code> por grupo. Para g = 5 000 a diferença é irrelevante; para g na ordem de 10<sup>6</sup> a imperativa poupa memória mensurável.</li>
-        <li>Caso limite decisivo: comerciante sem transacções aprovadas. <code>summarizingLong</code> devolve <code>getMax() == Long.MIN_VALUE</code> e <code>getAverage() == 0.0</code> num grupo vazio — quem não trata isto publica <code>-9223372036854775808</code> no relatório. Foi por isso que o enunciado o exigiu.</li>
-        <li>Segundo caso limite: <code>filter</code> antes do <code>groupingBy</code> faria desaparecer o comerciante «B» do resultado. <code>Collectors.filtering</code> mantém o grupo.</li>
-        <li><code>TreeMap::new</code> dá ordem determinística; sem ele, os testes que comparam o mapa serializado tornam-se instáveis entre execuções com <code>String</code> de <em>hash</em> diferente.</li>
-        <li>Em paralelo, a versão funcional continua correcta porque cada colector tem <code>combiner</code>; a imperativa não é segura sem sincronização. Isto é argumento a favor da funcional apenas se o paralelismo for real — ver a secção seguinte.</li>
-        <li>O que se procura na defesa: reconhecer que a imperativa é mais fácil de depurar (<em>breakpoint</em> no ciclo, <em>stack trace</em> legível) e a funcional mais fácil de compor e paralelizar; escolher com base em quem mantém o código, e não por gosto.</li>
+        <li>Uma só passagem, <code>O(n)</code> no número de eventos, <code>O(1)</code> de memória além do estado corrente; cada transição aloca um <em>record</em> pequeno que o <em>escape analysis</em> raramente elimina, mas 4 alocações de 24 a 32 bytes por pagamento são irrelevantes face ao custo de I/O.</li>
+        <li>Zero <code>default</code>: acrescentar um quinto evento (por exemplo <code>Estornada</code>) produz erro de compilação nos três <code>switch</code> internos, com ficheiro e linha. É esse o critério de aceitação do exercício.</li>
+        <li>As guardas <code>when</code> separam invariantes de valor (montante) de invariantes de tipo (transição), e a existência obrigatória do rótulo não guardado a seguir a cada guarda garante que o caso inválido tem mensagem própria.</li>
+        <li>Casos limite a mencionar em voz alta: lista vazia devolve <code>Nova</code>; eventos fora de ordem (o método assume ordenação — se não for garantida, ordenar por <code>em()</code> custa <code>O(n log n)</code> e deve ser decisão explícita); reembolsos parciais múltiplos, cobertos pelo acumulador; captura de valor zero; captura parcial seguida de nova captura, que aqui é ilegal e num sistema real seria um requisito a esclarecer.</li>
+        <li>O que se avalia: se o candidato pergunta pelas regras antes de escrever, se separa estado de evento em vez de misturar os dois numa hierarquia, se usa desconstrução onde ela clarifica e variável simples onde não clarifica, e se justifica a ausência de <code>default</code> em vez de a tratar como estilo.</li>
+        <li>Extensão típica pedida a seguir: tornar o resultado <code>Either</code>-like devolvendo <code>sealed interface Resultado permits Ok, Erro</code> em vez de lançar excepções, e discutir o que muda no chamador (custo de excepção com <em>stack trace</em> na ordem dos microssegundos contra ramificação explícita).</li>
       </ul>
     </div>
   </div>
 </div>
 
-<h2 id="sec-6-4" class="h2"><span class="secnum">6.4</span> Streams paralelos: quando ajudam e quando destroem<a class="anchor" href="#sec-6-4" aria-label="ligação">#</a></h2>
+<h2 id="sec-6-6" class="h2"><span class="secnum">6.6</span> Optional: uso correcto em APIs<a class="anchor" href="#sec-6-6" aria-label="ligação">#</a></h2>
 
-<p><code>parallelStream()</code> e <code>stream().parallel()</code> submetem o trabalho ao <code>ForkJoinPool.commonPool()</code>, um <em>pool</em> estático partilhado por todo o processo cuja dimensão por omissão é <code>Runtime.getRuntime().availableProcessors() - 1</code> — o <em>thread</em> chamador também participa. Num contentor Kubernetes com <code>limits.cpu: 2</code>, uma JVM moderna respeita a quota do <em>cgroup</em> e reporta 2 processadores, portanto o <em>pool</em> comum tem 1 <em>thread</em> além do chamador. Todo o ganho teórico do paralelismo desaparece, e fica só o custo de dividir e fundir.</p>
+<p><code>Optional</code> foi desenhado para uma coisa: o valor de retorno de um método que pode legitimamente não ter resultado. Não é um substituto universal de <code>null</code>, não é um contentor de uso geral e não é serializável. Usá-lo fora do papel de retorno é o erro de <em>design</em> mais frequente em código Java pós-8, e é uma pergunta de entrevista precisamente porque separa quem leu a intenção de quem copiou o padrão.</p>
 
-<p>A heurística de decisão é o modelo N·Q: N é o número de elementos e Q o custo por elemento em unidades arbitrárias. Abaixo de N·Q na ordem de 10<sup>4</sup>, o custo fixo do <em>fork/join</em> — dividir o <code>Spliterator</code>, submeter tarefas, roubar trabalho, fundir com o <code>combiner</code> — domina e o paralelo perde. Há ainda a qualidade da divisão: <code>ArrayList</code>, arrays e <code>IntStream.range</code> dividem-se em O(1) e por metades exactas; <code>LinkedList</code>, <code>Stream.iterate</code>, <code>BufferedReader.lines</code> e <code>HashMap</code> com muitas colisões dividem-se mal ou não dividem, e nesses casos o paralelo é quase sempre mais lento.</p>
+<p>Como campo, <code>Optional</code> acrescenta um objecto por campo por instância — 16 bytes de cabeçalho mais a referência — e impede a serialização Java nativa, porque <code>Optional</code> não implementa <code>Serializable</code>. Como parâmetro, duplica os caminhos que o chamador tem de considerar: em vez de duas hipóteses (valor, ausência) passam a existir três, porque o próprio <code>Optional</code> pode vir a <code>null</code>. Como tipo de retorno de uma colecção é redundante: uma colecção vazia já exprime ausência, e <code>Optional&lt;List&lt;X&gt;&gt;</code> obriga o chamador a desembrulhar duas vezes para chegar ao mesmo <code>isEmpty()</code>.</p>
 
-<p>O problema grave, porém, não é a performance: é o acoplamento. O <em>pool</em> comum é partilhado com tudo o que na aplicação use <code>CompletableFuture</code> sem executor explícito e com qualquer outra biblioteca que dele dependa. Um único <code>parallelStream()</code> que faça uma chamada HTTP bloqueante por elemento sobre 500 elementos ocupa os poucos <em>threads</em> do <em>pool</em> durante segundos e paralisa componentes que não têm nada a ver com aquele pedido. Num servidor que já processa 200 pedidos concorrentes, cada um com o seu <em>thread</em>, não há paralelismo por explorar: o CPU já está saturado e o paralelismo por pedido só acrescenta contenção e piora a cauda de latência.</p>
+<p>Detalhe operacional que aparece em revisões de código: <code>orElse(calcularCaro())</code> avalia o argumento sempre, mesmo quando o valor está presente, porque é um argumento de método normal. <code>orElseGet(this::calcularCaro)</code> só avalia quando é preciso. Num caminho quente que chame um serviço remoto no ramo de omissão, a diferença entre os dois é o custo total desse serviço multiplicado por cada chamada — a mesma latência que se estava a tentar evitar.</p>
 
-<figure class="listing java" id="lst-6-5"><div class="lhead"><span class="lnum">Listagem 6.5</span>
-<span class="lcap">Isolar o paralelismo do pool comum, e a alternativa correcta para I/O.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// MAU: bloqueia o pool comum de todo o processo com I/O
-List&lt;Resposta&gt; r = ids.parallelStream().map(cliente::obterBloqueante).toList();
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>optional.get()</code> sem verificação prévia lança <code>NoSuchElementException</code> sem contexto nenhum — nem o identificador da entidade, nem a operação. Desde o Java 10 existe <code>orElseThrow()</code> sem argumentos, com a mesma semântica e um nome que declara a intenção; e <code>orElseThrow(() -&gt; new PagamentoInexistente(id))</code> devolve um erro que a camada de API consegue traduzir num 404 com corpo útil. Em código de produção, um <code>get()</code> numa revisão devia ser bloqueante.</p></aside>
 
-// Menos mau para trabalho CPU-bound que se quer isolar: pool dedicado.
-// Funciona porque uma ForkJoinTask submetida a um pool executa nesse pool.
-try (var pool = new java.util.concurrent.ForkJoinPool(4)) {
-    List&lt;Long&gt; hashes = pool.submit(() -&gt;
-            blocos.parallelStream().map(Hashing::sha256).toList()).join();
-}
-
-// CERTO para I/O em Java 21+: um thread virtual por chamada, sem tocar no pool comum
-try (var exec = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
-    List&lt;java.util.concurrent.Future&lt;Resposta&gt;&gt; fs =
-            exec.invokeAll(ids.stream()
-                    .&lt;java.util.concurrent.Callable&lt;Resposta&gt;&gt;map(
-                            id -&gt; () -&gt; cliente.obterBloqueante(id))
-                    .toList());
-}</code></pre></figure>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Somar 100 elementos de um <code>ArrayList</code> em paralelo custa tipicamente mais 5 a 20 microssegundos do que em série, só em <em>overhead</em> de <em>fork/join</em>. Somar 10 milhões de <code>int</code> de um array com 8 núcleos disponíveis chega a ganhar 4x a 6x. Entre estes extremos, N·Q ≈ 10<sup>4</sup> é a fronteira empírica citada pelos autores da API, e a única forma de a confirmar no caso concreto é um <em>benchmark</em> JMH com a fonte real.</p></aside>
-
-<div class="qa" id="q-6-8" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Concorrência</span>
+<div class="qa" id="q-6-10" data-box="qa" data-area="api" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Um colega substituiu <code>stream()</code> por <code>parallelStream()</code> num serviço REST e diz que ficou mais rápido no portátil dele. O que pergunta antes de aprovar o <em>pull request</em>?</div>
+  <div class="qprompt">Vejo <code>Optional&lt;String&gt;</code> como campo de uma entidade e <code>void enviar(String destino, Optional&lt;String&gt; copia)</code> como assinatura. Comente as duas decisões e diga o que faria em cada caso.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Não aprovo sem quatro respostas. Primeira: onde é que este <em>pipeline</em> corre? Se for dentro de um <em>handler</em> de pedido de um serviço que já processa dezenas ou centenas de pedidos concorrentes, o CPU já está saturado por paralelismo entre pedidos; acrescentar paralelismo dentro do pedido não cria capacidade, só acrescenta contenção e alarga o p99. O portátil dele tem 10 núcleos ociosos e um pedido de cada vez — não é o ambiente de produção.</p>
-      <p>Segunda: qual é N e qual é Q? Se forem 50 elementos com uma comparação de <code>String</code> cada, N·Q está três ordens de grandeza abaixo do limiar útil e o paralelo é mais lento por causa do custo de dividir e fundir. Terceira: a fonte divide-se bem? <code>ArrayList</code> e arrays dividem em O(1); <code>LinkedList</code>, <code>Stream.iterate</code> ou linhas de ficheiro não, e o trabalho acaba desequilibrado num ramo só.</p>
-      <p>Quarta, e a mais importante: há I/O ou bloqueio no <em>pipeline</em>? <code>parallelStream()</code> usa o <code>ForkJoinPool.commonPool()</code>, que é global ao processo e dimensionado a <code>availableProcessors() - 1</code>. Num contentor com <code>limits.cpu: 2</code> isso é um <em>thread</em>. Uma chamada HTTP de 200 ms por elemento sobre 100 elementos ocupa esse <em>pool</em> durante dezenas de segundos e bloqueia todos os <code>CompletableFuture</code> sem executor explícito da aplicação inteira. Para I/O, a resposta em Java 21 é um executor de <em>threads</em> virtuais ou concorrência estruturada, não um stream paralelo.</p>
-      <p>Também verifico se o <em>pipeline</em> é seguro: nada de acumular em colecções partilhadas não sincronizadas, e o <code>combiner</code> dos colectores tem de ser associativo. E peço a medição certa — JMH ou um teste de carga com a distribuição real de N, não um <code>System.nanoTime</code> em torno de uma execução única com o JIT ainda frio.</p></div>
+      <p>As duas estão erradas, por razões diferentes. <code>Optional</code> foi introduzido como tipo de retorno para exprimir «este método pode não ter resultado, e o compilador obriga-o a lidar com isso»; nem como campo nem como parâmetro cumpre esse papel.</p>
+      <p>Como campo, os problemas são três. Não é serializável, o que quebra serialização Java nativa e obriga a configuração extra em vários <em>frameworks</em>. Custa um objecto adicional por campo e por instância — cerca de 16 bytes de cabeçalho mais a referência; numa cache com 2 milhões de entidades e três campos <em>optional</em>, são perto de 100 MB de <em>heap</em> gastos a exprimir ausência que uma referência a <code>null</code> exprimia de graça. E não impede que o campo seja <code>null</code>, portanto não elimina o problema que dizia resolver: continua a ser preciso verificar. A alternativa é campo <code>null</code>-ável com um acessor que devolve <code>Optional</code>, ou — melhor — modelar a ausência no domínio, com um subtipo <code>sealed</code> ou um valor por omissão explícito.</p>
+      <p>Como parâmetro, o problema é de contrato. O chamador que não tem cópia tem de escrever <code>Optional.empty()</code>, o que é mais ruidoso do que <code>null</code> e não é verificado por ninguém; e o autor do método tem agora três estados para tratar em vez de dois. A alternativa idiomática é sobrecarregar: <code>enviar(String destino)</code> e <code>enviar(String destino, String copia)</code>. Se houver muitos parâmetros opcionais, o sinal é outro — agrupá-los num <em>record</em> de opções com valores por omissão, ou um <em>builder</em>.</p>
+      <p>Onde <code>Optional</code> é correcto: retorno de pesquisas (<code>findById</code>), operações de <em>parsing</em> que podem falhar sem ser excepcionais, e composição funcional com <code>map</code>, <code>flatMap</code>, <code>filter</code> e <code>or</code>. E há um <em>trade-off</em> a assumir: em caminhos com milhões de chamadas por segundo, a alocação do <code>Optional</code> é real — o <em>escape analysis</em> do C2 costuma eliminá-la quando o método é <em>inlined</em>, mas deixa de o fazer em <em>call sites</em> megamórficos. Aí a assinatura <code>null</code>-ável, anotada com <code>@Nullable</code> e verificada estaticamente, é a escolha pragmática.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Se ficou mais rápido, aprova-se.» Ou rejeita paralelismo por princípio, sem argumento.</td></tr>
-        <tr><td>Mid</td><td>Sabe que é preciso medir e que N tem de ser grande; desconhece o <em>pool</em> comum e o efeito em contentor.</td></tr>
-        <tr><td>Sénior</td><td>Nomeia o <code>commonPool</code>, a paralelismo <code>availableProcessors()-1</code>, o problema do I/O bloqueante e a saturação já existente no servidor.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o efeito no p99 e no orçamento de latência, propõe <em>threads</em> virtuais para I/O, e define o critério de aceitação da medição antes de mudar código.</td></tr>
+        <tr><td>Insuficiente</td><td>Acha que ambas as utilizações são boas práticas porque «evitam <code>null</code>».</td></tr>
+        <tr><td>Mid</td><td>Sabe que é anti-padrão, cita a documentação, mas não explica o custo nem propõe alternativa concreta.</td></tr>
+        <tr><td>Sénior</td><td>Serialização, custo de memória com número, o argumento dos três estados no parâmetro, e alternativas (sobrecarga, <em>record</em> de opções, acessor).</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o comportamento do <em>escape analysis</em> e quando a assinatura <code>null</code>-ável com verificação estática é preferível.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como isolaria o paralelismo do <em>pool</em> comum?»</li>
-      <li>«O que reporta <code>availableProcessors()</code> num contentor com <code>cpu: 500m</code>?»</li>
-      <li>«Que fontes se dividem mal e porquê?»</li>
-      <li>«E se o <em>pipeline</em> tiver <code>forEach</code> com escrita numa <code>ArrayList</code> partilhada?»</li></ul></div>
+      <li>«Qual é a diferença entre <code>orElse</code> e <code>orElseGet</code>, e quando é que ela custa dinheiro?»</li>
+      <li>«Devolveria <code>Optional&lt;List&lt;Pagamento&gt;&gt;</code>? Justifique.»</li>
+      <li>«Como trata um campo opcional numa entidade JPA?»</li>
+      <li>«O que acha de <code>Optional</code> em DTO de API REST?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Achar que <code>parallelStream()</code> cria <em>threads</em> novos por invocação.</li>
-      <li>Recomendar paralelismo para chamadas de rede.</li>
-      <li>Medir com uma execução única sem aquecimento do JIT.</li></ul></div>
+      <li>Usar <code>optional.get()</code> em código de produção sem <code>isPresent()</code> nem justificação.</li>
+      <li>Devolver <code>null</code> a partir de um método cujo tipo de retorno é <code>Optional</code>.</li>
+      <li>Não saber que <code>orElse</code> avalia sempre o argumento.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-6-5" class="h2"><span class="secnum">6.5</span> Efeitos secundários, estado partilhado e ordem<a class="anchor" href="#sec-6-5" aria-label="ligação">#</a></h2>
+<h2 id="sec-6-7" class="h2"><span class="secnum">6.7</span> O que mudou de Java 8 para 17, 21 e 25<a class="anchor" href="#sec-6-7" aria-label="ligação">#</a></h2>
 
-<p>O contrato dos streams pede que as funções passadas às operações sejam não-interferentes (não modificam a fonte durante o percurso) e sem estado (o resultado não depende de nada que mude entre invocações). Violar a primeira dá <code>ConcurrentModificationException</code> — ou, pior, resultados silenciosamente errados em fontes que não detectam modificação. Violar a segunda dá código que funciona em série e produz resultados diferentes em paralelo ou depois de uma optimização do JIT.</p>
+<p>A pergunta «o que mudou desde o Java 8?» é um teste de perspectiva, não de memória. Um candidato que responda com uma lista de funcionalidades soa a quem leu as <em>release notes</em>; um sénior responde com três eixos — o que mudou na linguagem, o que mudou na plataforma e o que isso custa a migrar — e ilustra cada um com um exemplo do sistema que operou.</p>
 
-<p>O erro mais comum é acumular num contentor externo: <code>lista.stream().forEach(x -&gt; resultado.add(x))</code>. Em série funciona; em paralelo, com um <code>ArrayList</code> não sincronizado, produz elementos perdidos, <code>null</code> no meio ou <code>ArrayIndexOutOfBoundsException</code>, porque o crescimento do array interno não é atómico. A correcção não é sincronizar — é usar <code>collect</code>, que foi desenhado exactamente para isto e cujo <code>combiner</code> funde contentores privados de cada ramo sem contenção.</p>
+<p>Na linguagem, o arco é claro: <code>var</code> (Java 10) para reduzir ruído em declarações locais; <em>text blocks</em> (15) para SQL e JSON embutidos, com remoção automática do espaço incidental e <code>\</code> para continuar a linha; <em>records</em> (16) e <code>instanceof</code> com padrão (16); <code>sealed</code> (17); <code>switch</code> com padrões e desconstrução de <em>records</em> (21); colecções sequenciadas com <code>getFirst</code>, <code>getLast</code> e <code>reversed</code> (21). O Java 25, LTS de Setembro de 2025, continua o mesmo arco: corpos de construtor flexíveis, que permitem validar argumentos antes da chamada a <code>super()</code>, e importação de módulos inteiros numa declaração, que encurta o cabeçalho de ficheiros pequenos.</p>
 
-<p>Sobre ordem: um stream tem ou não a característica <code>ORDERED</code>, herdada da fonte (<code>List</code> tem, <code>HashSet</code> não). Num stream ordenado e paralelo, <code>forEachOrdered</code> garante a ordem de encontro e <code>forEach</code> não; o primeiro custa sincronização e frequentemente anula o ganho do paralelismo. Ao contrário, chamar <code>unordered()</code> explicitamente pode acelerar <code>distinct()</code>, <code>limit()</code> e <code>skip()</code> em paralelo, por dispensar o rastreio de posições. E <code>findAny()</code> existe precisamente para dizer ao <em>runtime</em> que qualquer resultado serve.</p>
+<p>Na plataforma, as mudanças que importam a um backend são maiores do que as da linguagem: <em>virtual threads</em> (21), que tornam viável o modelo bloqueante com dezenas de milhares de pedidos concorrentes; G1 por omissão desde o Java 9 e ZGC generacional para <em>heaps</em> grandes com pausas na ordem do milissegundo; <em>class data sharing</em> e melhorias de arranque que reduzem o tempo até ao primeiro pedido num contentor; e a encapsulação forte dos internos da JDK, que é a fonte real da dor da migração.</p>
 
-<div class="qa" id="q-6-9" data-box="qa" data-area="java" data-level="senior" data-freq="media">
+<figure class="listing java" id="lst-6-7"><div class="lhead"><span class="lnum">Listagem 6.7</span>
+<span class="lcap"><code>var</code>, <em>text blocks</em> e colecções sequenciadas em código de todos os dias.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>var sql = """
+        SELECT p.id, p.estado, SUM(l.valor) AS total
+          FROM pagamento p
+          JOIN linha l ON l.pagamento_id = p.id
+         WHERE p.criado_em &gt;= ?
+         GROUP BY p.id, p.estado
+        """;                        // sem "+", sem \n, indentação incidental removida
+
+// var: o tipo tem de continuar óbvio à direita do "="
+var porEstado = pagamentos.stream()                       // Map&lt;Estado, Long&gt;
+        .collect(Collectors.groupingBy(Pagamento::estado, Collectors.counting()));
+
+var ordenados = pagamentos.stream()                       // List&lt;Pagamento&gt; imutável
+        .sorted(Comparator.comparing(Pagamento::criadoEm))
+        .toList();
+
+var primeiro = ordenados.getFirst();                      // Java 21: SequencedCollection
+var ultimo   = ordenados.getLast();
+
+// var que prejudica: o leitor não sabe o que sai daqui
+// var r = servico.processar(pedido);</code></pre></figure>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 6.2</span> O que perguntar a si próprio antes de dizer «migrámos para o Java 21».</div>
+<div class="tscroll"><table><thead><tr><th>Frente</th><th>O que parte na migração 8 &rarr; 21</th><th>Mitigação</th></tr></thead><tbody>
+<tr><td>Módulos e reflexão</td><td>Acesso reflexivo a internos da JDK é negado por omissão desde o Java 16</td><td><code>--add-opens</code> como medida temporária; substituir a biblioteca é a solução</td></tr>
+<tr><td>Java EE removido</td><td><code>javax.xml.bind</code>, JAX-WS e CORBA saíram da JDK no Java 11</td><td>Adicionar as dependências Jakarta explicitamente</td></tr>
+<tr><td>Geração de <em>bytecode</em></td><td>ASM, cglib, Byte Buddy, Lombok, Mockito falham em versões novas</td><td>Actualizar antes de mudar de JDK, não depois</td></tr>
+<tr><td>Codificação por omissão</td><td>O <em>charset</em> por omissão passou a UTF-8 (Java 18); ficheiros lidos sem <em>charset</em> explícito mudam de comportamento</td><td>Fixar o <em>charset</em> em todas as chamadas de I/O; <code>-Dfile.encoding</code> só como diagnóstico</td></tr>
+<tr><td><em>Garbage collector</em></td><td>Parallel deixou de ser omissão no Java 9; parâmetros afinados para CMS deixaram de existir</td><td>Refazer a afinação do zero com medições, não traduzir <em>flags</em></td></tr>
+<tr><td>Concorrência</td><td>Piscinas de <em>threads</em> dimensionadas para I/O bloqueante deixam de fazer sentido com <em>virtual threads</em></td><td>Migrar por serviço, medindo; rever <code>synchronized</code> nos caminhos bloqueantes</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-6-11" data-box="qa" data-area="java" data-level="mid" data-freq="media">
   <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Pusemos um <code>peek</code> com <code>log.debug</code> a meio de um <em>pipeline</em> para diagnosticar um problema e as linhas não aparecem todas. Explique porquê e diga como usaria <code>peek</code> correctamente.</div>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A equipa discute se deve usar <code>var</code> em todo o lado. Qual é a sua regra, e o que responde a quem diz que <code>var</code> torna Java uma linguagem de tipagem dinâmica?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque o número de vezes que <code>peek</code> é invocado não faz parte do contrato: depende de quantos elementos o operador terminal precisa de ver. Com <code>findFirst()</code> ou <code>anyMatch()</code> a jusante, o <em>pipeline</em> pára cedo e o <code>peek</code> só corre para os elementos consumidos. Pior: com <code>count()</code>, desde o Java 9 o <em>runtime</em> pode saltar completamente o percurso quando consegue determinar o tamanho a partir da fonte e nenhuma operação altera a contagem — nesse caso o <code>peek</code> não corre nenhuma vez, e o <em>Javadoc</em> documenta isto explicitamente. Se houver um <code>filter</code> no meio, a contagem deixa de ser conhecida e o <code>peek</code> volta a correr.</p>
-      <p>A segunda causa possível é o paralelismo: em <code>parallelStream()</code>, o <code>peek</code> corre em vários <em>threads</em>, sem ordem garantida, e as linhas surgem intercaladas — o que parece «faltarem linhas» é muitas vezes ordem baralhada mais um <em>appender</em> assíncrono a descartar sob carga.</p>
-      <p>O uso correcto de <code>peek</code> é o que o <em>Javadoc</em> declara: observação temporária em desenvolvimento, tipicamente com o <em>pipeline</em> terminado num <code>toList()</code> que consome tudo. O que não se deve fazer é usar <code>peek</code> para efeitos com significado de negócio — enviar eventos, incrementar métricas, mutar entidades — porque a semântica passa a depender do operador terminal. Para métricas, coloca-se o efeito num <code>map</code> explícito, ou melhor, fora do <em>pipeline</em>, num ciclo sobre o resultado já materializado.</p>
-      <p>O trade-off honesto: <code>peek</code> é conveniente para depurar um <em>pipeline</em> longo sem o partir em variáveis intermédias. Em código que vai para produção, partir o <em>pipeline</em> em dois passos nomeados dá mais informação no <em>stack trace</em> e permite testar cada metade.</p></div>
+      <p>Quem diz isso está enganado: <code>var</code> é inferência de tipo em compilação. O tipo é fixado no <em>bytecode</em>, é estático, e não se pode reatribuir a variável com um valor de outro tipo. A única coisa que <code>var</code> remove é a repetição do tipo no lado esquerdo quando ele já está escrito no lado direito.</p>
+      <p>A regra prática tem três partes. Primeira, usar <code>var</code> quando o tipo é evidente na mesma linha: <code>var pagamento = new Pagamento(...)</code>, <code>var it = lista.iterator()</code>, <code>var e : mapa.entrySet()</code> — aqui elimina-se uma repetição literal e a legibilidade sobe. Segunda, não usar quando o tipo vem de uma chamada cujo nome não o revela: <code>var r = servico.processar(pedido)</code> obriga o leitor a abrir outro ficheiro, e numa revisão de código no navegador não há sequer <em>hover</em> do IDE. Terceira, nunca usar com literais numéricos ambíguos nem com o operador diamante vazio: <code>var l = new ArrayList&lt;&gt;()</code> infere <code>ArrayList&lt;Object&gt;</code> e transforma um erro de compilação num bug.</p>
+      <p>Há restrições da linguagem que convém saber: <code>var</code> só se aplica a variáveis locais, ao índice de um <code>for</code>, ao recurso de um <em>try-with-resources</em> e — desde o Java 11 — aos parâmetros de uma lambda quando é preciso anotá-los. Não se aplica a campos, parâmetros de método, tipos de retorno nem a variáveis sem inicializador, precisamente porque nesses sítios o tipo é parte do contrato público e não deve ser inferido.</p>
+      <p>O <em>trade-off</em> é de audiência: <code>var</code> troca redundância por dependência da ferramenta. Numa equipa que revê código no IDE, o custo é quase nulo; numa equipa que revê em <em>diffs</em> no GitHub, com <em>reviewers</em> de outra equipa, o custo é real e a regra deve ser mais conservadora. O acordo deve ficar escrito no guia de estilo e verificado pelo <em>linter</em>, não decidido em cada <em>pull request</em>.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Culpa o <em>logger</em> ou o nível de <em>log</em>, sem ligar à preguiça do <em>pipeline</em>.</td></tr>
-        <tr><td>Mid</td><td>Sabe que os streams são preguiçosos e que <code>findFirst</code> corta, mas desconhece a elisão com <code>count()</code>.</td></tr>
-        <tr><td>Sénior</td><td>Explica a dependência do terminal, o caso do <code>count()</code>, o efeito do paralelismo e diz para que serve <code>peek</code> de facto.</td></tr>
-        <tr><td>Staff</td><td>Generaliza para a regra de não pôr efeitos com significado dentro de operações intermédias e propõe onde colocar métricas e eventos.</td></tr>
+        <tr><td>Insuficiente</td><td>Diz que <code>var</code> é tipagem dinâmica ou que «deixa o compilador decidir em <em>runtime</em>».</td></tr>
+        <tr><td>Mid</td><td>Sabe que é inferência estática e dá uma regra de gosto pessoal, sem casos concretos.</td></tr>
+        <tr><td>Sénior</td><td>Regra com três casos, conhece as restrições da linguagem e a armadilha do diamante vazio.</td></tr>
+        <tr><td>Staff</td><td>Transforma a discussão em política de equipa verificável pelo <em>linter</em>, com o contexto de revisão como critério.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se em vez de <code>count()</code> tiver <code>filter(...).count()</code>?»</li>
-      <li>«Como registaria uma métrica por elemento processado sem <code>peek</code>?»</li>
-      <li>«Que diferença há entre <code>forEach</code> e <code>forEachOrdered</code> em paralelo?»</li>
-      <li>«O que é interferência com a fonte e que excepção dá?»</li></ul></div>
+      <li>«O que infere <code>var x = new ArrayList&lt;&gt;();</code>?»</li>
+      <li>«Pode usar <code>var</code> num campo? Porquê não?»</li>
+      <li>«E em <em>text blocks</em>: como preserva espaços no fim da linha?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Usar <code>peek</code> para publicar eventos ou gravar em base de dados.</li>
-      <li>Acumular numa <code>ArrayList</code> externa dentro de <code>map</code> ou <code>peek</code>.</li>
-      <li>Assumir que <code>forEach</code> preserva a ordem em paralelo.</li></ul></div>
+      <li>Confundir inferência de tipo com tipagem dinâmica.</li>
+      <li>Defender uso absoluto («sempre» ou «nunca») sem critério de legibilidade.</li></ul></div>
   </div>
 </div>
 
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>Collectors.toMap</code> lança <code>NullPointerException</code> quando o valor calculado é <code>null</code>, porque internamente usa <code>Map::merge</code>. <code>groupingBy</code> aceita elementos cujo <em>downstream</em> produza <code>null</code>, mas lança <code>NullPointerException</code> se a própria chave de classificação for <code>null</code>. Num relatório sobre dados vindos de uma tabela com colunas anuláveis, isto rebenta em produção com dados reais e nunca nos testes com dados sintéticos: a defesa é <code>Objects.requireNonNullElse</code> na função de classificação, ou filtrar explicitamente e contar os descartados.</p></aside>
-
-<h2 id="sec-6-6" class="h2"><span class="secnum">6.6</span> Streams vs ciclos: legibilidade e performance<a class="anchor" href="#sec-6-6" aria-label="ligação">#</a></h2>
-
-<p>A comparação honesta não é «streams são lentos» contra «streams são elegantes». Para a esmagadora maioria do código de serviço — dezenas ou centenas de elementos por pedido — a diferença de desempenho é de microssegundos e irrelevante face aos 2 a 20 ms de uma consulta a PostgreSQL. O critério é legibilidade e composição, e os streams ganham quando o <em>pipeline</em> é uma sequência de transformações declarativas com um resultado agregado.</p>
-
-<p>Os ciclos ganham em cinco situações concretas. Primeira, quando é preciso <code>break</code> com estado, <code>continue</code> condicional ou <code>return</code> a meio: <code>takeWhile</code> e <code>findFirst</code> cobrem parte dos casos, mas um ciclo com duas condições de paragem escreve-se melhor imperativamente. Segunda, quando o corpo lança excepções verificadas: os tipos funcionais de <code>java.util.function</code> não as declaram, e embrulhar em <code>RuntimeException</code> para desembrulhar depois é pior do que o ciclo. Terceira, em ciclos quentes sobre primitivos onde cada nanossegundo conta e o <em>boxing</em> ou a profundidade de <em>inlining</em> pesam. Quarta, quando o <em>pipeline</em> passa a ter mais de quatro ou cinco estágios com lambdas de várias linhas — nesse ponto a versão imperativa é mais fácil de depurar com <em>breakpoints</em> e produz <em>stack traces</em> legíveis. Quinta, quando é preciso iterar dois índices em paralelo ou olhar para o elemento anterior: os streams não têm um conceito nativo de janela, e emular isso com <code>IntStream.range</code> e acessos por índice é pior do que um <code>for</code>.</p>
-
-<p>Há uma armadilha de <em>performance</em> específica que merece ser conhecida: um <em>call site</em> de lambda que veja três ou mais implementações diferentes torna-se megamórfico e o JIT deixa de o poder inserir em linha. Numa biblioteca genérica onde o mesmo <code>map</code> é chamado com dezenas de lambdas distintas, o custo por elemento pode subir várias vezes em relação ao caso monomórfico. Isto não afecta o código de aplicação típico, onde cada <em>call site</em> vê um só lambda, mas explica resultados de <em>benchmark</em> contraditórios entre um microteste e uma biblioteca real.</p>
-
-<figure class="listing java" id="lst-6-6"><div class="lhead"><span class="lnum">Listagem 6.6</span>
-<span class="lcap">Três casos em que o ciclo é a resposta certa.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="java"><code>// 1) Excepções verificadas: o stream obriga a embrulhar; o ciclo não.
-List&lt;Config&gt; cfgs = new ArrayList&lt;&gt;(caminhos.size());
-for (Path p : caminhos) {
-    cfgs.add(Config.ler(p));          // throws IOException — propaga naturalmente
-}
-
-// 2) Duas condições de paragem com estado acumulado
-long total = 0;
-int lidos = 0;
-for (Registo r : registos) {
-    if (total &gt; ORCAMENTO_BYTES || lidos &gt;= MAX_REGISTOS) break;
-    total += r.tamanho();
-    lidos++;
-}
-
-// 3) Janela sobre o elemento anterior: sem equivalente natural em stream
-List&lt;Long&gt; deltas = new ArrayList&lt;&gt;(amostras.size() - 1);
-for (int i = 1; i &lt; amostras.size(); i++) {
-    deltas.add(amostras.get(i).valor() - amostras.get(i - 1).valor());
-}</code></pre></figure>
-
-<div class="qa" id="q-6-10" data-box="qa" data-area="java" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Java e a linguagem</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Numa revisão de código, quando é que exige que um stream seja reescrito como ciclo, e quando é que exige o contrário? Dê-me o critério que aplicaria à equipa.</div>
+<div class="qa" id="q-6-12" data-box="qa" data-area="jvm" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Herdou um monólito em Java 8, Spring Boot 2.7, 700 mil linhas, 40 dependências. Como planeia a migração para Java 21 e o que espera ganhar em números?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O critério que defendo é de manutenção, com uma excepção medida de performance. Exijo stream quando o código é uma agregação ou transformação declarativa — filtrar, mapear, agrupar, somar — e a versão imperativa seria um ciclo com um <code>Map</code> temporário e três <code>if</code>. Aí o stream elimina estado intermédio nomeado, que é onde nascem os <em>bugs</em>.</p>
-      <p>Exijo ciclo em cinco casos: quando há excepções verificadas no corpo; quando há duas ou mais condições de paragem com estado; quando é preciso olhar para o elemento vizinho ou iterar dois índices; quando o <em>pipeline</em> passa de quatro estágios ou tem lambdas de mais de três linhas; e quando o código está no caminho quente medido e o <em>benchmark</em> mostra ganho. Fora destes casos, reescrever por gosto é ruído na revisão.</p>
-      <p>Sobre os números, sou explícito com a equipa para desarmar a discussão. Para um pedido HTTP que faz duas consultas a PostgreSQL de 3 ms cada e transforma 200 objectos, a escolha entre stream e ciclo vale menos de 50 microssegundos, ou seja, menos de 1% da latência do <em>endpoint</em>. Optimizar aí é desperdício. Já num ciclo de 10<sup>8</sup> iterações sobre <code>int[]</code>, o <em>boxing</em> de um <code>Stream&lt;Integer&gt;</code> pode custar um factor de 3 a 8, e isso é uma discussão legítima — que se resolve mudando para <code>IntStream</code>, não necessariamente para um ciclo.</p>
-      <p>Acrescento duas regras que valem mais do que a escolha: nunca esconder efeitos secundários dentro de operações intermédias, e nunca introduzir <code>parallelStream()</code> sem medição no ambiente de produção. Estas duas causam incidentes; a escolha entre <code>for</code> e <code>stream</code> causa, no máximo, debates.</p></div>
+      <p>A migração faz-se em quatro fases, e a primeira não muda de JDK. Fase zero: actualizar todas as dependências que geram ou lêem <em>bytecode</em> — Lombok, Mockito, ASM, cglib, Byte Buddy, o <em>plugin</em> de compilação — ainda em Java 8, porque são elas que falham primeiro e porque uma falha aqui é indistinguível de uma incompatibilidade da aplicação. Fase um: compilar para Java 8 mas <em>correr</em> em JDK 21, com <code>--add-opens</code> onde for preciso e a lista desses <em>flags</em> tratada como dívida registada. Fase dois: subir o alvo de compilação para 21 e resolver os erros. Fase três: adoptar funcionalidades — <em>records</em>, <code>sealed</code>, <em>virtual threads</em> — módulo a módulo, cada uma com uma decisão própria.</p>
+      <p>A actualização do Spring Boot é uma migração separada e não deve ser feita ao mesmo tempo: 2.7 para 3.x troca <code>javax.*</code> por <code>jakarta.*</code> em todo o código, o que toca centenas de ficheiros e produz um <em>diff</em> impossível de rever em conjunto com uma mudança de JDK. A ordem sensata é JDK primeiro (o Boot 2.7 corre em JDK 17 e 21), depois Boot 3.x, com libertação em produção entre as duas.</p>
+      <p>O que esperar em números, com honestidade sobre a incerteza: os ganhos de <em>throughput</em> só do <em>runtime</em> — melhorias do G1, do JIT e de <code>String</code> — situam-se tipicamente entre 5% e 15% sem qualquer alteração de código, e a única forma de os saber é medir com a carga real. O ganho grande é outro: substituir a piscina de 200 <em>threads</em> de plataforma por <em>virtual threads</em> num serviço dominado por I/O permite passar de centenas para dezenas de milhares de pedidos concorrentes com o mesmo código bloqueante, com o limite a deslocar-se para a piscina de ligações à base de dados — que passa a ser o verdadeiro semáforo e tem de ser dimensionada explicitamente.</p>
+      <p>As armadilhas a nomear: o <em>charset</em> por omissão passou a UTF-8, o que altera silenciosamente a leitura de ficheiros escritos com a codificação da plataforma; a afinação de GC herdada do CMS não se traduz, refaz-se com medições; e o modelo de <em>threads</em> obriga a rever blocos <code>synchronized</code> longos nos caminhos bloqueantes, porque no Java 21 uma <em>virtual thread</em> bloqueada dentro de <code>synchronized</code> fixa a <em>thread</em> transportadora — comportamento melhorado em versões posteriores, mas que na 21 obriga a preferir <code>ReentrantLock</code> nesses pontos.</p>
+      <p>A forma de decidir se vale a pena: o argumento não é «estar actualizado», é o custo de segurança e de contratação. O Java 8 público deixou de ter actualizações gratuitas para uso comercial, cada CVE por corrigir passa a exigir um fornecedor pago, e nenhum engenheiro sénior quer entrar numa equipa que corre uma versão de 2014. Isso quantifica-se em custo de licença e em tempo de recrutamento, que é a linguagem em que a direcção decide.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Preferência dogmática num sentido ou noutro («streams são sempre melhores», «streams são lentos»).</td></tr>
-        <tr><td>Mid</td><td>Diz «depende da legibilidade» sem conseguir enunciar um critério que outra pessoa possa aplicar.</td></tr>
-        <tr><td>Sénior</td><td>Dá casos concretos em ambos os sentidos, quantifica a irrelevância da diferença no código de serviço e distingue <em>boxing</em> de abstracção.</td></tr>
-        <tr><td>Staff</td><td>Formula o critério como regra de equipa aplicável em revisão, separa o que causa incidentes do que causa debates e diz como o mediria antes de decidir.</td></tr>
+        <tr><td>Insuficiente</td><td>«Mudava a versão no <code>pom.xml</code> e via o que rebentava.» Sem fases, sem ordem, sem medição.</td></tr>
+        <tr><td>Mid</td><td>Descreve a subida de versão e cita <code>--add-opens</code>, mas junta a migração do Spring Boot na mesma alteração.</td></tr>
+        <tr><td>Sénior</td><td>Fases explícitas com a ordem justificada, separação JDK/Boot, armadilhas concretas (charset, GC, <em>pinning</em>) e medição antes e depois.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o argumento de negócio (segurança, custo, contratação), trata os <code>--add-opens</code> como dívida registada e define o critério de sucesso por serviço.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como mede a diferença de forma credível?»</li>
-      <li>«O que é um <em>call site</em> megamórfico e porque é que interessa aqui?»</li>
-      <li>«Como trata excepções verificadas dentro de um stream, se tiver mesmo de o fazer?»</li>
-      <li>«Escreveria esta regra num guia de estilo? Com que redacção?»</li></ul></div>
+      <li>«O que mede antes e depois, e durante quanto tempo?»</li>
+      <li>«Como reverte se o p99 piorar em produção?»</li>
+      <li>«Que serviço escolhe para o primeiro piloto e porquê?»</li>
+      <li>«Onde é que <em>virtual threads</em> não ajudam nada?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Reescrever código alheio por preferência estética sem argumento de manutenção.</li>
-      <li>Citar ganhos de performance sem nunca ter medido.</li>
-      <li>Embrulhar <code>IOException</code> em <code>RuntimeException</code> dentro de um lambda e chamar-lhe solução.</li></ul></div>
+      <li>Prometer ganhos de performance sem medição («o Java 21 é 40% mais rápido»).</li>
+      <li>Fazer JDK e Spring Boot na mesma libertação.</li>
+      <li>Não referir nenhuma incompatibilidade concreta em 700 mil linhas e 40 dependências.</li></ul></div>
   </div>
 </div>
 
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Desde as versões posteriores ao Java 21, a API de <em>gatherers</em> (<code>Stream::gather</code>) preenche a lacuna das operações intermédias personalizadas: janelas deslizantes, agrupamento por blocos, <em>scan</em> com estado — tudo o que antes obrigava a sair do <em>pipeline</em>. Em entrevista, mencioná-la mostra actualização; o que não convence é propô-la como solução sem saber se a versão de Java do candidato à vaga a inclui.</p></aside>
+<h2 id="sec-6-8" class="h2"><span class="secnum">6.8</span> Resumo e checklist<a class="anchor" href="#sec-6-8" aria-label="ligação">#</a></h2>
 
-<h2 id="sec-6-7" class="h2"><span class="secnum">6.7</span> Resumo e checklist<a class="anchor" href="#sec-6-7" aria-label="ligação">#</a></h2>
-
-<p>O que reter deste capítulo:</p>
+<p>O fio condutor deste capítulo é que cada funcionalidade moderna de Java existe para mover uma verificação de <em>runtime</em> para compilação, e que cada uma tem um limite onde deixa de servir. Quem sabe dizer o limite passa a ronda; quem só sabe a sintaxe não.</p>
 
 <ul class="lst">
-  <li>Um lambda não é uma classe anónima: é <code>invokedynamic</code> com <code>LambdaMetafactory</code>; sem captura é instanciado uma vez, com captura aloca por avaliação, e <code>this</code> refere o objecto envolvente.</li>
-  <li><code>expr::metodo</code> avalia o receptor uma única vez, no momento da criação; o lambda equivalente avalia-o em cada invocação. Guardar referências de método em campos de vida longa serve dados obsoletos sem erro visível.</li>
-  <li>As operações intermédias não fazem nada até haver uma terminal, e a execução é elemento a elemento com fusão de estágios; <code>sorted()</code> e <code>distinct()</code> são barreiras que anulam o corte antecipado a montante.</li>
-  <li>Um <code>Stream</code> é de utilização única: guardar a fonte ou um <code>Supplier&lt;Stream&lt;T&gt;&gt;</code>, nunca o stream. Streams de I/O fecham-se em <code>try-with-resources</code>.</li>
-  <li><code>reduce</code> é redução imutável e serve escalares; <code>collect</code> é redução mutável e serve estruturas. <code>reduce(&quot;&quot;, String::concat)</code> é O(n²) e <code>joining()</code> é O(n).</li>
-  <li><code>groupingBy</code> sem <em>downstream</em> materializa listas inteiras; <code>counting()</code>, <code>summingLong</code>, <code>filtering</code> e <code>teeing</code> resolvem em memória constante por grupo e num só percurso. <code>filtering</code> mantém os grupos que um <code>filter</code> a montante faria desaparecer.</li>
-  <li><code>parallelStream()</code> usa o <code>ForkJoinPool.commonPool()</code> global, com paralelismo <code>availableProcessors() - 1</code>, que num contentor de 2 CPU é 1. Nunca com I/O bloqueante; para isso existem <em>threads</em> virtuais.</li>
-  <li>Efeitos secundários dentro de operações intermédias não têm contagem garantida (<code>peek</code> com <code>count()</code> pode não correr) nem ordem garantida em paralelo.</li>
-  <li>Entre stream e ciclo, o critério é manutenção; a diferença de latência num <em>endpoint</em> típico está abaixo de 1% e não justifica reescritas.</li>
+  <li>Os genéricos são apagados: <code>new T[]</code>, <code>o instanceof T</code>, <code>static T</code>, sobrecarga por argumento de tipo e subtipos genéricos de <code>Throwable</code> são impossíveis, e o custo real do apagamento é o <em>boxing</em> nos caminhos quentes.</li>
+  <li><code>@SafeVarargs</code> é uma promessa de que o <em>array</em> de <em>varargs</em> não é guardado nem devolvido; se essa promessa não se puder dar, a assinatura muda para <code>List&lt;T&gt;</code>.</li>
+  <li>PECS aplica-se a parâmetros de métodos públicos e não a tipos de retorno; a decisão tem de ser tomada na primeira versão da API, porque alargar depois obriga a rever todas as implementações.</li>
+  <li>Um <em>record</em> tem invariantes fortes se o construtor compacto validar e copiar; não é entidade JPA, mas é a melhor projecção de leitura e a melhor DTO de fronteira.</li>
+  <li>Interface <code>sealed</code> com <em>records</em> substitui <em>visitor</em> quando o conjunto de tipos muda menos do que o de operações — e a única razão para a usar é a exaustividade verificada, que um <code>default</code> destrói.</li>
+  <li>Guardas <code>when</code> fazem parte do rótulo e permitem retroceder para o rótulo seguinte; um <code>if</code> no corpo não. Num <code>switch</code> com padrões, <code>null</code> lança <code>NullPointerException</code> salvo <code>case null</code>.</li>
+  <li><code>Optional</code> é tipo de retorno, não campo nem parâmetro; <code>orElse</code> avalia sempre o argumento, <code>orElseGet</code> só quando é preciso, e <code>get()</code> não pertence a código de produção.</li>
+  <li>Numa migração 8 &rarr; 21, primeiro as dependências que geram <em>bytecode</em>, depois o <em>runtime</em>, depois o alvo de compilação, e só no fim as funcionalidades — com o Spring Boot 3.x como libertação separada.</li>
 </ul>
 
-<p>Checklist antes da ronda:</p>
+<p>Checklist accionável antes de uma ronda de linguagem:</p>
 
 <ul class="lst">
-  <li>Saber desenhar no quadro o percurso de <code>filter().map().findFirst()</code> e dizer o número exacto de invocações de cada função.</li>
-  <li>Escrever de memória um <code>groupingBy</code> com <code>teeing</code> e <code>filtering</code>, incluindo o tratamento do grupo vazio em <code>summarizingLong</code>.</li>
-  <li>Ter na ponta da língua as três armadilhas de <code>toMap</code>: chave duplicada, valor <code>null</code>, mapa mutável devolvido.</li>
-  <li>Conseguir enunciar a heurística N·Q ≈ 10<sup>4</sup> e o valor de <code>availableProcessors()</code> num contentor com <code>limits.cpu: 2</code>.</li>
-  <li>Ter um exemplo próprio, com números antes e depois, de um <em>pipeline</em> que foi optimizado ou de um <code>parallelStream()</code> que foi removido.</li>
-  <li>Preparar a resposta a «streams ou ciclos?» como critério de equipa, não como preferência pessoal.</li>
-  <li>Saber quando escolheria <code>IntStream</code> em vez de <code>Stream&lt;Integer&gt;</code> e quantificar o custo do <em>boxing</em>.</li>
-  <li>Praticar a reescrita de um <em>pipeline</em> de cinco estágios em ciclo e vice-versa, em papel, em menos de cinco minutos.</li>
+  <li>Escrever de memória, em papel, cinco operações que o apagamento torna ilegais e a razão de cada uma.</li>
+  <li>Implementar <code>copiar(List&lt;? super T&gt;, List&lt;? extends T&gt;)</code> sem consultar nada e explicar em voz alta porque é que cada lado tem o <em>wildcard</em> que tem.</li>
+  <li>Converter uma classe de 70 linhas do próprio projecto em <em>record</em> com construtor compacto que valide e copie os componentes mutáveis.</li>
+  <li>Modelar um domínio real do trabalho actual com interface <code>sealed</code> e três a cinco <em>records</em>, e escrever um <code>switch</code> exaustivo sem <code>default</code>.</li>
+  <li>Acrescentar um subtipo a essa hierarquia e confirmar que a compilação parte exactamente nos sítios previstos.</li>
+  <li>Rever o próprio código à procura de <code>Optional</code> como campo ou parâmetro e de chamadas a <code>get()</code>, e corrigir cada ocorrência.</li>
+  <li>Preparar três números do sistema actual para a pergunta de migração: versão do JDK, tempo de arranque e p99 antes e depois da última actualização de plataforma.</li>
+  <li>Ensaiar a resposta de dois minutos a «o que mudou desde o Java 8», estruturada em linguagem, plataforma e custo de migração.</li>
 </ul>

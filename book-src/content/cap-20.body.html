@@ -1,685 +1,739 @@
-<p>Uma ronda de modelação relacional mede se o candidato consegue escrever, ao vivo, um esquema que sobrevive a três anos de produção — e depois defender cada decisão contra um requisito novo que o entrevistador acrescenta a meio. O que se avalia não é saber recitar as formas normais: é saber onde é que o modelo guarda cada invariante, quanto custa em bytes e em páginas de índice cada escolha de tipo, e o que se parte quando o requisito muda. Onde os candidatos caem é em três sítios previsíveis: usam <code>uuid</code> aleatório como chave primária de uma tabela de 200 milhões de linhas sem saber o que isso faz ao B-tree, resolvem histórico com um <code>deleted_at</code> e ficam sem resposta quando se pergunta pela unicidade do email, e guardam dinheiro em <code>double precision</code>. Este capítulo trata o modelo como aquilo que é — a última linha de defesa da correcção, porque a aplicação será reescrita duas vezes e os dados ficam.</p>
+<p>Nesta área o entrevistador não quer saber se o candidato conhece o nome «hexagonal»: quer saber se sabe onde é que uma regra de negócio tem de viver para continuar a ser encontrável daqui a três anos, e quanto custa essa arrumação. A pergunta é quase sempre a mesma sob roupagens diferentes — «desenhe-me os pacotes deste serviço» — e o sinal está no que o candidato faz a seguir: quem responde com o diagrama canónico de <em>Clean Architecture</em> e não menciona um único custo é lido como alguém que aplicou um <em>template</em>; quem descreve a estrutura em função dos casos de uso concretos, admite onde a regra da dependência foi quebrada de propósito e diz em que serviço da mesma empresa não a aplicaria, é lido como sénior. Os candidatos caem em três sítios: modelo anémico defendido como se fosse uma escolha de <em>design</em>, agregados desenhados pelo diagrama entidade-relação em vez de pelas invariantes, e incapacidade de dizer quando é que um controlador que fala directamente com o repositório é a resposta correcta. Este capítulo trata as camadas, os agregados, os eventos e — com igual espaço — a factura.</p>
 
-<h2 id="sec-20-1" class="h2"><span class="secnum">20.1</span> Normalização até 3FN e desnormalização deliberada<a class="anchor" href="#sec-20-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-20-1" class="h2"><span class="secnum">20.1</span> Camadas, portas e adaptadores<a class="anchor" href="#sec-20-1" aria-label="ligação">#</a></h2>
 
-<p>As três primeiras formas normais resolvem um problema só: eliminar a possibilidade de o mesmo facto existir em dois sítios com valores diferentes. A 1FN exige valores atómicos e ausência de grupos repetidos — nada de <code>tags</code> em texto separado por vírgulas, nada de <code>phone1</code>, <code>phone2</code>, <code>phone3</code>. A 2FN elimina dependências parciais de parte de uma chave composta: numa tabela com chave <code>(order_id, product_id)</code>, a coluna <code>product_name</code> depende só de metade da chave e tem de sair. A 3FN elimina dependências transitivas entre atributos não-chave: se <code>city</code> se deduz de <code>postcode</code>, a cidade pertence a uma tabela de códigos postais. A BCNF aperta o caso raro em que existe uma dependência funcional sobre um determinante que não é chave candidata; em entrevista basta reconhecer o caso, não o recitar.</p>
+<p>A arquitectura hexagonal, <em>clean</em>, <em>onion</em> e a arquitectura em camadas tradicional partilham noventa por cento do conteúdo e discordam numa única coisa: a direcção das setas que atravessam a fronteira da persistência. Nas camadas clássicas, o serviço depende do repositório e o repositório depende do JDBC; a seta aponta para fora, para a infra-estrutura. Nas três variantes modernas, a seta é invertida por uma interface declarada no interior: o domínio ou a aplicação declara <code>SubscriptionRepository</code>, e o adaptador JPA é que implementa essa interface. Tudo o resto — hexágonos, círculos concêntricos, nomes de anéis — é vocabulário. A regra da dependência (*dependency rule*) é o invariante: o código de dentro não conhece nomes do código de fora, nem por importação, nem por tipo de retorno, nem por excepção lançada.</p>
 
-<p>O erro simétrico é normalizar factos históricos. A morada de entrega de uma encomenda de 2023 não é uma referência à morada actual do cliente: é um valor congelado no momento da compra. Copiá-la para a tabela <code>sales_order</code> não viola a 3FN, porque não existe dependência funcional entre a encomenda e a morada corrente — são atributos distintos que por acaso tiveram o mesmo valor um dia. O mesmo vale para o preço unitário na linha de encomenda. Um candidato que apresenta <code>order_line.unit_price</code> como redundância a eliminar está a dizer ao entrevistador que nunca reconciliou uma factura.</p>
+<p>Daqui saem dois tipos de portas, e é aqui que a maioria dos candidatos tropeça na nomenclatura. As portas de entrada (*driving ports*) são as interfaces dos casos de uso: quem as chama é o mundo exterior — um controlador REST, um <em>listener</em> de Kafka, um <em>job</em> agendado, um teste. As portas de saída (*driven ports*) são as interfaces que o interior declara para pedir alguma coisa ao mundo: persistir, cobrar, notificar, obter a hora. A assimetria prática é que as portas de entrada raramente valem o custo — a interface <code>RenewSubscription</code> com uma única implementação existe sobretudo para documentar o caso de uso — enquanto as portas de saída pagam-se sozinhas, porque são elas que permitem testar a aplicação sem base de dados nem rede.</p>
 
-<p>A desnormalização deliberada entra depois de existir um número. A regra prática que resiste à pergunta seguinte é: só se desnormaliza um agregado quando o plano de execução do <em>join</em> equivalente já foi medido, quando o rácio de leituras para escritas justifica pagar amplificação de escrita, e quando existe um processo de reconciliação que detecta divergência. Um contador <code>order_count</code> na tabela do cliente poupa uma agregação de 40 ms por pedido no p99, mas cria um ponto de contenção: cada encomenda nova passa a fazer <code>UPDATE</code> da mesma linha do cliente, e num cliente empresarial com 300 encomendas por minuto isso é uma fila de escritores no mesmo <em>tuple</em>.</p>
+<p>A estrutura de pacotes deve partir por funcionalidade e só depois por camada, nunca o contrário. Um pacote raiz <code>web</code>, um <code>service</code> e um <code>repository</code> com quarenta classes cada obrigam a percorrer três pacotes distantes para seguir uma alteração e tornam impossível declarar visibilidade: tudo tem de ser <code>public</code> para atravessar as fronteiras. Com <code>subscription/</code>, <code>invoice/</code>, <code>dunning/</code> no primeiro nível e as camadas dentro de cada um, a maior parte das classes de adaptador pode ser <em>package-private</em>, e o compilador passa a ser o guarda da fronteira em vez de um documento no Confluence.</p>
 
-<figure class="listing sql" id="lst-20-1"><div class="lhead"><span class="lnum">Listagem 20.1</span>
-<span class="lcap">Núcleo em 3FN com valores históricos copiados de propósito (PostgreSQL 17).</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS citext;
+<figure class="listing text" id="lst-20-1"><div class="lhead"><span class="lnum">Listagem 20.1</span>
+<span class="lcap">Estrutura de pacotes de um módulo de subscrições: funcionalidade primeiro, camada depois.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>com.acme.billing
+├── subscription/                          ← um módulo = um bounded context
+│   ├── domain/                            ← sem imports de spring, jakarta, jackson
+│   │   ├── Subscription.java              ← raiz de agregado
+│   │   ├── SubscriptionId.java            ← value object
+│   │   ├── BillingPeriod.java             ← value object
+│   │   ├── Money.java
+│   │   └── event/SubscriptionRenewed.java ← evento de domínio
+│   ├── application/
+│   │   ├── RenewSubscription.java         ← porta de entrada (caso de uso)
+│   │   ├── RenewSubscriptionService.java  ← orquestração + @Transactional
+│   │   └── port/
+│   │       ├── SubscriptionRepository.java   ← porta de saída
+│   │       ├── PaymentGateway.java           ← porta de saída
+│   │       └── SubscriptionEventPublisher.java
+│   ├── adapter/
+│   │   ├── in/web/SubscriptionController.java     (package-private)
+│   │   ├── in/messaging/PaymentSettledListener.java
+│   │   ├── out/persistence/SubscriptionJpaAdapter.java
+│   │   ├── out/persistence/SubscriptionRecord.java ← @Entity, nunca sai daqui
+│   │   └── out/payment/StripePaymentAdapter.java
+│   └── package-info.java                  ← @ApplicationModule
+├── invoice/
+├── dunning/
+└── shared/                                ← Money, Clock, tipos sem dono</code></pre></figure>
 
-CREATE TABLE customer (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    email       citext      NOT NULL,
-    vat_number  text,
-    tier        text        NOT NULL DEFAULT 'STANDARD',
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    deleted_at  timestamptz,
-    CONSTRAINT customer_tier_ck CHECK (tier IN ('STANDARD','GOLD','PARTNER'))
-);
-CREATE UNIQUE INDEX customer_email_live_uq ON customer (email) WHERE deleted_at IS NULL;
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Declarar a porta de saída no pacote <code>domain</code> mantém o domínio auto-suficiente e permite que uma entidade a use num serviço de domínio; declará-la em <code>application/port</code> mantém o domínio sem qualquer referência a persistência, mas obriga a que toda a leitura passe pelo caso de uso. A segunda opção é a mais comum em Spring e é a que se defende melhor numa entrevista, porque torna o domínio testável sem <em>mocks</em>. A primeira ganha quando há muitos serviços de domínio que precisam de carregar agregados vizinhos.</p></aside>
 
-CREATE TABLE product (
-    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    sku        text          NOT NULL,
-    name       text          NOT NULL,
-    list_price numeric(12,4) NOT NULL CHECK (list_price &gt;= 0),
-    currency   char(3)       NOT NULL,
-    CONSTRAINT product_sku_uq UNIQUE (sku)
-);
-
-CREATE TABLE sales_order (
-    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    customer_id   bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
-    placed_at     timestamptz NOT NULL DEFAULT now(),
-    paid_at       timestamptz,
-    status        text        NOT NULL,
-    -- cópia deliberada: o que valia no momento da compra, não a morada actual
-    ship_line1    text        NOT NULL,
-    ship_city     text        NOT NULL,
-    ship_postcode text        NOT NULL,
-    CONSTRAINT sales_order_status_ck CHECK (status IN ('NEW','PAID','SHIPPED','CANCELLED')),
-    CONSTRAINT sales_order_paid_ck   CHECK (status &lt;&gt; 'PAID' OR paid_at IS NOT NULL)
-);
-CREATE INDEX sales_order_customer_ix ON sales_order (customer_id, placed_at DESC);
-
-CREATE TABLE order_line (
-    order_id   bigint        NOT NULL REFERENCES sales_order(id) ON DELETE CASCADE,
-    line_no    smallint      NOT NULL,
-    product_id bigint        NOT NULL REFERENCES product(id) ON DELETE RESTRICT,
-    qty        integer       NOT NULL CHECK (qty &gt; 0),
-    unit_price numeric(12,4) NOT NULL CHECK (unit_price &gt;= 0),
-    PRIMARY KEY (order_id, line_no)
-);
-CREATE INDEX order_line_product_ix ON order_line (product_id);</code></pre></figure>
-
-<div class="qa" id="q-20-1" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
+<div class="qa" id="q-20-1" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Recebo esta tabela de um colega: <code>invoice(id, customer_email, customer_name, customer_postcode, customer_city, line_items_csv, total)</code>. Leve-a até à 3FN em voz alta e diga o que ganhou e o que perdeu em cada passo.</div>
+  <div class="qprompt">Vamos criar um serviço novo de subscrições em Spring Boot 3.5. Desenhe-me a estrutura de pacotes no quadro e diga-me onde ficam as entidades JPA e os DTO do REST.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Três passos, um por forma normal, e um quarto passo que reverte parte do trabalho de propósito.</p>
-      <p>1FN: <code>line_items_csv</code> viola a atomicidade. Sai para <code>invoice_line(invoice_id, line_no, product_id, qty, unit_price)</code> com chave <code>(invoice_id, line_no)</code>. Ganho: as linhas passam a ser indexáveis, agregáveis e validáveis por <em>constraint</em>; deixa de ser possível gravar uma linha com quantidade negativa. Perda: ler uma factura completa passa de uma leitura de uma linha para um <em>join</em>, tipicamente um <code>Nested Loop</code> com <em>index scan</em> de 3 a 6 páginas.</p>
-      <p>2FN e 3FN: <code>customer_name</code> e <code>customer_email</code> dependem do cliente, não da factura, e <code>customer_city</code> depende transitivamente de <code>customer_postcode</code>. Saem para <code>customer</code> e, se o negócio for pan-europeu, <code>postcode</code> fica como tabela de referência. Ganho: uma alteração de email é uma escrita, não um <code>UPDATE</code> sobre 400 mil facturas. Perda: perde-se o dado histórico, que é exactamente o que a facturação precisa.</p>
-      <p>Passo quatro, a desnormalização deliberada: o nome e a morada fiscais impressos na factura voltam para <code>invoice</code>, agora como colunas <code>billing_*</code>, e o <code>total</code> fica materializado com uma verificação nocturna contra a soma das linhas. Não é violação de 3FN — é um facto diferente, o valor no momento da emissão. Uma factura emitida é um documento legal imutável; se o modelo permite que a morada da factura mude por um <code>UPDATE</code> noutra tabela, o modelo está errado, por mais normalizado que esteja.</p></div>
+      <p>Parte-se por funcionalidade no primeiro nível — <code>subscription</code>, <code>invoice</code>, <code>dunning</code> — e por camada dentro de cada uma: <code>domain</code>, <code>application</code>, <code>adapter</code>. As entidades JPA ficam em <code>adapter/out/persistence</code> e nunca atravessam essa fronteira; os DTO do REST ficam em <code>adapter/in/web</code> e também não. O que atravessa são objectos de domínio ou comandos e resultados definidos pelo caso de uso.</p>
+      <p>O mecanismo que torna isto verificável é a visibilidade de Java, não a disciplina da equipa. Com a divisão por funcionalidade, o controlador, o adaptador JPA e a entidade de persistência podem ser <em>package-private</em>: só a porta de entrada e os tipos de domínio expostos são <code>public</code>. Com a divisão por camada, tudo tem de ser público para ser visto do pacote vizinho, e a fronteira deixa de existir no compilador. É a diferença entre uma regra que falha na compilação e uma regra que falha em revisão de código quando alguém tem pressa.</p>
+      <p>O custo é real e deve ser dito sem ser perguntado: para o caso de uso de renovação, existem em vez de três classes cerca de sete — porta de entrada, serviço de aplicação, comando, raiz de agregado, porta de repositório, adaptador JPA e registo de persistência — mais o mapeamento entre <code>Subscription</code> e <code>SubscriptionRecord</code>. Numa equipa que escreve catorze casos de uso, isso é dezenas de ficheiros extra e um mapeamento a manter em duplicado. O retorno vem em duas coisas concretas: os testes do caso de uso correm em milissegundos com <em>fakes</em> em memória, sem <code>@SpringBootTest</code> nem contentor de PostgreSQL; e uma troca de <em>gateway</em> de pagamento toca num pacote e não em quinze ficheiros.</p>
+      <p>Onde a regra se quebra de propósito: as anotações de transacção. O <code>@Transactional</code> vive no serviço de aplicação, que passa assim a importar Spring. Vale a pena admitir isso em voz alta — a alternativa purista, um decorador de transacção na camada de adaptador, acrescenta indirecção sem eliminar a dependência real, que é a existência de uma transacção. O domínio, esse, não importa nada de Spring nem de Jakarta.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Recita as definições das formas normais sem as aplicar às colunas dadas, ou parte tudo em tabelas sem justificar nenhuma.</td></tr>
-        <tr><td>Mid</td><td>Normaliza correctamente até 3FN, extrai o cliente e as linhas, mas não vê o problema do documento fiscal histórico.</td></tr>
-        <tr><td>Sénior</td><td>Normaliza, identifica a dependência transitiva do código postal e depois reverte deliberadamente os campos de facturação, explicando que são factos distintos.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o custo de leitura do modelo final, a estratégia de reconciliação do total materializado e o que muda se a empresa passar a emitir notas de crédito.</td></tr>
+        <tr><td>Insuficiente</td><td><code>controller</code>, <code>service</code>, <code>repository</code>, <code>model</code>, com a entidade JPA a servir de objecto de domínio e de resposta REST; não distingue as três representações.</td></tr>
+        <tr><td>Mid</td><td>Recita as camadas de <em>clean architecture</em> correctamente mas divide por camada no primeiro nível e não sabe explicar o que ganha com isso; não menciona visibilidade nem custo.</td></tr>
+        <tr><td>Sénior</td><td>Funcionalidade primeiro, camada depois; entidade JPA e DTO confinados aos adaptadores; usa <em>package-private</em> como mecanismo de fronteira; quantifica o custo em ficheiros e diz onde quebra a regra.</td></tr>
+        <tr><td>Staff</td><td>Ata a estrutura à evolução: os módulos de primeiro nível são candidatos a serviços autónomos, define o que teria de mudar para extrair um, e propõe um teste de arquitectura automatizado em vez de confiar na revisão.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se um produto for eliminado do catálogo — a factura antiga ainda tem de imprimir o nome?»</li>
-      <li>«Onde é que valida que o total bate certo com as linhas, e com que frequência?»</li>
-      <li>«O que é a BCNF e este esquema está nela?»</li>
-      <li>«Quantos <em>joins</em> custa agora o ecrã de detalhe da factura?»</li></ul></div>
+      <li>«Quem faz o mapeamento entre <code>Subscription</code> e a entidade JPA — o adaptador ou uma biblioteca?»</li>
+      <li>«E se a equipa tiver quatro pessoas e o serviço tiver dois casos de uso, mantinha isto?»</li>
+      <li>«Como impede que alguém acrescente amanhã um <code>import</code> de <code>jakarta.persistence</code> no domínio?»</li>
+      <li>«Onde põe a validação de <em>input</em> do REST e onde põe a regra de negócio?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Deixar <code>line_items_csv</code> «porque a aplicação já sabe fazer o <em>parse</em>».</li>
-      <li>Apontar <code>unit_price</code> na linha como redundância a eliminar.</li>
-      <li>Não distinguir referência corrente de valor histórico em nenhum momento.</li></ul></div>
+      <li>Devolver a entidade JPA no corpo da resposta REST e chamar-lhe pragmatismo sem falar de <em>lazy loading</em> nem de acoplamento do esquema ao contrato público.</li>
+      <li>Apresentar a estrutura como obrigatória em todos os serviços da empresa.</li>
+      <li>Não conseguir nomear um único custo do desenho que acabou de propor.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-20-2" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
+<figure class="listing java" id="lst-20-2"><div class="lhead"><span class="lnum">Listagem 20.2</span>
+<span class="lcap">Porta de entrada, serviço de aplicação e portas de saída: a inversão em quatro ficheiros.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// application/RenewSubscription.java — porta de entrada
+public interface RenewSubscription {
+    RenewalResult handle(RenewSubscriptionCommand command);
+}
+
+// application/port/PaymentGateway.java — porta de saída, vocabulário do domínio
+public interface PaymentGateway {
+    ChargeOutcome charge(SubscriptionId id, Money amount, IdempotencyKey key);
+}
+
+// application/RenewSubscriptionService.java — orquestra, não decide
+@Service
+class RenewSubscriptionService implements RenewSubscription {
+    private final SubscriptionRepository repository;
+    private final PaymentGateway payments;
+    private final Clock clock;
+
+    RenewSubscriptionService(SubscriptionRepository repository,
+                             PaymentGateway payments, Clock clock) {
+        this.repository = repository; this.payments = payments; this.clock = clock;
+    }
+
+    @Override
+    @Transactional
+    public RenewalResult handle(RenewSubscriptionCommand command) {
+        Subscription subscription = repository.findById(command.subscriptionId())
+                .orElseThrow(() -&gt; new SubscriptionNotFound(command.subscriptionId()));
+        Money due = subscription.amountDueOn(LocalDate.now(clock));   // decisão: no domínio
+        ChargeOutcome outcome = payments.charge(subscription.id(), due, command.idempotencyKey());
+        subscription.applyRenewal(outcome, LocalDate.now(clock));     // invariante: no domínio
+        repository.save(subscription);
+        return RenewalResult.from(subscription);
+    }
+}
+
+// adapter/out/payment/StripePaymentAdapter.java — o SDK vive só aqui
+@Component
+class StripePaymentAdapter implements PaymentGateway {
+    @Override public ChargeOutcome charge(SubscriptionId id, Money amount, IdempotencyKey key) {
+        try {
+            PaymentIntent intent = stripe.paymentIntents().create(toStripeParams(amount, key));
+            return ChargeOutcome.settled(intent.getId());
+        } catch (StripeException e) {                 // excepção do SDK não sai daqui
+            return ChargeOutcome.rejected(mapReason(e));
+        }
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-20-2" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A renovação precisa de cobrar no Stripe. Explique-me como é que o núcleo do sistema não fica a depender do SDK do Stripe — e diga-me onde é que essa regra é quebrada na prática.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Por inversão de dependência: a aplicação declara <code>PaymentGateway</code> em vocabulário próprio — <code>charge(SubscriptionId, Money, IdempotencyKey)</code> devolvendo <code>ChargeOutcome</code> — e o adaptador <code>StripePaymentAdapter</code> implementa-a. Em tempo de compilação, a seta aponta do adaptador para o interior; em tempo de execução, a chamada vai do interior para o adaptador. É essa a única coisa que a regra da dependência exige.</p>
+      <p>A parte que separa quem percebeu de quem decorou está no tipo de retorno e nas excepções. Se a porta devolver <code>com.stripe.model.PaymentIntent</code>, ou deixar escapar <code>StripeException</code>, a inversão é cosmética: o núcleo continua a precisar do <em>jar</em> do Stripe no <em>classpath</em> e o compilador prova-o. Por isso o adaptador traduz o resultado e traduz a falha — <code>ChargeOutcome.rejected(Reason.INSUFFICIENT_FUNDS)</code> — e os códigos de erro do fornecedor morrem no adaptador. O teste desta propriedade é mecânico: se o módulo do domínio for um módulo Maven separado sem a dependência do Stripe, ou compila ou não compila.</p>
+      <p>A regra quebra-se em três sítios com frequência, e vale mais nomeá-los do que fingir que não existem. Primeiro, o <code>@Transactional</code> e as anotações de <em>bean</em> no serviço de aplicação, que trazem Spring para dentro da camada de aplicação — aceitável, porque a demarcação de transacção é uma decisão de caso de uso. Segundo, a paginação: <code>org.springframework.data.domain.Page</code> tende a escapar para as portas; a alternativa é um tipo <code>Page</code> próprio com três campos, e o custo é escrever esse tipo. Terceiro, as anotações de validação de Jakarta em objectos de domínio, que trocam a invariante por metadados e devem ficar nos DTO de entrada.</p>
+      <p>Quando é que esta inversão não compensa: quando existe exactamente um fornecedor e o contrato dele é o contrato do negócio. Um serviço que só existe para reencaminhar <em>webhooks</em> do Stripe para Kafka não ganha nada com uma porta — ganha uma tradução extra que tem de ser mantida sempre que o fornecedor acrescenta um campo. O valor da porta é proporcional à quantidade de lógica que existe do lado de dentro dela.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Uso uma interface» — mas a interface devolve tipos do SDK e lança as excepções do SDK; não percebe que a dependência continua lá.</td></tr>
+        <tr><td>Mid</td><td>Descreve correctamente a inversão e o <code>@Component</code> que implementa a porta, mas justifica-a só com «para poder trocar de fornecedor», hipótese que raramente se concretiza.</td></tr>
+        <tr><td>Sénior</td><td>Cuida dos tipos de retorno e das excepções, propõe o módulo Maven separado como prova mecânica, e justifica pelo teste rápido sem rede antes de justificar pela troca de fornecedor.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a semântica difícil: idempotência da cobrança atravessa a porta, o adaptador tem <em>timeouts</em> e <em>circuit breaker</em>, e a diferença entre uma rejeição de negócio e uma falha de infra-estrutura é modelada no tipo de retorno, não numa excepção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O Stripe respondeu com <em>timeout</em> mas cobrou. Quem trata disso — a porta ou o adaptador?»</li>
+      <li>«Como testa o adaptador em si, já que o núcleo é testado com um <em>fake</em>?»</li>
+      <li>«Quantas implementações reais desta porta existem no vosso sistema?»</li>
+      <li>«E se o segundo fornecedor não suportar idempotência com chave do cliente?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Defender a porta apenas com o argumento hipotético da troca de fornecedor, sem nunca a ter feito nem previsto.</li>
+      <li>Deixar tipos ou excepções do fornecedor na assinatura e chamar a isso hexagonal.</li>
+      <li>Criar uma porta por cada classe do SDK, replicando a API externa em vez de exprimir a necessidade do domínio.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-20-2" class="h2"><span class="secnum">20.2</span> Modelo de domínio rico vs anémico<a class="anchor" href="#sec-20-2" aria-label="ligação">#</a></h2>
+
+<p>Um modelo anémico é um conjunto de estruturas com <em>getters</em> e <em>setters</em> onde toda a decisão vive em classes <code>...Service</code>. Não é um erro por definição — é um erro quando as regras que operam sobre esses dados aparecem em mais do que um sítio e divergem. O sintoma diagnóstico é fácil de descrever numa entrevista: procura-se <code>setStatus(</code> no repositório de código; se aparecer em nove classes diferentes, a máquina de estados da subscrição não existe em lado nenhum, existe nove vezes.</p>
+
+<p>O modelo rico faz o contrário: o estado é privado, as mutações são métodos com nomes do negócio — <code>applyRenewal</code>, <code>cancelAtPeriodEnd</code>, <code>suspendForNonPayment</code> — e cada método valida a transição antes de a aplicar. Os <em>value objects</em> são a outra metade do trabalho e a que dá mais retorno por linha escrita: <code>Money</code> com moeda, <code>BillingPeriod</code> com início e fim validados, <code>SubscriptionId</code> em vez de <code>UUID</code>. Um <code>record</code> de Java 21 com validação no construtor compacto elimina classes inteiras de erros de argumentos trocados, porque passar um <code>CustomerId</code> onde se espera um <code>SubscriptionId</code> deixa de compilar.</p>
+
+<p>Em Spring, o obstáculo prático a um domínio rico é o JPA. Um construtor sem argumentos exigido pelo Hibernate, <em>setters</em> abertos para o <em>dirty checking</em>, colecções que carregam preguiçosamente fora da transacção — tudo empurra para o anémico. Há duas saídas honestas. A primeira: anotar a própria raiz de agregado, aceitando o construtor protegido e mantendo os <em>setters</em> ausentes, o que funciona bem e evita duplicação. A segunda: separar <code>Subscription</code> (domínio puro) de <code>SubscriptionRecord</code> (<code>@Entity</code>) com mapeamento explícito no adaptador. A primeira é mais barata e é o que a maioria das equipas faz; a segunda é o que se defende quando o modelo de persistência diverge do modelo de negócio — por exemplo, quando existem colunas de auditoria e chaves técnicas que não têm significado nenhum no domínio.</p>
+
+<figure class="listing java" id="lst-20-3"><div class="lhead"><span class="lnum">Listagem 20.3</span>
+<span class="lcap">Value objects e uma transição de estado que não pode ser contornada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>public record Money(BigDecimal amount, Currency currency) {
+    public Money {
+        if (amount.scale() &gt; currency.getDefaultFractionDigits())
+            throw new IllegalArgumentException(&quot;escala inválida para &quot; + currency);
+    }
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency))
+            throw new CurrencyMismatch(currency, other.currency);
+        return new Money(amount.add(other.amount), currency);
+    }
+}
+
+public final class Subscription {                       // raiz de agregado
+    private final SubscriptionId id;
+    private SubscriptionStatus status;
+    private BillingPeriod currentPeriod;
+    private int consecutiveFailures;
+    private final List&lt;DomainEvent&gt; events = new ArrayList&lt;&gt;();
+
+    public void applyRenewal(ChargeOutcome outcome, LocalDate today) {
+        if (status == SubscriptionStatus.CANCELLED)
+            throw new IllegalStateTransition(id, status, &quot;applyRenewal&quot;);
+        if (outcome.settled()) {
+            this.currentPeriod = currentPeriod.next(today);
+            this.consecutiveFailures = 0;
+            this.status = SubscriptionStatus.ACTIVE;
+            events.add(new SubscriptionRenewed(id, currentPeriod, outcome.reference()));
+        } else if (++consecutiveFailures &gt;= 3) {        // invariante do agregado
+            this.status = SubscriptionStatus.SUSPENDED;
+            events.add(new SubscriptionSuspended(id, consecutiveFailures));
+        }
+    }
+
+    public List&lt;DomainEvent&gt; pullEvents() {
+        List&lt;DomainEvent&gt; drained = List.copyOf(events);
+        events.clear();
+        return drained;
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-20-3" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">A base de código tem entidades só com <em>getters</em> e <em>setters</em> e a lógica toda em classes <code>Service</code>. Isto é um problema? Como o demonstraria à equipa e o que mudaria primeiro?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É um problema quando produz divergência, e não por violar um princípio. A demonstração é empírica, não retórica: procura-se <code>setStatus(</code> e cada mutação directa de estado no repositório de código. Se a mesma transição for aplicada em cinco sítios com validações ligeiramente diferentes — um esquece o caso de subscrição já cancelada, outro não reinicia o contador de falhas — a máquina de estados não está em lado nenhum e o custo já foi pago em incidentes. Se aparecer num sítio só, o modelo anémico está a funcionar e mexer nele é gasto sem retorno.</p>
+      <p>A primeira mudança é fechar uma transição, não reescrever o modelo. Torna-se <code>setStatus</code> privado, cria-se <code>suspendForNonPayment()</code> na entidade com a validação lá dentro, e migram-se os chamadores um a um. O compilador faz a migração: cada chamador que deixa de compilar é um sítio que tinha lógica implícita a descobrir. É uma alteração que uma pessoa faz em dois ou três dias num módulo, e que se pode parar a meio sem deixar o sistema num estado incoerente.</p>
+      <p>Os <em>value objects</em> vêm a seguir e são o melhor retorno por esforço. Substituir <code>BigDecimal amount</code> mais <code>String currency</code> por um <code>Money</code>, e <code>UUID</code> por <code>SubscriptionId</code>, elimina por construção duas famílias de defeitos: somas entre moedas diferentes e argumentos trocados na mesma posição. Em Java 21 são <code>record</code> com validação no construtor compacto; o custo em memória de um <em>wrapper</em> por identificador é irrelevante face ao número de objectos que um pedido HTTP já cria.</p>
+      <p>Quando o anémico é a escolha certa: serviços de leitura e projecções. Um <em>endpoint</em> que devolve um extracto agregado de doze meses não tem invariantes para proteger; forçar objectos ricos aí acrescenta mapeamento e retira a possibilidade de projectar directamente em SQL. A regra que se defende numa entrevista é «rico do lado da escrita, plano do lado da leitura» — e é também a porta de entrada natural para a conversa sobre CQRS.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Modelo anémico é um anti-padrão» sem descrever nenhum sintoma observável nem nenhum custo concreto.</td></tr>
+        <tr><td>Mid</td><td>Explica bem a diferença e propõe mover a lógica para as entidades, mas em bloco, sem estratégia de migração incremental nem critério para parar.</td></tr>
+        <tr><td>Sénior</td><td>Diagnostica pela duplicação real, fecha uma transição de cada vez usando o compilador como guia, introduz <em>value objects</em>, e delimita onde o anémico continua correcto.</td></tr>
+        <tr><td>Staff</td><td>Liga a decisão ao ciclo de vida do produto: mede quantos incidentes vieram de transições incoerentes, negoceia o esforço com esse número, e evita a reescrita total que a equipa não conseguiria terminar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O Hibernate precisa de construtor sem argumentos. Como mantém a entidade fechada?»</li>
+      <li>«Onde põe uma regra que precisa de consultar a base de dados para decidir?»</li>
+      <li>«E a serialização para JSON, que gosta de <em>getters</em> e de construtor vazio?»</li>
+      <li>«Como testa a máquina de estados sem levantar o contexto Spring?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor reescrever o modelo inteiro num <em>sprint</em> dedicado.</li>
+      <li>Chamar «rico» a uma entidade que continua com <em>setters</em> públicos e ganhou dois métodos.</li>
+      <li>Não distinguir o lado da escrita do lado da leitura.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-4" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quantas representações do mesmo conceito existem no seu serviço — DTO de REST, entidade JPA, objecto de domínio? Justifique manter três e diga quando reduziria a duas.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Três, e cada uma existe porque tem um dono e um ritmo de mudança diferente. O DTO de REST é contrato público com consumidores externos: muda quando a API muda e está preso a compatibilidade retroactiva. A entidade JPA é o esquema da base de dados: muda quando há migração e carrega chaves técnicas, colunas de auditoria e versões optimistas. O objecto de domínio muda quando a regra de negócio muda. Colapsar os três significa que uma migração de esquema quebra clientes externos e que renomear um campo do negócio obriga a uma <em>migration</em>.</p>
+      <p>O mapeamento faz-se explicitamente no adaptador, à mão ou com MapStruct que gera o código em tempo de compilação. Evita-se mapeamento por reflexão em <em>runtime</em>: falha silenciosamente quando um campo é renomeado, e o custo por objecto é uma ordem de grandeza superior. O código gerado pelo MapStruct é lido como código normal e falha na compilação quando um campo deixa de existir — que é exactamente a propriedade que se quer.</p>
+      <p>Reduz-se a duas em dois casos concretos. Primeiro, quando a API é interna e serve um único <em>front-end</em> que a mesma equipa mantém: aí a projecção de leitura pode ser lida directamente para o DTO de resposta, sem passar pelo domínio. Segundo, quando o serviço é um CRUD sem invariantes — uma tabela de referência de países ou de planos — e o esquema e o contrato são deliberadamente o mesmo. O que não se faz é reduzir a duas expondo a entidade JPA no REST: além do acoplamento do esquema ao contrato, arrasta <em>lazy loading</em> para a serialização e produz consultas extra dentro do <em>writer</em> do Jackson, ou <code>LazyInitializationException</code> se a sessão já fechou.</p>
+      <p>O número que torna a conversa concreta: cerca de 60 a 80 linhas de mapeamento por agregado de tamanho médio, mais os testes desse mapeamento. É pouco por agregado e muito por serviço com trinta agregados — razão bastante para não aplicar a mesma regra a todos os módulos do mesmo repositório.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Uma classe só, anotada com <code>@Entity</code> e com anotações do Jackson, devolvida directamente no controlador.</td></tr>
+        <tr><td>Mid</td><td>Sabe que se deve separar DTO de entidade, mas justifica com «boas práticas» e não distingue o objecto de domínio da entidade JPA.</td></tr>
+        <tr><td>Sénior</td><td>Justifica pela diferença de donos e de ritmos de mudança, prefere mapeamento verificado em compilação, e nomeia os dois casos em que reduziria a duas representações.</td></tr>
+        <tr><td>Staff</td><td>Trata o DTO como contrato versionado com política de compatibilidade explícita, e liga a decisão ao processo — quem pode alterar o quê sem coordenação com outras equipas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde vive a anotação <code>@NotBlank</code>: no DTO ou no domínio?»</li>
+      <li>«Como evita que o mapeamento silencie um campo novo esquecido?»</li>
+      <li>«E numa consulta que devolve dez mil linhas, passa tudo pelo domínio?»</li>
+      <li>«Como versiona a resposta quando um campo obrigatório deixa de existir?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Serializar entidades JPA com relações preguiçosas e não reconhecer o problema.</li>
+      <li>Mapeamento por reflexão genérica sem qualquer teste do mapeamento.</li>
+      <li>Insistir em três representações também nas tabelas de referência, sem avaliar o custo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-20-3" class="h2"><span class="secnum">20.3</span> Agregados, invariantes e limites de transacção<a class="anchor" href="#sec-20-3" aria-label="ligação">#</a></h2>
+
+<p>Um agregado é a menor unidade que tem de ser consistente num único instante. A definição operacional é esta e não a do diagrama: pergunta-se qual é a regra que não pode ser violada nem por um milissegundo, e o conjunto de dados necessário para a verificar é o agregado. «Uma subscrição suspende ao fim de três falhas consecutivas» só precisa da subscrição — logo, a subscrição é a raiz e o contador vive lá dentro. «Um cliente não pode ter mais do que cinco subscrições activas» já precisa do cliente e das suas subscrições; ou o cliente passa a ser a raiz, ou a regra é tratada como eventualmente consistente com compensação.</p>
+
+<p>Duas regras derivam desta definição e são as que os entrevistadores usam para separar níveis. Uma transacção altera um agregado — se um caso de uso altera dois, ou o limite está mal desenhado, ou aceita-se consistência eventual entre eles através de um evento. E as referências entre agregados fazem-se por identificador, nunca por referência de objecto: <code>Subscription</code> guarda um <code>CustomerId</code>, não um <code>Customer</code>. Isto elimina o carregamento acidental de grafos inteiros, torna a serialização previsível e é o que permite mais tarde extrair o módulo para outro serviço sem reescrever o domínio.</p>
+
+<p>O tamanho é a decisão difícil. Um agregado grande — cliente com todas as facturas — dá consistência forte de graça mas cria contenção: duas operações em facturas diferentes do mesmo cliente colidem no bloqueio optimista e uma delas recebe <code>OptimisticLockException</code>. Um agregado pequeno reduz contenção mas empurra regras para consistência eventual. O critério prático é a taxa de escrita concorrente na mesma raiz: se dois pedidos por segundo tocarem no mesmo cliente e a transacção durar 50 ms, a probabilidade de colisão é pequena; se forem cinquenta por segundo, o <em>retry</em> passa a ser o comportamento normal e o desenho está errado.</p>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Com bloqueio optimista via <code>@Version</code>, a probabilidade aproximada de conflito numa raiz é dada por <span class="formula">p ≈ 1 − e<sup>−λ·t</sup></span>, em que λ é a taxa de escritas nessa raiz e t a duração da transacção. Com λ = 2/s e t = 50 ms, p ≈ 10%; com λ = 20/s e t = 200 ms, p ≈ 98% — nesse regime a aplicação passa mais tempo a repetir do que a trabalhar. Reduzir t é quase sempre mais barato do que partir o agregado: tirar a chamada HTTP de dentro da transacção corta t de 200 ms para 15 ms.</p></aside>
+
+<div class="qa" id="q-20-5" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Regra nova: um cliente não pode ter mais de cinco subscrições activas. Como a implementa e onde põe o limite da transacção?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro pergunta-se qual é o custo de violar a regra durante um segundo. Se for um cliente com seis subscrições activas até o processo de reconciliação corrigir, a regra não precisa de consistência forte e resolve-se com verificação no caso de uso mais um <em>constraint</em> assíncrono. Se for uma regra contratual ou regulatória em que a sexta subscrição não pode existir nem transitoriamente, é preciso um ponto de serialização — e isso muda o desenho do agregado.</p>
+      <p>Na versão fortemente consistente, há três implementações defensáveis e uma que não é. A primeira: o cliente passa a raiz do agregado, carrega as suas subscrições activas e valida lá dentro; funciona, mas transforma qualquer escrita numa subscrição numa escrita no cliente, com a contenção que isso traz. A segunda, mais barata: manter <code>Subscription</code> como raiz e criar um índice único parcial em PostgreSQL — uma tabela <code>customer_subscription_slot</code> com <code>(customer_id, slot)</code> único e <em>slot</em> de 1 a 5, onde criar uma subscrição significa reservar uma linha; a base de dados faz a serialização e a sexta inserção falha com violação de unicidade traduzida numa excepção de domínio. A terceira: bloqueio explícito da linha do cliente com <code>SELECT ... FOR UPDATE</code> no início da transacção, simples de explicar e de auditar, ao custo de serializar todas as operações desse cliente.</p>
+      <p>O que não é defensável é <code>count(*) &lt; 5</code> seguido de <code>insert</code> na mesma transacção em <em>read committed</em> — que é o nível por omissão em PostgreSQL — sem qualquer bloqueio. Dois pedidos concorrentes lêem quatro, ambos inserem, e ficam seis. Este é o ponto exacto onde a maioria dos candidatos falha, e é o que o entrevistador está a testar: saber que a leitura não bloqueia nada e que a contagem lida não é uma promessa.</p>
+      <p>Na versão eventualmente consistente, o caso de uso valida com a contagem — que apanha 99% dos casos, porque as corridas são raras — e emite <code>SubscriptionActivated</code>; um <em>listener</em> no mesmo contexto detecta o excesso e aplica a compensação acordada com o negócio: cancelar a última, marcar para revisão manual, ou notificar. A compensação tem de ser decidida com o produto, não inventada pelo engenheiro; e essa frase, dita em voz alta, é sinal de nível.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Contagem seguida de inserção, sem noção de concorrência; não reconhece a corrida quando lhe é apontada.</td></tr>
+        <tr><td>Mid</td><td>Identifica a corrida e propõe <code>synchronized</code> ou um bloqueio em memória, que deixa de funcionar com duas instâncias do serviço.</td></tr>
+        <tr><td>Sénior</td><td>Começa por perguntar o custo da violação transitória; propõe <em>constraint</em> na base de dados ou bloqueio de linha; sabe que <em>read committed</em> não protege contagens.</td></tr>
+        <tr><td>Staff</td><td>Modela a alternativa eventualmente consistente com compensação explícita, quantifica a contenção introduzida por cada opção e escolhe em função da taxa de escrita real.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E em <em>serializable</em>? O que muda e quanto custa em <em>retries</em>?»</li>
+      <li>«Se as subscrições passarem a viver noutro serviço, qual das soluções sobrevive?»</li>
+      <li>«Como testa a corrida de forma determinista?»</li>
+      <li>«Quem decide a compensação quando a regra é violada?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Bloqueio na JVM (<code>synchronized</code>, <code>ReentrantLock</code>) para uma invariante distribuída.</li>
+      <li>Aumentar o agregado até tudo caber numa transacção, sem falar de contenção.</li>
+      <li>Assumir que <code>@Transactional</code> resolve a leitura suja por si.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-6" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O ecrã de listagem de clientes faz uma agregação sobre 40 milhões de encomendas e está a 900 ms no p95. A equipa quer uma coluna <code>order_count</code> no cliente. Qual é a sua posição?</div>
+  <div class="qprompt">Quantos repositórios tem o seu módulo e o que devolvem? Porque é que não há um <code>SubscriptionItemRepository</code>?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>A posição é: ainda não. Uma agregação de 900 ms sobre 40 milhões de linhas quase sempre significa índice em falta ou plano errado, não falta de desnormalização. Com um índice em <code>(customer_id, placed_at DESC)</code> e um <code>count</code> restrito à janela que o ecrã mostra, o mesmo trabalho cai tipicamente para 5-20 ms por cliente. Desnormalizar antes de esgotar isto é comprar dívida permanente para resolver um problema temporário.</p>
-      <p>Se o número persistir depois de o plano estar correcto — porque o ecrã agrega sobre todo o histórico de todos os clientes visíveis —, há três instrumentos por ordem de custo crescente. Primeiro, vista materializada com <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code>: a divergência é limitada pelo intervalo de <em>refresh</em>, ninguém escreve no caminho crítico, e o custo é uma tabela extra a manter. Segundo, coluna mantida por <em>trigger</em>: consistente na mesma transacção, mas serializa escritas na linha do cliente. Terceiro, contador incremental fora da base, em Redis, com reconciliação periódica: rápido, mas passa a existir uma segunda fonte de verdade e um modo de falha que ninguém vê até divergir.</p>
-      <p>O <em>trade-off</em> decisivo é a contenção. Com <em>trigger</em>, 300 encomendas por minuto de um cliente empresarial tornam-se 300 <code>UPDATE</code> na mesma linha; em <em>MVCC</em> isso são 300 versões da linha, mais trabalho de <em>autovacuum</em> e escritores em fila no bloqueio da linha. Se o rácio for de 200 leituras por escrita e a tolerância a atraso for de um minuto, a vista materializada ganha; se o valor tiver de ser exacto no mesmo pedido — um limite de crédito, por exemplo — não há alternativa à coluna transaccional, e aí aceita-se a contenção e mede-se.</p></div>
+      <p>Um repositório por raiz de agregado, e devolve a raiz completa — nunca uma entidade interna. Se existisse <code>SubscriptionItemRepository</code>, qualquer código poderia carregar e gravar um item sem passar pela subscrição, e a invariante que a raiz protege deixaria de ser garantida. O repositório é o único ponto de entrada para o agregado; é essa exclusividade que o torna útil, não o facto de esconder SQL.</p>
+      <p>A interface é pequena e escrita no vocabulário do domínio: <code>findById</code>, <code>save</code>, <code>nextIdentity</code> e um punhado de consultas de negócio como <code>findDueForRenewal(LocalDate)</code>. Não expõe <code>JpaRepository</code> nem <code>Specification</code>: se a porta estender <code>JpaRepository</code>, o núcleo herda cerca de vinte métodos genéricos, incluindo <code>deleteAll</code> e paginação com tipos de Spring Data, e a inversão desaparece. O adaptador é que implementa a porta usando um <code>JpaRepository</code> interno e <em>package-private</em>.</p>
+      <p>A objecção previsível do entrevistador é o desempenho: «e para o ecrã de listagem, carrega mil agregados completos?» A resposta é não — e é aqui que se separa leitura de escrita. As consultas de leitura não passam pelo repositório do agregado; usam uma porta distinta, por exemplo <code>SubscriptionQueries</code>, implementada com uma projecção SQL directa para o DTO de resposta. É CQRS na sua forma mais barata, sem base de dados separada nem sincronização: dois caminhos de código sobre o mesmo esquema. O repositório do agregado serve o caminho de escrita, onde carregar o grafo completo é necessário e o número de raízes por transacção é um ou dois.</p>
+      <p>Quando um repositório por agregado é excesso: num módulo com três agregados que são sempre lidos juntos e sem invariantes entre eles, um repositório partilhado poupa código sem custo real. E em serviços de leitura pura, o repositório do agregado pode simplesmente não existir.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Aceita a coluna imediatamente, ou recusa-a por «viola a normalização» sem nenhum número.</td></tr>
-        <tr><td>Mid</td><td>Sugere índice ou cache, mas não distingue consistência transaccional de eventual nem menciona custo de escrita.</td></tr>
-        <tr><td>Sénior</td><td>Exige o plano primeiro, apresenta as três opções com o critério de escolha e nomeia a contenção na linha do cliente.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o mecanismo de detecção de divergência, o que acontece no <em>backfill</em> das 40 milhões de linhas e como se reverte a decisão se falhar.</td></tr>
+        <tr><td>Insuficiente</td><td>Um repositório por tabela, incluindo entidades filhas; grava filhos directamente sem passar pela raiz.</td></tr>
+        <tr><td>Mid</td><td>Diz «um repositório por agregado» mas a porta estende <code>JpaRepository</code> e devolve entidades JPA ao caso de uso.</td></tr>
+        <tr><td>Sénior</td><td>Porta pequena em vocabulário de domínio, adaptador com Spring Data escondido, e separação explícita entre repositório de escrita e consultas de leitura projectadas.</td></tr>
+        <tr><td>Staff</td><td>Discute o custo de carregar o agregado completo, propõe carregamento parcial quando a invariante o permite, e define regra de equipa sobre o que pode ou não ser lido fora do agregado.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como faz o <em>backfill</em> inicial sem bloquear a tabela?»</li>
-      <li>«Que consulta corre para detectar que o contador divergiu, e com que custo?»</li>
-      <li>«E se a encomenda for cancelada — quem decrementa?»</li></ul></div>
+      <li>«O ecrã precisa de dados de três agregados. Faz três chamadas ou uma consulta?»</li>
+      <li>«Quem gera o identificador — a base de dados ou o domínio?»</li>
+      <li>«Como faz a eliminação em cascata dos filhos sem repositório próprio?»</li>
+      <li>«Onde põe uma consulta de relatório com sete <em>joins</em>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor <em>trigger</em> sem mencionar a contenção nem o <em>autovacuum</em>.</li>
-      <li>Assumir que a cache em Redis é gratuita em correcção.</li>
-      <li>Nunca pedir o plano de execução antes de mudar o modelo.</li></ul></div>
+      <li>Expor <code>JpaRepository</code> como porta e chamar-lhe arquitectura hexagonal.</li>
+      <li>Carregar agregados completos para servir listagens paginadas.</li>
+      <li>Repositório com trinta métodos de consulta, sinal de que o agregado está a ser usado como camada de acesso a dados.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-20-2" class="h2"><span class="secnum">20.2</span> Chaves primárias: sequencial, UUID e ULID<a class="anchor" href="#sec-20-2" aria-label="ligação">#</a></h2>
+<div class="qa" id="q-20-7" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Quando a subscrição é suspensa é preciso avisar o cliente por e-mail e actualizar o serviço de análise. Como implementa isso sem meter o cliente de e-mail dentro do domínio?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com um evento de domínio. O agregado regista <code>SubscriptionSuspended(subscriptionId, failures, occurredAt)</code> quando aplica a transição; o caso de uso, depois de gravar, drena os eventos e entrega-os ao publicador. O domínio não conhece e-mail nem análise — conhece o facto de negócio que aconteceu. O nome do evento está no passado e refere-se ao negócio, não à tabela: <code>SubscriptionSuspended</code>, não <code>SubscriptionUpdated</code>.</p>
+      <p>Em Spring, o mecanismo mais limpo é o <code>ApplicationEventPublisher</code> com <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code>: os consumidores só correm depois do <em>commit</em>, o que evita enviar um e-mail sobre uma transacção que foi revertida. Se a raiz de agregado for uma entidade Spring Data, <code>AbstractAggregateRoot</code> e <code>@DomainEvents</code> automatizam o drenar no <code>save</code>. Para consumidores no mesmo processo isto chega.</p>
+      <p>Para consumidores noutro serviço, o <code>AFTER_COMMIT</code> não chega, e é este o ponto que distingue a resposta sénior. Entre o <em>commit</em> e a publicação em Kafka existe uma janela: se o processo morre aí, a transacção está gravada e o evento nunca sai — perda silenciosa. A solução é o padrão <em>outbox</em>: na mesma transacção do agregado, insere-se uma linha numa tabela <code>outbox</code>; um processo separado — <em>poller</em> ou captura de alterações via CDC — lê e publica em Kafka com <code>at-least-once</code>. O custo é uma tabela extra, um processo extra e latência adicional de publicação, tipicamente 50 a 500 ms com <em>polling</em>; e obriga os consumidores a serem idempotentes, porque a mesma mensagem pode chegar duas vezes.</p>
+      <p>Quando não vale a pena: se o único consumidor está no mesmo processo e a perda ocasional de uma notificação é tolerável — um evento de análise, por exemplo — o <em>outbox</em> é infra-estrutura a manter sem retorno. A decisão faz-se por evento, não por sistema: o mesmo módulo pode ter <code>SubscriptionSuspended</code> em <em>outbox</em> porque a facturação depende dele, e <code>SubscriptionViewed</code> em publicação directa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Injecta o serviço de e-mail na entidade ou chama-o directamente do método de domínio.</td></tr>
+        <tr><td>Mid</td><td>Usa eventos de aplicação de Spring mas publica antes do <em>commit</em>, ou não sabe dizer o que acontece se a transacção reverter.</td></tr>
+        <tr><td>Sénior</td><td>Evento com nome de negócio no passado, registado no agregado e drenado pelo caso de uso, entrega após <em>commit</em>, e identifica a janela de perda na publicação externa.</td></tr>
+        <tr><td>Staff</td><td>Distingue evento de domínio (interno, rico) de evento de integração (externo, versionado e estável), decide o <em>outbox</em> por evento, e trata ordenação e idempotência do lado do consumidor.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O e-mail falhou depois do <em>commit</em>. O que acontece à subscrição?»</li>
+      <li>«O evento leva o agregado inteiro ou só o identificador? Porquê?»</li>
+      <li>«Como garante a ordem entre <code>Renewed</code> e <code>Suspended</code> do mesmo cliente?»</li>
+      <li>«Quem é dono do esquema do evento quando três equipas o consomem?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Publicar em Kafka dentro da transacção e acreditar que é atómico com a base de dados.</li>
+      <li>Eventos com nomes genéricos (<code>EntityChanged</code>) que obrigam o consumidor a adivinhar o que mudou.</li>
+      <li>Reagir ao próprio evento no mesmo agregado, criando ciclos difíceis de seguir.</li></ul></div>
+  </div>
+</div>
 
-<p>A chave primária é a decisão de modelação com maior alcance, porque se propaga a todas as chaves estrangeiras, a todos os índices que as cobrem, a todas as caches e a todos os contratos de API. Em PostgreSQL 17, <code>bigint GENERATED ALWAYS AS IDENTITY</code> ocupa 8 bytes, é a forma normalizada do antigo <code>bigserial</code> e produz inserções estritamente crescentes; <code>uuid</code> ocupa 16 bytes e, na versão 4, é aleatório em todos os 122 bits úteis. A diferença de 8 bytes por coluna parece irrelevante até se contar quantas vezes a chave aparece.</p>
+<figure class="listing java" id="lst-20-4"><div class="lhead"><span class="lnum">Listagem 20.4</span>
+<span class="lcap">Evento de domínio drenado após gravação, com <em>outbox</em> na mesma transacção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Service
+class SuspendSubscriptionService implements SuspendSubscription {
 
-<p>A aritmética do B-tree é o número que separa quem já mediu de quem repete slogans. Uma página de índice tem 8 kB, com cerca de 8 160 bytes utilizáveis. Uma entrada de folha para <code>bigint</code> custa 8 bytes de cabeçalho de tuplo mais 8 de valor mais 4 do ponteiro de linha, à volta de 20 bytes, dando por volta de 400 entradas por página; para <code>uuid</code> são 8 mais 16 mais 4, à volta de 28 bytes, cerca de 290 entradas. São 100 milhões de linhas em aproximadamente 2,1 GB de índice contra 2,9 GB. Mas o custo maior não é esse: com valores aleatórios, cada inserção vai para uma folha imprevisível, o que provoca divisões de página constantes e deixa as folhas com 50-70% de ocupação — o índice real cresce para 4 GB e o conjunto de páginas tocadas por inserção deixa de caber em <code>shared_buffers</code>. Numa tabela com escrita intensa, é comum ver a taxa de inserção cair para metade ou menos quando o índice ultrapassa a memória disponível, com <em>random I/O</em> onde antes havia acrescento sequencial.</p>
+    @Override
+    @Transactional
+    public void handle(SuspendSubscriptionCommand command) {
+        Subscription subscription = repository.findById(command.id()).orElseThrow();
+        subscription.suspendForNonPayment(command.reason());
+        repository.save(subscription);
+        subscription.pullEvents().forEach(outbox::append);   // mesma transacção
+    }
+}
 
-<p>UUIDv7, definido no RFC 9562, resolve exactamente isto: 48 bits iniciais de timestamp em milissegundos seguidos de aleatoriedade, ordenável no tempo. O ULID tem a mesma propriedade com outra codificação textual. Em PostgreSQL 17 não existe gerador de UUIDv7 no núcleo — <code>gen_random_uuid()</code> produz v4 —, portanto gera-se na aplicação (Java 21, com uma biblioteca ou 20 linhas sobre <code>SecureRandom</code>) ou numa função SQL própria. Guardar UUID como <code>varchar(36)</code> é o erro de custo mais alto e mais silencioso: 37 bytes em vez de 16, comparações por texto em vez de por 128 bits, e um índice mais de duas vezes maior.</p>
+// adapter/out/persistence/OutboxAppender.java
+@Component
+class OutboxAppender implements DomainEventOutbox {
+    @Override public void append(DomainEvent event) {
+        jdbc.update(&quot;&quot;&quot;
+            insert into outbox (id, aggregate_id, type, payload, occurred_at, published_at)
+            values (?, ?, ?, ?::jsonb, ?, null)
+            &quot;&quot;&quot;, UUID.randomUUID(), event.aggregateId().value(),
+                 event.getClass().getSimpleName(), serializer.toJson(event), event.occurredAt());
+    }
+}
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.1</span> Estratégias de chave primária, para uma tabela de 100 milhões de linhas com três chaves estrangeiras a apontar-lhe.</div>
-<div class="tscroll"><table><thead><tr><th>Estratégia</th><th>Bytes por linha (PK + 3 FK)</th><th>Localidade de escrita</th><th>Índice PK aproximado</th><th>Quando é a escolha certa</th></tr></thead><tbody>
-<tr><td><code>bigint</code> identity</td><td>32</td><td>Acrescento no fim; folhas cheias</td><td>≈ 2,1 GB</td><td>Uma só base a gerar ids; ids nunca expostos ao exterior ou expostos sem risco de enumeração.</td></tr>
-<tr><td><code>uuid</code> v4</td><td>64</td><td>Aleatória; divisões de página, folhas a 50-70%</td><td>≈ 3,5-4 GB</td><td>Ids gerados por vários produtores sem coordenação e sem qualquer ordenação temporal desejável.</td></tr>
-<tr><td><code>uuid</code> v7 / ULID</td><td>64</td><td>Quase sequencial por milissegundo</td><td>≈ 2,9 GB</td><td>Ids gerados no cliente ou em vários serviços, com escrita intensa; o defeito razoável hoje.</td></tr>
-<tr><td><code>varchar(36)</code> com UUID</td><td>148</td><td>Aleatória, com comparação textual</td><td>≈ 7 GB</td><td>Nunca; só existe por migração descuidada de um ORM.</td></tr>
-<tr><td>Chave natural composta</td><td>variável, tipicamente 40-120</td><td>Depende do primeiro atributo</td><td>Muito variável</td><td>Tabelas de associação puras e tabelas de referência estáveis (código ISO, código de moeda).</td></tr>
+// Consumidor no mesmo processo: só corre se a transacção fez commit
+@Component
+class SuspensionNotifier {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    void on(SubscriptionSuspended event) {
+        mailer.sendSuspensionNotice(event.subscriptionId());   // falha aqui não reverte nada
+    }
+}</code></pre></figure>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Publicar em Kafka dentro de um método <code>@Transactional</code> não torna a publicação transaccional: o <em>broker</em> confirma a mensagem e a base de dados pode reverter a seguir, produzindo um evento sobre um facto que nunca existiu. É o erro mais comum nesta pergunta e o entrevistador espera por ele. Ou se usa <em>outbox</em>, ou se aceita explicitamente a inconsistência e se documenta o consumidor como tolerante a eventos fantasma.</p></aside>
+
+<h2 id="sec-20-4" class="h2"><span class="secnum">20.4</span> Bounded contexts e a linguagem ubíqua<a class="anchor" href="#sec-20-4" aria-label="ligação">#</a></h2>
+
+<p>Um <em>bounded context</em> é a fronteira dentro da qual uma palavra tem um significado só. «Cliente» na facturação é um conjunto de dados fiscais, morada de facturação e método de pagamento; «cliente» no <em>marketing</em> é um perfil com consentimentos e segmentos; «cliente» no suporte é um histórico de conversas. Tentar um modelo canónico de cliente para os três produz uma classe com quarenta campos, metade nulos em qualquer utilização, e um dono que é toda a gente e portanto ninguém. A solução do DDD estratégico é não unificar: cada contexto tem o seu modelo, e a tradução entre eles é explícita.</p>
+
+<p>A linguagem ubíqua é a consequência prática e o teste é simples: os nomes das classes e dos métodos são exactamente as palavras que o especialista de negócio usa na reunião. Se o negócio diz «suspender por incumprimento» e o código diz <code>updateStatusFlag(2)</code>, cada conversa entre engenharia e produto passa por uma tradução mental que ninguém escreveu e que se perde quando a pessoa que a fazia sai da equipa. Numa entrevista, o candidato que devolve os nomes do enunciado nas suas classes está a demonstrar isto sem precisar de citar Evans.</p>
+
+<p>Entre contextos, as relações são de poucos tipos e vale a pena saber nomeá-los, porque o entrevistador usa-os para falar de organização e não só de código. O <em>anti-corruption layer</em> é o mais citado e o mais útil: uma camada de tradução no contexto a jusante que impede que o modelo do vizinho contamine o próprio. É o que se põe quando se integra com o ERP antigo cujo modelo não se pode mudar.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.1</span> Padrões de relação entre contextos e o que implicam na prática.</div>
+<div class="tscroll"><table><thead><tr><th>Padrão</th><th>Quem manda no contrato</th><th>Quando escolher</th><th>Custo</th></tr></thead><tbody>
+<tr><td>Parceria</td><td>As duas equipas, em conjunto</td><td>Dois contextos que mudam ao mesmo ritmo e falham juntos</td><td>Coordenação em cada versão; não escala para além de duas equipas</td></tr>
+<tr><td>Cliente–fornecedor</td><td>A jusante negoceia, a montante decide</td><td>Existe processo de <em>backlog</em> partilhado e prioridades negociáveis</td><td>A jusante fica bloqueada quando a montante despriorizar</td></tr>
+<tr><td>Conformista</td><td>A montante, sem negociação</td><td>Fornecedor externo ou equipa muito maior; modelo aceitável</td><td>Toda a mudança do vizinho propaga-se ao domínio próprio</td></tr>
+<tr><td>Anti-corruption layer</td><td>A jusante, por tradução</td><td>Modelo do vizinho é hostil ou legado e o próprio domínio é rico</td><td>Camada de tradução a manter, mais um teste de contrato</td></tr>
+<tr><td>Serviço aberto e publicado</td><td>A montante, com versionamento</td><td>Muitos consumidores desconhecidos</td><td>Compatibilidade retroactiva permanente e depreciação lenta</td></tr>
 </tbody></table></div></div>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Trocar <code>bigint</code> por <code>uuid</code> numa tabela de 100 milhões de linhas referenciada por três tabelas filhas acrescenta cerca de 32 bytes por linha em dados e mais 0,8 GB por cada índice de chave estrangeira. Com quatro índices envolvidos, o custo total ronda 6-8 GB de armazenamento adicional e a mesma proporção de páginas extra a competir por <code>shared_buffers</code>. Passar de v4 para v7 não devolve os bytes, mas devolve a localidade: as divisões de página desaparecem e a densidade das folhas volta a 85-90%.</p></aside>
-
-<figure class="listing sql" id="lst-20-2"><div class="lhead"><span class="lnum">Listagem 20.2</span>
-<span class="lcap">Medir o efeito real da chave: densidade e fragmentação das folhas do B-tree.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS pgcrypto;     -- gen_random_uuid() = UUIDv4
-CREATE EXTENSION IF NOT EXISTS pgstattuple;
-
-CREATE TABLE event_v4 (
-    id         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-    payload    jsonb       NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
--- UUIDv7 (RFC 9562): 48 bits de tempo + aleatoriedade. PostgreSQL 17 não o gera
--- em core; o id chega já preenchido pela aplicação.
-CREATE TABLE event_v7 (
-    id         uuid        PRIMARY KEY,
-    payload    jsonb       NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE event_seq (
-    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    payload    jsonb       NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
--- depois da carga: o que interessa é avg_leaf_density e leaf_fragmentation
-SELECT 'v4'  AS k, * FROM pgstatindex('event_v4_pkey')
-UNION ALL
-SELECT 'v7',       * FROM pgstatindex('event_v7_pkey')
-UNION ALL
-SELECT 'seq',      * FROM pgstatindex('event_seq_pkey');
-
-SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS heap
-FROM pg_class WHERE relname LIKE 'event\_%' AND relkind = 'r';</code></pre></figure>
-
-<div class="qa" id="q-20-3" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">A tabela de eventos vai receber 30 mil inserções por segundo e crescer para mil milhões de linhas. A equipa propõe <code>uuid</code> gerado com <code>gen_random_uuid()</code> como chave primária. O que responde?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Respondo que a decisão de gerar o id fora da base é boa e a versão do UUID é má. <code>gen_random_uuid()</code> produz v4, aleatório em todos os bits úteis; a mudança é para UUIDv7, gerado na aplicação, que mantém as garantias de unicidade sem coordenação e acrescenta ordenação temporal.</p>
-      <p>O mecanismo é a localidade de escrita no B-tree. Com v4, cada inserção aterra numa folha aleatória do índice. Com mil milhões de linhas, o índice da chave primária tem 3 a 4 GB; se <code>shared_buffers</code> forem 8 GB numa máquina com outros índices a competir, a folha alvo raramente está em memória e cada inserção paga uma leitura aleatória, mais a escrita da página suja, mais divisões de página quando a folha enche. As folhas estabilizam com 50-70% de ocupação. Com v7, as inserções concentram-se nas últimas folhas: praticamente sem divisões, densidade a 85-90%, e o conjunto de trabalho de escrita reduz-se a algumas dezenas de páginas quentes independentemente do tamanho da tabela.</p>
-      <p>Aos 30 mil por segundo, isto é a diferença entre caber e não caber. Vale a pena acrescentar duas coisas na mesma resposta. Primeira: a 30 mil eventos por segundo, uma tabela única não chega; particiona-se por intervalo em <code>created_at</code>, o que também torna a remoção por retenção um <code>DETACH PARTITION</code> em vez de um <code>DELETE</code> de mil milhões de linhas. Segunda: o custo do v7 é revelar o instante de criação a quem vir o id — se o id for público e o tempo de criação for informação sensível, ou se o requisito for id opaco e não enumerável, então v4 é a escolha certa e paga-se a fragmentação, ou usa-se v7 interno com um identificador público separado.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«UUID é sempre melhor porque evita colisões» ou «sequencial é sempre melhor», sem falar de índices.</td></tr>
-        <tr><td>Mid</td><td>Sabe que UUID aleatório fragmenta o índice, mas não explica divisões de página nem relaciona com a memória disponível.</td></tr>
-        <tr><td>Sénior</td><td>Explica a localidade de escrita no B-tree com números, propõe v7 e nomeia o custo de expor o tempo de criação.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta particionamento e retenção, o impacto nas chaves estrangeiras e na replicação, e como migraria uma tabela já em produção.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como migra uma tabela de 400 milhões de linhas de v4 para v7 sem parar o serviço?»</li>
-      <li>«Qual é o efeito no volume de WAL e na replicação?»</li>
-      <li>«Porque não usar <code>bigint</code> com uma sequência com <code>CACHE</code> alto?»</li>
-      <li>«O que muda se o id for a chave de particionamento?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Guardar o UUID em <code>varchar(36)</code> ou <code>text</code>.</li>
-      <li>Não saber que <code>gen_random_uuid()</code> é v4.</li>
-      <li>Afirmar que o problema se resolve com <code>REINDEX</code> periódico.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-20-4" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O domínio já tem identificadores únicos naturais: IBAN para a conta, ISIN para o instrumento, número de contribuinte para a entidade. Porque não usá-los directamente como chaves primárias?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Porque nenhuma das três propriedades que uma chave primária precisa está garantida por uma chave natural: imutabilidade, estreiteza e disponibilidade no momento da inserção. O padrão é chave <em>surrogate</em> interna como primária e a chave natural como <code>UNIQUE NOT NULL</code>.</p>
-      <p>Imutabilidade: os identificadores naturais mudam. Um IBAN muda quando o banco é adquirido e migra os códigos; um número de contribuinte muda numa fusão de sociedades; um SKU é reatribuído quando o catálogo é reestruturado. Se essa coluna for a chave primária, cada alteração propaga-se por <code>ON UPDATE CASCADE</code> a todas as tabelas filhas — uma escrita de negócio trivial torna-se um <code>UPDATE</code> de milhões de linhas com bloqueios em cadeia.</p>
-      <p>Estreiteza: um IBAN tem até 34 caracteres. Como chave primária propagada a cinco tabelas filhas, são cerca de 35 bytes por linha em cada uma, contra 8 de um <code>bigint</code>. Numa tabela de movimentos com 500 milhões de linhas, são mais de 13 GB só na coluna e outro tanto em cada índice que a inclua, além de comparações de texto com colação em vez de comparação de inteiros.</p>
-      <p>Disponibilidade: a entidade tem de existir no modelo antes de o identificador natural ser conhecido — um cliente em <em>onboarding</em> cria-se antes de o número de contribuinte ser validado. Com chave natural, ou se inventa um valor de sentinela, ou se atrasa a criação da linha.</p>
-      <p>A escolha contrária é legítima em dois casos: tabelas de referência estáveis, onde o código ISO da moeda ou do país é a chave primária e a legibilidade das consultas compensa; e tabelas de associação puras, onde a chave é o par de chaves estrangeiras e não há nada mais a identificar.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Usa-se sempre um id auto-incremento», sem justificação, ou aceita a chave natural sem ver o problema da mutação.</td></tr>
-        <tr><td>Mid</td><td>Menciona que a chave natural pode mudar, mas não quantifica a propagação nem fala de largura.</td></tr>
-        <tr><td>Sénior</td><td>Dá as três propriedades com exemplos do domínio e mantém a chave natural como <code>UNIQUE</code>, com números de custo.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta os casos em que a chave natural ganha e discute a estabilidade da chave de negócio nos contratos de integração externos.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Se o cliente externo integra pelo ISIN, que id expõe na API?»</li>
-      <li>«O que faz quando o mesmo IBAN reaparece com outra entidade?»</li>
-      <li>«Onde põe a validação de formato do IBAN — <code>CHECK</code>, domínio ou aplicação?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Deixar cair a <code>UNIQUE</code> sobre a chave natural depois de criar a <em>surrogate</em>.</li>
-      <li>Usar <code>ON UPDATE CASCADE</code> como resposta ao problema da mutabilidade.</li>
-      <li>Expor a chave sequencial interna numa API pública sem pensar em enumeração.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-20-3" class="h2"><span class="secnum">20.3</span> Constraints, integridade referencial e a defesa em profundidade<a class="anchor" href="#sec-20-3" aria-label="ligação">#</a></h2>
-
-<p>O argumento contra <em>constraints</em> na base — «a validação está na aplicação» — falha por uma razão empírica: a aplicação não é o único escritor. Ao longo da vida de um sistema escrevem na base o serviço principal, um segundo serviço criado dois anos depois, os <em>scripts</em> de migração, as correcções manuais em incidente, a ferramenta de importação de dados e o pipeline de reprocessamento. A <em>constraint</em> é a única regra que todos esses caminhos atravessam. O custo é conhecido e pequeno: uma chave estrangeira acrescenta uma verificação por índice na inserção do filho e um bloqueio <code>FOR KEY SHARE</code> na linha do pai, tipicamente unidades de microssegundos quando o índice está em memória.</p>
-
-<p>O erro operacional mais frequente com chaves estrangeiras é não indexar a coluna do lado filho. O PostgreSQL cria automaticamente o índice da chave primária, nunca o do lado que referencia. Sem ele, cada <code>DELETE</code> ou <code>UPDATE</code> da chave no pai obriga a uma varredura sequencial completa da tabela filha para verificar a restrição: numa filha de 50 milhões de linhas, um apagamento de uma linha do pai passa de sub-milissegundo para vários segundos, com o bloqueio a ser mantido durante todo esse tempo.</p>
-
-<p><code>ON DELETE CASCADE</code> merece a mesma desconfiança. É correcto quando o filho não tem existência independente do pai — linhas de encomenda, endereços de um perfil — e perigoso quando a cardinalidade é grande ou desconhecida: apagar um <em>tenant</em> com 12 milhões de linhas em cascata é uma única transacção que gera gigabytes de WAL, mantém bloqueios em todas as tabelas envolvidas e não tem ponto de retoma se falhar a meio. Para essas relações usa-se <code>ON DELETE RESTRICT</code> e um processo de eliminação por lotes com transacções curtas, ou apagamento por partição.</p>
-
-<figure class="listing sql" id="lst-20-3"><div class="lhead"><span class="lnum">Listagem 20.3</span>
-<span class="lcap">Invariantes que o modelo garante e a aplicação não consegue: unicidade condicional, não-sobreposição e adição sem bloqueio longo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE EXTENSION IF NOT EXISTS btree_gist;
-
--- Adicionar FK a uma tabela grande sem manter bloqueio durante a validação:
--- NOT VALID só verifica as linhas novas; VALIDATE varre com bloqueio fraco.
-ALTER TABLE sales_order
-    ADD CONSTRAINT sales_order_customer_fk FOREIGN KEY (customer_id)
-    REFERENCES customer(id) ON DELETE RESTRICT NOT VALID;
-ALTER TABLE sales_order VALIDATE CONSTRAINT sales_order_customer_fk;
-
--- Um único contrato activo por cliente: unicidade parcial, impossível com UNIQUE
-CREATE TABLE contract (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    customer_id bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
-    started_at  timestamptz NOT NULL,
-    ended_at    timestamptz,
-    CONSTRAINT contract_period_ck CHECK (ended_at IS NULL OR ended_at &gt; started_at)
-);
-CREATE UNIQUE INDEX contract_one_active_uq
-    ON contract (customer_id) WHERE ended_at IS NULL;
-
--- Preços com períodos que não se podem sobrepor para o mesmo produto
-CREATE TABLE price_period (
-    product_id   bigint        NOT NULL REFERENCES product(id) ON DELETE CASCADE,
-    valid_during tstzrange     NOT NULL,
-    amount       numeric(12,4) NOT NULL CHECK (amount &gt;= 0),
-    EXCLUDE USING gist (product_id WITH =, valid_during WITH &amp;&amp;)
-);
-
--- Inserções circulares entre duas tabelas: adiar a verificação até ao COMMIT
-ALTER TABLE department
-    ADD CONSTRAINT department_head_fk FOREIGN KEY (head_employee_id)
-    REFERENCES employee(id) DEFERRABLE INITIALLY IMMEDIATE;
--- na transacção:  SET CONSTRAINTS department_head_fk DEFERRED;</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Uma <code>UNIQUE</code> sobre <code>(email)</code> numa tabela com <em>soft delete</em> impede reutilizar o email de um registo apagado; substituí-la por índice único parcial <code>WHERE deleted_at IS NULL</code> resolve a unicidade mas deixa de proteger contra dois registos apagados idênticos — que é exactamente o que se quer. O erro simétrico, mais caro, é remover a <code>UNIQUE</code> e não criar o índice parcial: a partir daí a base aceita duplicados e a aplicação passa a ter de os tratar em cada leitura.</p></aside>
-
-<div class="qa" id="q-20-5" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O arquitecto quer o esquema sem chaves estrangeiras nem <code>CHECK</code>: «a validação é responsabilidade do domínio e as <em>constraints</em> custam desempenho». Argumente contra ou a favor.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Argumento contra, com uma concessão. A validação de negócio pertence ao domínio; os invariantes estruturais pertencem à base, porque a base é o único ponto por onde passam todos os escritores. Ao fim de três anos, escrevem na tabela o serviço original, um segundo serviço, migrações, correcções manuais em incidente e um importador. A regra que só existe em Java não é aplicada por nenhum destes.</p>
-      <p>O argumento de desempenho é mensurável e pequeno. Uma chave estrangeira custa uma pesquisa por índice na tabela pai por linha inserida e um bloqueio <code>FOR KEY SHARE</code> na linha referenciada — microssegundos quando o índice está em <code>shared_buffers</code>. Um <code>CHECK</code> é uma avaliação de expressão sobre a linha em memória, ruído estatístico. Em inserções em massa, desactiva-se temporariamente com <code>ALTER TABLE ... DISABLE TRIGGER</code> ou carrega-se para uma partição sem restrições e valida-se depois — a solução é operacional, não é apagar a regra.</p>
-      <p>O custo real das <em>constraints</em> é outro e vale a pena nomeá-lo primeiro, porque é o que mostra experiência: rigidez em migrações. Adicionar uma coluna <code>NOT NULL</code> sem valor por omissão a uma tabela de 200 milhões de linhas, ou uma chave estrangeira validada de imediato, mantém um bloqueio longo. A resposta é <code>ADD CONSTRAINT ... NOT VALID</code> seguido de <code>VALIDATE CONSTRAINT</code>, que corre com um bloqueio muito mais fraco, e nunca é «não pôr a restrição».</p>
-      <p>A concessão: regras que dependem de estado externo ou que mudam a cada campanha — limites de desconto, elegibilidade, políticas de preço — não devem ser <code>CHECK</code>. Alterá-las exige migração e não devem ser bloqueadas por uma janela de manutenção. A linha divisória é: se a regra falhar, os dados ficam corrompidos ou apenas indesejados? Corrompidos vai para a base.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Concorda com o arquitecto, ou defende <em>constraints</em> por dogma sem nenhum custo mensurável.</td></tr>
-        <tr><td>Mid</td><td>Defende as <em>constraints</em> pela integridade, mas não sabe quantificar o custo nem lidar com migrações.</td></tr>
-        <tr><td>Sénior</td><td>Argumento dos múltiplos escritores, custo real quantificado, <code>NOT VALID</code>/<code>VALIDATE</code>, e a linha divisória entre invariante e política.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta como isto se aplica em vários serviços sobre a mesma base, o efeito em <em>schema evolution</em> e o processo de aprovação de migrações.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como adiciona uma coluna <code>NOT NULL</code> a 200 milhões de linhas sem indisponibilidade?»</li>
-      <li>«E se dois serviços diferentes escreverem na mesma tabela com regras diferentes?»</li>
-      <li>«Que <em>constraint</em> já teve de remover em produção e porquê?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>«As <em>constraints</em> são lentas» sem nunca ter medido.</li>
-      <li>Não conhecer <code>NOT VALID</code> nem o efeito dos bloqueios em <code>ALTER TABLE</code>.</li>
-      <li>Propor validação só na aplicação num sistema com mais de um escritor.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-20-6" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Um pedido de esquecimento apaga um cliente com <code>ON DELETE CASCADE</code> em sete tabelas, uma delas com 12 milhões de linhas desse cliente. O que espera que aconteça e o que faria diferente?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Espero uma transacção única de longa duração, gigabytes de WAL, bloqueios exclusivos nas sete tabelas até ao <code>COMMIT</code>, replicação em atraso e nenhum ponto de retoma se falhar. Se alguma das tabelas filhas não tiver índice na coluna da chave estrangeira, acrescenta-se uma varredura sequencial completa por cada nível da cascata.</p>
-      <p>Há ainda dois efeitos menos óbvios. O <em>autovacuum</em> tem 12 milhões de tuplos mortos para recolher depois do <code>COMMIT</code>, e o espaço em disco não é devolvido ao sistema de ficheiros — a tabela fica com o mesmo tamanho e espaço livre interno. E a cascata é silenciosa: ninguém no código da aplicação vê quantas linhas foram apagadas, o que torna impossível auditar a operação exigida pelo próprio requisito de conformidade que a motivou.</p>
-      <p>O que faço diferente: <code>ON DELETE RESTRICT</code> nas relações de cardinalidade alta e um processo explícito de eliminação. Apaga-se por lotes de 5 000 a 50 000 linhas, cada lote em transacção própria, da folha para a raiz da árvore de dependências, com registo de progresso numa tabela de trabalho para poder retomar. Se a tabela grande estiver particionada pelo cliente ou pelo <em>tenant</em>, o caminho preferido é <code>DETACH PARTITION</code> seguido de <code>DROP TABLE</code>, que é uma operação de metadados em vez de 12 milhões de apagamentos.</p>
-      <p>Quando a cascata é a escolha certa: relações de composição estrita e cardinalidade pequena e limitada — linhas de encomenda, moradas de um perfil, permissões de um utilizador —, onde o filho não tem existência sem o pai e a contagem é conhecida às dezenas.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Funciona, a base trata disso» — não vê nem a duração da transacção nem os bloqueios.</td></tr>
-        <tr><td>Mid</td><td>Vê que será lento e sugere apagar por lotes, mas não fala de WAL, replicação, índices de FK nem auditoria.</td></tr>
-        <tr><td>Sénior</td><td>Descreve transacção longa, WAL, bloqueios, <em>autovacuum</em> e falta de índice na FK; propõe lotes com retoma e nomeia quando a cascata é correcta.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta particionamento com <code>DETACH</code>, a trilha de auditoria da eliminação e a distinção entre apagar e anonimizar quando há obrigação legal de reter.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como sabe se as colunas de chave estrangeira estão indexadas? Escreva a consulta.»</li>
-      <li>«E se a lei obrigar a reter as facturas sete anos?»</li>
-      <li>«Qual o tamanho de lote e como o calibra?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não saber que o PostgreSQL não indexa automaticamente o lado filho da chave estrangeira.</li>
-      <li>Achar que <code>DELETE</code> devolve espaço ao sistema de ficheiros.</li>
-      <li>Confundir apagamento com anonimização perante um requisito de retenção.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-20-4" class="h2"><span class="secnum">20.4</span> Modelar tempo: histórico, soft delete e auditoria<a class="anchor" href="#sec-20-4" aria-label="ligação">#</a></h2>
-
-<p>Três requisitos são frequentemente confundidos num só. «Poder repor um registo apagado» é reversibilidade. «Saber qual era o escalão do cliente em Março» é histórico de estado. «Saber quem alterou o quê e quando» é auditoria. Cada um tem a sua estrutura: reversibilidade resolve-se com um estado no próprio registo, histórico com versões com validade temporal, auditoria com um registo imutável de eventos. Responder aos três com um <code>deleted_at</code> é o erro mais comum desta secção.</p>
-
-<p>O <em>soft delete</em> tem quatro custos concretos. Primeiro, unicidade: qualquer <code>UNIQUE</code> passa a incluir linhas apagadas e tem de se tornar índice único parcial. Segundo, integridade referencial: a chave estrangeira continua a ver a linha apagada, portanto a base deixa de impedir que um registo vivo aponte para um pai apagado — o invariante muda-se para a aplicação, que é onde não devia estar. Terceiro, todas as consultas passam a precisar do predicado; uma esquecida numa junção é uma fuga de dados que passa nos testes porque em ambiente de teste não há registos apagados. Quarto, custo de leitura: numa tabela em que 60% das linhas estão apagadas, cada varredura de índice lê aproximadamente 2,5 vezes mais entradas do que o resultado útil, salvo se todos os índices relevantes forem parciais.</p>
-
-<p>Para histórico, o padrão robusto em PostgreSQL 17 é uma tabela de versões com um intervalo <code>tstzrange</code> e uma restrição <code>EXCLUDE</code> que impede sobreposições — o equivalente prático a uma dimensão de tipo 2 de <em>data warehouse</em>. O PostgreSQL 17 não tem tabelas com versionamento de sistema como as definidas no SQL:2011, portanto a escrita das versões é feita por <em>trigger</em> ou pela camada de aplicação. Vale a pena distinguir tempo de validade — quando o facto foi verdadeiro no mundo — de tempo de transacção — quando a base soube dele; sistemas financeiros e de seguros precisam dos dois, e é a essa modelação bitemporal que uma pergunta de <em>deep dive</em> costuma chegar.</p>
-
-<figure class="listing sql" id="lst-20-4"><div class="lhead"><span class="lnum">Listagem 20.4</span>
-<span class="lcap">Histórico com intervalos sem sobreposição e consulta ao estado numa data.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE TABLE customer_version (
-    customer_id  bigint      NOT NULL REFERENCES customer(id) ON DELETE RESTRICT,
-    valid_during tstzrange   NOT NULL,   -- tempo de validade (mundo real)
-    recorded_at  timestamptz NOT NULL DEFAULT now(),  -- tempo de transacção
-    recorded_by  text        NOT NULL DEFAULT current_user,
-    email        citext      NOT NULL,
-    tier         text        NOT NULL,
-    EXCLUDE USING gist (customer_id WITH =, valid_during WITH &amp;&amp;),
-    CONSTRAINT customer_version_ck CHECK (NOT isempty(valid_during))
-);
-CREATE INDEX customer_version_ix ON customer_version USING gist (valid_during);
-
--- Estado do cliente 42 em 1 de Março de 2026
-SELECT tier, email
-FROM   customer_version
-WHERE  customer_id = 42
-  AND  valid_during @&gt; timestamptz '2026-03-01 00:00:00+00';
-
--- Fechar a versão corrente e abrir a nova, atomicamente
-BEGIN;
-UPDATE customer_version
-   SET valid_during = tstzrange(lower(valid_during), now(), '[)')
- WHERE customer_id = 42 AND upper_inf(valid_during);
-INSERT INTO customer_version (customer_id, valid_during, email, tier)
-VALUES (42, tstzrange(now(), NULL, '[)'), 'ana@exemplo.pt', 'GOLD');
-COMMIT;</code></pre></figure>
-
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Soft delete</em> dá reversibilidade imediata e custa correcção: unicidade, integridade referencial e um predicado obrigatório em cada consulta. Apagamento verdadeiro com cópia para uma tabela de arquivo dá um modelo limpo e custa um caminho de reposição escrito à mão. A escolha inverte-se quando a taxa de reposição é significativa — acima de uns poucos por cento das eliminações — ou quando o registo é referenciado por outros vivos; abaixo disso, arquivar e apagar sai mais barato ao longo de três anos.</p></aside>
-
-<div class="qa" id="q-20-7" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">O <em>soft delete</em> está implementado com <code>deleted_at</code> em 40 tabelas e um filtro no repositório. Que problemas prevê e como os resolveria sem reescrever o sistema?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Prevejo quatro problemas, por ordem de gravidade. O primeiro é a fuga: basta uma consulta que não passe pelo repositório — um relatório, uma junção escrita à mão, um <em>export</em> — para devolver registos apagados. O segundo é a unicidade: todas as <code>UNIQUE</code> passaram a contar linhas apagadas, portanto reutilizar o email de um cliente eliminado falha com violação de restrição. O terceiro é a integridade: a chave estrangeira continua satisfeita por um pai apagado, logo o modelo já não impede um filho vivo pendurado num pai morto. O quarto é o custo de leitura, que cresce com a fracção de registos apagados.</p>
-      <p>Sem reescrever, ataco por três frentes. Substituo cada <code>UNIQUE</code> afectada por índice único parcial <code>WHERE deleted_at IS NULL</code> e torno parciais os índices das consultas quentes — o que reduz simultaneamente o tamanho do índice e o trabalho de varredura. Crio uma vista por tabela, <code>customer_live</code>, com o predicado embutido, e faço com que tudo o que não é caminho de administração leia a vista; onde houver <em>row level security</em> disponível, uma política com <code>USING (deleted_at IS NULL)</code> aplica o filtro mesmo a quem escreve SQL directamente, o que é a única defesa que não depende de disciplina. E acrescento um teste de arquitectura que falha a compilação quando uma consulta nova toca a tabela base em vez da vista.</p>
-      <p>A médio prazo, separo os três requisitos. Reversibilidade fica no <code>deleted_at</code> com janela de retenção curta, tipicamente 30 dias, e uma tarefa que apaga definitivamente ou arquiva depois disso — o que trava o crescimento da fracção morta. Histórico de estado vai para tabelas de versões. Auditoria vai para um registo próprio, imutável, apenas com acrescento.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Não vê problema nenhum: «basta filtrar por <code>deleted_at IS NULL</code>».</td></tr>
-        <tr><td>Mid</td><td>Identifica o risco de esquecer o filtro e sugere uma classe base no ORM; não menciona unicidade nem integridade referencial.</td></tr>
-        <tr><td>Sénior</td><td>Enumera unicidade, integridade, fuga e custo, com correcções concretas (índice parcial, vista, RLS) e uma política de retenção.</td></tr>
-        <tr><td>Staff</td><td>Separa reversibilidade, histórico e auditoria como requisitos distintos e desenha o caminho de migração incremental com o custo de cada etapa.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que <em>constraint</em> impede um filho vivo de apontar para um pai apagado?»</li>
-      <li>«E quando o requisito de esquecimento obriga a apagar mesmo?»</li>
-      <li>«Como estima a fracção de linhas mortas por tabela?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Confiar apenas no filtro do ORM como garantia.</li>
-      <li>Não ver que a chave estrangeira deixou de garantir o invariante.</li>
-      <li>Manter <em>soft delete</em> indefinidamente, sem janela de retenção.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-20-8" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
+<div class="qa" id="q-20-8" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">O negócio precisa de responder a «qual era o preço deste produto a 12 de Março?» e também a «que preço é que o sistema achava, a 12 de Março, que estava em vigor a 1 de Janeiro?». Como modela isto?</div>
+  <div class="qprompt">A facturação, o suporte e o <em>marketing</em> têm cada um a sua ideia de «cliente». O arquitecto propõe um modelo canónico partilhado. O que responde?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>São duas perguntas em eixos temporais diferentes, portanto o modelo é bitemporal: cada versão tem um intervalo de tempo de validade — quando o preço vigorou no mundo — e um intervalo de tempo de transacção — quando a base conheceu essa afirmação. A primeira pergunta filtra pelo tempo de validade com o tempo de transacção aberto; a segunda fixa os dois.</p>
-      <p>A implementação em PostgreSQL 17 é uma tabela <code>price_version(product_id, valid_during tstzrange, system_during tstzrange, amount numeric(12,4))</code> com <code>EXCLUDE USING gist</code> sobre <code>(product_id WITH =, valid_during WITH &amp;&amp;)</code> restrito às linhas correntes por índice parcial. Uma correcção retroactiva nunca actualiza uma linha: fecha o <code>system_during</code> da afirmação antiga e insere uma nova com o mesmo <code>valid_during</code> e valor diferente. É por isso que o modelo é apenas de acrescento — a reemissão de uma factura de Janeiro continua a produzir o mesmo resultado que produziu em Janeiro.</p>
-      <p>O custo é real e há que dizê-lo. As consultas ganham dois predicados de intervalo e passam a depender de índices GiST, que são maiores e mais lentos a manter do que B-tree; o número de linhas cresce com cada correcção; e a maioria dos ORM não sabe exprimir isto, portanto estas leituras são SQL escrito à mão. A regra de decisão é: se ninguém alguma vez precisar de reconstruir o que o sistema sabia numa data passada — auditoria financeira, cálculo de sinistros, resolução de disputas —, o tempo de transacção é peso morto e uma tabela de versões unitemporal chega.</p></div>
+      <p>Que o modelo canónico resolve um problema de nomes e cria um problema de acoplamento. Um <code>Customer</code> partilhado pelos três contextos passa a mudar por três razões diferentes: uma alteração fiscal na facturação obriga a redeploy do suporte, e um campo novo de consentimento do <em>marketing</em> aparece num objecto que a facturação também tem de conhecer. A alternativa é aceitar três modelos e uma única identidade partilhada — o <code>CustomerId</code> — com cada contexto a guardar apenas os atributos de que precisa.</p>
+      <p>A pergunta seguinte, que é a que interessa, é quem é dono da identidade e como os atributos chegam a cada contexto. Duas opções: consulta síncrona a um serviço de clientes, mais simples mas com acoplamento em tempo de execução — se ele cair, a facturação cai; ou replicação por eventos, em que cada contexto mantém uma cópia local dos poucos campos de que precisa, actualizada por <code>CustomerRegistered</code> e <code>CustomerAddressChanged</code>. A segunda é mais robusta e é a que se defende num sistema com requisitos de disponibilidade, ao custo de dados desactualizados por segundos e de uma cópia por contexto.</p>
+      <p>Aceita-se o modelo partilhado num caso concreto: quando os três contextos são mantidos pela mesma equipa, no mesmo repositório, e o custo de coordenação é zero. Aí um tipo partilhado é mais barato do que três traduções. O sinal de que deixou de ser verdade é organizacional: quando duas equipas diferentes começam a pedir campos ao mesmo modelo, a fronteira já existe na organização e o código está atrasado em relação a ela.</p>
+      <p>A forma de conduzir a conversa sem transformar isto num conflito é propor um <em>context map</em> desenhado numa reunião de uma hora com as três equipas: caixas para os contextos, setas com o padrão de relação, e o nome do dono de cada contrato. É barato e costuma resolver a discussão, porque torna visível que não há uma definição de cliente, há três — e que a proposta canónica obrigaria alguém a ceder.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Uma coluna <code>updated_at</code> e um <em>trigger</em> de auditoria, sem perceber que são duas perguntas distintas.</td></tr>
-        <tr><td>Mid</td><td>Propõe tabela de histórico com <code>valid_from</code>/<code>valid_to</code>, mas não distingue tempo de validade de tempo de transacção.</td></tr>
-        <tr><td>Sénior</td><td>Modelo bitemporal com dois intervalos, apenas com acrescento, e <code>EXCLUDE</code> a garantir não-sobreposição das versões correntes.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o custo dos índices GiST, o crescimento de linhas, o efeito no ORM e o critério para não fazer bitemporal.</td></tr>
+        <tr><td>Insuficiente</td><td>Aceita o modelo canónico sem reservas, ou rejeita-o citando DDD sem explicar o custo concreto.</td></tr>
+        <tr><td>Mid</td><td>Sabe o conceito de <em>bounded context</em> e defende modelos separados, mas não resolve como os atributos chegam a cada contexto.</td></tr>
+        <tr><td>Sénior</td><td>Identidade partilhada com modelos separados; compara consulta síncrona e replicação por eventos com os custos de cada uma; nomeia o caso em que o modelo partilhado é aceitável.</td></tr>
+        <tr><td>Staff</td><td>Trata a fronteira como decisão organizacional, propõe um <em>context map</em> com donos e padrões de relação, e desenha a transição sem exigir uma reescrita coordenada.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como impede que existam duas versões correntes sobrepostas?»</li>
-      <li>«Que índice serve a consulta “preço em vigor agora”, que é 99% do tráfego?»</li>
-      <li>«Como faz isto sem <code>tstzrange</code>, se a base for MySQL?»</li></ul></div>
+      <li>«Se cada contexto tem cópia da morada, qual é a verdadeira para efeitos legais?»</li>
+      <li>«Como trata o pedido de apagamento do RGPD em três cópias?»</li>
+      <li>«Quanto tempo de desactualização é aceitável na facturação?»</li>
+      <li>«Como convence o arquitecto sem transformar isto numa guerra?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Fazer <code>UPDATE</code> sobre versões passadas numa correcção retroactiva.</li>
-      <li>Guardar intervalos como dois <code>timestamp</code> sem restrição de não-sobreposição.</li>
-      <li>Propor bitemporal em todo o lado, sem critério de custo.</li></ul></div>
+      <li>Propor uma biblioteca partilhada de DTO entre equipas como se fosse desacoplamento.</li>
+      <li>Ignorar a questão da identidade e do dono do dado.</li>
+      <li>Tratar a discussão como uma questão puramente técnica sem falar das equipas.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-20-5" class="h2"><span class="secnum">20.5</span> Tipos, precisão e dinheiro<a class="anchor" href="#sec-20-5" aria-label="ligação">#</a></h2>
-
-<p>Dinheiro nunca vai para vírgula flutuante binária. Um <code>double precision</code> tem 53 bits de mantissa e não representa exactamente 0,1; somar mil linhas acumula erro e a reconciliação com o extracto bancário falha por cêntimos que ninguém consegue explicar. As duas representações defensáveis são <code>numeric(p,s)</code>, aritmética decimal exacta com escala fixa, e inteiro em unidades menores — cêntimos em <code>bigint</code>. O <code>numeric</code> é mais lento porque a aritmética é feita em software e não em instruções do processador, tipicamente uma ordem de grandeza acima de <code>bigint</code>, mas em cargas OLTP normais o tempo de aritmética é ruído face ao acesso a páginas. O tipo <code>money</code> do PostgreSQL evita-se: a escala depende da configuração regional do servidor.</p>
-
-<p>A escala escolhe-se pelo pior caso do domínio, não pela moeda. Duas casas chegam para guardar totais em euros, mas não para preços unitários de fornecedores, taxas de câmbio ou cálculo de juros; o padrão prático é <code>numeric(18,4)</code> para montantes e <code>numeric(18,8)</code> para taxas, com o arredondamento a acontecer uma única vez, num sítio explícito e documentado. Do lado do Java, mapeia-se para <code>BigDecimal</code> com <code>RoundingMode</code> explícito, nunca para <code>double</code>, e nunca se constrói um <code>BigDecimal</code> a partir de um literal de vírgula flutuante.</p>
-
-<p>Em tempo, a regra é <code>timestamptz</code> por omissão. Os dois tipos ocupam 8 bytes; a diferença é semântica. <code>timestamptz</code> guarda um instante absoluto em UTC e converte na entrada e na saída conforme o <code>TimeZone</code> da sessão; <code>timestamp</code> guarda um par data-hora sem instante associado, o que significa que duas sessões com fusos diferentes lêem o mesmo valor como momentos distintos. Escrever <code>timestamp</code> «porque guardamos sempre UTC» funciona até alguém ligar-se com outra configuração ou até uma transição de hora de Verão duplicar uma hora local. <code>timestamp</code> sem fuso é correcto exactamente num caso: quando o valor é uma hora de parede sem instante — as 09:00 de abertura de uma loja, que são 09:00 locais em todos os dias do ano.</p>
-
-<figure class="listing sql" id="lst-20-5"><div class="lhead"><span class="lnum">Listagem 20.5</span>
-<span class="lcap">Tipos para dinheiro, tempo e domínios enumerados.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE TABLE currency (
-    code        char(3)  PRIMARY KEY,          -- ISO 4217
-    minor_unit  smallint NOT NULL CHECK (minor_unit BETWEEN 0 AND 4),
-    active      boolean  NOT NULL DEFAULT true
-);
-
-CREATE TABLE payment (
-    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    order_id      bigint         NOT NULL REFERENCES sales_order(id) ON DELETE RESTRICT,
-    amount        numeric(18,4)  NOT NULL CHECK (amount &gt; 0),
-    currency      char(3)        NOT NULL REFERENCES currency(code),
-    fx_rate       numeric(18,8),                       -- taxa aplicada, se houver
-    amount_eur    numeric(18,4)  NOT NULL,
-    captured_at   timestamptz    NOT NULL DEFAULT now(),  -- instante absoluto
-    settlement_day date          NOT NULL,               -- dia de negócio, decidido a montante
-    store_opens_at time           NOT NULL DEFAULT '09:00'  -- hora de parede, sem instante
-);
-
--- Porque não double precision: o erro acumula e a reconciliação falha
-SELECT sum(0.1::double precision) AS flutuante,   -- diferente de 1.0
-       sum(0.1::numeric)          AS decimal_exacto
-FROM   generate_series(1, 10);
-
--- Domínio fechado sem tipo enum: continua a ser uma tabela, com FK
-CREATE TABLE payment_status (
-    code       text PRIMARY KEY,
-    label_pt   text NOT NULL,
-    is_final   boolean NOT NULL
-);
-ALTER TABLE payment
-    ADD COLUMN status text NOT NULL DEFAULT 'PENDING'
-        REFERENCES payment_status(code);</code></pre></figure>
-
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p><code>numeric(18,4)</code> ocupa cerca de 12 bytes por valor face aos 8 de <code>bigint</code> ou <code>double precision</code>, e a aritmética decimal em software custa aproximadamente uma ordem de grandeza mais do que a inteira. Numa consulta OLTP que lê 40 linhas, isso são microssegundos contra os 200-800 microssegundos de acesso a páginas: irrelevante. Num agregado analítico sobre 200 milhões de linhas, deixa de o ser — e aí a resposta é pré-agregar, não trocar por <code>double</code>.</p></aside>
-
-<div class="qa" id="q-20-9" data-box="qa" data-area="dados" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Encontra <code>amount double precision</code> na tabela de pagamentos de um sistema em produção com 80 milhões de linhas. Qual é o impacto e como corrige?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O impacto é erro de representação que se acumula e nunca é reprodutível na mesma ordem. O binário de 64 bits do IEEE 754 tem 53 bits de mantissa e não representa exactamente 0,1 nem 0,01; qualquer soma de valores monetários acumula desvio, e o desvio depende da ordem das parcelas — o que significa que a mesma agregação com outro plano de execução, ou paralelizada por mais <em>workers</em>, dá um resultado ligeiramente diferente. Em reconciliação, isto aparece como diferenças de cêntimos que ninguém consegue atribuir.</p>
-      <p>A correcção é <code>numeric(18,4)</code> — ou <code>bigint</code> em unidades menores, se a equipa já estiver disciplinada quanto à moeda. A migração numa tabela de 80 milhões de linhas não se faz com <code>ALTER TABLE ... TYPE</code>, que reescreve toda a tabela com bloqueio exclusivo. O padrão é: acrescentar <code>amount_num numeric(18,4)</code>, que em PostgreSQL 17 é uma alteração de metadados; escrever nas duas colunas a partir da aplicação; preencher o histórico por lotes de dezenas de milhares de linhas com pausa entre lotes para o <em>autovacuum</em> acompanhar; correr uma verificação que compara as duas colunas com a tolerância esperada; trocar a leitura; e só depois deixar cair a coluna antiga.</p>
-      <p>A parte que separa níveis é o que se faz com os dados já corrompidos. O valor gravado é o valor errado, não há como o recuperar do <code>double</code>; é preciso decidir a fonte de verdade — o extracto do processador de pagamentos, os eventos originais em Kafka, os ficheiros de liquidação — e reconstruir a partir dela, com um relatório das linhas que divergem acima do limite aceite. Migrar o tipo sem reconstruir os valores deixa o erro no sítio, agora com aparência de exactidão.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Arredonda-se a duas casas na leitura» ou não vê problema nenhum em <code>double</code> para dinheiro.</td></tr>
-        <tr><td>Mid</td><td>Sabe que deve ser <code>numeric</code>/<code>BigDecimal</code> e propõe <code>ALTER TABLE</code> directo, sem ver o bloqueio nem os dados já errados.</td></tr>
-        <tr><td>Sénior</td><td>Explica a mantissa e a dependência da ordem de soma, faz migração em duas colunas por lotes e valida.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta a reconstrução a partir da fonte de verdade, o relatório de divergências e o efeito nos relatórios financeiros já emitidos.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Que escala escolhe e porquê? E para taxas de câmbio?»</li>
-      <li>«Como mapeia em Java sem cair em <code>new BigDecimal(0.1)</code>?»</li>
-      <li>«Quanto tempo bloqueia um <code>ALTER TABLE ... TYPE</code> nessa tabela?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Propor o tipo <code>money</code> do PostgreSQL.</li>
-      <li>Achar que arredondar na apresentação resolve o erro acumulado.</li>
-      <li>Migrar o tipo e não tocar nos valores históricos.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-20-10" data-box="qa" data-area="dados" data-level="mid" data-freq="alta">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Um relatório diário dá totais diferentes conforme a máquina que o corre. As colunas de data são <code>timestamp</code>. Diagnostique e diga o que muda no modelo.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>O diagnóstico é que <code>timestamp</code> sem fuso não guarda um instante: guarda um par data-hora sem referência. O valor entra convertido — ou não convertido — segundo o <code>TimeZone</code> de quem escreveu, e sai interpretado segundo o de quem lê. Quando o relatório corta o dia com <code>WHERE created_at &gt;= '2026-03-01'</code>, cada máquina com configuração diferente inclui um conjunto diferente de linhas na fronteira. Em Portugal, com hora de Verão, há ainda uma hora local que se repete e outra que não existe.</p>
-      <p>A mudança é <code>timestamptz</code>: 8 bytes, exactamente como <code>timestamp</code>, mas guarda o instante absoluto em UTC e faz a conversão na entrada e na saída pelo fuso da sessão. As comparações passam a ser entre instantes e deixam de depender de quem corre a consulta. Em Java 21, o correspondente é <code>OffsetDateTime</code> ou <code>Instant</code>, nunca <code>LocalDateTime</code>.</p>
-      <p>Falta a parte de modelação, que é o que distingue a resposta. «Dia» é um conceito de negócio, não uma projecção do instante: um pagamento capturado às 23:40 UTC pertence a que dia contabilístico, no fuso do comerciante ou no da empresa? A resposta é uma coluna <code>date</code> explícita — <code>settlement_day</code> — decidida uma vez pela aplicação, à entrada, com o fuso de negócio conhecido. O relatório agrupa por essa coluna, que é indexável e determinística, em vez de aplicar <code>AT TIME ZONE</code> sobre 80 milhões de linhas em cada execução, o que além de ambíguo impede o uso do índice.</p>
-      <p>Onde <code>timestamp</code> sem fuso continua certo: horas de parede recorrentes — abertura da loja às 09:00, um alarme às 07:00 — que devem permanecer 09:00 locais quando o fuso muda.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Configura-se o mesmo fuso em todas as máquinas» e fica-se por aí.</td></tr>
-        <tr><td>Mid</td><td>Sabe que deve ser <code>timestamptz</code>, mas acha que este guarda o fuso e não fala do dia de negócio.</td></tr>
-        <tr><td>Sénior</td><td>Explica a semântica dos dois tipos, corrige o modelo e introduz a coluna de dia de negócio com o fuso decidido a montante.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o mapeamento em Java, o efeito na hora de Verão, a migração dos dados existentes e o efeito no particionamento por data.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«<code>timestamptz</code> guarda o fuso original? Porque não?»</li>
-      <li>«Como converte a coluna existente sem perder informação?»</li>
-      <li>«E se cada <em>tenant</em> tiver o seu fuso contabilístico?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Acreditar que <code>timestamptz</code> guarda o fuso de origem.</li>
-      <li>Agrupar relatórios com <code>AT TIME ZONE</code> sobre a tabela inteira.</li>
-      <li>Mapear para <code>LocalDateTime</code> em Java e assumir UTC por convenção.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-20-11" data-box="qa" data-area="dados" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
+<div class="qa" id="q-20-9" data-box="qa" data-area="spring" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Para o estado do pagamento: tipo <code>ENUM</code> do PostgreSQL, <code>text</code> com <code>CHECK</code>, ou tabela de referência com chave estrangeira?</div>
+  <div class="qprompt">Temos um monólito Spring Boot com quatro áreas de negócio e não queremos microserviços. Como impede que os módulos se misturem, e o que é que o Spring Modulith acrescenta a isso?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Tabela de referência, salvo em dois casos. O critério é a frequência de mudança do conjunto e a quantidade de atributos que cada valor carrega.</p>
-      <p>O tipo <code>ENUM</code> é compacto — 4 bytes — e rápido, mas o conjunto vive no catálogo, não nos dados. Acrescentar um valor é <code>ALTER TYPE ... ADD VALUE</code>, uma migração; remover ou renomear um valor é bastante mais penoso e, na prática, obriga a recriar o tipo e a reescrever as colunas que o usam. A ordenação é a de declaração, o que surpreende quem espera ordem alfabética, e inserir um valor no meio exige <code>BEFORE</code>/<code>AFTER</code> explícito. Nenhum <em>driver</em> ou ferramenta o trata de forma uniforme.</p>
-      <p><code>text</code> com <code>CHECK (status IN (...))</code> é o meio-termo mais comum: legível, alterável com uma migração que substitui a restrição, e sem nada além do valor. Custa mais bytes por linha do que o <code>ENUM</code> e não permite anexar atributos ao estado.</p>
-      <p>A tabela de referência ganha quando o estado tem propriedades — se é terminal, se é visível ao cliente, a etiqueta traduzida, se permite reembolso. Essas propriedades são dados: passam a poder ser consultadas em SQL, alteradas sem migração de esquema e usadas em junções, em vez de ficarem espalhadas por <code>switch</code> no código. O custo é uma junção — normalmente irrelevante, porque a tabela tem dezenas de linhas e vive nas páginas em cache — e mais uma chave estrangeira a verificar por inserção.</p>
-      <p>Os dois casos em que não uso tabela: conjuntos verdadeiramente imutáveis e sem atributos, como o lado de uma transacção contabilística, onde <code>CHECK</code> chega; e colunas de altíssimo volume onde os 4 bytes do <code>ENUM</code> face aos 8 ou 12 de um código de texto se traduzem em gigabytes numa tabela de milhares de milhões de linhas.</p></div>
+      <p>Com três camadas de defesa, por ordem de custo. A primeira é gratuita: pacote de primeiro nível por área de negócio e tudo <em>package-private</em> excepto a API do módulo. A segunda é um teste automatizado que falha a compilação da <em>build</em> quando alguém importa de um pacote interno de outro módulo. A terceira, mais cara, é a separação em módulos Maven ou Gradle, em que a fronteira passa a ser verificada pelo compilador e as dependências ciclicas se tornam impossíveis.</p>
+      <p>O Spring Modulith entra na segunda camada e traz três coisas concretas. Uma verificação de estrutura executável num teste — os pacotes de primeiro nível são módulos, os seus subpacotes são internos por omissão, e a violação falha o teste com a lista de importações ilegais. Documentação gerada a partir do código, com o diagrama de dependências entre módulos, que é o único diagrama que não fica desactualizado. E integração com eventos: publicação entre módulos com registo persistente das entregas, o que dá reprocessamento de eventos falhados sem escrever um <em>outbox</em> à mão.</p>
+      <p>O valor real não é técnico, é de opção. Módulos com fronteiras verificadas mantêm em aberto a hipótese de extrair um serviço mais tarde, com um custo estimável — o que muda é o transporte entre módulos, de chamada de método para HTTP ou Kafka, não o desenho do domínio. Sem essa disciplina, a extracção começa por três semanas a desemaranhar importações e a decidir para que lado vai cada classe.</p>
+      <p>O custo e os limites: os módulos partilham a mesma base de dados e o mesmo processo, portanto continua a ser possível fazer uma transacção que atravessa dois módulos — a fronteira é de código, não de dados, e isso tem de ser dito. Impor que cada módulo só toque nas suas tabelas exige esquemas separados e revisão humana. E a comunicação entre módulos por eventos dentro do mesmo processo é mais difícil de depurar do que uma chamada directa: uma cadeia de cinco <em>listeners</em> não aparece em nenhum <em>stack trace</em> completo.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Escolhe por gosto, sem mencionar migrações nem atributos do estado.</td></tr>
-        <tr><td>Mid</td><td>Prefere <code>ENUM</code> «porque valida», sem saber o custo de alterar o tipo.</td></tr>
-        <tr><td>Sénior</td><td>Compara os três em migração, atributos, bytes e ferramentas, e escolhe com um critério explícito.</td></tr>
-        <tr><td>Staff</td><td>Acrescenta o efeito no mapeamento Java e nos contratos de API, e como evolui o conjunto de estados sem quebrar consumidores.</td></tr>
+        <tr><td>Insuficiente</td><td>«Combinamos na equipa e revemos nos <em>pull requests</em>» como única defesa.</td></tr>
+        <tr><td>Mid</td><td>Propõe convenções de pacotes e talvez ArchUnit, mas não usa visibilidade de Java nem sabe o que acontece à camada de dados.</td></tr>
+        <tr><td>Sénior</td><td>Visibilidade primeiro, teste de arquitectura a seguir, módulos de <em>build</em> em último; conhece o que o Modulith verifica e documenta; nomeia o limite da fronteira ao nível dos dados.</td></tr>
+        <tr><td>Staff</td><td>Enquadra a modularidade como opção de extracção futura com custo estimado, define o critério que dispararia a extracção, e reconhece o custo de depuração de cadeias de eventos internas.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como remove um valor de um <code>ENUM</code> já usado em produção?»</li>
-      <li>«Onde vive a máquina de estados — na base ou no domínio?»</li>
-      <li>«Como mapeia isto para um <code>enum</code> de Java sem partir com um valor novo?»</li></ul></div>
+      <li>«Dois módulos precisam da mesma tabela. O que faz?»</li>
+      <li>«Quando é que extrairia mesmo um módulo para serviço próprio?»</li>
+      <li>«Como testa um módulo isoladamente sem levantar a aplicação toda?»</li>
+      <li>«E se aparecer uma dependência circular entre dois módulos?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Guardar o ordinal do <code>enum</code> de Java na coluna.</li>
-      <li>Não saber que <code>ALTER TYPE ... ADD VALUE</code> é uma migração de esquema.</li>
-      <li>Duplicar a lista de estados na base e no código sem uma fonte única.</li></ul></div>
+      <li>Confundir modularidade com microserviços e propor a divisão em serviços como resposta imediata.</li>
+      <li>Assumir que a fronteira de código impede o acesso cruzado às tabelas.</li>
+      <li>Tudo <code>public</code> «porque o Spring precisa» — não precisa, os <em>beans</em> podem ser <em>package-private</em>.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-20-6" class="h2"><span class="secnum">20.6</span> Multi-tenancy no modelo de dados<a class="anchor" href="#sec-20-6" aria-label="ligação">#</a></h2>
+<figure class="listing java" id="lst-20-5"><div class="lhead"><span class="lnum">Listagem 20.5</span>
+<span class="lcap">Declaração de módulo e verificação da fronteira num teste de <em>build</em>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// com/acme/billing/subscription/package-info.java
+@org.springframework.modulith.ApplicationModule(
+    displayName = &quot;Subscrições&quot;,
+    allowedDependencies = { &quot;shared&quot;, &quot;invoice::api&quot; })   // só a API do módulo invoice
+package com.acme.billing.subscription;
 
-<p>Há três desenhos e a escolha faz-se por três eixos: isolamento exigido pelo contrato, custo operacional por <em>tenant</em> e distribuição do tamanho dos <em>tenants</em>. Discriminador partilhado é uma coluna <code>tenant_id</code> em todas as tabelas, com a mesma tabela a servir todos. Schema por <em>tenant</em> replica o conjunto de tabelas dentro da mesma base. Base por <em>tenant</em> replica tudo.</p>
+// src/test/java/com/acme/billing/ModularityTest.java
+class ModularityTest {
+    static final ApplicationModules MODULES = ApplicationModules.of(BillingApplication.class);
 
-<p>O discriminador escala em número de <em>tenants</em> e é o único desenho em que uma migração é uma operação. O seu ponto fraco é o isolamento: uma cláusula <code>WHERE</code> em falta é uma fuga de dados entre clientes, e é por isso que a coluna <code>tenant_id</code> não deve ser defendida apenas pelo código. A <em>row level security</em> do PostgreSQL aplica o predicado no motor: com <code>FORCE ROW LEVEL SECURITY</code> e uma política ligada a <code>current_setting('app.tenant_id')</code>, uma consulta escrita à mão numa consola continua isolada. O padrão em Spring Boot 3.x é executar <code>SET LOCAL app.tenant_id = ...</code> no início de cada transacção, a partir de um interceptor, para que o valor não sobreviva à devolução da ligação ao <em>pool</em>.</p>
+    @Test void semDependenciasIlegais() {
+        MODULES.verify();          // falha com a lista de importações que atravessam fronteiras
+    }
 
-<p>Schema por <em>tenant</em> dá isolamento perceptível e uma via natural de exportação, e paga-se em catálogo e em migrações. Com 2 000 <em>tenants</em> e 40 tabelas cada, são 80 000 relações mais os índices, com efeito no planeamento, no <em>autovacuum</em> e no tempo de <code>pg_dump</code>; uma migração que demore 200 ms por schema demora mais de 6 horas em série e obriga a orquestração, a acompanhamento de progresso e a tolerar o período em que metade dos <em>tenants</em> tem o esquema novo e a outra metade o antigo. Base por <em>tenant</em> dá o isolamento mais forte e o custo mais alto: um <em>pool</em> de ligações por base, cópias de segurança por base, e qualquer relatório agregado passa a ser um processo externo.</p>
+    @Test void documentacaoActualizada() {
+        new Documenter(MODULES).writeModulesAsPlantUml().writeModuleCanvases();
+    }
+}</code></pre></figure>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.2</span> Estratégias de multi-tenancy, avaliadas para 2 000 <em>tenants</em> com 40 tabelas por <em>tenant</em>.</div>
-<div class="tscroll"><table><thead><tr><th>Eixo</th><th>Discriminador <code>tenant_id</code></th><th>Schema por <em>tenant</em></th><th>Base por <em>tenant</em></th></tr></thead><tbody>
-<tr><td>Isolamento</td><td>Lógico; depende de RLS ou de disciplina no código</td><td>Por objecto; erro de <code>search_path</code> ainda é possível</td><td>Físico; a mais forte</td></tr>
-<tr><td>Migração de esquema</td><td>1 operação</td><td>2 000 operações orquestradas (&gt; 6 h em série a 200 ms cada)</td><td>2 000 operações e 2 000 janelas de manutenção</td></tr>
-<tr><td>Catálogo e planeamento</td><td>40 relações</td><td>≈ 80 000 relações mais índices; <em>autovacuum</em> e <code>pg_dump</code> sofrem</td><td>40 relações por base, mas 2 000 bases a monitorizar</td></tr>
-<tr><td>Ligações</td><td>Um <em>pool</em></td><td>Um <em>pool</em>, com <code>search_path</code> por transacção</td><td>Um <em>pool</em> por base; ou um <em>proxy</em> pelo meio</td></tr>
-<tr><td>Agregação entre <em>tenants</em></td><td>Uma consulta</td><td><code>UNION ALL</code> gerado ou vista externa</td><td>Processo de exportação e armazém de dados</td></tr>
-<tr><td>Raio de impacto de um erro</td><td>Todos os <em>tenants</em></td><td>Um <em>tenant</em> por objecto afectado</td><td>Um <em>tenant</em></td></tr>
-<tr><td>Quando escolher</td><td>SaaS com muitos <em>tenants</em> pequenos; distribuição homogénea</td><td>Dezenas a poucas centenas de <em>tenants</em>, com exigência contratual de separação</td><td>Poucos <em>tenants</em> grandes, requisitos de residência de dados ou de cifra por cliente</td></tr>
+<h2 id="sec-20-5" class="h2"><span class="secnum">20.5</span> Onde vive a lógica: serviço, entidade ou caso de uso<a class="anchor" href="#sec-20-5" aria-label="ligação">#</a></h2>
+
+<p>Existem três destinos possíveis para uma regra e um critério único para escolher entre eles. Se a regra só precisa do estado de um agregado, vive na raiz desse agregado como método. Se precisa de dois ou mais agregados já carregados, mas continua a ser uma decisão de negócio pura, vive num serviço de domínio — uma classe sem estado, sem anotações, que recebe os agregados como argumentos e devolve uma decisão. Se envolve carregar, chamar sistemas externos, demarcar a transacção ou publicar eventos, vive no caso de uso. Orquestração no caso de uso, decisão no domínio: é assim que se resume numa frase.</p>
+
+<p>O sinal de que uma regra está no sítio errado é o serviço de aplicação com condicionais sobre estado. Um <code>if (subscription.getStatus() == ACTIVE &amp;&amp; subscription.getFailures() &gt; 2)</code> dentro do caso de uso é lógica de domínio a escapar: a mesma condição vai reaparecer noutro caso de uso com um limite diferente. O caso de uso deve ler-se como uma sequência de passos sem ramificações de negócio — carregar, decidir no domínio, chamar a porta, gravar, publicar.</p>
+
+<p>É também aqui que a conversa sobre CQRS aparece naturalmente. A separação entre o caminho de escrita — que carrega agregados, valida invariantes e é lento por natureza — e o caminho de leitura — que quer projecções planas e rápidas — resolve uma tensão real. A forma barata é dois caminhos de código sobre o mesmo esquema; a forma cara é dois modelos de dados com sincronização assíncrona, e essa exige uma justificação numérica.</p>
+
+<div class="qa" id="q-20-10" data-box="qa" data-area="design" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">SOLID e design patterns</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O desconto de fidelidade depende do plano da subscrição e do histórico de pagamentos do cliente — dois agregados. Onde põe esse cálculo e porquê?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Num serviço de domínio sem estado, por exemplo <code>LoyaltyDiscountPolicy</code>, com assinatura <code>Money discountFor(Subscription subscription, PaymentHistory history)</code>. Não vai para dentro de <code>Subscription</code> porque a subscrição teria de conhecer o histórico de pagamentos, e uma referência entre agregados quebra a regra de que só se referenciam por identificador. Não vai para o caso de uso porque é uma decisão de negócio que se quer testar sozinha, com uma tabela de casos, e reutilizar noutro fluxo — por exemplo, na pré-visualização do preço antes da renovação.</p>
+      <p>O caso de uso fica com o trabalho de infra-estrutura: carrega a subscrição pelo repositório, carrega o histórico pela sua porta, chama a política, aplica o resultado ao agregado com <code>subscription.applyDiscount(discount)</code> — método que valida que o desconto não excede o valor devido — e grava. A política não sabe de onde vieram os dados; o caso de uso não sabe como se calcula o desconto. Cada um testa-se sem o outro.</p>
+      <p>O teste que confirma a escolha é escrever o teste primeiro. Se o teste da regra de desconto precisar de <em>mocks</em> de repositórios, a regra está no sítio errado. A versão correcta é um teste de tabela com dez linhas — plano, número de pagamentos pontuais, atrasos, desconto esperado — sem Spring, sem base de dados, a correr em milissegundos. Numa suite com duzentos casos de negócio, essa diferença é a diferença entre uma <em>build</em> de 40 segundos e uma de oito minutos.</p>
+      <p>Quando o serviço de domínio é excesso: se o cálculo tiver três linhas e for usado num sítio só, um método privado no caso de uso é honesto e extrai-se depois. A regra prática é extrair na segunda utilização, ou na primeira em que o teste exigir <em>mocks</em> para chegar à regra.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Tudo no serviço de aplicação, com o repositório injectado e a regra misturada com o carregamento.</td></tr>
+        <tr><td>Mid</td><td>Cria uma classe <code>DiscountService</code> anotada com <code>@Service</code> que injecta repositórios e carrega os dados por si própria.</td></tr>
+        <tr><td>Sénior</td><td>Serviço de domínio puro que recebe os agregados como argumentos; justifica com testabilidade e reutilização; mantém a orquestração no caso de uso.</td></tr>
+        <tr><td>Staff</td><td>Trata a política como peça substituível e versionada — descontos mudam por campanha — e discute como aplicar uma regra nova sem recalcular o histórico já facturado.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o desconto precisar de uma chamada a um serviço externo de <em>rating</em>?»</li>
+      <li>«Como testa a política sem levantar Spring?»</li>
+      <li>«Se a regra mudar em Janeiro, como reproduz o cálculo de Dezembro?»</li>
+      <li>«Onde põe o arredondamento e a moeda?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Injectar repositórios num serviço de domínio e chamá-lo puro.</li>
+      <li>Guardar o histórico de pagamentos dentro do agregado da subscrição para «facilitar».</li>
+      <li>Testar a regra apenas através de um teste de <em>endpoint</em> com base de dados.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-20-11" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O ecrã de gestão de subscrições faz sete <em>joins</em> e está a 900 ms no p95. Alguém propõe CQRS com base de leitura separada e, já agora, <em>event sourcing</em>. O que faz?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Separa-se a proposta em três degraus com custos muito diferentes e escolhe-se o mais baixo que resolve o problema medido. Degrau um: caminho de leitura separado no mesmo esquema — uma consulta SQL projectada directamente para o DTO, sem passar por agregados, mais índices adequados. Custo: dias. Resolve a maioria dos casos de 900 ms, porque a lentidão costuma vir de carregar agregados completos e de índices em falta, não da forma do esquema.</p>
+      <p>Degrau dois: modelo de leitura desnormalizado, actualizado por eventos, numa tabela própria ou noutro motor. Custo: uma <em>pipeline</em> de sincronização, reconstrução da projecção quando o formato muda, monitorização do atraso de replicação, e uma interface que tem de lidar com leituras desactualizadas — o utilizador grava e não vê a alteração. Esta última parte é a que mata projectos: exige decisões de produto sobre o que fazer no <em>write-then-read</em>, e a resposta habitual é ler o próprio agregado depois de escrever, o que reintroduz o caminho de escrita na leitura.</p>
+      <p>Degrau três, <em>event sourcing</em>: guardar os factos em vez do estado. O que se ganha é auditoria completa, capacidade de reconstruir qualquer estado passado e projecções novas sobre história antiga — valioso em domínios financeiros e regulados. O custo real, que raramente é dito: migração de esquema deixa de existir e passa a haver versionamento de eventos, com <em>upcasters</em> para ler eventos escritos há dois anos; consultas por atributo obrigam sempre a uma projecção, porque a loja de eventos só sabe procurar por identificador; é preciso <em>snapshots</em> a cada centena de eventos para o carregamento não degradar; apagar dados pessoais num registo imutável exige criptografia por sujeito com destruição da chave; e a curva de aprendizagem da equipa mede-se em meses, não em <em>sprints</em>. Nada disto se justifica para um ecrã lento.</p>
+      <p>A resposta que se dá em entrevista é portanto: primeiro medir onde estão os 900 ms — plano de execução, número de linhas lidas, tempo de rede — e aplicar o degrau um. CQRS completo justifica-se quando as cargas de leitura e escrita divergem em ordem de grandeza (por exemplo, 50 000 leituras por segundo contra 200 escritas) ou quando o modelo de leitura é genuinamente diferente do de escrita. <em>Event sourcing</em> justifica-se quando o histórico de alterações é requisito de negócio, e não quando é um efeito colateral desejável.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Aceita a proposta e começa a desenhar a loja de eventos sem perguntar de onde vêm os 900 ms.</td></tr>
+        <tr><td>Mid</td><td>Explica CQRS e <em>event sourcing</em> correctamente como conceitos, mas não hierarquiza soluções por custo nem propõe medir primeiro.</td></tr>
+        <tr><td>Sénior</td><td>Mede antes de decidir; propõe o caminho de leitura separado no mesmo esquema; nomeia o problema de leitura desactualizada e o custo de versionamento de eventos.</td></tr>
+        <tr><td>Staff</td><td>Define os limiares numéricos que justificariam cada degrau, trata o apagamento de dados pessoais num registo imutável, e avalia o custo de formação da equipa como parte da decisão.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O utilizador grava e não vê a alteração. Como resolve?»</li>
+      <li>«Como reconstrói uma projecção com 200 milhões de eventos sem parar o serviço?»</li>
+      <li>«Como responde a um pedido de apagamento do RGPD numa loja de eventos?»</li>
+      <li>«Que métrica olharia para saber que a projecção está atrasada?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <em>event sourcing</em> como solução de desempenho.</li>
+      <li>Não distinguir CQRS de <em>event sourcing</em>, tratando-os como um só padrão.</li>
+      <li>Ignorar por completo a consistência eventual do lado da interface.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-20-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 20.1 — Portas e adaptadores de um caso de uso de subscrição</span>
+    <div class="labpills"><span class="qpill">Desenho</span><span class="qpill">25 min</span></div></div>
+  <div class="labbody">
+    <p>Enunciado: implementar o caso de uso «cancelar subscrição com efeito no fim do período», que tem de (1) validar que a subscrição está activa ou suspensa, (2) marcar o cancelamento para a data de fim do período corrente, (3) pedir ao <em>gateway</em> de pagamentos que cancele o mandato de débito, e (4) publicar um facto de negócio para que a facturação deixe de emitir. Restrições: o pacote <code>domain</code> não pode importar Spring, Jakarta nem qualquer SDK; a transacção cobre um só agregado; a chamada ao <em>gateway</em> pode falhar por rede e não pode deixar o sistema num estado em que o cliente foi cancelado no nosso lado e continua a ser cobrado no do fornecedor. Escrever as interfaces das portas, a assinatura do serviço de aplicação e o método de domínio — corpo de implementação só onde houver decisão. Entrada de exemplo: subscrição activa com período de 2026-01-15 a 2026-02-15, pedido de cancelamento a 2026-01-20. Saída esperada: estado <code>PENDING_CANCELLATION</code>, data efectiva 2026-02-15, um evento <code>SubscriptionCancellationScheduled</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing java" id="lst-20-6"><div class="lhead"><span class="lnum">Listagem 20.6</span>
+        <span class="lcap">Porta de entrada, domínio e orquestração com o efeito externo fora da transacção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// ---------- domain ----------
+public final class Subscription {
+    private SubscriptionStatus status;
+    private BillingPeriod currentPeriod;
+    private LocalDate cancellationEffectiveOn;
+    private final List&lt;DomainEvent&gt; events = new ArrayList&lt;&gt;();
+
+    public LocalDate scheduleCancellation(LocalDate requestedOn) {
+        if (status != SubscriptionStatus.ACTIVE &amp;&amp; status != SubscriptionStatus.SUSPENDED)
+            throw new IllegalStateTransition(id, status, &quot;scheduleCancellation&quot;);
+        if (requestedOn.isAfter(currentPeriod.end()))
+            throw new IllegalArgumentException(&quot;pedido fora do período corrente&quot;);
+        this.status = SubscriptionStatus.PENDING_CANCELLATION;
+        this.cancellationEffectiveOn = currentPeriod.end();
+        events.add(new SubscriptionCancellationScheduled(id, cancellationEffectiveOn));
+        return cancellationEffectiveOn;
+    }
+}
+
+// ---------- application: portas ----------
+public interface CancelSubscription {                       // porta de entrada
+    CancellationResult handle(CancelSubscriptionCommand command);
+}
+public interface SubscriptionRepository {                    // porta de saída
+    Optional&lt;Subscription&gt; findById(SubscriptionId id);
+    void save(Subscription subscription);
+}
+public interface MandateGateway {                            // porta de saída
+    void revoke(MandateReference reference, IdempotencyKey key);
+}
+
+// ---------- application: orquestração ----------
+@Service
+class CancelSubscriptionService implements CancelSubscription {
+
+    @Override
+    public CancellationResult handle(CancelSubscriptionCommand command) {
+        // 1) transacção curta: decisão de domínio + outbox, sem rede lá dentro
+        CancellationResult result = tx.execute(status -&gt; {
+            Subscription subscription = repository.findById(command.id())
+                    .orElseThrow(() -&gt; new SubscriptionNotFound(command.id()));
+            LocalDate effective = subscription.scheduleCancellation(command.requestedOn());
+            repository.save(subscription);
+            subscription.pullEvents().forEach(outbox::append);
+            outbox.append(new RevokeMandateRequested(command.id(), subscription.mandate()));
+            return new CancellationResult(command.id(), effective);
+        });
+        return result;   // 2) a revogação do mandato é feita pelo consumidor do outbox
+    }
+}
+
+// ---------- adapter: consumidor do outbox, idempotente e com retentativa ----------
+@Component
+class RevokeMandateHandler {
+    void on(RevokeMandateRequested request) {
+        gateway.revoke(request.mandate(), IdempotencyKey.of(request.subscriptionId()));
+    }
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A decisão de tirar a chamada de rede de dentro da transacção é o ponto principal: com o <em>gateway</em> lá dentro, a transacção dura o tempo do fornecedor (centenas de milissegundos, ou o <em>timeout</em>) e mantém bloqueios de linha durante esse tempo.</li>
+        <li>Consistência: o <em>outbox</em> garante que a revogação acontece pelo menos uma vez mesmo que o processo morra; a chave de idempotência garante que duas entregas não produzem dois efeitos no fornecedor.</li>
+        <li>Casos limite a nomear em voz alta: pedido repetido (deve ser idempotente e devolver a mesma data efectiva), subscrição já cancelada (excepção de domínio, não <code>IllegalStateException</code> genérica), pedido com data fora do período, e cancelamento imediato — variante frequente que muda a invariante e deve ser um método distinto.</li>
+        <li>O domínio não importa Spring: <code>scheduleCancellation</code> testa-se com três linhas de JUnit e sem contexto, o que permite cobrir a matriz de estados por completo.</li>
+        <li>O que faz falhar o exercício: pôr o <code>if</code> do estado no serviço de aplicação, devolver a entidade JPA em <code>CancellationResult</code>, ou publicar o evento em Kafka dentro da transacção.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-20-6" class="h2"><span class="secnum">20.6</span> Custo da arquitectura: quando hexagonal é excesso<a class="anchor" href="#sec-20-6" aria-label="ligação">#</a></h2>
+
+<p>A parte honesta desta conversa é que a arquitectura hexagonal cobra sempre e só paga em certas condições. Cobra em ficheiros: um caso de uso que em camadas simples ocupa controlador, serviço e repositório passa a ocupar entre seis e oito tipos, mais o mapeamento entre representações. Cobra em navegação: seguir um pedido do <em>endpoint</em> até ao SQL passa por mais dois saltos de indirecção, o que penaliza quem entra na equipa. Cobra em tempo de escrita: acrescentar um campo que atravessa as três representações toca em quatro ou cinco ficheiros em vez de um.</p>
+
+<p>Paga quando existem invariantes não triviais, quando o domínio tem vocabulário próprio que o negócio usa, quando a suite de testes precisa de ser rápida porque tem centenas de casos de regra, e quando a integração externa é volátil. Se nenhuma destas condições for verdadeira — e num CRUD administrativo nenhuma é — o resultado é cerimónia sem retorno. Um serviço de gestão de tabelas de referência, um <em>backoffice</em> de configuração, um agregador que lê de três APIs e devolve JSON: nestes casos, controlador com validação, serviço fino e Spring Data com projecções é a resposta certa, e defendê-la numa entrevista é sinal de maturidade, não de preguiça — desde que venha acompanhada do critério que faria mudar de ideias.</p>
+
+<p>A escolha também não tem de ser uniforme dentro do mesmo repositório. O módulo de subscrições, onde vivem as invariantes e o dinheiro, ganha a estrutura completa; o módulo de tabelas de referência, ao lado, fica em duas camadas. Uma equipa que consegue justificar por módulo está a demonstrar que a arquitectura é uma decisão de custo e não uma identidade.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 20.2</span> Sinais que empurram para cada extremo, com o custo que se aceita.</div>
+<div class="tscroll"><table><thead><tr><th>Sinal observável</th><th>Escolha indicada</th><th>Custo aceite</th></tr></thead><tbody>
+<tr><td>Máquina de estados com 5+ transições e regras de transição</td><td>Domínio rico com portas de saída</td><td>2 a 3 vezes mais tipos por caso de uso</td></tr>
+<tr><td>Suite de testes de negócio com 200+ casos</td><td>Núcleo sem Spring, testado sem contexto</td><td>Mapeamento entre domínio e persistência</td></tr>
+<tr><td>Integração com 2+ fornecedores externos voláteis</td><td>Portas de saída com tradução no adaptador</td><td>Tipos próprios para resultados e falhas</td></tr>
+<tr><td>Entidades sem invariantes; API espelha as tabelas</td><td>Camadas simples com Spring Data</td><td>Refactorização futura se aparecerem regras</td></tr>
+<tr><td>Serviço com ciclo de vida previsto de 6 a 12 meses</td><td>Camadas simples</td><td>Substituição em vez de evolução</td></tr>
+<tr><td>Equipa de 2 pessoas, produto ainda a procurar o modelo</td><td>Camadas simples, fronteiras por pacote</td><td>Custo de introduzir portas mais tarde</td></tr>
 </tbody></table></div></div>
 
-<figure class="listing sql" id="lst-20-6"><div class="lhead"><span class="lnum">Listagem 20.6</span>
-<span class="lcap">Discriminador com particionamento por hash e isolamento imposto pelo motor.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="sql"><code>CREATE TABLE invoice (
-    tenant_id   uuid          NOT NULL,
-    id          bigint        GENERATED ALWAYS AS IDENTITY,
-    number      text          NOT NULL,
-    total       numeric(18,4) NOT NULL CHECK (total &gt;= 0),
-    issued_at   timestamptz   NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, id)
-) PARTITION BY HASH (tenant_id);
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>A migração de camadas simples para hexagonal é incremental e barata quando a divisão de pacotes já é por funcionalidade: extrai-se a interface do repositório, move-se a entidade JPA para o adaptador e cria-se o objecto de domínio, um módulo de cada vez. O que é caro é a migração no sentido inverso da divisão de pacotes — de <code>controller/service/repository</code> para <code>subscription/invoice/dunning</code> — porque toca em todos os ficheiros ao mesmo tempo e colide com todos os ramos abertos. Por isso a decisão que se toma no dia um não é «hexagonal ou não», é «por funcionalidade ou por camada».</p></aside>
 
-CREATE TABLE invoice_p0 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 0);
-CREATE TABLE invoice_p1 PARTITION OF invoice FOR VALUES WITH (MODULUS 8, REMAINDER 1);
--- ... p2 a p7
-
--- numa tabela particionada, o índice único tem de conter a chave de partição
-CREATE UNIQUE INDEX invoice_number_uq ON invoice (tenant_id, number);
-CREATE INDEX invoice_issued_ix        ON invoice (tenant_id, issued_at DESC);
-
-ALTER TABLE invoice ENABLE ROW LEVEL SECURITY;
-ALTER TABLE invoice FORCE  ROW LEVEL SECURITY;   -- aplica-se também ao dono da tabela
-
-CREATE POLICY invoice_tenant_isolation ON invoice
-    USING      (tenant_id = current_setting('app.tenant_id', true)::uuid)
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
-
--- em cada transacção da aplicação, antes da primeira consulta:
---   SET LOCAL app.tenant_id = '3f1c...';   -- LOCAL: morre no COMMIT, não polui o pool</code></pre></figure>
-
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Com o discriminador, <code>tenant_id</code> deve ser a primeira coluna de praticamente todos os índices. Não é uma questão de estética: torna cada índice uma colecção de intervalos contíguos por <em>tenant</em>, o que mantém as leituras de um <em>tenant</em> pequeno em poucas páginas mesmo quando a tabela global tem mil milhões de linhas, e permite ao planeador eliminar partições quando existe particionamento por <code>tenant_id</code>.</p></aside>
-
-<div class="qa" id="q-20-12" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Bases de dados</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">SaaS B2B com 2 000 <em>tenants</em>: 1 900 têm menos de 10 mil linhas e 4 têm mais de 300 milhões, e dois clientes exigem por contrato que os seus dados estejam separados. Que estratégia de multi-tenancy propõe?</div>
+<div class="qa" id="q-20-12" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Descreva-me um serviço em que não usaria arquitectura hexagonal. Como o estruturaria e o que o faria mudar de ideias mais tarde?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>Proponho um modelo híbrido, porque a distribuição é fortemente assimétrica e a exigência contratual só existe para dois clientes: discriminador <code>tenant_id</code> partilhado como padrão, base dedicada para os dois clientes com cláusula de separação, e uma decisão explícita sobre os quatro <em>tenants</em> gigantes.</p>
-      <p>O padrão é o discriminador com <code>tenant_id uuid</code> como primeira coluna de todas as chaves primárias e de todos os índices, particionamento por hash de <code>tenant_id</code>, e <em>row level security</em> com <code>FORCE</code> para que o isolamento não dependa de nenhuma cláusula <code>WHERE</code> escrita à mão. Isto resolve os 1 900 pequenos com uma migração por implantação e um <em>pool</em> de ligações. Schema por <em>tenant</em> está fora: 2 000 schemas por 40 tabelas são 80 000 relações e uma migração que demora horas.</p>
-      <p>Os quatro gigantes são o problema interessante. Com particionamento por hash, cada um cai numa partição e desequilibra-a; a saída é uma lista de partições dedicadas para esses <em>tenants</em> e hash para o resto, ou uma partição por <em>tenant</em> nos que passem um limite acordado, digamos 50 milhões de linhas. Isso mantém as varreduras e o <em>autovacuum</em> contidos por <em>tenant</em> e dá um caminho de saída barato: se um gigante crescer para lá do que a instância aguenta, extrai-se a partição.</p>
-      <p>Os dois clientes contratuais vão para bases dedicadas com o mesmo esquema e o mesmo código; o encaminhamento é uma <code>DataSource</code> escolhida por <em>tenant</em>, com um catálogo de <em>tenants</em> a mapear identificador para <em>datasource</em>. O custo que digo em voz alta: passa a haver dois caminhos de migração e é preciso um teste que garanta que os dois esquemas convergem, além de relatórios agregados que já não são uma consulta única. É o preço de vender a esses dois clientes.</p></div>
+      <p>Um serviço de gestão de catálogo de planos: seis entidades, regras que são validações de formato e de unicidade, dez <em>endpoints</em> CRUD e um consumidor — o <em>backoffice</em> interno. Aqui a estrutura é controlador com DTO validados, um serviço fino que demarca a transacção, e Spring Data com projecções para as leituras. Duas representações, não três; sem portas de saída, porque não há sistema externo. O ganho é directo: um campo novo toca em dois ficheiros e uma migração, e um programador que entra na equipa lê o fluxo completo em dez minutos.</p>
+      <p>A honestidade que o entrevistador procura está no critério de reversão, e deve ser dito com sinais observáveis, não com «se ficar complexo». Três gatilhos concretos: aparece a primeira máquina de estados com mais de três transições e regras sobre elas; aparece a segunda integração externa com um fornecedor que pode ser substituído; ou os testes de regra de negócio passam a precisar de base de dados e a <em>build</em> ultrapassa poucos minutos. Qualquer um destes justifica extrair o domínio de um módulo — não de todos.</p>
+      <p>O que se mantém desde o primeiro dia, porque é barato e caro de acrescentar depois: a divisão de pacotes por funcionalidade e a proibição de expor entidades JPA no contrato REST. Estas duas decisões custam praticamente nada em camadas simples e são exactamente as que tornam possível migrar mais tarde módulo a módulo. Sem elas, a migração passa a ser uma reescrita.</p>
+      <p>Há um argumento adicional que costuma pesar mais do que o técnico: a equipa. Uma estrutura que a equipa não entende é aplicada mal — portas com métodos que espelham o SDK, serviços de domínio com repositórios injectados, objectos de domínio anémicos com mais três camadas à volta. O resultado é o pior dos dois mundos: o custo da indirecção sem o benefício do isolamento. Introduzir a estrutura num módulo, com uma pessoa a acompanhar, e alargar depois de a equipa ver o retorno, é mais eficaz do que impô-la por norma de arquitectura.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Escolhe uma das três estratégias sem olhar à distribuição de tamanhos nem ao requisito contratual.</td></tr>
-        <tr><td>Mid</td><td>Propõe discriminador com <code>tenant_id</code> e filtro no repositório; não menciona RLS, particionamento nem os <em>tenants</em> gigantes.</td></tr>
-        <tr><td>Sénior</td><td>Discriminador com RLS e <code>tenant_id</code> à cabeça dos índices, particionamento, e reconhece a necessidade de tratamento especial para os grandes e os contratuais.</td></tr>
-        <tr><td>Staff</td><td>Desenha o híbrido, o encaminhamento de <code>DataSource</code>, a convergência dos esquemas, o custo operacional dos dois caminhos e o critério para promover um <em>tenant</em> a base dedicada.</td></tr>
+        <tr><td>Insuficiente</td><td>«Uso sempre hexagonal» ou «nunca uso, é excesso de engenharia», sem critério em nenhum dos casos.</td></tr>
+        <tr><td>Mid</td><td>Reconhece que depende do contexto mas o critério é vago — «se o projecto for grande» — e não nomeia sinais observáveis.</td></tr>
+        <tr><td>Sénior</td><td>Dá um exemplo concreto de serviço em camadas simples, quantifica o ganho, e define gatilhos de reversão observáveis.</td></tr>
+        <tr><td>Staff</td><td>Decide por módulo dentro do mesmo repositório, preserva as duas decisões baratas que mantêm a migração possível, e inclui a capacidade da equipa no critério.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Como move um <em>tenant</em> do partilhado para uma base dedicada sem indisponibilidade?»</li>
-      <li>«Onde põe o <code>SET LOCAL</code> do <em>tenant</em> e o que acontece se o esquecer?»</li>
-      <li>«Qual é o custo da RLS no plano de execução e como o mede?»</li>
-      <li>«Como impede um <em>tenant</em> grande de esgotar o <em>pool</em> partilhado?»</li></ul></div>
+      <li>«Esse serviço cresceu para trinta <em>endpoints</em>. Muda alguma coisa?»</li>
+      <li>«Como convence uma equipa que quer hexagonal em tudo?»</li>
+      <li>«Quanto tempo demorou a última migração deste tipo que fez?»</li>
+      <li>«E se a norma da empresa impuser a estrutura completa?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Isolamento assente apenas em filtros do ORM.</li>
-      <li>Propor schema por <em>tenant</em> para 2 000 <em>tenants</em> sem contar as migrações.</li>
-      <li>Não indexar <code>tenant_id</code> como primeira coluna.</li>
-      <li>Guardar o <code>tenant_id</code> numa variável de sessão sem <code>LOCAL</code>, com <em>pool</em> de ligações.</li></ul></div>
+      <li>Tratar a escolha como identidade pessoal em vez de decisão de custo.</li>
+      <li>Não conseguir nomear um único sinal que o faria mudar de opinião.</li>
+      <li>Propor a estrutura completa para um serviço de três <em>endpoints</em> com ciclo de vida de seis meses.</li></ul></div>
   </div>
 </div>
 
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>A RLS aplica o isolamento no motor e sobrevive a SQL escrito à mão, a novos serviços e a correcções em incidente; em troca, o predicado entra em todos os planos e o depuramento fica menos óbvio, porque uma consulta pode devolver zero linhas por causa de uma variável de sessão em falta. Se a base for escrita por um único serviço bem testado e a auditoria não exigir controlo no motor, um filtro central com teste de arquitectura é mais simples; assim que existe um segundo escritor, a RLS deixa de ser opcional.</p></aside>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Portas de entrada com uma só implementação são a parte da arquitectura hexagonal com pior relação custo-benefício: acrescentam um ficheiro por caso de uso e um salto na navegação, e o benefício — poder trocar a implementação — quase nunca se concretiza. Omiti-las, mantendo apenas as portas de saída, conserva a propriedade que importa (testar a aplicação sem infra-estrutura) e corta uma fatia visível do custo. A escolha contrária ganha quando o mesmo caso de uso é servido por três adaptadores diferentes — REST, mensagem e <em>job</em> — e a interface documenta o contrato partilhado.</p></aside>
 
 <h2 id="sec-20-7" class="h2"><span class="secnum">20.7</span> Resumo e checklist<a class="anchor" href="#sec-20-7" aria-label="ligação">#</a></h2>
 
 <p>O que reter deste capítulo, na forma em que é útil dentro da entrevista:</p>
 
 <ul class="lst">
-<li>Normalizar até 3FN é o ponto de partida; copiar valores históricos — preço, morada de facturação — não é violação de 3FN, é modelar factos diferentes.</li>
-<li>Desnormalizar só depois de o plano de execução estar correcto, com rácio de leitura/escrita conhecido e um mecanismo de detecção de divergência.</li>
-<li>A chave primária propaga-se a todas as chaves estrangeiras e índices: 8 bytes de diferença por linha tornam-se gigabytes e páginas a competir por <code>shared_buffers</code>.</li>
-<li>UUIDv4 destrói a localidade de escrita no B-tree — divisões de página e folhas a 50-70%; UUIDv7 ou ULID devolvem a localidade sem exigir coordenação.</li>
-<li>Chave natural fica como <code>UNIQUE</code>, nunca como primária: os identificadores de negócio mudam, são largos e nem sempre existem no momento da inserção.</li>
-<li>As <em>constraints</em> defendem contra todos os escritores, não só contra a aplicação actual; adicionam-se com <code>NOT VALID</code> seguido de <code>VALIDATE</code> para não bloquear tabelas grandes.</li>
-<li><code>ON DELETE CASCADE</code> só em composição estrita e cardinalidade pequena; o lado filho da chave estrangeira precisa sempre de índice.</li>
-<li>Reversibilidade, histórico e auditoria são três requisitos com três estruturas; <em>soft delete</em> exige índices únicos parciais e uma janela de retenção.</li>
-<li>Dinheiro em <code>numeric</code> ou em unidades menores; tempo em <code>timestamptz</code>, com o dia de negócio como coluna <code>date</code> própria.</li>
+  <li>Hexagonal, <em>clean</em> e <em>onion</em> discordam em vocabulário e concordam no essencial: a regra da dependência. Tudo o que o interior conhece do exterior é uma interface que o próprio interior declarou.</li>
+  <li>Dividir pacotes por funcionalidade e só depois por camada transforma a fronteira arquitectural numa regra do compilador, através de <em>package-private</em>, em vez de uma convenção.</li>
+  <li>O agregado define-se pela invariante que tem de ser verdadeira a cada instante, não pelo diagrama de tabelas. Uma transacção, um agregado; entre agregados, identificadores e consistência eventual.</li>
+  <li>Contagem seguida de inserção não protege nenhuma invariante em <em>read committed</em>: ou há <em>constraint</em> na base de dados, ou bloqueio de linha, ou aceita-se a violação transitória com compensação acordada.</li>
+  <li>Eventos de domínio publicam-se depois do <em>commit</em>; para consumidores noutro serviço, sem <em>outbox</em> existe uma janela de perda silenciosa entre o <em>commit</em> e a publicação.</li>
+  <li>Orquestração no caso de uso, decisão no domínio. Um <code>if</code> sobre estado dentro do serviço de aplicação é lógica de domínio a escapar.</li>
+  <li>CQRS tem três degraus de custo muito diferentes; <em>event sourcing</em> justifica-se por requisito de auditoria, nunca por desempenho, e o custo escondido está no versionamento de eventos e no apagamento de dados pessoais.</li>
+  <li>A arquitectura hexagonal cobra sempre. Num CRUD sem invariantes, camadas simples é a resposta correcta — desde que acompanhada dos gatilhos observáveis que a fariam mudar.</li>
 </ul>
 
-<p>Checklist para rever um esquema, próprio ou dado numa entrevista:</p>
+<p>Checklist accionável antes de uma ronda de arquitectura de aplicação:</p>
 
 <ul class="lst">
-<li>Cada tabela tem chave primária declarada e ela é estreita, imutável e disponível na inserção.</li>
-<li>Se a chave é <code>uuid</code>, é v7 ou ULID, é do tipo <code>uuid</code> e não de texto, e existe razão para não ser <code>bigint</code>.</li>
-<li>Toda a coluna de chave estrangeira tem índice; todo o <code>CASCADE</code> tem cardinalidade máxima conhecida.</li>
-<li>Cada invariante estrutural tem <code>NOT NULL</code>, <code>CHECK</code>, <code>UNIQUE</code> ou <code>EXCLUDE</code> — e cada <code>UNIQUE</code> foi revista contra o <em>soft delete</em>.</li>
-<li>Nenhuma coluna monetária é <code>double precision</code>, <code>real</code> ou <code>money</code>; a escala aguenta taxas e preços unitários.</li>
-<li>Todas as colunas de instante são <code>timestamptz</code>; as horas de parede estão identificadas e justificadas.</li>
-<li>Existe resposta escrita para «qual era o valor a 12 de Março» ou existe decisão explícita de não a suportar.</li>
-<li>Em multi-tenancy, <code>tenant_id</code> é a primeira coluna dos índices e o isolamento não depende de nenhuma cláusula <code>WHERE</code> escrita à mão.</li>
-<li>Cada migração pendente foi avaliada quanto ao bloqueio que adquire e ao tempo que o mantém na maior tabela afectada.</li>
+  <li>Ter na ponta da língua a estrutura de pacotes de um serviço real que se manteve, com o nome dos módulos de primeiro nível e a razão dessa divisão.</li>
+  <li>Preparar uma invariante concreta do último sistema e explicar como foi garantida — <em>constraint</em>, bloqueio ou compensação — com o nível de isolamento nomeado.</li>
+  <li>Saber dizer quantas representações do mesmo conceito existiam e quem era dono de cada uma.</li>
+  <li>Ter um exemplo de regra que foi movida do serviço para a entidade e o defeito concreto que isso eliminou.</li>
+  <li>Saber desenhar o <em>outbox</em> no quadro em menos de dois minutos, incluindo a tabela, o processo publicador e a idempotência do consumidor.</li>
+  <li>Levar um número da suite de testes: quantos testes de domínio correm sem contexto Spring e em quanto tempo.</li>
+  <li>Preparar um serviço da própria experiência que deliberadamente não foi feito em hexagonal, e os gatilhos que teriam mudado a decisão.</li>
+  <li>Rever a diferença entre evento de domínio e evento de integração, e quem é dono do esquema de cada um.</li>
+  <li>Treinar a resposta a «isto não é excesso de engenharia?» sem defensiva: nomear o custo primeiro, o benefício depois, e a condição de reversão no fim.</li>
 </ul>

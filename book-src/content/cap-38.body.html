@@ -1,0 +1,808 @@
+<p>Uma ronda de segurança aplicacional para backend sénior não mede se o candidato sabe explorar um sistema: mede se escreve e revê código que não precisa de ser explorado para se perceber que está errado. O entrevistador procura três coisas — se o candidato reconhece a classe de vulnerabilidade a partir da forma do código, se conhece o controlo idiomático da <em>stack</em> (Spring Security 6, JDBC, Jackson, o fornecedor de identidade) e se sabe onde é que o controlo tem de ficar para não ser esquecido no próximo <em>endpoint</em>. Onde os candidatos caem é na terceira: sabem dizer «usa-se <em>prepared statement</em>» mas colocam a verificação de propriedade num <code>if</code> dentro do controlador, que a próxima pessoa a escrever um método esquece. Este capítulo trata a matéria pela perspectiva defensiva: código vulnerável ao lado do código corrigido, e a discussão de onde é que a correcção pertence.</p>
+
+<h2 id="sec-38-1" class="h2"><span class="secnum">38.1</span> OWASP Top 10 aplicado a um serviço Java<a class="anchor" href="#sec-38-1" aria-label="ligação">#</a></h2>
+
+<p>O OWASP Top 10 de 2021 não é uma lista de ataques, é uma lista de categorias de falha ordenada por prevalência nos dados de teste recolhidos. Num serviço Java típico — Spring Boot 3.x atrás de um <em>gateway</em>, PostgreSQL, Kafka, sem HTML servido pelo backend — a distribuição real do risco é muito desigual: A01 (controlo de acesso quebrado) e A03 (injecção) explicam a esmagadora maioria dos achados de uma auditoria, A06 (componentes vulneráveis) explica quase todo o ruído de alertas, e categorias como A10 (SSRF) só aparecem se o serviço fizer pedidos HTTP a URLs que o utilizador controla.</p>
+
+<p>A tradução para a arquitectura importa mais do que a memorização da lista. Num serviço que só devolve JSON, o XSS deixa de ser um problema do backend e passa a ser um problema do cliente que renderiza — mas só se o backend não servir HTML, não devolver ficheiros com <em>content type</em> adivinhado e não escrever dados não confiáveis em respostas de erro. O CSRF, do mesmo modo, só aplica quando a credencial é enviada automaticamente pelo navegador, ou seja, quando há <em>cookie</em> de sessão; com um cabeçalho <code>Authorization: Bearer</code> não há CSRF porque o navegador não anexa o cabeçalho sozinho. Dizer isto em entrevista vale mais do que recitar dez categorias.</p>
+
+<p>A injecção continua a dominar porque a forma vulnerável é sintacticamente mais curta do que a segura. Concatenar uma <em>string</em> tem menos caracteres do que declarar um parâmetro, e o resultado funciona nos testes. A correcção não é «usar sempre JPA» — o JPQL também é concatenável e o <code>@Query</code> com <em>string</em> montada é tão vulnerável quanto o JDBC — é separar dados de comando: valores vão por parâmetro vinculado, identificadores (nomes de coluna, direcção de ordenação) vão por lista branca fechada.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 38.1</span> Onde cada categoria do OWASP Top 10 (2021) se manifesta num serviço Spring Boot e qual é o controlo idiomático.</div>
+<div class="tscroll"><table><thead><tr><th>Categoria</th><th>Forma concreta no serviço</th><th>Controlo</th></tr></thead><tbody>
+<tr><td>A01 — Controlo de acesso</td><td>IDOR no <code>{id}</code> do caminho; <code>@PreAuthorize</code> em falta num método novo</td><td>Propriedade na consulta; filtro por inquilino no repositório; teste por <em>endpoint</em></td></tr>
+<tr><td>A02 — Falhas criptográficas</td><td>Palavras-passe com SHA-256; PII em claro em colunas e em <em>logs</em></td><td>Argon2id/bcrypt; TLS obrigatório; cifra ao nível da coluna com chave gerida</td></tr>
+<tr><td>A03 — Injecção</td><td>SQL concatenado; JPQL montado; <em>logs</em> com quebras de linha injectadas</td><td>Parâmetros vinculados; lista branca para identificadores; validação na fronteira</td></tr>
+<tr><td>A04 — Design inseguro</td><td>Reposição de palavra-passe sem limite de tentativas; sem limite de tamanho de corpo</td><td><em>Rate limiting</em>, quotas, limites explícitos no contrato da API</td></tr>
+<tr><td>A05 — Má configuração</td><td><em>Actuator</em> exposto, <em>stack traces</em> na resposta, CORS com <code>*</code></td><td>Perfil de produção sem defeitos permissivos; teste de configuração no CI</td></tr>
+<tr><td>A06 — Componentes vulneráveis</td><td>Biblioteca transitiva com CVE crítico há oito meses</td><td>SCA no CI, SBOM, política de prazo por severidade</td></tr>
+<tr><td>A07 — Falhas de autenticação</td><td>JWT sem validar <code>exp</code>, sessão sem rotação, <em>credential stuffing</em></td><td>Validação completa do <em>token</em>; rotação de sessão; limite por identidade e por IP</td></tr>
+<tr><td>A08 — Integridade de software/dados</td><td>Deserialização Java nativa de bytes da rede; artefacto sem assinatura</td><td>Formato de dados sem execução; filtro de classes; assinatura e proveniência</td></tr>
+<tr><td>A09 — Registo e monitorização</td><td>Falha de autorização não gera evento; <em>logs</em> sem identidade</td><td>Evento estruturado por decisão negada, com <em>trace id</em> e principal</td></tr>
+<tr><td>A10 — SSRF</td><td><em>Webhook</em> configurável pelo cliente; importação por URL</td><td>Lista branca de destinos, resolução de DNS validada, sem redireccionamentos</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Numa aplicação com 120 <em>endpoints</em> REST, um único ponto de aplicação de autorização — uma consulta de repositório que exige sempre o identificador do inquilino — cobre os 120 de uma vez. A alternativa, um <code>if</code> por método, exige 120 verificações correctas e mantém-se correcta durante exactamente o tempo até alguém acrescentar o método 121. É por isso que as auditorias encontram A01 em serviços cuja equipa jura que «verifica sempre».</p></aside>
+
+<div class="qa" id="q-38-1" data-box="qa" data-area="seguranca" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Este método aceita um filtro de estado e um nome de coluna para ordenação, e monta o SQL por concatenação. Explique o que está errado e como o corrige sem perder a ordenação dinâmica.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O erro é misturar dados com comando: o valor do filtro entra na <em>string</em> do SQL, portanto quem controla o valor controla a gramática da consulta. A correcção tem duas metades diferentes, porque o problema tem duas naturezas diferentes. Valores — o estado, o identificador, as datas — passam a parâmetros vinculados, e o motor trata-os como literais independentemente do conteúdo. Identificadores — o nome da coluna de ordenação, a direcção — não podem ser parâmetros vinculados em SQL, por isso só há uma defesa válida: uma lista branca fechada, definida no código, com um valor por omissão para tudo o que não estiver nela.</p>
+      <p>O mecanismo por baixo é a <em>prepared statement</em>: o PostgreSQL recebe o texto da consulta e o vector de parâmetros em mensagens separadas do protocolo, e o <em>plan</em> é construído antes de os valores existirem. Não há escape a fazer nem cadeia de caracteres a filtrar, porque o valor nunca chega ao analisador sintáctico. Efeito lateral positivo: o <em>plan cache</em> passa a ter uma entrada por forma de consulta em vez de uma por valor.</p>
+      <p>O erro habitual da correcção é tentar «sanitizar» — remover plicas, escapar caracteres, rejeitar a palavra <code>DROP</code>. Não funciona: os vectores de escape variam com o <em>charset</em>, com o modo do servidor e com a função utilizada, e a lista negra é sempre incompleta. Validar o formato de entrada (o estado tem de pertencer a um <code>enum</code>, o nome tem no máximo 80 caracteres) é útil como defesa em profundidade e como qualidade de erro, mas não substitui o parâmetro vinculado.</p>
+      <p>O <em>trade-off</em> aparece nas consultas com número variável de condições, em que a concatenação é tentadora. A resposta sénior é gerar o texto a partir de fragmentos que a aplicação controla e nunca a partir de entrada do utilizador: um construtor de critérios (Criteria API, jOOQ, ou uma função que devolve pares fragmento/parâmetro) mantém a árvore de valores separada. Quando o custo disso não se justifica — um relatório interno com dois filtros — a alternativa aceitável é a lista branca, não a concatenação directa.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Escapa-se a plica» ou «valida-se com uma <em>regex</em> que rejeita <code>--</code>». Não distingue dados de identificadores.</td></tr>
+        <tr><td>Mid</td><td>Usa <em>prepared statement</em> para os valores, mas continua a concatenar o nome da coluna sem lista branca.</td></tr>
+        <tr><td>Sénior</td><td>Separa valores (parâmetro) de identificadores (lista branca), explica que o <em>plan</em> é construído antes dos valores, acrescenta limite de linhas e validação de formato como defesa em profundidade.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais como se impede a reintrodução: proibição do <code>String</code> montado em revisão, regra estática no CI, camada de acesso única e testes que passam entrada hostil por todos os filtros.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o filtro for uma lista de estados de tamanho variável?»</li>
+      <li>«O JPA protege automaticamente? E o <code>@Query</code> nativo?»</li>
+      <li>«Como é que impede que isto volte a entrar daqui a seis meses?»</li>
+      <li>«Que privilégios tem o utilizador de base de dados da aplicação?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Confiar em «sanitização» ou em lista negra de palavras-chave.</li>
+      <li>Achar que um ORM elimina a classe de vulnerabilidade por si só.</li>
+      <li>Não notar a ausência de <code>LIMIT</code> — a mesma consulta é também um vector de esgotamento de memória.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-38-1"><div class="lhead"><span class="lnum">Listagem 38.1</span>
+<span class="lcap">Injecção por concatenação e a correcção com parâmetro vinculado e lista branca</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// VULNERÁVEL: o valor e o identificador vêm ambos do query string.
+@GetMapping("/api/faturas")
+public List&lt;Fatura&gt; procurar(@RequestParam String estado, @RequestParam String ordem) {
+    String sql = "SELECT * FROM fatura WHERE estado = '" + estado + "' ORDER BY " + ordem;
+    return jdbc.query(sql, new FaturaRowMapper());
+}
+// estado = x' OR '1'='1  devolve as facturas de todos os clientes.
+// ordem  = 1; DROP TABLE ...  depende do driver permitir múltiplos comandos.
+
+// CORRIGIDO: valores por parâmetro, identificador por lista branca fechada.
+private static final Set&lt;String&gt; ORDENS = Set.of("criada_em", "total_cents", "numero");
+
+@GetMapping("/api/faturas")
+public List&lt;Fatura&gt; procurar(@RequestParam Estado estado,          // enum: formato validado
+                             @RequestParam(defaultValue = "criada_em") String ordem) {
+    String coluna = ORDENS.contains(ordem) ? ordem : "criada_em";   // nunca a entrada crua
+    return jdbc.query(
+        "SELECT id, numero, estado, total_cents FROM fatura "
+      + "WHERE tenant_id = ? AND estado = ? ORDER BY " + coluna + " DESC LIMIT 200",
+        ps -&gt; { ps.setLong(1, TenantContext.actual()); ps.setString(2, estado.name()); },
+        new FaturaRowMapper());
+}</code></pre></figure>
+
+<div class="qa" id="q-38-2" data-box="qa" data-area="seguranca" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Encontrou num serviço um <code>ObjectInputStream</code> a ler directamente do corpo do pedido, e noutro serviço um <code>ObjectMapper</code> com tipagem polimórfica activada por omissão. Porque é que as duas coisas são graves e o que põe no lugar delas?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São graves porque em ambos os casos o formato de dados carrega o tipo, e o tipo escolhe o código que corre. Na serialização Java nativa, <code>readObject()</code> instancia classes e executa os seus métodos de deserialização — <code>readObject</code>, <code>readResolve</code>, <code>finalize</code> — antes de o <em>cast</em> para o tipo esperado acontecer. O <em>cast</em> não é uma defesa: falha depois de o dano estar feito. Uma <em>gadget chain</em> encadeia classes que já estão no <em>classpath</em> da aplicação e transforma bytes em execução de comandos, sem qualquer bug no código próprio.</p>
+      <p>No Jackson, <code>activateDefaultTyping</code> com um validador permissivo reproduz a mesma propriedade em JSON: o documento passa a conter um campo com o nome de classe a instanciar, e o atacante escolhe classes do <em>classpath</em> com efeitos secundários no construtor ou nos <em>setters</em>. Foi a origem de uma sequência longa de CVEs em que a resposta upstream — a lista de tipos bloqueados — nunca ficou completa, precisamente porque a superfície é o <em>classpath</em>, que muda a cada dependência acrescentada.</p>
+      <p>A substituição é sempre a mesma: um formato de dados que não transporta código nem tipo, deserializado para um tipo alvo fixo e fechado. JSON para um <em>record</em> concreto, com <code>FAIL_ON_UNKNOWN_PROPERTIES</code> activo para que campos inesperados sejam erro e não silêncio. Onde o polimorfismo é mesmo necessário — eventos com variantes —, usa-se <code>@JsonSubTypes</code> com a lista de subtipos declarada no código, o que é uma lista branca, e não a resolução dinâmica de nomes.</p>
+      <p>Quando a serialização nativa é inevitável — um protocolo legado, RMI, um <em>cache</em> antigo — o controlo residual é o filtro de deserialização introduzido no JDK 9: um <code>ObjectInputFilter</code> com padrão de lista branca terminado em <code>!*</code>, aplicado por <em>stream</em>, mais limites de profundidade e de número de referências para travar bombas de expansão. É mitigação, não solução: a única solução estrutural é deixar de aceitar bytes serializados de fora do perímetro de confiança.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Deserialização insegura é mau» sem saber dizer em que momento o código do atacante corre.</td></tr>
+        <tr><td>Mid</td><td>Sabe que a serialização nativa é perigosa; propõe verificar o tipo depois de ler, ou uma lista negra de classes.</td></tr>
+        <tr><td>Sénior</td><td>Explica que a execução antecede o <em>cast</em>, liga a tipagem polimórfica do Jackson ao mesmo problema, propõe tipo alvo fechado e <code>@JsonSubTypes</code>, conhece o filtro do JDK como mitigação.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a fronteira de confiança: que canais entregam bytes deserializados, como se mede a superfície do <em>classpath</em>, e o plano de migração de um protocolo legado sem parar o serviço.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O <em>cast</em> para <code>Carrinho</code> não protege? Porquê?»</li>
+      <li>«E a mesma questão em YAML e em XML?»</li>
+      <li>«Como é que escreve o padrão do filtro de deserialização para um pacote?»</li>
+      <li>«Se o <em>cache</em> Redis guarda objectos serializados, isso é fronteira de confiança?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor lista negra de classes conhecidas como defesa principal.</li>
+      <li>Acreditar que o problema desaparece porque «só serviços internos chamam este <em>endpoint</em>».</li>
+      <li>Confundir com XML External Entity, que é outra classe de falha.</li></ul></div>
+  </div>
+</div>
+
+<figure class="listing java" id="lst-38-2"><div class="lhead"><span class="lnum">Listagem 38.2</span>
+<span class="lcap">Deserialização insegura em duas formas e a substituição por tipo alvo fechado</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// VULNERÁVEL 1: serialização nativa sobre bytes da rede.
+try (ObjectInputStream in = new ObjectInputStream(request.getInputStream())) {
+    Carrinho c = (Carrinho) in.readObject();   // a gadget chain executa ANTES do cast
+}
+
+// VULNERÁVEL 2: tipagem polimórfica aberta — o JSON escolhe a classe a instanciar.
+ObjectMapper m = new ObjectMapper();
+m.activateDefaultTyping(LaissezFaireSubTypeValidator.instance,
+                        ObjectMapper.DefaultTyping.NON_FINAL);
+
+// CORRIGIDO: JSON para um tipo fixo; campos desconhecidos são erro, não silêncio.
+ObjectMapper seguro = JsonMapper.builder()
+        .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+        .build();
+Carrinho c = seguro.readValue(corpo, Carrinho.class);
+
+// Polimorfismo necessário: lista branca declarada no código, não resolução dinâmica.
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "tipo")
+@JsonSubTypes({ @JsonSubTypes.Type(value = PagamentoCartao.class, name = "cartao"),
+                @JsonSubTypes.Type(value = PagamentoSepa.class,   name = "sepa") })
+sealed interface Pagamento permits PagamentoCartao, PagamentoSepa { }
+
+// Legado inevitável (RMI, cache antigo): filtro de classes por stream.
+ObjectInputFilter filtro = ObjectInputFilter.Config.createFilter(
+        "com.acme.carrinho.*;java.util.*;java.lang.*;maxdepth=12;maxrefs=5000;!*");
+in.setObjectInputFilter(filtro);</code></pre></figure>
+
+<div class="qa" id="q-38-3" data-box="qa" data-area="api" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">APIs e integração</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O serviço é uma API REST que só devolve JSON e é consumida por uma SPA. Ainda tem de se preocupar com XSS e com CSRF? Justifique cada um separadamente.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São perguntas independentes com respostas diferentes. O XSS continua a ser problema, mas o backend deixa de ser o local da correcção e passa a ser o local da contenção: o servidor não escapa nada, porque não gera HTML; o cliente é que decide como renderiza. O que o backend pode fazer mal é devolver conteúdo com um <em>content type</em> que o navegador interprete como HTML — um <code>text/html</code> num <em>endpoint</em> de erro, um ficheiro carregado pelo utilizador servido tal como veio, uma resposta JSON sem <code>X-Content-Type-Options: nosniff</code>. Servir ficheiros de utilizadores num domínio separado e forçar <code>Content-Disposition: attachment</code> resolve a maior parte disto.</p>
+      <p>O CSRF só existe quando o navegador anexa a credencial automaticamente. Com <em>cookie</em> de sessão, anexa; com o cabeçalho <code>Authorization: Bearer</code>, não anexa, porque o cabeçalho tem de ser posto por código que a política de mesma origem impede o site atacante de correr no contexto certo. Logo: API puramente <em>stateless</em> com <em>bearer token</em> não precisa de <em>token</em> anti-CSRF; API com <em>cookie</em> de sessão precisa, mesmo que devolva JSON. O erro clássico é desactivar a protecção CSRF no Spring Security «porque é uma API» e manter o <em>cookie</em> de sessão activo para o painel de administração na mesma aplicação.</p>
+      <p>Quando a SPA guarda o <em>token</em> num <em>cookie</em> — escolha defensável, porque evita ter o <em>token</em> acessível a JavaScript — volta a haver CSRF, e a defesa passa a ser <code>SameSite=Lax</code> ou <code>Strict</code> mais o padrão do <em>cookie</em> duplo que o Spring Security implementa com <code>CookieCsrfTokenRepository</code>. A escolha entre guardar em memória (imune a roubo por CSRF, perdido em cada actualização da página) e em <em>cookie</em> <code>HttpOnly</code> (sobrevive, exige anti-CSRF) é o <em>trade-off</em> a nomear.</p>
+      <p>Números úteis para enquadrar: um cabeçalho <code>Content-Security-Policy</code> restritivo no servidor da SPA reduz o impacto de um XSS de execução arbitrária para exfiltração limitada, e custa uma linha de configuração; um <em>token</em> guardado em <code>localStorage</code> é lido por qualquer XSS em milissegundos e continua válido durante todo o tempo de vida configurado, tipicamente 5 a 15 minutos num desenho correcto e 24 horas num desenho preguiçoso.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É uma API, logo não há XSS nem CSRF.» Ou desactiva CSRF sem saber porquê.</td></tr>
+        <tr><td>Mid</td><td>Sabe que o CSRF depende de <em>cookies</em>, mas não liga o caso do <em>token</em> guardado em <em>cookie</em> nem o risco de <em>content type</em>.</td></tr>
+        <tr><td>Sénior</td><td>Separa os dois, condiciona o CSRF ao envio automático da credencial, refere <code>SameSite</code>, <code>nosniff</code>, domínio separado para ficheiros e o custo de cada opção de armazenamento do <em>token</em>.</td></tr>
+        <tr><td>Staff</td><td>O mesmo, mais a coexistência de cadeias de filtros com políticas diferentes na mesma aplicação e a decisão de onde vive a fronteira de sessão no sistema.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se a mesma aplicação servir também um painel com sessão por <em>cookie</em>?»</li>
+      <li>«<code>SameSite=Lax</code> chega? Em que caso não chega?»</li>
+      <li>«Onde guardaria o <em>access token</em> na SPA e porquê?»</li>
+      <li>«Que cabeçalhos de resposta configura por omissão?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Desactivar a protecção CSRF como gesto reflexo, sem verificar se há <em>cookie</em> de sessão.</li>
+      <li>Servir ficheiros carregados por utilizadores no mesmo domínio da aplicação.</li>
+      <li>Achar que escapar no backend uma API JSON resolve o XSS do cliente.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-38-2" class="h2"><span class="secnum">38.2</span> Autenticação: sessões, JWT, OAuth2 e OIDC<a class="anchor" href="#sec-38-2" aria-label="ligação">#</a></h2>
+
+<p>A pergunta de autenticação numa entrevista sénior raramente é «o que é um JWT». É «porque é que escolheu isto» e «o que acontece quando é preciso revogar». As duas famílias de resposta são credencial com estado no servidor (sessão identificada por um <em>cookie</em> opaco, estado em Redis ou na base de dados) e credencial sem estado (um <em>token</em> assinado que carrega as afirmações). A primeira revoga em O(1) — apaga-se a entrada — e custa uma leitura por pedido. A segunda não exige leitura, mas não revoga: o <em>token</em> vale até expirar, e a única forma de o encurtar é encurtar a expiração ou reintroduzir estado.</p>
+
+<p>Daí a arquitectura dominante: <em>access token</em> curto, de 5 a 15 minutos, sem consulta a estado no caminho quente; <em>refresh token</em> longo, de horas a semanas, guardado com estado no fornecedor de identidade, revogável e rotativo. O <em>refresh</em> é usado poucas vezes por sessão, por isso o custo do estado é irrelevante, e a janela de exposição de um <em>access token</em> roubado fica limitada pela sua validade. Quando o requisito é revogação imediata — despedimento, fraude detectada — acrescenta-se uma lista de identificadores de <em>token</em> revogados em Redis, consultada só enquanto os <em>tokens</em> emitidos antes do corte ainda não expiraram, o que mantém a lista pequena.</p>
+
+<p>Do lado do serviço, a regra é não implementar nada disto à mão. O Spring Security 6 configurado como <em>resource server</em> valida assinatura, emissor, audiência e expiração antes de o pedido chegar ao controlador, e falha fechado. O que o candidato tem de saber explicar é o que essa validação inclui: a assinatura contra a chave pública obtida do JWKS do emissor, com o algoritmo escolhido por lista branca do lado do verificador — nunca lido do campo <code>alg</code> do <em>token</em> —, o <code>iss</code> esperado, o <code>aud</code> que identifica este serviço em concreto, e <code>exp</code>/<code>nbf</code> com uma tolerância de relógio pequena, na ordem dos 30 a 60 segundos.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Descodificar o segundo segmento do JWT em Base64 e ler o <code>sub</code> «só para <em>logging</em>» é a forma mais comum de a validação desaparecer sem ninguém notar. O valor lido assim não está autenticado, e passa a estar a um <em>refactor</em> de distância de ser usado numa decisão de autorização. Se o principal é preciso no controlador, obtém-se de <code>@AuthenticationPrincipal Jwt</code>, que já passou pelo validador.</p></aside>
+
+<figure class="listing java" id="lst-38-3"><div class="lhead"><span class="lnum">Listagem 38.3</span>
+<span class="lcap">Cadeia de filtros de <em>resource server</em> com validação completa do <em>token</em></span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Bean
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http.securityMatcher("/api/**")
+        .authorizeHttpRequests(a -&gt; a
+            .requestMatchers("/api/publico/**").permitAll()
+            .requestMatchers(HttpMethod.POST, "/api/faturas/**").hasAuthority("SCOPE_faturas:write")
+            .anyRequest().authenticated())                    // falha fechado por omissão
+        .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.decoder(decoder())))
+        .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .csrf(c -&gt; c.disable());   // legítimo AQUI: sem cookie de sessão nesta cadeia
+    return http.build();
+}
+
+@Bean
+JwtDecoder decoder() {
+    NimbusJwtDecoder d = NimbusJwtDecoder
+            .withJwkSetUri("https://idp.interno/.well-known/jwks.json")
+            .jwsAlgorithm(SignatureAlgorithm.RS256)   // lista branca do verificador
+            .build();                                 // o campo "alg" do token NÃO decide
+
+    OAuth2TokenValidator&lt;Jwt&gt; audiencia = new JwtClaimValidator&lt;List&lt;String&gt;&gt;(
+            "aud", aud -&gt; aud != null &amp;&amp; aud.contains("faturacao-api"));
+
+    d.setJwtValidator(new DelegatingOAuth2TokenValidator&lt;&gt;(
+            JwtValidators.createDefaultWithIssuer("https://idp.interno/"),  // iss + exp + nbf
+            audiencia));
+    return d;
+}</code></pre></figure>
+
+<div class="qa" id="q-38-4" data-box="qa" data-area="seguranca" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Vai desenhar a autenticação de um novo serviço interno. Sessão com <em>cookie</em> ou JWT? Defenda a escolha e diga o que perde com ela.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A escolha decide-se por dois eixos: quem consome e qual é o requisito de revogação. Para uma aplicação web com um único domínio e utilizadores humanos, a sessão com <em>cookie</em> opaco continua a ser a opção mais simples e a mais segura por omissão — revogação imediata, nada de criptografia a gerir na aplicação, <code>HttpOnly</code> impede o acesso por JavaScript, e o custo é uma leitura de Redis de menos de 1 ms por pedido. Para uma API consumida por vários serviços e por clientes móveis, ou quando há mais de um domínio, o <em>token</em> assinado ganha, porque a validação é local e não cria dependência de disponibilidade num armazém de sessões partilhado.</p>
+      <p>O que se perde com o JWT é a revogação, e é isso que tem de ser dito sem ser perguntado. Um <em>token</em> emitido é válido até <code>exp</code>, aconteça o que acontecer à conta. As três respostas legítimas são: expiração curta (5 a 15 minutos) com <em>refresh</em> rotativo; lista de revogação consultada apenas para <em>tokens</em> emitidos antes de um marco temporal, o que a mantém com dezenas de entradas em vez de milhões; ou incremento de uma versão por utilizador incluída no <em>token</em> e comparada com um valor em <em>cache</em>, que reintroduz uma leitura mas de um objecto muito mais pequeno e partilhável.</p>
+      <p>O que se perde com a sessão é a independência: cada pedido depende do <em>store</em>, e uma falha de Redis é uma falha de autenticação em todo o sistema. Mitiga-se com réplicas e com uma janela de tolerância, mas o acoplamento existe. Perde-se também a facilidade de propagar identidade entre serviços — reencaminhar um <em>cookie</em> de sessão entre serviços internos é um anti-padrão que acaba em cada serviço a chamar o serviço de sessões.</p>
+      <p>A resposta que impressiona nomeia o híbrido usado na prática: sessão com <em>cookie</em> na fronteira (<em>BFF</em>), que troca a sessão por um <em>token</em> de curta duração para as chamadas internas. O navegador nunca vê o <em>token</em>, portanto não há problema de armazenamento nem de XSS a roubá-lo; os serviços internos continuam <em>stateless</em>.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«JWT porque é <em>stateless</em> e escala.» Sem menção a revogação nem a expiração.</td></tr>
+        <tr><td>Mid</td><td>Conhece as duas opções e a diferença de estado, mas trata a revogação como detalhe a resolver depois.</td></tr>
+        <tr><td>Sénior</td><td>Decide por consumidor e por requisito de revogação, quantifica o custo da leitura de sessão e a janela de exposição, apresenta <em>refresh</em> rotativo e lista de revogação limitada.</td></tr>
+        <tr><td>Staff</td><td>Propõe o padrão de fronteira com troca de credencial, discute a dependência de disponibilidade do <em>store</em> e o efeito de cada opção no plano de resposta a incidentes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um utilizador é despedido às 14h05. Quando é que perde o acesso, na sua solução?»</li>
+      <li>«Quanto custa a leitura de sessão no p99?»</li>
+      <li>«E se o Redis de sessões ficar indisponível durante 30 segundos?»</li>
+      <li>«Como propaga a identidade do utilizador para três serviços a jusante?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Escolher JWT por reflexo e não conseguir descrever a revogação.</li>
+      <li>Propor <em>tokens</em> de 24 horas sem <em>refresh</em>.</li>
+      <li>Implementar assinatura e verificação de <em>tokens</em> à mão em vez de usar a biblioteca.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-5" data-box="qa" data-area="spring" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Spring e frameworks</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Enumere tudo o que tem de ser verificado num JWT antes de o serviço confiar nele, e diga o que corre mal em produção se cada verificação faltar.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>São seis verificações e cada uma tem um modo de falha concreto. Primeira, a assinatura, contra a chave pública obtida do JWKS do emissor e com o algoritmo fixado por lista branca no verificador. Se faltar, qualquer pessoa forja afirmações — inclusive as duas variantes históricas, o <code>alg: none</code> e a confusão de algoritmo em que uma chave pública RSA é aceite como segredo HMAC. Segunda, o <code>iss</code>: sem ele, um <em>token</em> legítimo de outro emissor, ou de um ambiente de teste, é aceite em produção.</p>
+      <p>Terceira, o <code>aud</code>: sem ele, um <em>token</em> emitido para o serviço de <em>newsletters</em> serve para chamar o serviço de pagamentos, e a compartimentação entre serviços desaparece. Quarta, <code>exp</code> e <code>nbf</code>, com tolerância de relógio explícita — 30 a 60 segundos chegam com NTP; tolerâncias de 5 minutos aparecem em código que estava a esconder um problema de sincronização. Sem <code>exp</code> verificado, um <em>token</em> capturado num <em>log</em> de 2023 continua válido.</p>
+      <p>Quinta, o tipo e a forma: rejeitar <em>tokens</em> cujo cabeçalho declare um tipo inesperado e não aceitar um <em>ID token</em> OIDC onde se espera um <em>access token</em> — o <em>ID token</em> é para o cliente, tem audiência do cliente e não representa autorização de API. Sexta, as afirmações de autorização propriamente ditas: <code>scope</code> ou <code>roles</code> mapeados para autoridades, com a decisão a ser tomada por regra explícita e não pela mera presença de um <em>token</em> válido.</p>
+      <p>Operacionalmente, faltam dois pontos que separam sénior de mid: a rotação de chaves e o <em>caching</em> do JWKS. O verificador tem de escolher a chave por <code>kid</code> e voltar a buscar o conjunto quando aparece um <code>kid</code> desconhecido, com um limite de frequência para que uma vaga de <em>tokens</em> forjados não se transforme num ataque de amplificação contra o fornecedor de identidade. E o <em>token</em> nunca entra nos <em>logs</em>, nem sequer truncado: um prefixo de 20 caracteres não é útil para diagnóstico e é suficiente para correlacionar sessões.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Verifica-se a assinatura e a expiração», sem emissor nem audiência; não sabe o que é o <code>alg: none</code>.</td></tr>
+        <tr><td>Mid</td><td>Lista assinatura, <code>exp</code>, <code>iss</code>; não distingue <em>ID token</em> de <em>access token</em>; não fala de rotação de chaves.</td></tr>
+        <tr><td>Sénior</td><td>Cobre as seis verificações com o modo de falha de cada uma, fixa o algoritmo do lado do verificador, discute <code>kid</code>, JWKS em <em>cache</em> e tolerância de relógio.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o risco de amplificação na obtenção do JWKS, a política de rotação de chaves com sobreposição, e o desenho de auditoria de decisões negadas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o algoritmo não pode vir do próprio <em>token</em>?»</li>
+      <li>«O fornecedor roda a chave às 03h00. O que acontece aos <em>tokens</em> em voo?»</li>
+      <li>«Que diferença faz aceitar um <em>ID token</em> na API?»</li>
+      <li>«Onde é que este <em>token</em> aparece em <em>logs</em> ou em <em>traces</em> hoje?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Descodificar o <em>payload</em> sem verificar a assinatura para «poupar tempo».</li>
+      <li>Guardar o segredo HMAC no ficheiro de configuração do repositório.</li>
+      <li>Registar o <em>token</em> completo em <em>logs</em> de depuração «só em pré-produção».</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-6" data-box="qa" data-area="seguranca" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Temos uma SPA, uma aplicação móvel e um <em>job</em> nocturno que chama a mesma API. Que fluxos OAuth2 usa para cada um, e onde entra o OIDC?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Três consumidores, dois fluxos. A SPA e a aplicação móvel são clientes públicos — não conseguem guardar um segredo, porque o código está no dispositivo do utilizador — e usam ambos <em>authorization code</em> com PKCE. O <em>job</em> nocturno é um cliente confidencial que actua em nome próprio e não de um utilizador, portanto usa <em>client credentials</em>, com a credencial obtida de um cofre ou, melhor, de uma identidade de carga de trabalho (conta de serviço do Kubernetes trocada por credencial no fornecedor) para não haver segredo estático nenhum.</p>
+      <p>O PKCE existe para fechar a janela entre a autorização e a troca do código. O cliente gera um valor aleatório, envia o seu resumo criptográfico no pedido de autorização e o valor original na troca do código; quem intercepte o código — por um <em>redirect</em> mal registado, por um esquema de URI capturado por outra aplicação móvel — não o consegue trocar sem o valor original. É por isso que substituiu o fluxo implícito, que devolvia o <em>token</em> directamente no fragmento do URL e o deixava em histórico e em <em>referrers</em>.</p>
+      <p>O OIDC entra numa camada acima e responde a outra pergunta. O OAuth2 é delegação de autorização: dá ao cliente um <em>access token</em> para chamar uma API. O OIDC acrescenta o <em>ID token</em>, um JWT dirigido ao cliente que diz quem é o utilizador autenticado, com <code>sub</code>, <code>auth_time</code> e <code>nonce</code>. Confundir os dois é o erro sénior mais frequente nesta pergunta: o <em>ID token</em> nunca é enviado à API como credencial, e o <em>access token</em> não é uma prova de identidade para o cliente.</p>
+      <p>O <em>trade-off</em> a nomear é o do <em>job</em> nocturno em relação aos dados de utilizadores. Com <em>client credentials</em>, o <em>job</em> tem uma identidade própria e os seus <em>scopes</em> são amplos por natureza, o que o torna um alvo valioso. As defesas são <em>scopes</em> mínimos por tarefa, credenciais de vida curta renovadas por identidade de carga de trabalho, e auditoria separada — as acções do <em>job</em> devem ser distinguíveis das de um humano em qualquer registo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde OAuth2 com autenticação e propõe o mesmo fluxo para os três casos.</td></tr>
+        <tr><td>Mid</td><td>Sabe que a SPA usa <em>authorization code</em>, mas não explica porque é que o PKCE é obrigatório nem separa cliente público de confidencial.</td></tr>
+        <tr><td>Sénior</td><td>Mapeia os três consumidores aos dois fluxos, explica o mecanismo do PKCE, distingue <em>ID token</em> de <em>access token</em> e o papel do OIDC.</td></tr>
+        <tr><td>Staff</td><td>Elimina o segredo estático do <em>job</em> com identidade de carga de trabalho, define <em>scopes</em> mínimos por tarefa e desenha a auditoria que separa acções de máquina das de humanos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o fluxo implícito foi desaconselhado?»</li>
+      <li>«O que acontece se o <code>redirect_uri</code> aceitar um prefixo em vez de correspondência exacta?»</li>
+      <li>«O <em>job</em> precisa de agir em nome de um utilizador concreto. Como resolve?»</li>
+      <li>«Onde guarda o <em>refresh token</em> da aplicação móvel?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Propor <em>resource owner password credentials</em> para a aplicação móvel.</li>
+      <li>Enviar o <em>ID token</em> à API como credencial de acesso.</li>
+      <li>Guardar um segredo de cliente numa aplicação distribuída ao público.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-38-3" class="h2"><span class="secnum">38.3</span> Autorização: RBAC, ABAC e o erro do IDOR<a class="anchor" href="#sec-38-3" aria-label="ligação">#</a></h2>
+
+<p>A autenticação responde a «quem és»; a autorização responde a «podes fazer isto a este objecto», e é a segunda parte da pergunta — <em>a este objecto</em> — que quase todos os sistemas falham. O RBAC decide pela primeira metade: o principal tem o papel <code>GESTOR_FACTURACAO</code>, logo pode chamar o <em>endpoint</em> de facturas. Nada nisto liga a factura número 91 872 ao utilizador que a pediu. Essa ligação é autorização ao nível do objecto, e a sua ausência chama-se IDOR — ou, no vocabulário do OWASP para APIs, BOLA, <em>broken object level authorization</em>, consistentemente o primeiro item dessa lista.</p>
+
+<p>O ABAC generaliza: a decisão passa a ser função de atributos do sujeito, do recurso, da acção e do contexto — «um gestor pode ver facturas da sua região, durante o horário de expediente, se o montante for inferior a 50 000 euros». Ganha-se expressividade e granularidade; perde-se em capacidade de raciocinar sobre quem tem acesso a quê, porque a resposta deixa de ser uma consulta a uma tabela e passa a ser a avaliação de um conjunto de regras. Numa organização com dezenas de papéis e políticas por linha, a resposta pragmática é RBAC para a fronteira grosseira e regras de atributos para o filtro fino, com as regras expressas em consultas e não espalhadas por condicionais.</p>
+
+<p>Os <em>scopes</em> do OAuth2 são frequentemente confundidos com papéis e não são a mesma coisa. Um <em>scope</em> limita o que a <em>aplicação</em> pode fazer em nome do utilizador; um papel descreve o que o <em>utilizador</em> pode fazer. Uma aplicação de leitura de facturas com <code>faturas:read</code> não deve poder escrever mesmo que o utilizador seja administrador, e um utilizador sem permissão não passa a ter permissão porque a aplicação pediu o <em>scope</em>. A decisão correcta é a intersecção: <em>scope</em> concedido <strong>e</strong> permissão do utilizador <strong>e</strong> propriedade do objecto.</p>
+
+<figure class="listing java" id="lst-38-4"><div class="lhead"><span class="lnum">Listagem 38.4</span>
+<span class="lcap">IDOR e a correcção que põe a propriedade dentro da consulta</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>// VULNERÁVEL: o id vem do cliente e nada liga o recurso ao principal autenticado.
+// O papel foi verificado ("é gestor"), o objecto não ("é gestor DESTA factura").
+@GetMapping("/api/faturas/{id}")
+@PreAuthorize("hasRole('GESTOR_FACTURACAO')")
+public FaturaDto ver(@PathVariable long id) {
+    return mapper.toDto(repo.findById(id).orElseThrow());
+}
+
+// CORRIGIDO: a propriedade é parte da consulta, não um if posterior que se esquece.
+public interface FaturaRepo extends Repository&lt;Fatura, Long&gt; {
+    Optional&lt;Fatura&gt; findByIdAndClienteId(long id, long clienteId);
+}
+
+@GetMapping("/api/faturas/{id}")
+@PreAuthorize("hasAuthority('SCOPE_faturas:read')")
+public FaturaDto ver(@PathVariable long id, @AuthenticationPrincipal Jwt jwt) {
+    long cliente = Long.parseLong(jwt.getSubject());
+    return repo.findByIdAndClienteId(id, cliente)
+               .map(mapper::toDto)
+               // 404 e não 403: um 403 confirma que o recurso existe.
+               .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.NOT_FOUND));
+}</code></pre></figure>
+
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Pôr o filtro de propriedade no repositório (ou numa política de segurança ao nível de linha no PostgreSQL) torna impossível esquecê-lo, mas complica testes e tarefas administrativas legítimas, que passam a precisar de um caminho explícito e auditado. Deixá-lo no serviço mantém tudo simples e visível, mas depende de disciplina em cada método novo. Para uma equipa acima de seis pessoas ou com rotação, o custo do caminho administrativo compensa; para uma equipa pequena e um domínio estável, a disciplina com testes por <em>endpoint</em> pode chegar.</p></aside>
+
+<div class="qa" id="q-38-7" data-box="qa" data-area="seguranca" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um utilizador autenticado muda o <code>{id}</code> no URL e vê a factura de outro cliente. Descreva a causa, a correcção e como impede que a mesma falha volte noutro <em>endpoint</em>.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A causa é autorização ao nível do objecto em falta: verificou-se o papel, não se verificou a relação entre o principal e o recurso concreto. É a classe A01 do OWASP e o primeiro item da lista específica de APIs, e é a mais comum precisamente porque o código parece correcto — há uma anotação de segurança visível por cima do método.</p>
+      <p>A correcção imediata não é acrescentar um <code>if (factura.clienteId() != principal)</code> depois da leitura. Isso funciona e é o que quase toda a gente escreve, mas mantém a falha a uma distância de um método novo. A correcção estrutural é fazer da propriedade parte da consulta: <code>findByIdAndClienteId</code>, ou um filtro de inquilino aplicado em todas as consultas, ou uma política ao nível de linha no PostgreSQL com a identidade injectada por sessão. Assim, o caminho errado deixa de existir em vez de ser detectado depois.</p>
+      <p>Um detalhe que distingue a resposta: devolver 404 e não 403 quando o recurso existe mas não pertence ao principal. Um 403 confirma a existência do identificador, o que permite enumerar o espaço de identificadores e inferir volume de negócio. Pelo mesmo motivo, identificadores sequenciais expostos publicamente são uma escolha de desenho com custo — UUIDv7 ou identificadores opacos por recurso não substituem a autorização, mas removem a facilidade de varrimento.</p>
+      <p>A prevenção sistemática tem três peças. Primeira, um teste de contrato por <em>endpoint</em> que autentica como o utilizador B e pede um recurso do utilizador A, esperando 404; se o teste for gerado a partir da lista de rotas, um <em>endpoint</em> novo sem teste falha o CI. Segunda, o filtro obrigatório na camada de dados. Terceira, um evento estruturado por decisão negada, com principal e identificador de recurso, para que a tentativa de enumeração apareça como um pico e não como silêncio.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe identificadores aleatórios como solução («ninguém adivinha um UUID»).</td></tr>
+        <tr><td>Mid</td><td>Acrescenta a verificação de propriedade num <code>if</code> dentro do controlador e considera o problema resolvido.</td></tr>
+        <tr><td>Sénior</td><td>Move a propriedade para a consulta, explica 404 contra 403, e propõe testes por <em>endpoint</em> que exercitam o acesso cruzado.</td></tr>
+        <tr><td>Staff</td><td>Desenha a prevenção a nível de plataforma — filtro de inquilino obrigatório ou política de linha, geração de testes a partir das rotas, telemetria de negações — e discute o caminho administrativo auditado.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porquê 404 e não 403?»</li>
+      <li>«E num <em>endpoint</em> de listagem, onde não há <code>{id}</code>?»</li>
+      <li>«Como faz isto num sistema com 40 tabelas e vários inquilinos?»</li>
+      <li>«Que evento emite quando a verificação falha?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Segurança por obscuridade do identificador.</li>
+      <li>Verificação depois da leitura, com o objecto já em memória e possivelmente já registado.</li>
+      <li>Não perceber que a operação de escrita e a de eliminação têm exactamente o mesmo problema.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-8" data-box="qa" data-area="seguranca" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Qual é a diferença entre um <em>scope</em> do OAuth2 e um papel do utilizador? Se o <em>token</em> traz <code>SCOPE_faturas:write</code> mas o utilizador é apenas leitor, o que decide?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Decide a intersecção, e nunca a união: o pedido só passa se o <em>scope</em> autorizar a aplicação a fazer escritas <strong>e</strong> o utilizador tiver permissão de escrita <strong>e</strong> o objecto lhe pertencer. O <em>scope</em> é um tecto imposto ao cliente, não uma concessão ao utilizador. Um cliente com <code>faturas:write</code> a agir por um utilizador leitor não pode escrever; um utilizador administrador através de um cliente com <code>faturas:read</code> também não. Isto é o princípio da delegação: a aplicação nunca pode exceder o utilizador, e o utilizador nunca é ampliado pela aplicação.</p>
+      <p>Na prática do Spring Security 6, os <em>scopes</em> chegam como autoridades prefixadas com <code>SCOPE_</code> e os papéis como <code>ROLE_</code>. Se ambos vierem no <em>token</em>, o <em>converter</em> de autoridades tem de os mapear separadamente, e a expressão de autorização tem de exigir os dois — <code>hasAuthority('SCOPE_faturas:write') and hasRole('GESTOR')</code>. O erro comum é mapear <em>scopes</em> para papéis e perder a distinção, o que dá exactamente a união em vez da intersecção.</p>
+      <p>Há uma razão operacional para manter os papéis fora do <em>token</em> quando eles mudam com frequência: um <em>token</em> de 15 minutos carrega uma fotografia das permissões no momento da emissão, e a remoção de um papel só produz efeito no <em>refresh</em> seguinte. Com <em>scopes</em>, que descrevem a aplicação e mudam raramente, o custo é nulo. Se o requisito for revogação de permissões em segundos, a permissão fina é resolvida no serviço contra uma fonte de verdade em <em>cache</em>, e o <em>token</em> carrega apenas o <em>scope</em> e a identidade.</p>
+      <p>O <em>trade-off</em> é claro: permissões no <em>token</em> custam zero leituras e ficam obsoletas até à expiração; permissões consultadas custam uma leitura por pedido — 0,2 a 1 ms com <em>cache</em> local de curta duração — e são imediatamente exactas. A escolha depende de quantas vezes por dia uma permissão é revogada com urgência.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Trata <em>scope</em> e papel como sinónimos; responde que basta o <em>scope</em>.</td></tr>
+        <tr><td>Mid</td><td>Distingue os conceitos mas não formula a regra como intersecção nem sabe como coexistem no Spring Security.</td></tr>
+        <tr><td>Sénior</td><td>Enuncia a intersecção com propriedade do objecto incluída, conhece os prefixos e o <em>converter</em>, e explica a obsolescência das permissões no <em>token</em>.</td></tr>
+        <tr><td>Staff</td><td>Decide o que vive no <em>token</em> e o que se consulta em função do requisito de revogação, com o custo por pedido quantificado.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quem emite os <em>scopes</em> e quem aprova um <em>scope</em> novo?»</li>
+      <li>«Um papel é removido às 10h00 e o <em>token</em> expira às 10h12. É aceitável?»</li>
+      <li>«Como é que testa a intersecção sem escrever 4 testes por <em>endpoint</em>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Mapear todos os <em>scopes</em> para papéis «para simplificar».</li>
+      <li>Confiar apenas na presença de um <em>token</em> válido para autorizar escritas.</li>
+      <li>Colocar centenas de permissões finas dentro do <em>token</em> e fazê-lo crescer para vários kilobytes.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-9" data-box="qa" data-area="arquitectura" data-level="staff" data-freq="baixa">
+  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">O produto pede regras do tipo «um gestor vê contratos da sua região abaixo de 50 000 euros». Mantém RBAC ou passa a ABAC? Como o implementa sem espalhar condicionais por todo o código?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Os dois, em camadas distintas. O RBAC fica na fronteira e responde à pergunta grosseira — este principal pode sequer tocar em contratos? —, porque é barato, legível e auditável: uma tabela diz quem tem cada papel. As regras de atributos ficam por baixo e respondem à pergunta fina, mas não como condicionais no serviço: como predicados que entram na consulta. «Região do gestor» e «montante abaixo de 50 000» são cláusulas <code>WHERE</code>, e escrevê-las como filtro em memória transforma um problema de autorização num problema de paginação errada, em que a segunda página vem meio vazia.</p>
+      <p>A forma que sobrevive à manutenção é uma política declarada num só sítio que produz duas coisas a partir da mesma definição: um predicado para as leituras em lista e uma decisão booleana para os acessos a um objecto. Em Spring, isso são especificações do Spring Data ou expressões de segurança em métodos com um avaliador de permissões próprio; em sistemas maiores, um motor de políticas externo com as regras versionadas fora do código da aplicação. O critério de escolha é quem escreve as regras: se for a engenharia, ficam no repositório; se forem o negócio ou a conformidade a alterá-las sem <em>deploy</em>, tem de haver motor externo e registo de alterações.</p>
+      <p>O custo do ABAC que ninguém antecipa é a explicabilidade. Com RBAC, «porque é que a Ana vê este contrato?» responde-se com uma consulta. Com regras de atributos, a resposta exige reproduzir a avaliação com o contexto do momento. Por isso, um sistema ABAC sério regista a decisão com os atributos que a determinaram — não a decisão sozinha — e tem uma ferramenta de simulação que responde «quem veria este recurso» sem tentar todos os utilizadores.</p>
+      <p>O momento de mudar é quando as combinações de papéis começam a multiplicar-se: quando aparece <code>GESTOR_NORTE_ABAIXO_50K</code>, o RBAC já está a codificar atributos em nomes e é altura de os extrair. Enquanto o número de papéis se mantiver na ordem das dezenas e estável, acrescentar um motor de políticas é complexidade sem retorno.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Faz-se um <code>if</code> no serviço» ou acrescenta mais um papel por combinação.</td></tr>
+        <tr><td>Mid</td><td>Propõe ABAC mas com filtragem em memória depois da consulta, sem notar o efeito na paginação.</td></tr>
+        <tr><td>Sénior</td><td>Camada grossa RBAC e predicados de atributos empurrados para a consulta, com a política declarada uma vez e reutilizada em leitura e em decisão pontual.</td></tr>
+        <tr><td>Staff</td><td>Decide onde vivem as regras em função de quem as altera, exige registo dos atributos que determinaram a decisão e uma ferramenta de simulação de acesso.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E a paginação, com o filtro aplicado depois da consulta?»</li>
+      <li>«Como responde a uma auditoria que pergunta quem podia ver este contrato em Março?»</li>
+      <li>«Quando é que um motor de políticas externo passa a valer o custo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Multiplicar papéis para codificar atributos.</li>
+      <li>Filtrar em memória o resultado de uma consulta paginada.</li>
+      <li>Introduzir um motor de políticas sem plano para a latência que acrescenta ao caminho quente.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-38-4" class="h2"><span class="secnum">38.4</span> Segredos, criptografia e dados pessoais<a class="anchor" href="#sec-38-4" aria-label="ligação">#</a></h2>
+
+<p>Nesta secção quase nada é criptografia e quase tudo é gestão. Um serviço bem construído não implementa algoritmos: usa TLS para o trânsito, cifra gerida pelo fornecedor para o repouso, uma biblioteca para as palavras-passe e um cofre para as chaves. As perguntas de entrevista concentram-se, por isso, nas decisões — que algoritmo de derivação, onde vive a chave, quem a pode ler, o que acontece quando é rodada — e nos dados pessoais, onde o RGPD impõe requisitos que se traduzem em desenho concreto.</p>
+
+<p>Palavras-passe nunca são cifradas nem resumidas com funções rápidas. São passadas por uma função de derivação deliberadamente lenta e com <em>salt</em> por utilizador, para que um ficheiro roubado não permita testar milhares de milhões de candidatos por segundo em GPU. A escolha corrente é Argon2id, com bcrypt como opção madura e amplamente suportada. Em Spring Security 6, o <code>DelegatingPasswordEncoder</code> guarda o identificador do algoritmo no próprio valor — <code>{bcrypt}$2a$…</code> — o que permite migrar de algoritmo verificando com o antigo e voltando a derivar com o novo no momento em que o utilizador se autentica, sem forçar reposições em massa.</p>
+
+<p>Segredos em código são a falha mais barata de evitar e a mais cara de limpar, porque um segredo que entrou no histórico do Git está lá para sempre, mesmo depois de o ficheiro ser alterado. A regra prática é que o repositório contém referências, não valores: o ficheiro de configuração aponta para um caminho no cofre, e o valor é resolvido no arranque ou injectado pela plataforma. A rotação passa a ser uma operação sem alteração de código, o que é o verdadeiro objectivo — um segredo que não pode ser rodado em minutos é um segredo que não vai ser rodado depois de um incidente.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 38.2</span> Funções de derivação para palavras-passe: para que servem os parâmetros e o que se ganha com cada uma.</div>
+<div class="tscroll"><table><thead><tr><th>Função</th><th>Parâmetros que interessam</th><th>Quando escolher</th></tr></thead><tbody>
+<tr><td>Argon2id</td><td>Memória, iterações, paralelismo — a memória é o que trava GPU e ASIC</td><td>Escolha por omissão em serviço novo; exige orçamentar memória por autenticação concorrente</td></tr>
+<tr><td>bcrypt</td><td>Factor de custo (exponencial); limite de 72 bytes de entrada</td><td>Maturidade e suporte universal; o limite de comprimento obriga a resumir antes se houver frases-passe longas</td></tr>
+<tr><td>scrypt</td><td>Custo de CPU e de memória, paralelismo</td><td>Alternativa aceitável quando Argon2 não está disponível na plataforma</td></tr>
+<tr><td>PBKDF2</td><td>Número de iterações, função interna, comprimento da saída</td><td>Apenas quando há exigência de conformidade que o imponha; é o que menos resiste a hardware dedicado</td></tr>
+<tr><td>SHA-256 simples</td><td>Nenhum</td><td>Nunca para palavras-passe; é rápido por desenho, que é exactamente o defeito</td></tr>
+</tbody></table></div></div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>O parâmetro certo é o que custa entre 100 e 500 ms no hardware de produção — tempo suficiente para tornar a força bruta cara e curto o bastante para não transformar a autenticação num vector de negação de serviço. Com 200 ms por derivação e um limite de 8 verificações em paralelo, o serviço aguenta 40 autenticações por segundo antes de saturar; se o pico previsto for superior, a resposta é isolar a autenticação num conjunto de <em>threads</em> próprio e não baixar o custo da derivação.</p></aside>
+
+<figure class="listing yaml" id="lst-38-5"><div class="lhead"><span class="lnum">Listagem 38.5</span>
+<span class="lcap">Segredo em ficheiro versionado e a substituição por referência resolvida no arranque</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code># ERRADO: o valor fica no histórico do Git para sempre; alterar o ficheiro não o apaga.
+spring:
+  datasource:
+    url: jdbc:postgresql://db.prod:5432/faturacao
+    username: faturacao_app
+    password: pR0d-2024-facturacao          # segredo em claro, versionado
+  security:
+    oauth2:
+      client:
+        registration:
+          idp:
+            client-secret: 7f3c9a1b-...      # idem
+
+# CERTO: o repositório contém referências; o valor é resolvido no arranque.
+spring:
+  config:
+    import: "aws-secretsmanager:/prod/faturacao/"   # ou vault://, ou variável injectada
+  datasource:
+    url: jdbc:postgresql://db.prod:5432/faturacao
+    username: faturacao_app
+    password: ${db-password}                 # nunca aparece no repositório nem na imagem
+  security:
+    oauth2:
+      client:
+        registration:
+          idp:
+            client-secret: ${idp-client-secret}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus       # nunca "*": /env e /configprops expõem configuração
+  endpoint:
+    health:
+      show-details: when-authorized</code></pre></figure>
+
+<div class="qa" id="q-38-10" data-box="qa" data-area="seguranca" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Segurança</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como guarda palavras-passe? E como migra uma base de dados existente com 3 milhões de utilizadores em SHA-256 sem forçar toda a gente a repor a palavra-passe?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com uma função de derivação lenta e com <em>salt</em> por utilizador: Argon2id como escolha por omissão, bcrypt como alternativa madura. O ponto é o custo deliberado. SHA-256 é rápido por desenho — é isso que se quer numa soma de verificação e é exactamente o defeito aqui — e permite testar candidatos a uma taxa que torna irrelevante a qualidade das palavras-passe dos utilizadores. O <em>salt</em> único por utilizador elimina tabelas pré-calculadas e impede que dois utilizadores com a mesma palavra-passe tenham o mesmo valor guardado.</p>
+      <p>A calibração faz-se por tempo, não por número mágico: escolhe-se o parâmetro que custa 100 a 500 ms no hardware de produção real e revê-se quando o hardware muda. Com Argon2id, o parâmetro que mais protege é a memória, porque é o que impede paralelização barata em GPU. Se o serviço tiver picos de autenticação, isola-se essa derivação num conjunto de <em>threads</em> dedicado, para que a saturação da autenticação não consuma as <em>threads</em> do resto da API.</p>
+      <p>A migração faz-se em duas fases e sem reposições em massa. Fase um: o valor guardado passa a ter prefixo de algoritmo — o <code>DelegatingPasswordEncoder</code> do Spring Security suporta isto directamente — e o antigo passa a ser identificado como tal. Fase dois: no <em>login</em> seguinte de cada utilizador, verifica-se com o algoritmo antigo e, se corresponder, deriva-se de novo com Argon2id e substitui-se o valor na mesma transacção. Com 3 milhões de utilizadores e uma taxa típica de autenticação, 80% a 90% migram em algumas semanas.</p>
+      <p>Para a cauda que nunca volta, há duas opções e um erro. As opções são forçar a reposição por correio ao fim de um prazo definido, ou envolver o valor antigo — aplicar Argon2id sobre o SHA-256 existente, o que permite migrar tudo sem a palavra-passe em claro, à custa de guardar o esquema composto. O erro é deixar registos em SHA-256 indefinidamente e considerar a migração concluída porque «a maioria já passou».</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe SHA-256 com <em>salt</em>, ou cifra reversível «para poder recuperar a palavra-passe».</td></tr>
+        <tr><td>Mid</td><td>Escolhe bcrypt correctamente mas fixa um parâmetro de cor, sem o ligar a tempo medido, e propõe reposição em massa.</td></tr>
+        <tr><td>Sénior</td><td>Calibra por tempo no hardware alvo, explica porque a memória protege no Argon2id, e desenha a migração progressiva com prefixo de algoritmo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o isolamento de <em>threads</em> da autenticação, o plano para a cauda de utilizadores inactivos e o efeito da derivação lenta na disponibilidade sob ataque.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é o parâmetro concreto que usaria e como chegou a ele?»</li>
+      <li>«Uma derivação de 400 ms não é um vector de negação de serviço?»</li>
+      <li>«O que faz com os utilizadores que não voltam a autenticar-se?»</li>
+      <li>«Onde é que o <em>salt</em> fica guardado?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Cifrar em vez de derivar, para «poder devolver a palavra-passe ao utilizador».</li>
+      <li><em>Salt</em> global e constante no código.</li>
+      <li>Comparar valores derivados com <code>equals</code> sobre <em>strings</em> em vez do método de verificação da biblioteca.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-11" data-box="qa" data-area="devops" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Encontraram uma chave de API de produção em <code>application.yml</code>, comitada há 14 meses. O que faz nas próximas horas e o que muda para que não volte a acontecer?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A primeira acção é rodar, não apagar. O segredo está no histórico do Git, em todos os clones, nas imagens de contentor construídas nesses 14 meses e provavelmente em <em>caches</em> de CI; reescrever o histórico não recupera nada e dá uma falsa sensação de resolução. Rotação primeiro, depois investigação: com que privilégios era usado, que registos de utilização existem, houve acesso de origens inesperadas no período. Só no fim se limpa o repositório, e a limpeza é higiene, não remediação.</p>
+      <p>A mudança estrutural tem três camadas. Prevenção: análise de segredos como <em>hook</em> de pré-<em>commit</em> e como passo obrigatório do CI, que falha a construção; detecção do lado do fornecedor de repositório, que apanha o que escapar. Arquitectura: o repositório passa a conter referências, e o valor vem de um cofre resolvido no arranque ou de uma identidade de carga de trabalho — a conta de serviço do <em>pod</em> trocada por credencial temporária, que é a única forma de não haver segredo estático nenhum a proteger. Operação: rotação automática com prazo definido e um exercício de rotação, porque um mecanismo de rotação que nunca foi usado não funciona.</p>
+      <p>Há detalhes que separam a resposta sénior. As variáveis de ambiente parecem seguras mas aparecem em <em>dumps</em> de processo, em <code>/proc</code>, em relatórios de erro e no <em>endpoint</em> de ambiente do Actuator se ele estiver exposto — são melhores do que o ficheiro versionado, não são um cofre. As camadas de uma imagem de contentor guardam ficheiros apagados em camadas anteriores. E os segredos do Kubernetes são Base64, não cifra: sem cifra em repouso configurada no <em>etcd</em> e sem RBAC apertado, quem lê o espaço de nomes lê os segredos.</p>
+      <p>O número que enquadra a prioridade: entre a comitação e a detecção passaram 14 meses; o que se tem de reduzir não é a probabilidade de acontecer, que nunca é zero, é o tempo até à detecção e o tempo até à rotação. Uma equipa que roda um segredo comprometido em menos de uma hora tem uma postura melhor do que uma que promete nunca comitar segredos.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Apaga-se do ficheiro e faz-se <em>commit</em>.» Não roda a credencial.</td></tr>
+        <tr><td>Mid</td><td>Roda o segredo e limpa o histórico, mas não investiga utilização nem muda o processo.</td></tr>
+        <tr><td>Sénior</td><td>Rotação primeiro, investigação de utilização, depois limpeza; introduz análise no CI e resolução por cofre no arranque.</td></tr>
+        <tr><td>Staff</td><td>Elimina o segredo estático com identidade de carga de trabalho, define prazos de rotação, exercita a rotação e mede o tempo até à detecção.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Reescrever o histórico resolve? Porquê não?»</li>
+      <li>«Segredos do Kubernetes chegam? O que falta configurar?»</li>
+      <li>«Como é que o serviço obtém a credencial sem ter nenhum segredo à partida?»</li>
+      <li>«Quanto tempo demora hoje a rodar essa chave?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Considerar o problema resolvido depois de reescrever o histórico.</li>
+      <li>Tratar Base64 como protecção.</li>
+      <li>Expor o Actuator completo e não ligar isso à exposição de configuração.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-38-12" data-box="qa" data-area="dados" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Bases de dados</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O serviço guarda nome, morada, NIF e histórico de compras. Que decisões de desenho toma por causa do RGPD, e o que significa exactamente pseudonimizar isto?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Quatro decisões concretas, todas com consequências de esquema. Primeira, minimização: cada campo pessoal tem de ter uma finalidade declarada, e os que não têm não se guardam. Isto elimina, na prática, metade das colunas «para o caso de vir a ser útil» e reduz a superfície de qualquer fuga. Segunda, localização: os dados pessoais concentram-se num número pequeno de tabelas com chave estável, em vez de copiados para dez tabelas de relatório, porque o apagamento e a exportação têm de ser operações finitas.</p>
+      <p>Terceira, apagamento com prazo: o direito ao apagamento exige que exista um caminho técnico que remove ou anonimiza dentro do prazo, incluindo cópias de segurança, réplicas de leitura, tópicos Kafka com retenção longa, índices de pesquisa e <em>data warehouse</em>. É neste ponto que os desenhos falham — apagar da tabela principal é trivial, apagar de um tópico compactado exige uma <em>tombstone</em> com a mesma chave, e apagar de cópias de segurança exige política de retenção definida em vez de cópias eternas. Quarta, registo de acessos: quem leu dados pessoais, quando e porquê, com retenção própria.</p>
+      <p>Pseudonimizar é substituir o identificador directo por um substituto, mantendo em separado e sob controlo a informação que permite reverter. O <em>data warehouse</em> recebe <code>cliente_ref</code> em vez de NIF; a tabela que liga <code>cliente_ref</code> ao NIF vive noutro esquema, com outras permissões e com registo de acesso. O ponto que quase todos falham: pseudonimizado continua a ser dado pessoal para efeitos do regulamento, porque é reversível — não dispensa base legal nem prazo de retenção. Anonimizar é diferente e é irreversível; se o histórico de compras individual for suficientemente distintivo para reidentificar, o resultado não está anonimizado por muito que o nome tenha desaparecido.</p>
+      <p>Do lado do código, as consequências práticas são três: nunca registar dados pessoais em <em>logs</em> nem em <em>traces</em> (o que implica um serializador que os omite por omissão, e não disciplina caso a caso), mascarar o NIF em respostas onde não é necessário na íntegra, e ter uma anotação ou tipo próprio que marque os campos pessoais para que a exportação e o apagamento sejam gerados a partir do modelo e não escritos à mão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Cifra-se a base de dados e está resolvido.» Confunde anonimizar com pseudonimizar.</td></tr>
+        <tr><td>Mid</td><td>Conhece os direitos de acesso e apagamento, mas ignora réplicas, tópicos Kafka, cópias de segurança e <em>logs</em>.</td></tr>
+        <tr><td>Sénior</td><td>Minimização, localização dos dados, caminho de apagamento em todos os destinos, distinção clara entre pseudonimizar e anonimizar.</td></tr>
+        <tr><td>Staff</td><td>Marca os campos pessoais no modelo e gera exportação e apagamento a partir daí; discute reidentificação por singularidade do histórico e o registo de acessos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como apaga de um tópico Kafka com retenção de 90 dias?»</li>
+      <li>«E das cópias de segurança de há seis meses?»</li>
+      <li>«Um histórico de compras sem nome está anonimizado?»</li>
+      <li>«Que campos deste modelo é que não guardaria de todo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tratar pseudonimização como se dispensasse as obrigações do regulamento.</li>
+      <li>Depender de disciplina individual para não registar dados pessoais em <em>logs</em>.</li>
+      <li>Não ter resposta para réplicas, índices de pesquisa e <em>data warehouse</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-38-5" class="h2"><span class="secnum">38.5</span> Dependências, supply chain e CVEs<a class="anchor" href="#sec-38-5" aria-label="ligação">#</a></h2>
+
+<p>Um serviço Spring Boot típico traz entre 150 e 400 artefactos no <em>classpath</em>, dos quais a equipa escolheu conscientemente talvez vinte. Todo o resto é transitivo, e é aí que vivem os CVEs que aparecem no relatório de segurança. A pergunta de entrevista não é «conhece o Dependency-Check» — é como se transforma um fluxo de alertas em decisões, sem parar o desenvolvimento e sem ignorar o que importa.</p>
+
+<p>A base é distinguir presença de exploitabilidade. Um CVE crítico numa biblioteca que está no <em>classpath</em> mas cuja função vulnerável nunca é chamada, ou que só é atingível por um <em>parser</em> que o serviço não usa, tem risco real muito inferior à sua pontuação. Ferramentas de análise com contexto de acessibilidade reduzem o volume de alertas de forma substancial, mas a decisão continua a ser humana e tem de ser registada: a excepção existe, tem prazo e tem dono. Uma política sem prazos degenera em toda a gente a ignorar o relatório.</p>
+
+<p>A segunda peça é o SBOM: a lista de componentes gerada na construção, com versões e resumos criptográficos, guardada com o artefacto. Sem ele, a pergunta «estamos expostos?» num dia em que sai uma vulnerabilidade de grande impacto responde-se com uma busca frenética em <em>builds</em>; com ele, responde-se com uma consulta em minutos, incluindo versões antigas ainda em produção. A terceira peça é a integridade da cadeia de construção: versões fixadas em vez de intervalos, repositório interno que não recorre silenciosamente ao público, verificação de assinaturas e artefactos com proveniência.</p>
+
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Um repositório interno configurado como espelho que recorre ao público quando não encontra o artefacto permite que um pacote público com o mesmo nome de um interno seja resolvido em vez do correcto — a substituição de dependências por confusão de nomes. A defesa é separar os repositórios por espaço de nomes e nunca permitir que o interno recorra ao público para artefactos do domínio da organização.</p></aside>
+
+<div class="qa" id="q-38-13" data-box="qa" data-area="devops" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">DevOps, cloud e Kubernetes</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O relatório de análise de dependências devolve 60 achados, 8 críticos, quase todos em bibliotecas transitivas. Como é que a equipa decide o que faz esta semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Triagem por exposição real, não por pontuação. A pontuação base descreve a vulnerabilidade em abstracto; o que decide é se o serviço chama o caminho vulnerável, se a entrada que o alcança vem de fora do perímetro, e se há mitigação já em vigor. Um problema de análise de XML numa biblioteca que o serviço só usa para gerar, nunca para ler, entrada externa, fica atrás de um problema médio num componente que processa o corpo de todos os pedidos.</p>
+      <p>Depois da triagem, a decisão é uma de quatro e cada uma com prazo. Actualizar, que resolve 80% a 90% dos casos e é quase sempre a acção mais barata quando as versões estão fixadas e há testes. Substituir, quando a biblioteca está sem manutenção. Mitigar, quando a actualização quebra e há um controlo alternativo — desactivar a funcionalidade, filtrar à entrada, remover a dependência transitiva com exclusão explícita. Aceitar com prazo e dono registados, para os casos em que a exposição é nula; a excepção volta a ser avaliada na data marcada em vez de desaparecer.</p>
+      <p>O ritmo importa mais do que a exaustividade. Uma política que define, por exemplo, 7 dias para críticos com exposição externa, 30 dias para altos e a janela de manutenção mensal para o resto, com o CI a falhar apenas para o primeiro escalão, mantém o desenvolvimento a andar e a dívida a decrescer. Fazer o CI falhar para tudo produz o resultado oposto: a equipa desactiva a verificação.</p>
+      <p>Estruturalmente, o que reduz o volume é a higiene do <em>classpath</em>. Um serviço com 150 dependências tem metade dos alertas de um com 300. Auditar o que é transitivo e desnecessário, escolher <em>starters</em> mais estreitos e actualizar a versão do Spring Boot com regularidade — cada versão menor traz dezenas de actualizações transitivas de uma só vez — é mais eficaz do que resolver achados um a um.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Actualiza-se tudo» ou «ignoram-se os transitivos porque não são nossos».</td></tr>
+        <tr><td>Mid</td><td>Ordena por pontuação e trata a lista de cima para baixo, sem avaliar acessibilidade nem definir prazos.</td></tr>
+        <tr><td>Sénior</td><td>Tria por exposição real, escolhe entre actualizar, substituir, mitigar e aceitar com prazo, e faz o CI falhar só no escalão crítico.</td></tr>
+        <tr><td>Staff</td><td>Ataca a causa — dimensão do <em>classpath</em>, cadência de actualização do <em>framework</em>, SBOM para responder em minutos — e mede o tempo médio de remediação por severidade.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Sai hoje uma vulnerabilidade grave numa biblioteca de <em>logging</em>. Quanto tempo demora a saber se está exposto?»</li>
+      <li>«O que faz quando a actualização quebra a compatibilidade?»</li>
+      <li>«Quem aprova uma excepção e onde fica registada?»</li>
+      <li>«Como impede que uma dependência interna seja resolvida a partir do repositório público?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Fazer o CI falhar em tudo e acabar com a verificação desactivada.</li>
+      <li>Não distinguir presença de exploitabilidade e tratar 60 achados como 60 incidentes.</li>
+      <li>Não ter forma de saber que versões estão realmente em produção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-38-6" class="h2"><span class="secnum">38.6</span> Segurança em code review<a class="anchor" href="#sec-38-6" aria-label="ligação">#</a></h2>
+
+<p>A revisão de código é onde a maior parte destas falhas é apanhada ou perdida, e é também o formato que muitas empresas usam na ronda técnica: dão um controlador com problemas e pedem comentários. O que o entrevistador avalia é a ordem pela qual o candidato olha para o código. Um revisor eficaz não lê linha a linha à procura de erros; procura primeiro as fronteiras — onde entra dado do exterior, onde se decide autorização, onde se constrói uma consulta, onde se escreve um <em>log</em>, onde se lê configuração — porque é aí que as classes de vulnerabilidade vivem.</p>
+
+<p>Um segundo hábito distingue níveis: perguntar sempre o que falta, não só o que está errado. Um <em>endpoint</em> público novo sem limite de tentativas, sem limite de tamanho de corpo e sem evento de auditoria não tem nenhuma linha errada — tem ausências. O <em>rate limiting</em> pertence a esta categoria: é um controlo de segurança e não apenas de capacidade, porque é o que transforma <em>credential stuffing</em>, enumeração de identificadores e abuso de reposição de palavra-passe de viáveis em impraticáveis. Sem ele, um atacante testa milhares de combinações por minuto contra um <em>endpoint</em> de autenticação que responde correctamente a todas.</p>
+
+<p>O terceiro hábito é distinguir o comentário que bloqueia a integração do que é sugestão. Bloqueia: qualquer coisa que permita ler ou escrever dados de outro principal, qualquer credencial no repositório, qualquer entrada externa a chegar a um interpretador. Não bloqueia: nomes, estrutura, cobertura de teste marginal. Um revisor que mistura os dois perde autoridade quando o comentário importante aparece.</p>
+
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Numa ronda de revisão em entrevista, começar por dizer em voz alta a lista de fronteiras que vai percorrer — entrada, autorização, consulta, saída, configuração, registo — vale mais do que encontrar as três falhas em silêncio. O entrevistador está a avaliar um método reutilizável, não a contagem de achados.</p></aside>
+
+<div class="qa" id="q-38-14" data-box="qa" data-area="testes" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Testes e qualidade</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Está a rever um PR que acrescenta um <em>endpoint</em> público de reposição de palavra-passe. O código compila e tem testes. O que exige antes de aprovar?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Exijo cinco coisas, todas ausências e nenhuma delas um erro de sintaxe. Primeira, resposta uniforme: o <em>endpoint</em> tem de responder o mesmo — mesma mensagem, mesmo código, tempo semelhante — quer o endereço exista quer não. Caso contrário, torna-se um oráculo de enumeração de contas, e a diferença de tempo entre o caminho que envia correio e o que não envia é suficiente para distinguir os casos.</p>
+      <p>Segunda, <em>rate limiting</em> em duas dimensões, por identidade alvo e por origem: por exemplo 3 pedidos por hora para o mesmo endereço e um limite mais largo por IP e por sub-rede, com a contagem partilhada entre instâncias — em Redis, não em memória do processo, senão o limite divide-se pelo número de réplicas e um <em>autoscaling</em> generoso transforma-se em relaxamento do controlo. Este é o controlo que separa um formulário de reposição de um vector de abuso.</p>
+      <p>Terceira, o <em>token</em> de reposição: gerado por um gerador criptograficamente seguro com pelo menos 128 bits de entropia, guardado apenas na sua forma derivada, de uso único, invalidado no primeiro uso e ao fim de 15 a 60 minutos, e invalidando as sessões activas quando a palavra-passe muda. Quarta, o canal: o <em>token</em> vai no corpo do correio, nunca em parâmetros de URL que acabam em <em>logs</em> de servidor e em cabeçalhos de referência.</p>
+      <p>Quinta, observabilidade: eventos de reposição pedida, reposição concluída e limite atingido, com identificador de correlação, para que uma campanha de abuso apareça num painel. E um teste que exercite o caminho negativo — <em>token</em> expirado, <em>token</em> reutilizado, endereço inexistente — porque o teste que existe no PR é sempre o do caminho feliz. Se faltar a resposta uniforme ou o limite de tentativas, bloqueio a integração; o resto pode entrar com tarefa associada e prazo.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Revê apenas o que está escrito; aprova porque «os testes passam».</td></tr>
+        <tr><td>Mid</td><td>Nota o <em>token</em> previsível ou a validade longa, mas não vê a enumeração de contas nem a ausência de limite de tentativas.</td></tr>
+        <tr><td>Sénior</td><td>Enumera as ausências — resposta uniforme, limite por alvo e por origem partilhado entre instâncias, <em>token</em> de uso único derivado, canal, eventos — e separa o que bloqueia do que não bloqueia.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a invalidação de sessões, o efeito do <em>autoscaling</em> num limite em memória, e propõe que estes requisitos passem a lista de verificação reutilizável para <em>endpoints</em> públicos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Onde guarda o contador do limite e porquê?»</li>
+      <li>«Como garante tempo de resposta semelhante nos dois caminhos?»</li>
+      <li>«O que acontece às sessões abertas quando a palavra-passe muda?»</li>
+      <li>«Que comentários seus bloqueiam a integração e quais não?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Mensagem diferente para «endereço não existe».</li>
+      <li>Contador de tentativas em memória do processo com várias réplicas.</li>
+      <li><em>Token</em> guardado em claro na base de dados ou enviado no URL.</li></ul></div>
+  </div>
+</div>
+
+<p>O exercício seguinte é a forma habitual deste formato: um controlador curto, três falhas de classes diferentes, 20 minutos para as nomear e corrigir. Vale a pena escrever a correcção completa antes de ver a solução, incluindo a assinatura do repositório, porque metade da avaliação está em onde o candidato decide pôr cada controlo.</p>
+
+<figure class="listing java" id="lst-38-6"><div class="lhead"><span class="lnum">Listagem 38.6</span>
+<span class="lcap">Controlador a rever: três vulnerabilidades de classes diferentes</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@RestController
+@RequestMapping("/api/faturas")
+public class FaturaController {
+
+    private final JdbcTemplate jdbc;
+    private final FaturaRepo repo;
+    private final PdfService pdf;
+
+    @GetMapping
+    public List&lt;Map&lt;String, Object&gt;&gt; procurar(
+            @RequestParam String nome,
+            @RequestHeader("Authorization") String auth) {
+
+        String payload = new String(Base64.getUrlDecoder()
+                .decode(auth.substring(7).split("\\.")[1]), UTF_8);
+        long cliente = Long.parseLong(JsonPath.read(payload, "$.sub").toString());
+
+        return jdbc.queryForList(
+                "SELECT * FROM fatura WHERE cliente_id = " + cliente
+              + " AND cliente_nome LIKE '%" + nome + "%'");
+    }
+
+    @GetMapping("/{id}/pdf")
+    public ResponseEntity&lt;byte[]&gt; pdf(@PathVariable long id) {
+        Fatura f = repo.findById(id).orElseThrow();
+        return ResponseEntity.ok(pdf.render(f));
+    }
+}</code></pre></figure>
+
+<div class="lab" id="lab-38-1" data-box="lab" data-lang="java">
+  <div class="labhead"><span class="labttl">Exercício 38.1 — Rever e corrigir um controlador com três vulnerabilidades</span>
+    <div class="labpills"><span class="qpill">Revisão de código</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>O controlador da Listagem 38.6 está em produção. A aplicação está configurada como <em>resource server</em> do OAuth2 e todos os pedidos a <code>/api/**</code> chegam já autenticados. Tarefa: nomear as três vulnerabilidades, dizer a que classe do OWASP pertence cada uma, e reescrever o controlador (mais a interface do repositório, se precisar) de forma a que a mesma falha não possa ser reintroduzida por um método novo. Restrições: manter o comportamento funcional — pesquisa por nome parcial e descarregamento do PDF —, não alterar o contrato do URL, e não confiar em nada que venha do cliente para determinar a identidade. Exemplo: com o cliente 42 autenticado, <code>GET /api/faturas/91872/pdf</code> em que a factura 91 872 pertence ao cliente 7 tem de devolver <code>404</code>.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <p>As três falhas: (1) o JWT é descodificado à mão a partir do cabeçalho, sem verificação de assinatura, emissor, audiência ou expiração — A07, e qualquer pessoa forja o <code>sub</code> e passa a ser outro cliente; (2) o nome entra por concatenação na consulta SQL — A03, injecção clássica agravada pelo <code>SELECT *</code> e pela ausência de limite de linhas; (3) o <em>endpoint</em> do PDF lê a factura só por <code>id</code>, sem ligar o recurso ao principal — A01, IDOR. O <code>cliente</code> aparecer na consulta não corrige nada, porque o seu valor vem do <em>token</em> não verificado.</p>
+      <figure class="listing java" id="lst-38-7"><div class="lhead"><span class="lnum">Listagem 38.7</span>
+        <span class="lcap">Controlador corrigido: identidade validada, parâmetros vinculados, propriedade na consulta</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>@RestController
+@RequestMapping("/api/faturas")
+@PreAuthorize("hasAuthority('SCOPE_faturas:read')")
+public class FaturaController {
+
+    private final FaturaRepo repo;
+    private final PdfService pdf;
+
+    FaturaController(FaturaRepo repo, PdfService pdf) { this.repo = repo; this.pdf = pdf; }
+
+    // (1) A identidade vem do principal que o resource server JÁ validou
+    //     (assinatura via JWKS, iss, aud, exp). O controlador nunca descodifica o token.
+    private static long clienteDe(Jwt jwt) {
+        return Long.parseLong(jwt.getSubject());
+    }
+
+    // (2) Parâmetro vinculado, projecção explícita e limite fixo de linhas.
+    @GetMapping
+    public List&lt;FaturaDto&gt; procurar(@RequestParam @Size(max = 80) String nome,
+                                    @AuthenticationPrincipal Jwt jwt) {
+        return repo.procurarPorNome(clienteDe(jwt), nome, PageRequest.of(0, 100));
+    }
+
+    // (3) A propriedade entra na consulta; 404 e não 403 para não confirmar existência.
+    @GetMapping("/{id}/pdf")
+    public ResponseEntity&lt;byte[]&gt; pdf(@PathVariable long id,
+                                      @AuthenticationPrincipal Jwt jwt) {
+        Fatura f = repo.findByIdAndClienteId(id, clienteDe(jwt))
+                .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.NOT_FOUND));
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_PDF)
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=fatura-" + f.numero() + ".pdf")
+                .body(pdf.render(f));
+    }
+}
+
+// A propriedade vive no repositório: NENHUM método consegue ler sem o cliente.
+public interface FaturaRepo extends Repository&lt;Fatura, Long&gt; {
+
+    Optional&lt;Fatura&gt; findByIdAndClienteId(long id, long clienteId);
+
+    @Query("""
+           select new com.acme.faturacao.FaturaDto(f.id, f.numero, f.totalCents, f.estado)
+           from Fatura f
+           where f.clienteId = :cliente
+             and lower(f.clienteNome) like lower(concat('%', :nome, '%'))
+           order by f.criadaEm desc
+           """)
+    List&lt;FaturaDto&gt; procurarPorNome(@Param("cliente") long cliente,
+                                    @Param("nome") String nome,
+                                    Pageable pagina);
+}</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A consulta de pesquisa é O(n) sobre as facturas do cliente; com <code>LIKE '%x%'</code> não há índice B-tree aplicável, e a resposta completa menciona um índice trigrama (<code>pg_trgm</code>) ou pesquisa de texto se o volume por cliente passar de algumas dezenas de milhares.</li>
+        <li>Casos limite a nomear: <code>nome</code> vazio ou só com <code>%</code> e <code>_</code>, que são metacaracteres do <code>LIKE</code> e devem ser escapados ou o filtro rejeitado; <em>token</em> sem <code>sub</code> numérico; factura inexistente e factura de outro cliente, que têm de produzir a mesma resposta.</li>
+        <li>O sinal principal é <em>onde</em> a correcção é colocada: quem põe a verificação de propriedade num <code>if</code> depois do <code>findById</code> corrige o bug, quem a põe na assinatura do repositório corrige a classe de bugs.</li>
+        <li>Sinal secundário: notar que <code>SELECT *</code> mais <code>Map&lt;String, Object&gt;</code> devolve todas as colunas, incluindo as que forem acrescentadas no futuro — uma fuga de dados a prazo, sem alteração de código.</li>
+        <li>Um candidato forte acrescenta o teste que fecha a classe: autenticar como cliente B, pedir um recurso do cliente A, esperar 404, gerado para todas as rotas a partir da lista de <em>endpoints</em>.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-38-7" class="h2"><span class="secnum">38.7</span> Resumo e checklist<a class="anchor" href="#sec-38-7" aria-label="ligação">#</a></h2>
+
+<p>O que reter deste capítulo, na forma em que é útil dentro de uma sala de entrevista:</p>
+
+<ul class="lst">
+  <li>A resposta forte descreve sempre <em>onde</em> o controlo vive, não só qual é. Propriedade do objecto na consulta vence propriedade do objecto num <code>if</code>, porque a segunda depende de disciplina em cada método novo.</li>
+  <li>Injecção resolve-se separando dados de comando: valores por parâmetro vinculado, identificadores por lista branca fechada. Escapar e sanitizar são respostas de nível insuficiente.</li>
+  <li>Deserialização insegura é grave porque a execução antecede o <em>cast</em>; a solução é um formato sem tipo dinâmico para um tipo alvo fechado, e o filtro de classes do JDK é mitigação de legado.</li>
+  <li>XSS e CSRF são perguntas independentes: o CSRF só existe quando o navegador anexa a credencial sozinho; desactivar a protecção sem verificar isso é <em>red flag</em>.</li>
+  <li>Um JWT exige seis verificações — assinatura com algoritmo fixado pelo verificador, <code>iss</code>, <code>aud</code>, <code>exp</code>/<code>nbf</code>, tipo de <em>token</em>, afirmações de autorização — e a revogação é o que se perde por escolher <em>stateless</em>.</li>
+  <li><em>Scope</em> limita a aplicação, papel descreve o utilizador, propriedade liga ao objecto: a decisão correcta é a intersecção dos três, nunca a união.</li>
+  <li>Palavras-passe: função de derivação lenta calibrada por tempo medido (100 a 500 ms no hardware alvo), migração progressiva com prefixo de algoritmo, nunca reposição em massa.</li>
+  <li>Um segredo comitado roda-se primeiro e limpa-se depois; o objectivo mensurável não é «nunca acontecer», é o tempo até à detecção e até à rotação.</li>
+  <li>Em revisão de código, o que apanha vulnerabilidades é percorrer fronteiras — entrada, autorização, consulta, saída, configuração, registo — e perguntar o que falta, não só o que está errado.</li>
+</ul>
+
+<p>Lista de verificação para usar antes de aprovar uma alteração ou antes de entrar numa ronda de segurança:</p>
+
+<ul class="lst">
+  <li>Toda a consulta com entrada externa usa parâmetros vinculados, e todo o identificador dinâmico vem de uma lista branca no código.</li>
+  <li>Todo o acesso a um recurso identificado inclui o principal na consulta; a resposta para «não é seu» é indistinguível de «não existe».</li>
+  <li>Existe um teste, por rota, que autentica como outro utilizador e espera 404; rotas novas sem esse teste falham o CI.</li>
+  <li>Nenhum código descodifica <em>tokens</em> à mão; a validação inclui emissor, audiência, expiração e algoritmo fixado pelo verificador.</li>
+  <li>A cadeia de filtros termina em <code>anyRequest().authenticated()</code>; a desactivação de CSRF está justificada pela ausência de <em>cookie</em> de sessão nessa cadeia.</li>
+  <li>Nenhum segredo no repositório nem na imagem; o valor é resolvido no arranque, e a rotação não exige alteração de código.</li>
+  <li>O Actuator expõe apenas <code>health</code>, <code>info</code> e métricas; <em>stack traces</em> e mensagens internas não saem nas respostas de erro.</li>
+  <li>Dados pessoais não entram em <em>logs</em> nem em <em>traces</em> por omissão do serializador, e existe caminho de apagamento para réplicas, tópicos e cópias de segurança.</li>
+  <li><em>Endpoints</em> públicos têm limite de tentativas partilhado entre instâncias, limite de tamanho de corpo e evento de auditoria por decisão negada.</li>
+  <li>A análise de dependências corre no CI, o SBOM é guardado com o artefacto, e cada excepção aceite tem prazo e dono registados.</li>
+</ul>

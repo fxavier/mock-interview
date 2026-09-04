@@ -1,51 +1,26 @@
 {"chapter": 7, "questions": [
-  {"q": "Um serviço tem `private volatile int[] contadores = new int[16];` e várias threads executam `contadores[i]++`. Que garantia existe?",
-   "options": [
-     "Cada `contadores[i]++` é atómico, porque o array é volátil.",
-     "Os incrementos podem perder-se: `volatile` aplica-se à referência do array, não aos elementos, e `++` nunca é atómico.",
-     "As escritas são visíveis e atómicas desde que só uma thread escreva em cada índice diferente.",
-     "É seguro porque `int` cabe numa palavra e a JVM garante atomicidade de escritas de 32 bits."
-   ],
+  {"q": "Sobre `List.of(\"a\",\"bb\",\"ccc\").stream().map(s -> s.length()).peek(System.out::println).count()` numa JVM Java 21: quantas linhas são impressas?",
+   "options": ["Três, uma por elemento.", "Nenhuma, porque `count()` pode determinar o tamanho pela fonte e o `peek` é eliminado.", "Uma, porque `count()` corta no primeiro elemento.", "Três, mas só se o stream for sequencial."],
    "answer": 1,
-   "explain": "`volatile` numa referência de array torna volátil apenas a leitura e escrita da própria referência; os elementos são acedidos como campos normais, sem visibilidade nem barreira. Além disso `++` é ler-somar-escrever, três operações. A opção sobre atomicidade de 32 bits confunde ausência de tearing com atomicidade de operação composta. A solução é `AtomicIntegerArray` ou `LongAdder` por posição."},
+   "explain": "Desde o Java 9, `count()` pode saltar o percurso quando a fonte é SIZED e nenhuma operação altera a contagem; `map` não altera, portanto o `peek` não corre. Basta acrescentar um `filter` para o tamanho deixar de ser conhecido e as três linhas voltarem a aparecer. `count()` não é uma operação de corte antecipado, logo a opção da única linha está errada."},
 
-  {"q": "Configurou `new ThreadPoolExecutor(4, 64, 60L, SECONDS, new LinkedBlockingQueue<>(), new AbortPolicy())` e o serviço recebe 800 pedidos/s de 200 ms. O que observa em produção?",
-   "options": [
-     "O pool cresce até 64 threads e depois começa a rejeitar tarefas com `RejectedExecutionException`.",
-     "O pool fica em 4 threads, a fila cresce sem limite, a latência dispara e acaba em `OutOfMemoryError`; a política de rejeição nunca é aplicada.",
-     "O pool cresce até 64 threads e a fila mantém-se vazia porque as threads consomem mais depressa do que a fila enche.",
-     "O `keepAliveTime` de 60 s faz o pool oscilar entre 4 e 64 threads conforme a carga."
-   ],
+  {"q": "Um relatório usa `txs.stream().filter(Tx::aprovada).collect(Collectors.groupingBy(Tx::comerciante, Collectors.counting()))`. Os comerciantes que só tiveram transacções recusadas desaparecem do mapa. Qual é a correcção mínima?",
+   "options": ["Trocar `groupingBy` por `groupingByConcurrent`.", "Remover o `filter` e mover o predicado para dentro do `groupingBy` com `Collectors.filtering`.", "Acrescentar `Collectors.collectingAndThen` com um `Map::copyOf` no fim.", "Substituir `counting()` por `summingLong(t -> 1L)`."],
    "answer": 1,
-   "explain": "O `ThreadPoolExecutor` só cria threads acima de `corePoolSize` quando a fila recusa a tarefa. Com uma `LinkedBlockingQueue` sem capacidade a fila nunca recusa, logo `maximumPoolSize` e a política de rejeição ficam inertes. Pela lei de Little seriam precisos 160 pedidos em curso e há 4 threads: a fila cresce indefinidamente. A correcção é uma fila limitada, que reactiva o crescimento do pool e a rejeição."},
+   "explain": "`filter` a montante elimina os elementos antes de existirem grupos, por isso o grupo nunca é criado. `Collectors.filtering` aplica o predicado dentro do grupo já formado e devolve contagem zero para esses comerciantes. `groupingByConcurrent` só muda a estratégia de concorrência, `collectingAndThen` só torna o mapa imutável e `summingLong` conta exactamente o mesmo subconjunto filtrado."},
 
-  {"q": "Num `ConcurrentHashMap<String, List<Evento>>` partilhado, qual destas linhas está correcta sob concorrência?",
-   "options": [
-     "`if (!m.containsKey(k)) m.put(k, new ArrayList<>()); m.get(k).add(e);`",
-     "`List<Evento> l = m.get(k); if (l == null) { l = new ArrayList<>(); m.put(k, l); } l.add(e);`",
-     "`m.computeIfAbsent(k, x -> Collections.synchronizedList(new ArrayList<>())).add(e);`",
-     "`m.putIfAbsent(k, new ArrayList<>()); m.get(k).add(e);`"
-   ],
+  {"q": "Num contentor Kubernetes com `resources.limits.cpu: 2`, um endpoint chama `ids.parallelStream().map(clienteHttp::obter).toList()` para 100 ids, cada chamada com 150 ms de latência. Qual é a consequência mais grave?",
+   "options": ["O tempo total fica em cerca de 150 ms porque o ForkJoinPool cria um thread por elemento.", "O `ForkJoinPool.commonPool()`, com paralelismo 1, fica bloqueado em I/O e afecta todo o processo.", "O `toList()` lança `IllegalStateException` porque o stream é paralelo.", "A ordem dos resultados deixa de corresponder à ordem dos ids."],
+   "answer": 1,
+   "explain": "O paralelismo por omissão é `availableProcessors() - 1`, ou seja 1 neste contentor, e o pool é global ao processo — o I/O bloqueante prende-o e paralisa todos os `CompletableFuture` sem executor explícito. O pool não cria um thread por elemento, `toList()` funciona bem em paralelo e preserva a ordem de encontro. Para I/O usa-se um executor de threads virtuais."},
+
+  {"q": "Um campo `Function<String,String> f = configService.obterMapa()::get` é inicializado no arranque. Após um recarregamento que substitui a instância devolvida por `obterMapa()`, o serviço continua a devolver valores antigos. Porquê?",
+   "options": ["Porque `Function` guarda um cache interno dos resultados.", "Porque a referência de método avaliou `configService.obterMapa()` uma só vez, ao ser criada, e capturou o receptor.", "Porque o campo teria de ser `volatile` para ver a nova instância.", "Porque `Map::get` devolve sempre o valor da primeira chamada para a mesma chave."],
+   "answer": 1,
+   "explain": "Em `expr::metodo` a expressão do receptor é avaliada no momento da criação da referência, ficando presa à instância então devolvida; o lambda `k -> configService.obterMapa().get(k)` reavaliaria em cada invocação. `volatile` não ajuda porque o campo `f` não é reatribuído, e nem `Function` nem `Map::get` fazem cache."},
+
+  {"q": "Qual destas afirmações sobre `reduce` e `collect` é correcta?",
+   "options": ["`reduce(\"\", String::concat)` sobre 100 000 cadeias tem o mesmo custo que `Collectors.joining()`.", "O `combiner` de um `Collector` é invocado em todos os percursos, sequenciais e paralelos.", "`reduce` com um acumulador que muta e devolve o argumento é correcto em série e pode dar resultados errados em paralelo.", "`collect` não pode ser usado em streams paralelos porque o contentor é mutável."],
    "answer": 2,
-   "explain": "As duas primeiras são check-then-act: duas threads podem criar listas diferentes e uma perde as suas escritas. A quarta cria a lista de forma atómica, mas o `add` continua a correr sobre um `ArrayList` não sincronizado, partilhado por várias threads, que pode corromper-se ao crescer. Só a terceira combina criação atómica com uma lista segura para escrita concorrente."},
-
-  {"q": "`CompletableFuture<Preco> f = catalogo.lerAsync(id).thenApply(a -> precos.consultarAsync(a));` — o que está errado?",
-   "options": [
-     "Nada: `thenApply` achata automaticamente o futuro devolvido pela função.",
-     "`thenApply` devolve `CompletableFuture<CompletableFuture<Preco>>`; é preciso `thenCompose` para achatar o resultado.",
-     "Falta `thenApplyAsync`, sem o qual a função nunca é executada.",
-     "`thenApply` bloqueia a thread chamadora até `lerAsync` completar."
-   ],
-   "answer": 1,
-   "explain": "`thenApply` é o `map` desta API: embrulha o que a função devolver, e como a função devolve um `CompletableFuture`, o resultado é um futuro dentro de um futuro. `thenCompose` é o `flatMap` e resolve isso. `thenApply` sem `Async` não bloqueia — executa na thread que completou o futuro anterior, ou na chamadora se ele já estiver completo."},
-
-  {"q": "Num serviço com um pool fixo de 200 threads, o contexto de tenant é guardado num `ThreadLocal` com `set()` no início de cada pedido. Porque é que a heap cresce indefinidamente?",
-   "options": [
-     "Porque o `ThreadLocal` é `static` e a JVM nunca liberta campos estáticos.",
-     "Porque as chaves do `ThreadLocalMap` são referências fortes e impedem a recolha do objecto `ThreadLocal`.",
-     "Porque os valores são referenciados fortemente pela thread e as threads do pool nunca morrem; falta `remove()` num `finally`.",
-     "Porque o `set()` acumula uma entrada nova por pedido no `ThreadLocalMap` de cada thread."
-   ],
-   "answer": 2,
-   "explain": "As chaves do `ThreadLocalMap` são referências fracas, mas os valores são fortes e vivem enquanto a thread viver — e as threads de um pool vivem tanto quanto o processo. Cada `set()` substitui a entrada anterior, por isso não há acumulação de entradas: o que fica retido é o último valor por thread, 200 contextos que o GC não pode recolher. A correcção é `remove()` num `finally`, no mesmo âmbito do `set()`."}
+   "explain": "`reduce` assume acumulação imutável e associativa; mutar o argumento funciona por acaso em série e corrompe resultados em paralelo, onde a identidade é partilhada entre ramos — é exactamente o caso que `collect` cobre com supplier/accumulator/combiner. `reduce` com `String::concat` é O(n²) contra O(n) de `joining()`, o `combiner` só é chamado em execução paralela, e `collect` é seguro em paralelo por usar contentores privados por ramo."}
 ]}

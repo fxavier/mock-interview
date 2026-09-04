@@ -1,46 +1,51 @@
 {"chapter": 22, "questions": [
-  {"q": "Numa tabela de 48 milhões de linhas, a consulta é `WHERE tenant_id = $1 AND created_at >= $2 AND status = $3` com `ORDER BY created_at DESC LIMIT 100`. Qual destes índices produz o varrimento mais estreito?",
+  {"q": "Uma tabela de 300 milhões de linhas usa `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` e as inserções degradaram-se à medida que a tabela cresceu. Qual é a explicação mecânica correcta?",
    "options": [
-     "`(created_at, tenant_id, status)`",
-     "`(tenant_id, status, created_at)`",
-     "`(created_at)` mais `(tenant_id)` mais `(status)`, deixando o planeador combiná-los",
-     "`(status, created_at, tenant_id)`"],
+     "O tipo `uuid` do PostgreSQL é guardado como texto de 36 bytes, o que torna as comparações lentas.",
+     "Os valores são aleatórios, cada inserção aterra numa folha imprevisível do B-tree, provocando divisões de página e leituras aleatórias quando o índice deixa de caber em `shared_buffers`.",
+     "O `gen_random_uuid()` bloqueia porque tem de consultar uma sequência partilhada para garantir unicidade.",
+     "O índice de chave primária deixa de ser usado acima de 100 milhões de linhas e o planeador passa a fazer varredura sequencial."
+   ],
    "answer": 1,
-   "explain": "As duas igualdades (`tenant_id`, `status`) fixam o prefixo lexicográfico e deixam as entradas já ordenadas por `created_at`, pelo que o `LIMIT 100` pára o varrimento à 100.ª folha. Pôr `created_at` à cabeça faz do intervalo o primeiro delimitador e transforma tudo o que vem depois em filtro. Três índices separados obrigam a `BitmapAnd` com dois bitmaps e a recolha na heap, quase sempre mais caro. A quarta opção desperdiça `status`, que tem 91% das linhas num só valor, como primeira coluna e volta a pôr o intervalo antes de `tenant_id`."},
+   "explain": "O problema é localidade de escrita: UUIDv4 é aleatório em todos os bits úteis, por isso as inserções espalham-se por todo o índice, dividem páginas e deixam as folhas com 50-70% de ocupação. O tipo `uuid` ocupa 16 bytes binários, não 36 (esse é o erro de guardar em `varchar`); `gen_random_uuid()` não coordena nada, é local; e o planeador não abandona o índice por causa do tamanho da tabela."},
 
-  {"q": "Um plano mostra `Index Only Scan using idx_orders_cust on orders` com `Heap Fetches: 412883` e 900 ms de execução. Qual é a causa mais provável?",
+  {"q": "Numa tabela com `soft delete` por `deleted_at`, qual é a consequência que a maioria das equipas não antecipa?",
    "options": [
-     "O índice não contém todas as colunas da projecção, por isso o motor vai à tabela buscar o resto",
-     "As estatísticas da coluna estão desactualizadas e o planeador escolheu o índice errado",
-     "O mapa de visibilidade não marca os blocos como todo-visíveis porque o `autovacuum` não acompanha a taxa de escrita",
-     "O índice está com bloat e precisa de `REINDEX CONCURRENTLY`"],
-   "answer": 2,
-   "explain": "Se o índice não cobrisse a projecção, o nó seria `Index Scan` e não `Index Only Scan`, logo a primeira opção é impossível. `Heap Fetches` conta exactamente as idas à heap causadas por blocos sem a marca all-visible no visibility map, que o `VACUUM` é que coloca — daí a ligação directa ao `autovacuum` (ou a uma transacção longa que fixa o horizonte de xmin). Estatísticas erradas manifestam-se no desvio entre rows estimadas e reais, e bloat manifesta-se no tamanho do índice, não neste contador."},
-
-  {"q": "A consulta `SELECT * FROM eventos WHERE date_trunc('day', ocorrido_em) = date '2026-08-30'` faz `Seq Scan` apesar de existir um B-tree em `ocorrido_em`. Qual é a correcção preferível?",
-   "options": [
-     "Reescrever como `ocorrido_em >= '2026-08-30' AND ocorrido_em < '2026-08-31'`",
-     "Criar `CREATE INDEX ... USING gin (ocorrido_em)`",
-     "Definir `enable_seqscan = off` na sessão da aplicação",
-     "Criar `CREATE INDEX ... ON eventos (date_trunc('day', ocorrido_em))`"],
+     "As chaves estrangeiras deixam de impedir que uma linha viva referencie um pai já apagado, porque a linha do pai continua a existir.",
+     "O PostgreSQL passa a ignorar automaticamente as linhas com `deleted_at` preenchido nas junções.",
+     "O `autovacuum` remove as linhas marcadas ao fim de um ciclo, o que torna a reposição impossível.",
+     "Os índices deixam de poder ser usados porque `deleted_at` é uma coluna anulável."
+   ],
    "answer": 0,
-   "explain": "O índice guarda `ocorrido_em`, não o resultado da função, por isso o predicado não é sargable; a reescrita como intervalo semi-aberto devolve exactamente o mesmo conjunto e usa o índice existente sem gastar espaço nem escrita. O índice de expressão funcionaria, mas `date_trunc` sobre `timestamptz` não é IMMUTABLE (depende de `TimeZone`) e o PostgreSQL recusa a criação sem fixar o fuso. GIN não serve predicados escalares de igualdade sobre timestamp, e desligar `enable_seqscan` é diagnóstico, nunca correcção."},
+   "explain": "O `soft delete` transfere para a aplicação um invariante que era da base: a chave estrangeira continua satisfeita por um pai marcado como apagado. O motor não conhece a convenção nem filtra nada, o `autovacuum` só recolhe tuplos mortos por MVCC (não linhas marcadas pela aplicação) e uma coluna anulável não impede o uso de índices — inclusive índices parciais, que são a correcção recomendada."},
 
-  {"q": "Num plano, um `Nested Loop` mostra `loops=1188402` e o seu lado externo mostra `(cost=... rows=40 ...) (actual ... rows=1188402 ...)`. Qual é a primeira acção?",
+  {"q": "Numa tabela filha com 50 milhões de linhas, a coluna que referencia o pai não tem índice. O que acontece ao apagar uma linha do pai com `ON DELETE CASCADE`?",
    "options": [
-     "Definir `enable_nestloop = off` para forçar um hash join",
-     "Investigar o erro de estimativa: `ANALYZE`, `SET STATISTICS` na coluna, e `CREATE STATISTICS` se houver colunas correlacionadas",
-     "Subir `work_mem` para que o nested loop caiba em memória",
-     "Criar um índice adicional no lado interno do join"],
-   "answer": 1,
-   "explain": "O planeador escolheu nested loop porque acreditou em 40 linhas do lado externo; com 1 188 402 reais, o algoritmo é uma consequência de uma premissa falsa e não a causa. Corrigir a estimativa costuma fazer o planeador trocar sozinho para hash join. Desligar `enable_nestloop` fixa o plano de hoje e cria um incidente quando a distribuição mudar; `work_mem` não afecta nested loops, que não materializam nada; e o lado interno já usa índice — é precisamente por isso que o nested loop parecia barato."},
-
-  {"q": "Um endpoint pagina com `ORDER BY created_at DESC OFFSET 100000 LIMIT 20` e demora 1,9 s. O que resolve o problema de forma estrutural?",
-   "options": [
-     "Um índice `(created_at DESC)` e aumentar `work_mem` para 256 MB",
-     "Substituir por `WHERE created_at < $1 ORDER BY created_at DESC LIMIT 20`, usando o `created_at` da última linha da página anterior",
-     "Substituir por `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20` com índice em `(created_at DESC, id DESC)`",
-     "Manter o `OFFSET` e colocar as páginas mais pedidas em Redis"],
+     "Nada de especial: a cascata usa o índice da chave primária da tabela filha.",
+     "O PostgreSQL recusa o `DELETE` porque a integridade referencial exige um índice do lado filho.",
+     "A verificação da restrição obriga a uma varredura sequencial completa da tabela filha, com o bloqueio mantido durante todo o tempo.",
+     "A cascata é adiada para o próximo `autovacuum` e o `DELETE` regressa de imediato."
+   ],
    "answer": 2,
-   "explain": "O custo do `OFFSET` é linear na profundidade porque o motor produz e descarta as 100 000 linhas anteriores; nenhum índice nem memória alteram essa semântica, o que elimina a primeira opção. A paginação por chave torna o custo constante, mas só é correcta com uma chave total: com apenas `created_at`, linhas com o mesmo instante são perdidas ou repetidas na fronteira das páginas, o que invalida a segunda opção. A comparação de tuplos com `id` como desempate traduz-se directamente num limite de varrimento do índice composto. Uma cache não corrige a consulta e degrada-se assim que a distribuição de páginas pedidas se dispersa."}
+   "explain": "O PostgreSQL cria índice para a chave primária mas nunca para a coluna que referencia; sem ele, cada apagamento no pai varre toda a tabela filha, transformando uma operação sub-milissegundo em segundos com bloqueio activo. Não é recusado, não usa a PK da filha (a coluna de FK é outra) e a verificação é imediata, não diferida para o `autovacuum`."},
+
+  {"q": "Qual destas colunas está correctamente tipada num modelo PostgreSQL 17 para pagamentos?",
+   "options": [
+     "`amount money NOT NULL`, porque o tipo é dedicado a valores monetários.",
+     "`captured_at timestamp NOT NULL`, porque a aplicação grava sempre em UTC.",
+     "`fx_rate double precision NOT NULL`, porque taxas de câmbio precisam de muitas casas decimais.",
+     "`amount numeric(18,4) NOT NULL` com `captured_at timestamptz NOT NULL`."
+   ],
+   "answer": 3,
+   "explain": "`numeric` dá aritmética decimal exacta com escala suficiente para montantes e `timestamptz` guarda um instante absoluto, imune à configuração de fuso de quem lê. O tipo `money` depende da configuração regional do servidor, `timestamp` sem fuso não fixa instante nenhum (a convenção UTC quebra-se no primeiro cliente com outra configuração) e `double precision` acumula erro de representação binária."},
+
+  {"q": "Num SaaS com 2 000 `tenants` e 40 tabelas, o argumento mais forte contra schema por tenant é:",
+   "options": [
+     "O PostgreSQL só suporta um número limitado de schemas por base de dados.",
+     "Cada migração passa a ser 2 000 operações orquestradas e o catálogo cresce para cerca de 80 000 relações, com impacto no `autovacuum` e nas cópias de segurança.",
+     "Não é possível garantir unicidade dentro de cada schema sem uma coluna `tenant_id`.",
+     "As ligações têm de ser abertas com um utilizador diferente por tenant, o que impede o uso de um pool."
+   ],
+   "answer": 1,
+   "explain": "O custo dominante é operacional: uma alteração de esquema multiplica-se por 2 000, deixando o sistema em estado misto durante horas, e o catálogo com dezenas de milhares de relações penaliza planeamento, `autovacuum` e `pg_dump`. O PostgreSQL não impõe um limite prático de schemas, cada schema tem as suas próprias restrições de unicidade e o `search_path` por transacção permite reutilizar um único pool."}
 ]}

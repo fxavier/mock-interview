@@ -1,600 +1,940 @@
-<p>A ronda comportamental de um sénior não mede simpatia nem «encaixe cultural»: mede se o candidato consegue provar, com histórias verificáveis, que já operou com autonomia sobre um âmbito maior do que uma tarefa e que a sua presença mudou o resultado de outras pessoas. É a ronda com maior variância de preparação — quase todos ensaiam <em>system design</em> e quase ninguém ensaia isto — e a que mais vezes decide o nível na oferta, porque é dela que sai a evidência de âmbito, influência e maturidade. Onde os candidatos caem é sempre no mesmo sítio: contam contexto durante quatro minutos, dissolvem o papel próprio na primeira pessoa do plural, não têm um único número no fim e escolhem uma história de conflito em que estavam objectivamente certos e o outro estava errado. Este capítulo constrói o banco de histórias, dá catorze respostas-modelo escritas na primeira pessoa e fecha com a parte que ninguém escreve por medo de parecer mercenária: nivelamento, componentes de compensação e como negociar com factos.</p>
+<p>Observabilidade é a ronda em que o entrevistador descobre se o candidato já esteve de plantão. Toda a gente sabe recitar «métricas, logs e traços»; poucos sabem dizer quanto custa uma etiqueta nova num histograma, porque é que a média de latência não serve para nada, ou o que fazem nos primeiros noventa segundos de um alerta às três da manhã. O sinal que se procura é procedimento: uma sequência de hipóteses ordenada por probabilidade e por custo de verificação, com um comando ou uma <em>query</em> concreta em cada passo, e a disciplina de mitigar antes de compreender. Este capítulo cobre o que instrumentar num serviço Java, como desenhar SLO e alertas que não geram ruído, como se lê um <em>thread dump</em>, como se perfila uma JVM em produção sem a parar, e como se conduz e se escreve um incidente.</p>
 
-<h2 id="sec-37-1" class="h2"><span class="secnum">37.1</span> O que a ronda comportamental mede num sénior<a class="anchor" href="#sec-37-1" aria-label="ligação">#</a></h2>
+<h2 id="sec-37-1" class="h2"><span class="secnum">37.1</span> Os três sinais e o que instrumentar num serviço Java<a class="anchor" href="#sec-37-1" aria-label="ligação">#</a></h2>
 
-<p>O entrevistador comportamental não recebe a instrução «vê se gostas dele». Recebe duas ou três dimensões da grelha para investigar e a obrigação de escrever evidência citável no <em>debrief</em>. As dimensões repetem-se com nomes diferentes entre empresas, mas reduzem-se a cinco: âmbito e autonomia (que decisões tomou sozinho e com que raio de impacto), influência sem autoridade (fez alguém mudar de opinião sem ser chefe dessa pessoa), lidar com ambiguidade e conflito, entrega sob restrição (prazos, incidentes, dívida técnica), e desenvolvimento de outros (mentoria, revisão de código, elevar o nível da equipa). Uma resposta que não alimenta nenhuma destas cinco caixas é tempo perdido, por mais interessante que seja tecnicamente.</p>
+<p>Os três sinais respondem a perguntas diferentes e têm custos que diferem em duas ordens de grandeza. Uma métrica responde a «está mau?» — é uma série temporal agregada, barata de guardar (alguns bytes por ponto por série) e barata de consultar em segundos sobre semanas de histórico, mas não sabe nada sobre o pedido individual. Um traço responde a «onde, dentro do pedido?» — mostra a árvore de chamadas com tempos por salto, custa uns 2 a 5 KB por pedido amostrado e só é útil se o contexto se propagar entre serviços. Um log responde a «o que aconteceu exactamente a este pedido?» — é o mais caro por unidade de informação (0,5 a 2 KB por linha, indexado) e o único que carrega o detalhe do domínio.</p>
 
-<p>A diferença de nível lê-se na unidade de impacto, não no vocabulário. Um <em>mid</em> conta histórias cuja unidade é a funcionalidade: «implementei o endpoint de reembolsos». Um sénior conta histórias cuja unidade é o sistema e o trimestre: «reduzi o p99 do serviço de autorização de 480 ms para 120 ms e isso destravou o contrato com o comerciante X». Um <em>staff</em> conta histórias cuja unidade é a organização: «mudei a forma como cinco equipas fazem migrações de esquema, o que eliminou 3 incidentes por trimestre». Nenhum destes níveis é atingido dizendo «sou muito sénior»; é atingido escolhendo a história certa e citando o número que o entrevistador consegue copiar para as notas.</p>
+<p>A regra de investimento que separa um sénior de um mid é esta: <strong>alerta-se em métricas, navega-se em traços, confirma-se em logs</strong>. Quem tenta alertar a partir de logs paga uma factura de indexação desproporcionada e obtém latência de detecção de minutos; quem tenta diagnosticar latência distribuída só com logs acaba a fazer <em>grep</em> por <em>timestamp</em> em cinco serviços. O caminho correcto é o alerta apontar para um painel, o painel para um <em>exemplar</em> de traço, e o traço para as linhas de log daquele <code>trace_id</code>.</p>
 
-<p>O formato dominante é a pergunta de comportamento passado — «fale-me de uma vez em que…» — precisamente porque o comportamento passado é observável e a intenção futura não é. Perguntas hipotéticas («o que faria se…») aparecem como aquecimento ou quando o candidato não tem experiência do caso; a resposta correcta a uma hipotética é convertê-la numa real: «aconteceu-me em 2023, deixe-me contar o caso concreto». Cerca de 45 minutos dão para quatro a seis histórias com <em>follow-ups</em>, o que fixa o orçamento: 2 a 3 minutos por história, nunca mais.</p>
+<p>Num serviço Spring Boot 3.5 com Java 25, o mínimo que tem de estar ligado no primeiro dia de produção é: <code>http.server.requests</code> como histograma (não apenas contador), o pool <em>HikariCP</em> (<code>hikaricp_connections_active</code>, <code>_pending</code>, <code>_timeout_total</code>), as métricas de JVM (<code>jvm_gc_pause_seconds</code>, <code>jvm_memory_used_bytes</code>, <code>jvm_threads_live_threads</code>), os clientes de saída (<code>http.client.requests</code>, consumidor e produtor Kafka, latência do Redis), e um <em>health check</em> separado para <em>liveness</em> e <em>readiness</em>. Falta qualquer um destes e há uma classe inteira de incidentes que fica invisível: sem <code>hikaricp_connections_pending</code>, uma saturação de pool aparece como «a aplicação está lenta» e não se distingue de um problema de GC.</p>
 
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 37.1</span> As cinco dimensões e a evidência que as satisfaz.</div>
-<div class="tscroll"><table><thead><tr><th>Dimensão</th><th>Pergunta típica</th><th>Evidência que conta</th></tr></thead><tbody>
-<tr><td>Âmbito e autonomia</td><td>«O projecto mais difícil que liderou.»</td><td>Decisão tomada sem aprovação prévia, com risco assumido e resultado medido.</td></tr>
-<tr><td>Influência sem autoridade</td><td>«Uma vez em que convenceu alguém.»</td><td>Nome do papel do outro, o argumento que fez virar, e o facto novo que o produziu.</td></tr>
-<tr><td>Ambiguidade e conflito</td><td>«Um desacordo técnico forte.»</td><td>Critério de decisão acordado antes de discutir a solução; o que ficou por decidir.</td></tr>
-<tr><td>Entrega sob restrição</td><td>«Um prazo impossível.»</td><td>Negociação de âmbito com números de esforço, não heroísmo nocturno.</td></tr>
-<tr><td>Desenvolver outros</td><td>«Como mentorou alguém.»</td><td>Trajectória de outra pessoa ao longo de meses, com um marco objectivo.</td></tr>
+<p>Acrescenta-se depois a camada que ninguém instrumenta e que é a que o negócio nota primeiro: métricas de domínio. Pagamentos autorizados por minuto, taxa de recusa por motivo, idade da mensagem mais antiga por partição de Kafka, tamanho da fila de reprocessamento. Um serviço pode ter 200 <em>OK</em> por segundo e estar completamente avariado porque passou a recusar tudo com <code>limite_diario</code>. As métricas técnicas medem o processo; as de domínio medem o resultado.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 37.1</span> Os três sinais: o que cada um responde, o que custa e onde falha.</div>
+<div class="tscroll"><table><thead><tr><th>Sinal</th><th>Responde a</th><th>Custo típico</th><th>Retenção viável</th><th>Falha quando</th></tr></thead><tbody>
+<tr><td>Métrica</td><td>Está mau? Desde quando? Em que instância?</td><td>Bytes por série por ponto; o custo é a cardinalidade, não o volume</td><td>13 meses a granularidade reduzida</td><td>É preciso o pedido individual ou um identificador de alta cardinalidade</td></tr>
+<tr><td>Traço</td><td>Onde se gastou o tempo dentro do pedido, através dos serviços</td><td>2-5 KB por pedido amostrado; 1-5% de amostragem em pico</td><td>7 a 30 dias</td><td>O contexto não se propaga (fila, <em>thread</em> de fundo, cliente sem instrumentação)</td></tr>
+<tr><td>Log</td><td>O que aconteceu exactamente, com dados de domínio</td><td>0,5-2 KB por linha indexada; o item mais caro dos três</td><td>7 a 14 dias quente, arquivo frio depois</td><td>Não é estruturado, não tem <code>trace_id</code>, ou o volume obriga a amostrar o que interessa</td></tr>
 </tbody></table></div></div>
 
-<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Uma ronda comportamental de 45 minutos reparte-se tipicamente em 3 minutos de introdução, 35 de histórias e 7 de perguntas do candidato. Com 2,5 minutos por história e dois <em>follow-ups</em> de 1 minuto cada, cabem 6 a 8 histórias. Um banco de 10 histórias bem trabalhadas cobre mais de 90% das perguntas possíveis, porque a mesma história responde a três ou quatro perguntas diferentes se for contada a partir de ângulos diferentes.</p></aside>
+<figure class="listing yaml" id="lst-37-1"><div class="lhead"><span class="lnum">Listagem 37.1</span>
+<span class="lcap">Configuração mínima de observabilidade num serviço Spring Boot 3.5.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code>management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,threaddump,heapdump
+  endpoint:
+    health:
+      probes:
+        enabled: true          # /health/liveness e /health/readiness separados
+  metrics:
+    tags:                      # etiquetas comuns a todas as séries deste processo
+      application: pagamentos
+      env: ${ENV}
+      version: ${GIT_SHA}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true      # baldes no servidor: p99 agregável
+      slo:
+        http.server.requests: 50ms,100ms,250ms,500ms,1s
+      maximum-expected-value:
+        http.server.requests: 5s        # limita o número de baldes gerados
+  tracing:
+    sampling:
+      probability: 0.05        # 5% em regime normal; 1.0 em staging
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces</code></pre></figure>
 
-<div class="qa" id="q-37-1" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+<div class="qa" id="q-37-1" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Fale-me do projecto tecnicamente mais difícil em que trabalhou. O que o tornava difícil e qual foi exactamente a sua parte?</div>
+  <div class="qprompt">Vai pôr em produção um serviço Spring Boot novo, com tráfego de cerca de 1500 pedidos por segundo. O que instrumenta antes do primeiro deploy e porquê exactamente isso?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «Em 2023 era o responsável técnico do serviço de autorização de pagamentos: Java 17 na altura, Spring Boot 3.1, PostgreSQL 15, cerca de 2 400 pedidos por segundo no pico de sexta-feira. A base de dados era partilhada por nós e por dois serviços de <em>back-office</em> que faziam relatórios com consultas de 30 segundos. Duas vezes por mês, um relatório saturava o disco e o nosso p99 subia de 120 ms para mais de 2 s; o contrato com o maior comerciante tinha um limite de 250 ms com penalização.»</p>
-      <p><strong>Tarefa.</strong> «A minha tarefa não era “separar as bases de dados” — era garantir o p99 contratual sem parar a <em>roadmap</em> de produto durante um trimestre inteiro, com quatro pessoas na equipa e nenhuma delas dedicada a infra-estrutura.»</p>
-      <p><strong>Acção.</strong> «Comecei por medir em vez de propor: instrumentei <code>pg_stat_statements</code> e correlacionei os picos com as sessões de <em>back-office</em>; 3 consultas explicavam 78% do tempo de I/O. A primeira decisão foi táctica e barata — mover essas 3 consultas para uma réplica de leitura, o que custou dois dias e cortou os incidentes de 2 por mês para 1 por trimestre. Só depois desenhei a separação real: extracção do <em>back-office</em> para uma base própria alimentada por CDC com Debezium sobre Kafka, faseada em 6 semanas por tabela, com escrita dupla e comparação de somatórios diários durante duas semanas antes de cortar cada leitura. Escrevi o ADR, discuti-o com o arquitecto de dados e com o responsável de produto, e negociei explicitamente 20% da capacidade da equipa por trimestre em vez de um congelamento.»</p>
-      <p><strong>Resultado.</strong> «O p99 estabilizou em 95 a 130 ms, os incidentes ligados a contenção de I/O desapareceram durante os 9 meses seguintes, e a penalização contratual — cerca de 40 mil euros de risco anual — deixou de estar em jogo. O que retiro disto é a ordem: a mitigação de dois dias comprou o direito político de fazer a migração de seis semanas. Se tivesse começado pelo desenho bonito, teria gasto o capital todo na discussão e continuado a acordar às três da manhã.»</p>
-      <p>A escolha da história importa tanto como a estrutura: «difícil» tem de significar dificuldade de decisão sob restrição, não dificuldade de sintaxe. Uma história sobre depurar um <em>deadlock</em> obscuro é interessante mas mede uma dimensão só; esta mede âmbito, negociação e execução faseada ao mesmo tempo.</p></div>
+      <p>Instrumento o que preciso para responder, sem fazer <em>deploy</em>, às quatro perguntas de um plantão: o serviço está a servir? está lento? está a errar? e está a ficar sem recursos? Na prática são quatro camadas.</p>
+      <ul class="lst">
+        <li><strong>RED nas entradas</strong>: <code>http.server.requests</code> como histograma com etiquetas <code>uri</code> (a rota, não o caminho com identificadores), <code>method</code>, <code>status</code> e <code>outcome</code>. Histograma e não <em>timer</em> simples, porque preciso de <code>histogram_quantile</code> agregável entre réplicas.</li>
+        <li><strong>USE nos recursos</strong>: pool de conexões (activas, pendentes, <em>timeouts</em>), <em>heap</em> por geração, pausas de GC, contagem de <em>threads</em>, fila do executor, ficheiros abertos. É aqui que se vê a saturação antes de ela virar latência.</li>
+        <li><strong>RED nas saídas</strong>: uma métrica por dependência — PostgreSQL, Redis, Kafka, cada cliente HTTP externo — com latência e taxa de erro separadas. Sem isto, uma dependência lenta é indistinguível de código lento.</li>
+        <li><strong>Domínio</strong>: 3 a 6 contadores que o negócio reconhece. Autorizações por minuto, recusas por motivo, atraso de consumo por tópico. São os que detectam a avaria silenciosa em que tudo devolve 200.</li>
+      </ul>
+      <p>Além das métricas, três coisas não negociáveis: logs em JSON com <code>trace_id</code> no MDC, <em>tracing</em> OTLP com 5% de amostragem e <em>exemplars</em> a ligar o histograma aos traços, e sondas <em>liveness</em>/<em>readiness</em> distintas — o <em>liveness</em> não pode consultar a base de dados, senão uma degradação do PostgreSQL faz o Kubernetes reiniciar toda a frota e transforma um incidente parcial num total.</p>
+      <p>Com 1500 pedidos por segundo e uma janela de <em>scrape</em> de 15 s, o volume de métricas é irrelevante face à cardinalidade: 20 rotas × 5 estados × 12 baldes de histograma × 6 réplicas dá cerca de 7000 séries, o que qualquer Prometheus digere. O que me tiraria do ar seria pôr o identificador do pagamento como etiqueta.</p>
+      <p>O <em>trade-off</em> é o custo de arranque: cada métrica é código, dinheiro e um painel a manter. Por isso a linha de corte é «existe um alerta ou uma pergunta de plantão que dependa desta série?». Se não existe, não entra no primeiro dia — entra quando um incidente provar que faz falta.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Cinco minutos de contexto de negócio, nenhuma decisão atribuível, nenhum número; ou uma história de dificuldade puramente sintáctica.</td></tr>
-        <tr><td>Mid</td><td>Descreve bem a solução técnica final, mas o papel é «fiz as tarefas do épico»; sem alternativa considerada e sem medição antes/depois.</td></tr>
-        <tr><td>Sénior</td><td>Situação com números, decisão própria, mitigação antes da solução, resultado medido e o custo negociado com produto.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, mais o que ficou deliberadamente por fazer, quem mais foi afectado, e como a abordagem foi reutilizada por outra equipa.</td></tr>
+        <tr><td>Insuficiente</td><td>«Ligo o Actuator e o Prometheus.» Não distingue contador de histograma nem sabe que métricas existem.</td></tr>
+        <tr><td>Mid</td><td>Enumera métricas técnicas (CPU, memória, latência) mas esquece dependências de saída, métricas de domínio e a separação <em>liveness</em>/<em>readiness</em>.</td></tr>
+        <tr><td>Sénior</td><td>Cobre entradas, recursos, saídas e domínio; justifica o histograma pela agregação de percentis; liga logs e traços por <code>trace_id</code>; fala de cardinalidade.</td></tr>
+        <tr><td>Staff</td><td>Parte dos SLO e do plantão para derivar a instrumentação; define o critério de corte de novas métricas; refere <em>exemplars</em>, orçamento de custo e o efeito de um <em>liveness</em> mal desenhado numa falha correlacionada.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que é que foi seu e o que foi do arquitecto de dados?»</li>
-      <li>«Porquê CDC e não escrita dupla aplicacional permanente?»</li>
-      <li>«O que correu mal durante as seis semanas?»</li>
-      <li>«Como convenceu o responsável de produto a ceder 20% da equipa?»</li></ul></div>
+      <li>«Porquê histograma e não os percentis pré-calculados que o Micrometer também sabe exportar?»</li>
+      <li>«O que põe no <em>liveness</em> e o que põe no <em>readiness</em>?»</li>
+      <li>«Como é que sabe que a instrumentação não está a custar mais do que vale?»</li>
+      <li>«Que métrica de domínio teria apanhado o vosso último incidente mais depressa?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>«Nós» do princípio ao fim, sem uma única frase na primeira pessoa do singular.</li>
-      <li>Dificuldade descrita como «o código era muito mau» sem responsabilidade própria por o melhorar.</li>
-      <li>Resultado qualitativo: «ficou muito mais rápido», sem valor antes nem depois.</li>
-      <li>Não conseguir explicar a alternativa que rejeitou.</li></ul></div>
+      <li>Pôr a base de dados na sonda de <em>liveness</em>.</li>
+      <li>Etiquetar métricas com identificadores de utilizador, de pedido ou com o caminho já expandido (<code>/conta/8371</code>).</li>
+      <li>Achar que se pode calcular o p99 global fazendo a média dos p99 das réplicas.</li>
+      <li>Nenhuma métrica de negócio: só existe CPU e memória.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-37-2" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Conte-me uma vez em que ajudou outro engenheiro a crescer. O que fez concretamente e como sabe que resultou?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «Recebi na equipa uma engenheira que vinha de dois anos de <em>front-end</em> e queria passar para backend. Escrevia Java correcto, mas as revisões de código dela demoravam três a quatro dias e acumulavam 20 a 30 comentários, quase todos sobre as mesmas três coisas: transacções mal delimitadas, ausência de idempotência nos consumidores de Kafka e testes que só cobriam o caminho feliz.»</p>
-      <p><strong>Tarefa.</strong> «O objectivo que combinei com ela e com o <em>engineering manager</em> foi concreto e datado: em seis meses, ser dona de um serviço de produção com plantão, o que na nossa equipa significava passar a revisão em menos de um dia e ter um incidente resolvido em autonomia.»</p>
-      <p><strong>Acção.</strong> «Fiz três coisas e evitei uma. Primeiro, parei de escrever comentários linha-a-linha e passei a escrever um comentário de topo por revisão com o padrão que estava em causa e um exemplo do nosso próprio código; a lista de comentários caiu porque o comentário passou a ensinar em vez de corrigir. Segundo, marcámos 45 minutos semanais fixos em que ela trazia o problema e eu só fazia perguntas — a regra que impus a mim próprio foi não tocar no teclado. Terceiro, dei-lhe trabalho com risco crescente: primeiro um <em>endpoint</em> novo, depois o consumidor de reconciliação, e por fim a migração do esquema de estornos, que era reversível mas visível. O que evitei foi assumir o trabalho dela quando o prazo apertou; em Novembro atrasámos uma entrega em quatro dias e defendi esse atraso na reunião de <em>sprint</em> em vez de reescrever a peça à noite.»</p>
-      <p><strong>Resultado.</strong> «Ao fim de cinco meses estava na escala de plantão e conduziu sozinha um incidente de <em>lag</em> de consumidor às 2 da manhã, com um MTTR de 35 minutos. O tempo mediano de revisão das <em>pull requests</em> dela passou de 3 dias para menos de 8 horas. Foi promovida a <em>mid</em> no ciclo seguinte, e a parte de que mais gosto é que o documento de padrões de idempotência que ela escreveu a partir dos meus comentários passou a ser usado pelas outras duas equipas de pagamentos.»</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Ajudo sempre os colegas, faço muitas revisões de código.» Nenhuma pessoa concreta, nenhum arco temporal.</td></tr>
-        <tr><td>Mid</td><td>Uma pessoa concreta, mas a ajuda é episódica: explicou um conceito, emparelhou uma tarde; sem mudança medida de comportamento.</td></tr>
-        <tr><td>Sénior</td><td>Objectivo datado, método deliberado, delegação com risco crescente, resiste a assumir o trabalho, resultado com marco objectivo.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e o efeito escapa da díade: o que ensinou virou artefacto reutilizado por outras equipas ou mudou o processo de revisão.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se ela não tivesse melhorado ao fim de três meses?»</li>
-      <li>«Como deu <em>feedback</em> negativo sem ser o chefe dela?»</li>
-      <li>«Que parte da sua abordagem não funcionou?»</li>
-      <li>«Já mentorou alguém mais sénior do que si em alguma dimensão?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Mentoria descrita como fazer o trabalho do outro mais depressa do que ele.</li>
-      <li>Tom condescendente sobre o mentorado («ela não percebia nada de backend»).</li>
-      <li>Nenhum sinal de que o candidato mudou de método quando o primeiro não pegou.</li></ul></div>
-  </div>
-</div>
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Percentis pré-calculados por instância (<code>percentiles: 0.99</code> no Micrometer) não são agregáveis. Com 6 réplicas obtêm-se 6 números que não se podem somar nem promediar para obter o p99 do serviço — o p99 global pode ser maior do que qualquer um deles. A forma correcta é exportar baldes (<code>percentiles-histogram: true</code>) e calcular com <code>histogram_quantile</code> sobre a soma dos baldes de todas as instâncias.</p></aside>
 
-<h2 id="sec-37-2" class="h2"><span class="secnum">37.2</span> Construir o teu banco de histórias<a class="anchor" href="#sec-37-2" aria-label="ligação">#</a></h2>
-
-<p>O erro de preparação mais comum é tentar decorar uma resposta por pergunta. As perguntas são dezenas; as histórias que uma carreira produz são dez ou doze. A preparação correcta é inversa: escrever 10 histórias em ficha, cada uma com números reais, e depois mapear cada pergunta provável para a ficha que melhor a serve. Uma boa história de migração responde a «projecto difícil», a «decisão sob incerteza», a «convencer alguém» e a «trabalhar com prazos», mudando apenas a primeira frase e o que se realça na acção.</p>
-
-<p>Cada ficha tem seis campos e cabe numa página: contexto em duas linhas com escala; a restrição que tornava o problema difícil; a decisão pessoal, escrita com um verbo de decisão («decidi», «recusei», «propus», «reverti»); a alternativa rejeitada e porquê; o resultado com dois números, um antes e um depois; e o que se faria diferente. O último campo é o que separa a história ensaiada da história pensada — quase todos os <em>follow-ups</em> de um entrevistador experiente atacam exactamente aí.</p>
-
-<p>O orçamento de tempo é fixo e vale ensaiar com cronómetro. A situação e a tarefa juntas não devem passar de 40 segundos: é contexto, não conteúdo. A acção leva 90 a 100 segundos e é onde vivem as decisões. O resultado leva 30 segundos e traz os números. O fecho, 10 a 15 segundos, é o que se aprendeu. Quem inverte esta distribuição — três minutos de contexto e dez segundos de resultado — soa a <em>mid</em> mesmo quando o trabalho foi de <em>staff</em>.</p>
-
-<figure class="listing text" id="lst-37-1"><div class="lhead"><span class="lnum">Listagem 37.1</span>
-<span class="lcap">Ficha de história: campos e orçamento de tempo por bloco.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code>TÍTULO      Migração do back-office para CDC              [etiqueta interna, nunca dita]
-S (20 s)    Autorização de pagamentos, 2 400 rps no pico, BD partilhada com 2 serviços
-T (20 s)    Garantir p99 &lt; 250 ms contratuais sem congelar a roadmap do trimestre
-A (95 s)    1) medi: 3 consultas = 78% do I/O
-            2) mitiguei em 2 dias: réplica de leitura
-            3) desenhei CDC com Debezium, 6 semanas, tabela a tabela, escrita dupla
-            4) negociei 20% da capacidade da equipa, escrevi o ADR, alinhei com produto
-R (30 s)    p99 480 ms -&gt; 120 ms; incidentes 2/mês -&gt; 1/trimestre; 40 k EUR/ano de risco
-L (15 s)    A mitigação barata comprou o direito político para a mudança estrutural
-ALT         Particionar a tabela quente: mais barato, não resolvia contenção de I/O
-DIFERENTE   Teria feito a comparação de somatórios desde o dia 1, não a partir da semana 3
-COBRE       projecto difícil | decisão sob incerteza | convencer produto | prazo apertado</code></pre></figure>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>A armadilha do STAR é o R desaparecer. Em gravações de simulações, é comum a acção ocupar mais de 70% do tempo e o resultado ser uma frase sem números — e depois o entrevistador não tem nada para escrever nas notas, porque só a acção é que ele não consegue verificar. Regra prática: nenhuma história sai da boca sem dois números, um antes e um depois, ainda que sejam estimativas assumidas como tal («na ordem de», «cerca de»).</p></aside>
-
-<div class="qa" id="q-37-3" data-box="qa" data-area="comportamental" data-level="staff" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Qual foi o maior impacto que teve fora da sua própria equipa? Quero perceber até onde chega o seu raio de acção.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «Tínhamos cinco equipas de backend a partilhar o mesmo <em>cluster</em> PostgreSQL e cada uma fazia migrações de esquema à sua maneira. Em dois trimestres houve 7 incidentes causados por migrações: colunas <code>NOT NULL</code> adicionadas sem valor por omissão, índices criados sem <code>CONCURRENTLY</code> a bloquear escritas durante minutos, e duas reversões que perderam dados de teste em pré-produção.»</p>
-      <p><strong>Tarefa.</strong> «Ninguém me pediu para resolver isto e eu não era responsável por nenhuma dessas equipas. Assumi porque o meu serviço era vítima frequente e porque tinha o histórico de incidentes para argumentar.»</p>
-      <p><strong>Acção.</strong> «Escrevi um documento de 4 páginas com os 7 incidentes classificados por causa e propus três regras: toda a migração passa por uma janela de expansão e contracção em duas versões, os índices são criados sempre com <code>CONCURRENTLY</code>, e nenhuma migração é irreversível sem aprovação escrita. Depois fiz a parte que realmente importou, que foi trabalho de campo: apresentei a proposta em três reuniões diferentes, ouvi a objecção da equipa de faturação — que tinha um caso legítimo de migração de 40 minutos em que a expansão/contracção duplicava o esforço — e alterei a regra para admitir uma excepção documentada com plano de reversão. Só depois de ter o acordo verbal dos <em>tech leads</em> é que implementei a parte automática: uma verificação em CI que rejeita <em>pull requests</em> com padrões proibidos, com mensagem que aponta para o documento e permite justificação explícita.»</p>
-      <p><strong>Resultado.</strong> «Nos três trimestres seguintes houve 1 incidente por migração, contra 7 nos dois anteriores. A verificação em CI rejeitou cerca de 30 <em>pull requests</em> no primeiro trimestre, o que é a métrica de que gosto mais: são 30 incidentes potenciais apanhados a custo zero. E, honestamente, a lição foi de processo e não de engenharia — a versão que impus primeiro pela ferramenta, num protótipo anterior, foi ignorada e desligada em duas semanas. Só funcionou quando a regra foi negociada antes de ser automatizada.»</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Impacto fora da equipa confunde-se com ter dado uma apresentação interna ou escrito um artigo no blogue.</td></tr>
-        <tr><td>Mid</td><td>Ajudou outra equipa a resolver um problema pontual; sem mudança persistente depois de o candidato sair de cena.</td></tr>
-        <tr><td>Sénior</td><td>Identificou um padrão a partir de dados de incidentes, propôs regra, obteve acordo e mediu a redução.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e reconhece que a adopção é um problema social: negociou a excepção legítima e automatizou só depois do acordo.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Quem discordou e com que argumento?»</li>
-      <li>«Como evitou que a verificação em CI se tornasse um travão insuportável?»</li>
-      <li>«O que aconteceu quando saiu da empresa ou mudou de equipa?»</li>
-      <li>«Como mediu que os incidentes eram causados pelas migrações e não por outra coisa?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Impor uma norma às outras equipas por decreto e apresentar a resistência delas como incompetência.</li>
-      <li>Contar a criação de uma ferramenta sem uma única prova de que alguém a usou.</li>
-      <li>Números de «antes» inventados no momento, que não sobrevivem a um <em>follow-up</em>.</li></ul></div>
-  </div>
-</div>
-
-<h2 id="sec-37-3" class="h2"><span class="secnum">37.3</span> As perguntas mais frequentes e as respostas que funcionam<a class="anchor" href="#sec-37-3" aria-label="ligação">#</a></h2>
-
-<p>Três perguntas aparecem em quase todos os loops e têm resposta má por omissão: como se prioriza, porque se quer sair, e qual é a maior fraqueza. As duas primeiras medem julgamento e maturidade; a terceira mede auto-consciência e é a única em que a resposta ensaiada e falsa se detecta em três segundos. Nenhuma delas premeia a resposta esperta; todas premeiam a resposta específica.</p>
-
-<p>Na priorização, o entrevistador procura um critério e um caso em que o critério doeu. Dizer «priorizo pelo impacto no negócio» é uma tautologia; dizer «tenho um orçamento fixo de 20% para fiabilidade e no trimestre passado usei-o todo em duas semanas por causa de um incidente, o que me obrigou a adiar a funcionalidade X e a explicá-lo ao responsável de produto» é uma decisão. Na motivação para sair, o sinal é a direcção: quem sai <em>de</em> alguma coisa soa amargo, quem sai <em>para</em> alguma coisa soa deliberado, e as duas frases podem descrever a mesma realidade. Na fraqueza, a resposta tem de ser uma fraqueza a sério, com o custo real que já teve e o mecanismo concreto de compensação — não «sou demasiado perfeccionista», que o entrevistador ouve dez vezes por mês e classifica como evasão.</p>
-
-<div class="qa" id="q-37-4" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Como prioriza quando tem mais trabalho do que capacidade? Dê-me um caso concreto em que a sua prioridade contrariou a de outra pessoa.</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Uso três perguntas por ordem, e a ordem é o que importa: o que é que falha e a quem dói se não fizermos nada; o que é reversível e o que é uma porta de sentido único; e qual é o custo de esperar mais um mês. A primeira separa urgência de ansiedade, a segunda diz-me onde posso decidir rápido e sozinho, e a terceira é a que evita que a dívida técnica ganhe sempre ou perca sempre.»</p>
-      <p><strong>Situação e tarefa.</strong> «No terceiro trimestre de 2024 tinha três coisas a competir pelo mesmo <em>sprint</em>: a integração com um novo adquirente prometida a um cliente, a substituição da biblioteca de serialização que estava fora de suporte, e o <em>alerting</em> do consumidor de reconciliação, que estava a falhar em silêncio — tínhamos descoberto 1 200 transacções não reconciliadas com 4 dias de atraso.»</p>
-      <p><strong>Acção.</strong> «Classifiquei: a reconciliação silenciosa era o único item em que a falha já estava a acontecer e o dano era financeiro e acumulava; a integração era receita nova mas com uma data que verifiquei ser interna, não contratual; a biblioteca fora de suporte era risco sem exposição conhecida nesse trimestre. Priorizei o <em>alerting</em>, que eram 3 dias de trabalho, e propus ao responsável de produto adiar a integração duas semanas. Ele discordou, com razão do ponto de vista dele: tinha comprometido a data com o cliente. Em vez de discutir prioridade em abstracto, pus os números na mesa — 1 200 transacções, 4 dias de detecção, cerca de 18 mil euros expostos por semana em pior caso — e propus uma alternativa: eu fazia o <em>alerting</em>, ele mantinha a data se aceitasse entregar a integração só com o fluxo de cartão e sem o de débito directo, que era 40% do esforço.»</p>
-      <p><strong>Resultado.</strong> «Fizemos as duas coisas: o <em>alerting</em> entrou nesse <em>sprint</em> e o tempo de detecção passou de 4 dias para menos de 10 minutos; a integração saiu na data com âmbito reduzido e o débito directo entrou três semanas depois, sem que o cliente notasse porque não o ia usar no primeiro mês. A biblioteca fora de suporte ficou para o trimestre seguinte, e eu registei-a como risco aceite no documento de equipa, com data — porque prioridade sem registo é só esquecimento organizado.»</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Falo com o meu gestor e ele decide.» Ou uma lista de <em>frameworks</em> de priorização sem um único caso real.</td></tr>
-        <tr><td>Mid</td><td>Critério razoável, mas o conflito resolve-se por escalada; o candidato não negoceia âmbito nem quantifica o risco.</td></tr>
-        <tr><td>Sénior</td><td>Critério explícito e ordenado, quantifica o risco em dinheiro ou clientes, negoceia âmbito em vez de data, regista o que ficou por fazer.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e institucionaliza: transforma o critério num orçamento recorrente de fiabilidade que a equipa passa a usar sem ele.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«De onde vieram os 18 mil euros por semana?»</li>
-      <li>«E se o responsável de produto tivesse recusado o âmbito reduzido?»</li>
-      <li>«Como é que a biblioteca fora de suporte não se tornou dívida eterna?»</li>
-      <li>«Já priorizou mal? O que aconteceu?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Tratar produto como adversário em vez de contraparte com restrições legítimas.</li>
-      <li>Fazer tudo: aceitar as três coisas e compensar com horas extra.</li>
-      <li>Priorizar dívida técnica por gosto, sem exposição quantificada.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-37-5" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Porque está a pensar sair da empresa actual? E porquê agora?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Saio por causa do tipo de problema que quero ter a seguir, não por causa de ninguém. Nos últimos dois anos levei o serviço de autorização de 300 para 2 400 pedidos por segundo e de dois para seis engenheiros; o sistema está estável, com o p99 dentro do orçamento e a rotação de plantão a funcionar sem mim durante duas semanas seguidas. O trabalho que resta é de manutenção e de mais um adquirente por trimestre. Quero voltar a estar na parte em que a arquitectura ainda não está decidida, e a vossa plataforma de liquidação está exactamente nessa fase.»</p>
-      <p>A estrutura tem três peças. A primeira é o que se completou, dito com números, porque isso transforma a saída em conclusão de um ciclo e não em fuga. A segunda é a limitação, dita como característica da situação e não como defeito de pessoas: «a empresa tem hoje uma equipa de plataforma que centraliza as decisões de infra-estrutura, o que faz todo o sentido para a escala dela, mas reduz o espaço onde eu quero trabalhar». A terceira é a razão pela qual é esta vaga — específica e verificável, do género «vocês estão a mover a liquidação de <em>batch</em> nocturno para fluxo contínuo, que é o problema que quero».</p>
-      <p>Ao «porquê agora» responde-se com um facto de calendário, não com uma emoção: uma entrega concluída, um ciclo de avaliação fechado, uma reorganização que mudou o âmbito, o fim de um contrato de projecto. Se houve uma razão desagradável — despedimento colectivo, gestor tóxico, promoção prometida e não cumprida — a versão a dizer é factual, curta e sem adjectivos: «houve uma reorganização em Março que reduziu a equipa de doze para sete pessoas e o meu âmbito passou a ser manutenção; procurei internamente durante dois meses e não havia posição equivalente». Um único parágrafo, sem regressar ao tema depois.</p>
-      <p>O erro que custa a oferta não é ter uma razão negativa; é o desequilíbrio de tempo. Trinta segundos sobre o que não funcionou e noventa sobre o que se procura passa por maturidade; noventa segundos de queixa e trinta de projecto passa por risco. O entrevistador está a fazer uma extrapolação simples e legítima: como é que este candidato falará da minha empresa daqui a dois anos.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Crítica pessoal ao gestor ou aos colegas; ou «quero um novo desafio», sem qualquer conteúdo.</td></tr>
-        <tr><td>Mid</td><td>Razão genérica (dinheiro, tecnologia mais moderna) sem ligação ao que a vaga concreta oferece.</td></tr>
-        <tr><td>Sénior</td><td>Ciclo concluído com números, limitação descrita sem culpados, razão específica para esta empresa e este problema.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e articula o que deixa preparado atrás de si — sucessão, documentação, plantão — sem que soe a auto-elogio.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«O que teria de mudar para ficar?»</li>
-      <li>«Já falou disto com o seu gestor?»</li>
-      <li>«O que procurou internamente antes de procurar fora?»</li>
-      <li>«Se lhe fizerem uma contraproposta, o que faz?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Nomear e desvalorizar pessoas concretas da empresa actual.</li>
-      <li>Três empregos anteriores, três histórias em que a culpa foi sempre dos outros.</li>
-      <li>Razão que a vaga em causa não resolve — sinal de que sai outra vez dentro de um ano.</li></ul></div>
-  </div>
-</div>
-
-<div class="qa" id="q-37-6" data-box="qa" data-area="comportamental" data-level="senior" data-freq="media">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+<div class="qa" id="q-37-2" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Qual é a sua maior fraqueza como engenheiro? E não me diga que é ser perfeccionista.</div>
+  <div class="qprompt">A equipa de plataforma diz que o vosso serviço é responsável por 40% do custo do Prometheus. O que é que provavelmente fizeram e como se corrige sem perder capacidade de diagnóstico?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«A minha é escrever pouco. Tenho tendência a decidir em conversa — no canal da equipa, numa chamada de vinte minutos — e a avançar para a implementação sem deixar o registo escrito. Isso funciona enquanto as pessoas envolvidas são três; falha assim que a decisão toca outra equipa.»</p>
-      <p><strong>O custo real.</strong> «Custou-me concretamente em 2023. Decidi com o arquitecto de dados, numa chamada, que a nova tabela de estornos não teria chave estrangeira para transacções por causa do custo de escrita a 2 400 pedidos por segundo. Seis meses depois, a equipa de relatórios construiu um <em>dashboard</em> assumindo integridade referencial e descobriu 800 linhas órfãs vindas de um reprocessamento. Perderam-se cerca de duas semanas de trabalho deles e a confiança nos números demorou mais um mês a recuperar. A decisão estava certa; o que faltou foi ela existir por escrito onde alguém a pudesse encontrar.»</p>
-      <p><strong>O mecanismo de compensação.</strong> «Adoptei três regras que sigo desde então e que são verificáveis. Primeira: qualquer decisão que altere um contrato de dados ou uma fronteira entre serviços vira um ADR de uma página, com contexto, decisão, alternativas e consequências, antes de haver código; escrevi 14 em dezoito meses. Segunda: reservo 30 minutos às sextas-feiras só para isso, porque sem espaço no calendário não acontece. Terceira: peço a uma pessoa fora da equipa para ler o ADR — se ela não perceber a consequência em cinco minutos, o texto não serve.»</p>
-      <p><strong>Onde ainda estou.</strong> «Melhorou mas não desapareceu: continuo a escrever depois de decidir, não durante, e isso significa que quem lê não vê o processo, só o resultado. A parte que ainda me custa é escrever antes, quando a decisão ainda está aberta e o texto é desconfortável. É o próximo passo e sei que não está resolvido.»</p>
-      <p>A resposta funciona porque tem quatro elementos que uma fraqueza falsa não consegue produzir: um custo concreto com dano medido, um mecanismo verificável, uma admissão de que não está resolvido, e uma fraqueza que é realmente uma fraqueza e não uma virtude disfarçada. A calibração importa: não se escolhe uma fraqueza que seja incompatível com a vaga — quem se candidata a um papel de plataforma não diz que evita infra-estrutura — mas também não se escolhe uma que ninguém acredite.</p></div>
+      <p>É quase sempre cardinalidade, não volume. O custo de um sistema de métricas escala com o número de séries temporais distintas — o produto cartesiano dos valores de todas as etiquetas — e não com o número de pedidos. Uma série ocupa tipicamente 1 a 3 KB de memória de índice; passar de 10 000 para 2 milhões de séries transforma um Prometheus de 4 GB num de 100 GB e degrada todas as <em>queries</em>, incluindo as dos vizinhos.</p>
+      <p>As três causas por ordem de frequência: (1) o caminho da URI não normalizado, com identificadores dentro (<code>/pagamentos/8371</code> em vez de <code>/pagamentos/{id}</code>), o que cria uma série por entidade; (2) etiquetas com identidade — <code>user_id</code>, <code>order_id</code>, <code>session</code>, <code>host</code> de <em>pods</em> efémeros que rodam a cada <em>deploy</em>; (3) mensagens de excepção ou <code>status</code> livres usados como etiqueta, em que cada nova mensagem cria uma série nova.</p>
+      <p>A correcção tem quatro passos. Primeiro medir: <code>topk(20, count by (__name__)({__name__=~&quot;.+&quot;}))</code> identifica as métricas com mais séries, e <code>count(count by (etiqueta)(metrica))</code> a etiqueta culpada. Segundo, normalizar as rotas e aplicar um <code>MeterFilter</code> que rejeita ou limita etiquetas de alta cardinalidade — o Micrometer tem <code>MeterFilter.maximumAllowableTags</code>, que colapsa o excedente em <code>other</code> e evita que um erro novo derrube o sistema. Terceiro, mover a dimensão que interessa para o sinal certo: o <code>user_id</code> pertence ao log e ao traço, onde é um atributo barato, não à métrica. Quarto, reduzir baldes de histograma — <code>maximum-expected-value</code> e um conjunto explícito de SLO em vez dos baldes por omissão.</p>
+      <p>Não se perde diagnóstico porque a pergunta muda de sinal: a métrica diz «os erros subiram na rota X»; o <em>exemplar</em> anexo ao balde leva a um traço concreto; o traço tem o <code>user_id</code>. A informação continua lá, apenas deixou de ser paga 24 horas por dia por todas as combinações possíveis.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Virtude disfarçada («trabalho demais», «sou perfeccionista») ou negação («não me ocorre nenhuma»).</td></tr>
-        <tr><td>Mid</td><td>Fraqueza real mas genérica («falar em público»), sem custo concreto e sem prova de trabalho sobre ela.</td></tr>
-        <tr><td>Sénior</td><td>Fraqueza profissional relevante, um episódio com dano medido, mecanismo concreto e verificável, e admissão de que persiste.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e mostra que ajustou o contexto à volta — mudou processo ou pediu a alguém que compensasse a lacuna estruturalmente.</td></tr>
+        <tr><td>Insuficiente</td><td>Fala em «reduzir a frequência de recolha» ou «guardar menos tempo»; não menciona cardinalidade.</td></tr>
+        <tr><td>Mid</td><td>Sabe que etiquetas com identificadores são más, mas não sabe medir a cardinalidade nem propor onde a dimensão deve viver.</td></tr>
+        <tr><td>Sénior</td><td>Explica o produto cartesiano, dá o custo por série, identifica as três causas típicas, corrige com <code>MeterFilter</code> e normalização de rotas, e move a dimensão para traços/logs.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta guardas permanentes: limite de séries por serviço no <em>collector</em>, alerta sobre crescimento de cardinalidade, revisão de novas métricas em <em>code review</em>, e o custo por equipa como número visível.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Qual foi o <em>feedback</em> mais duro que recebeu e o que fez com ele?»</li>
-      <li>«Quem na sua equipa diria que é a sua maior limitação?»</li>
-      <li>«Mostre-me um ADR que escreveu; o que tem de errado?»</li>
-      <li>«Em que tipo de equipa é que essa fraqueza seria fatal?»</li></ul></div>
+      <li>«Quantas séries acha aceitável para um serviço deste tamanho?»</li>
+      <li>«E se a equipa precisar mesmo de latência por cliente, com 3000 clientes?»</li>
+      <li>«O que muda se o backend for baseado em <em>push</em> e facturado por ponto ingerido?»</li>
+      <li>«Como impede que isto volte a acontecer no próximo <em>sprint</em>?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Fraqueza escolhida por ser inofensiva, sem qualquer episódio associado.</li>
-      <li>Culpar o ambiente pela fraqueza («não escrevia porque ninguém lia»).</li>
-      <li>Declarar o problema completamente resolvido — soa a guião.</li></ul></div>
+      <li>Confundir volume de pedidos com custo de métricas.</li>
+      <li>Propor apagar métricas sem saber quais têm alertas ou painéis dependentes.</li>
+      <li>Usar a mensagem de excepção como etiqueta e não ver o problema.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-37-4" class="h2"><span class="secnum">37.4</span> Conflito, desacordo e decisões impopulares<a class="anchor" href="#sec-37-4" aria-label="ligação">#</a></h2>
+<h2 id="sec-37-2" class="h2"><span class="secnum">37.2</span> Métricas: RED, USE, percentis e SLO<a class="anchor" href="#sec-37-2" aria-label="ligação">#</a></h2>
 
-<p>As perguntas de conflito são as que mais candidatos fortes deitam abaixo, por uma razão contra-intuitiva: escolhem uma história em que estavam certos. Uma história em que o candidato tinha razão, provou-o e o outro cedeu não fornece evidência de nada — só mostra que o candidato sabe ter razão. O entrevistador procura três sinais: se o candidato separa a posição do argumento (consegue reproduzir a posição do outro de forma que o outro a reconheceria), se converte a discussão sobre soluções numa discussão sobre critérios de decisão, e se sabe perder — comprometer-se com uma decisão contrária à sua sem sabotagem passiva.</p>
+<p>RED aplica-se a coisas que servem pedidos: <em>Rate</em> (pedidos por segundo), <em>Errors</em> (fracção que falha) e <em>Duration</em> (distribuição da latência). USE aplica-se a recursos: <em>Utilization</em>, <em>Saturation</em> e <em>Errors</em>. Um serviço Java precisa dos dois — RED nas rotas e nas dependências, USE no pool de conexões, no <em>heap</em>, nas <em>threads</em> e no executor. A confusão comum é medir utilização e chamar-lhe saturação: um pool a 100% de utilização com fila vazia está perfeitamente saudável; o que dói é a fila (<code>hikaricp_connections_pending</code>), porque é ela que se traduz em latência de espera.</p>
 
-<p>A técnica que funciona em quase todos os casos é subir um nível: quando duas pessoas discutem <code>Kafka</code> contra fila gerida, ou monólito contra serviços, a discussão é irresolúvel enquanto for sobre a solução. Torna-se resolúvel quando passa a ser sobre o critério — quantas mensagens por segundo, que garantia de ordenação, quantas pessoas para operar, que custo mensal aceitável — e sobre o teste que decidiria. Duas horas a construir uma prova de conceito com números resolvem discussões que duram semanas em reunião.</p>
+<p>A média de latência é inútil por três razões independentes. Primeira, não é robusta: 1% de pedidos a 10 s sobre 99% a 20 ms dá uma média de 120 ms, um número que nenhum utilizador experimenta. Segunda, não é composicional: um pedido que faz 10 chamadas de saída vê, com probabilidade elevada, pelo menos uma cauda — se cada chamada tiver p99 de 100 ms, a probabilidade de o pedido inteiro escapar a todas as caudas é 0,99<sup>10</sup> ≈ 90%, ou seja, o p99 do agregado é dominado pelas caudas das partes. Terceira, é o percentil alto que corresponde a dinheiro: são os pedidos lentos que fazem o utilizador desistir e o cliente reclamar.</p>
 
-<p>Sobre prazos, o sinal de senioridade é tratar prazo, âmbito e qualidade como três variáveis e recusar a ilusão de fixar as três. Um sénior chega à conversa com a decomposição em dias, a identificação da parte que não é negociável por razões técnicas, e duas ou três opções de âmbito reduzido com o custo de cada uma. O que não é sénior é aceitar em silêncio e compensar com noites, porque isso transfere risco para a equipa e esconde a informação de quem devia decidir.</p>
+<p>Um SLI é a razão entre eventos bons e eventos válidos; um SLO é o alvo dessa razão numa janela; o <em>error budget</em> é o complemento — quanto se pode falhar antes de a promessa ser quebrada. Com um SLO de disponibilidade de 99,9% em 30 dias, o orçamento é de 43,2 minutos de falha; com 99,95%, 21,6 minutos. Este número é a peça que transforma observabilidade em decisão de engenharia: se restam 5% do orçamento a meio do mês, congela-se o que for arriscado; se sobram 90% no dia 28, a equipa está a ser demasiado conservadora e devia estar a lançar mais depressa.</p>
 
-<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p>Escolher uma história de conflito em que se perdeu ganha pontos em maturidade e arrisca pontos em julgamento técnico — se a posição perdida for indefensável, o entrevistador anota o erro em vez da humildade. A escolha correcta é um caso em que a posição era razoável, a decisão contrária também era defensável, e a execução posterior foi leal. Uma história em que se venceu por escalada hierárquica é a pior de todas: mede-se poder, não influência.</p></aside>
+<p>Os alertas devem sair do orçamento, não de limiares fixos. A técnica padrão é o <em>burn rate</em>: a velocidade a que se consome o orçamento em relação ao ritmo que o esgotaria exactamente no fim da janela. Um <em>burn rate</em> de 14,4 durante 1 hora consome 2% do orçamento mensal — merece página imediata; um <em>burn rate</em> de 3 durante 6 horas consome 5% — merece um <em>ticket</em>, não uma chamada às quatro da manhã. Duas janelas por alerta (uma longa para significância, uma curta para deixar de disparar depressa quando o problema passa) eliminam a maior parte do ruído.</p>
 
-<div class="qa" id="q-37-7" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+<div class="formula">error_budget_restante = 1 − (1 − SLI_observado) / (1 − SLO) &nbsp;&nbsp;·&nbsp;&nbsp; burn_rate = (1 − SLI_janela) / (1 − SLO)</div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Orçamento de erro em 30 dias: 99% → 7,2 h; 99,9% → 43,2 min; 99,95% → 21,6 min; 99,99% → 4,3 min. Um único <em>rolling restart</em> mal feito consome facilmente 2 minutos. Prometer 99,99% a um serviço com dependência síncrona de uma base de dados de instância única é aritmeticamente impossível: a disponibilidade composta de dependências em série é o produto das disponibilidades.</p></aside>
+
+<div class="qa" id="q-37-3" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Conte-me um desacordo técnico forte com um colega. Como acabou e o que faria diferente?</div>
+  <div class="qprompt">O painel mostra latência média de 45 ms e a equipa diz que o serviço está rápido. O suporte tem reclamações diárias de lentidão. Explique o que se está a passar e o que mede em vez disso.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «Um colega sénior de outra equipa propôs que a comunicação entre o nosso serviço de autorização e o de liquidação passasse a ser síncrona por HTTP, substituindo o tópico de Kafka. O argumento dele era sólido: a reconciliação entre os dois lados consumia-nos cerca de um dia de trabalho por semana em depuração de mensagens perdidas ou duplicadas, e uma chamada síncrona daria erro imediato em vez de divergência silenciosa.»</p>
-      <p><strong>Tarefa.</strong> «A minha posição era contrária — a liquidação tinha 99,5% de disponibilidade e nós tínhamos 99,95% contratuais, portanto acoplar-nos sincronamente importava a indisponibilidade dela. Mas a discussão estava a repetir-se há três semanas em reuniões e ambos tínhamos razão sobre coisas diferentes.»</p>
-      <p><strong>Acção.</strong> «Fiz três coisas. Primeiro, escrevi a posição dele no documento antes da minha, e pedi-lhe que confirmasse que estava justa; ele corrigiu um ponto, e a partir daí a conversa deixou de ser adversarial. Segundo, propus que decidíssemos o critério antes da solução: qual a disponibilidade que a autorização tem de garantir, quanto custa uma transacção presa, e quanto tempo por semana estamos dispostos a gastar em reconciliação. Com os números na mesa — 99,95% contra 99,5%, cerca de 8 horas por semana de reconciliação — ficou claro que o problema real não era o transporte, era a falta de idempotência e de correlação. Terceiro, propus a solução que respondia ao problema dele sem me acoplar: manter o assíncrono, adicionar chave de idempotência por transacção, e um reconciliador automático que compara os dois lados de cinco em cinco minutos e emite alerta em vez de silêncio.»</p>
-      <p><strong>Resultado.</strong> «Implementámos em três semanas, a metade em cada equipa. O tempo de reconciliação manual passou de cerca de 8 horas por semana para menos de 1, e a divergência passou a ser detectada em menos de 10 minutos em vez de um dia. O que faria diferente: perdi três semanas a defender a minha solução antes de perceber que estava a resolver o problema errado — o colega não queria HTTP, queria parar de perder sábados. Se tivesse perguntado logo “o que é que te dói exactamente?”, tínhamos chegado aqui na primeira reunião.»</p></div>
+      <p>A média está a esconder a cauda. Distribuições de latência de serviços reais são fortemente assimétricas à direita — o corpo é estreito e há um rasto longo produzido por GC, esperas de pool, <em>cache miss</em>, retentativas e vizinhos barulhentos. Com 45 ms de média é perfeitamente possível ter p99 de 1,8 s: 1% de 1500 pedidos por segundo são 15 utilizadores por segundo com uma experiência péssima, o que dá dezenas de milhares de más experiências por dia — exactamente o volume que chega ao suporte.</p>
+      <p>Mede-se a distribuição: p50 para saber como está o caso típico, p95 e p99 para a cauda, e p99.9 quando o serviço é interno e um pedido do utilizador final abre dezenas de chamadas. O p50 e o p99 contam histórias diferentes e o diagnóstico depende de quais se movem juntos. Se p50 e p99 sobem em conjunto, o problema é sistémico — dependência lenta, saturação de CPU, tabela sem índice. Se o p50 está estável e só o p99 dispara, é fenómeno de cauda: pausas de GC, espera por conexão, retentativa por <em>timeout</em>, uma réplica doente, ou um subconjunto de pedidos com dados patológicos (o cliente com 40 000 linhas no carrinho).</p>
+      <p>Há duas correcções técnicas que um sénior traz. Primeira, medir na fronteira certa: a latência do servidor não inclui fila do <em>load balancer</em>, tempo de rede nem <em>garbage collection</em> antes de o pedido ser aceite — se o utilizador se queixa e o servidor diz 45 ms, é preciso comparar com o p99 do <em>ingress</em>. Segunda, calcular os percentis por agregação de baldes e não pela média dos percentis das réplicas, que é matematicamente inválida.</p>
+      <p>O <em>trade-off</em> dos percentis é a resolução: <code>histogram_quantile</code> interpola dentro do balde, por isso o p99 nunca é mais preciso do que a fronteira de baldes escolhida. Com baldes de 50 ms, 100 ms, 250 ms, 500 ms e 1 s, um p99 real de 700 ms será estimado dentro do intervalo 500 ms a 1 s. Isso é suficiente para alertar e insuficiente para afinar; para afinar usa-se o traço.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>História em que o outro era incompetente; ou resolução por escalada ao gestor sem tentativa própria.</td></tr>
-        <tr><td>Mid</td><td>Discussão de soluções do princípio ao fim; a vitória vem de argumentar melhor, não de dados.</td></tr>
-        <tr><td>Sénior</td><td>Reproduz a posição do outro com justiça, sobe ao critério, traz números, e a solução final incorpora a preocupação do outro.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e retira uma lição de processo — diagnosticar a dor antes de defender arquitectura — aplicada depois noutros casos.</td></tr>
+        <tr><td>Insuficiente</td><td>«A média é uma boa aproximação» ou propõe olhar para o máximo, que é ruído puro.</td></tr>
+        <tr><td>Mid</td><td>Diz «usar p95/p99» sem explicar o mecanismo da cauda nem o que significa p50 estável com p99 alto.</td></tr>
+        <tr><td>Sénior</td><td>Explica a assimetria, quantifica o impacto de 1%, usa o par p50/p99 como sinal de diagnóstico, e conhece a agregação correcta de baldes.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a amplificação de cauda em <em>fan-out</em>, a medição na fronteira do cliente e não do servidor, e liga a escolha de percentil ao SLO e ao custo do negócio.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se ele tivesse insistido no HTTP síncrono?»</li>
-      <li>«Como está a relação com esse colega hoje?»</li>
-      <li>«Já esteve do lado errado de um desacordo destes?»</li>
-      <li>«Quem tomou a decisão final formalmente?»</li></ul></div>
+      <li>«O p50 está bom e o p99 mau. Quais são as suas três primeiras hipóteses?»</li>
+      <li>«Porque é que o p99 do serviço A pode ser pior do que o p99 de cada uma das suas cinco dependências?»</li>
+      <li>«Como escolhe as fronteiras de baldes do histograma?»</li>
+      <li>«Quando é que o p99.9 é a métrica certa e quando é ruído?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Não conseguir enunciar o melhor argumento do outro lado.</li>
-      <li>Conflito descrito como choque de personalidades e não de critérios.</li>
-      <li>Vencer e depois humilhar: «passado um mês deu-me razão à frente de todos».</li></ul></div>
+      <li>Promediar percentis entre instâncias ou entre janelas de tempo.</li>
+      <li>Usar o máximo como métrica de alerta.</li>
+      <li>Não distinguir latência vista pelo servidor da vista pelo cliente.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-37-8" data-box="qa" data-area="comportamental" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+<div class="qa" id="q-37-4" data-box="qa" data-area="obs" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Defina o SLO do serviço de autorização de pagamentos e derive daí os alertas. Quantos alertas quer que o plantão receba por semana?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo pelo utilizador, não pela infra-estrutura. O SLI é «fracção de pedidos <code>POST /v1/autorizacoes</code> que devolvem resposta não-5xx em menos de 300 ms», medido no <em>ingress</em> e não na aplicação, porque é o que o comerciante experimenta. O SLO é 99,9% em janela deslizante de 30 dias: 43,2 minutos de orçamento. Um segundo SLO de latência separado — p99 abaixo de 300 ms em 99% das janelas de 5 minutos — evita que um serviço lento mas sem erros pareça saudável.</p>
+      <p>Os alertas saem do orçamento por <em>burn rate</em>, com quatro regras e duas severidades:</p>
+      <ul class="lst">
+        <li><em>Burn rate</em> 14,4 sustentado 1 h (com confirmação a 5 min): consome 2% do orçamento — <strong>página</strong>, alguém acorda.</li>
+        <li><em>Burn rate</em> 6 sustentado 6 h (confirmação a 30 min): consome 5% — <strong>página</strong> em horário laboral, <em>ticket</em> fora dele.</li>
+        <li><em>Burn rate</em> 3 sustentado 24 h: consome 10% — <em>ticket</em> para o dono do serviço.</li>
+        <li><em>Burn rate</em> 1 sustentado 3 dias: erosão lenta — item de <em>backlog</em>, revisto na reunião semanal.</li>
+      </ul>
+      <p>Quantos alertas por semana? O alvo é <strong>zero a dois avisos por semana de plantão, e todos accionáveis</strong>. Acima de cinco, a equipa começa a ignorar; é um resultado documentado de fadiga de alertas e transforma um sistema de alarme em ruído de fundo. A métrica de saúde do próprio sistema de alertas é a taxa de alertas que resultaram em acção: abaixo de 60%, há alertas a apagar.</p>
+      <p>O <em>trade-off</em> do SLO baseado em orçamento é a detecção de falhas curtas e catastróficas: uma paragem total de 3 minutos consome 7% do orçamento e pode não disparar a janela longa. Por isso mantenho duas — e só duas — excepções de limiar absoluto: «zero pedidos com sucesso durante 2 minutos» e «taxa de erro acima de 25% durante 2 minutos». Tudo o resto é orçamento. E os alertas sobre causas (CPU alto, <em>heap</em> a 85%, disco a 80%) não paginam ninguém: vão para painel, porque CPU alto com SLO cumprido é uma máquina a trabalhar, não um incidente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde SLA com SLO; propõe alertas em CPU e memória como sinal primário.</td></tr>
+        <tr><td>Mid</td><td>Define um SLO razoável mas alerta com limiar fixo («p99 acima de 300 ms durante 5 min»), sem noção de orçamento nem de ruído.</td></tr>
+        <tr><td>Sénior</td><td>SLI centrado no utilizador e medido na fronteira certa, orçamento quantificado em minutos, alertas por <em>burn rate</em> com múltiplas janelas, distinção sintoma/causa.</td></tr>
+        <tr><td>Staff</td><td>Usa o orçamento como instrumento de decisão (congelar lançamentos, negociar prioridades), define a meta de alertas por semana e a métrica de accionabilidade, e reconhece o buraco das falhas curtas com excepções explícitas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O orçamento esgotou no dia 12. O que muda na prática para a equipa?»</li>
+      <li>«Uma dependência externa causou metade da falha. Conta para o vosso orçamento?»</li>
+      <li>«Como mede o SLI quando o <em>load balancer</em> devolve 502 e a aplicação nunca vê o pedido?»</li>
+      <li>«Porque é que 99,99% pode ser uma promessa irresponsável?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Paginar em causas (CPU, memória) em vez de sintomas visíveis ao utilizador.</li>
+      <li>SLO decidido pela engenharia sem o dono do produto e sem número de negócio por trás.</li>
+      <li>Não ter resposta para «quantos alertas por semana é aceitável?».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-37-3" class="h2"><span class="secnum">37.3</span> Logs estruturados, correlação e custo<a class="anchor" href="#sec-37-3" aria-label="ligação">#</a></h2>
+
+<p>Um log estruturado é um objecto, não uma frase. A linha continua legível por humanos, mas cada campo é indexável e agregável: em vez de <code>log.info("pagamento " + id + " recusado por " + motivo)</code>, emite-se um evento com <code>event=autorizacao_recusada</code>, <code>motivo=limite_diario</code>, <code>valor_cent=128900</code>. A diferença mede-se na velocidade de resposta: com campos, «quantas recusas por motivo na última hora, por cliente» é uma agregação de dois segundos; com <em>string</em> concatenada, é uma expressão regular sobre 400 GB.</p>
+
+<p>A correlação faz-se com três identificadores. O <code>trace_id</code> liga tudo o que aconteceu num pedido através de todos os serviços; o <code>span_id</code> liga ao salto concreto; um identificador de negócio (referência do pagamento, número da encomenda) liga ao que o suporte tem em mãos. Em Java isto passa pelo <em>MDC</em> (<em>Mapped Diagnostic Context</em>), um mapa por <em>thread</em> que o <em>appender</em> serializa em cada linha. O Spring Boot com Micrometer Tracing já coloca <code>traceId</code> e <code>spanId</code> no MDC; o resto é responsabilidade do serviço.</p>
+
+<p>O MDC tem duas armadilhas caras. Primeira: como está associado à <em>thread</em>, tem de ser limpo no fim do pedido — se não for, a <em>thread</em> regressa ao pool do Tomcat com o <code>tenant</code> do pedido anterior e os logs passam a atribuir eventos ao cliente errado, um problema que já produziu incidentes de privacidade. Segunda: em código assíncrono — <code>CompletableFuture</code>, <code>@Async</code>, executores próprios, consumidores Kafka — o contexto não atravessa a fronteira de <em>thread</em> sem ajuda; é preciso um decorador (<code>TaskDecorator</code>, ou os <em>wrappers</em> de contexto do Micrometer) que copie o mapa. Com <em>virtual threads</em> em Java 21 e posteriores o problema muda de forma: cada tarefa tem a sua <em>thread</em>, o vazamento entre pedidos desaparece, mas o MDC clássico continua a não se propagar sozinho para as tarefas filhas.</p>
+
+<figure class="listing json" id="lst-37-2"><div class="lhead"><span class="lnum">Listagem 37.2</span>
+<span class="lcap">Uma linha de log estruturado com contexto de traço e de domínio.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="json"><code>{
+  &quot;@timestamp&quot;: &quot;2026-03-11T14:02:17.418Z&quot;,
+  &quot;level&quot;: &quot;WARN&quot;,
+  &quot;logger&quot;: &quot;pt.acme.pag.AutorizacaoService&quot;,
+  &quot;thread&quot;: &quot;http-nio-8080-exec-42&quot;,
+  &quot;service&quot;: &quot;pagamentos&quot;,
+  &quot;version&quot;: &quot;3.14.2&quot;,
+  &quot;env&quot;: &quot;prod&quot;,
+  &quot;trace_id&quot;: &quot;4bf92f3577b34da6a3ce929d0e0e4736&quot;,
+  &quot;span_id&quot;: &quot;00f067aa0ba902b7&quot;,
+  &quot;tenant&quot;: &quot;PT-0042&quot;,
+  &quot;event&quot;: &quot;autorizacao_recusada&quot;,
+  &quot;motivo&quot;: &quot;limite_diario&quot;,
+  &quot;valor_cent&quot;: 128900,
+  &quot;latencia_ms&quot;: 412,
+  &quot;msg&quot;: &quot;autorizacao recusada por limite diario&quot;
+}</code></pre></figure>
+
+<figure class="listing java" id="lst-37-3"><div class="lhead"><span class="lnum">Listagem 37.3</span>
+<span class="lcap">Filtro que enriquece o MDC e — sobretudo — o limpa no fim.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>@Component
+public class ContextoLogFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req,
+                                    HttpServletResponse res,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+        SpanContext ctx = Span.current().getSpanContext();
+        MDC.put(&quot;trace_id&quot;, ctx.getTraceId());
+        MDC.put(&quot;span_id&quot;, ctx.getSpanId());
+        String tenant = req.getHeader(&quot;X-Tenant&quot;);
+        if (tenant != null) {
+            MDC.put(&quot;tenant&quot;, tenant);
+        }
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            MDC.clear();   // sem isto, a thread volta ao pool com o tenant anterior
+        }
+    }
+}
+
+// Propagacao para tarefas assincronas: sem o decorador, o MDC nasce vazio na thread do executor.
+@Bean
+TaskDecorator mdcDecorator() {
+    return runnable -&gt; {
+        Map&lt;String, String&gt; ctx = MDC.getCopyOfContextMap();
+        return () -&gt; {
+            if (ctx != null) MDC.setContextMap(ctx);
+            try { runnable.run(); } finally { MDC.clear(); }
+        };
+    };
+}</code></pre></figure>
+
+<div class="qa" id="q-37-5" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Deram-lhe um prazo que considera irrealista para uma entrega com data pública. O que faz nos primeiros dois dias?</div>
+  <div class="qprompt">Um cliente diz que o pagamento <code>PG-99213</code> falhou às 14:02. Descreva, do princípio ao fim, como reconstrói o que aconteceu através de seis serviços.</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Não discuto o prazo antes de ter a decomposição. Nos primeiros dois dias produzo três coisas: a lista de trabalho em pedaços de meio dia a dois dias, com as dependências externas marcadas; a estimativa com intervalo em vez de ponto único; e duas ou três opções de âmbito com o que cada uma custa. Só com isto é que a conversa deixa de ser opinião contra opinião.»</p>
-      <p><strong>Caso concreto.</strong> «Em Setembro de 2024 comprometeram connosco uma integração com um novo adquirente para a Black Friday, com sete semanas de calendário. A minha decomposição deu 9 a 11 semanas de trabalho, e o intervalo vinha quase todo de duas incógnitas: a certificação do adquirente, que segundo eles demorava “duas a seis semanas”, e a migração dos comerciantes existentes, 340 no total.»</p>
-      <p><strong>Acção.</strong> «Levei ao responsável de produto e ao gestor três opções, com números: entregar tudo em 10 semanas, o que falhava a Black Friday; entregar em 7 semanas só o fluxo de cartão para os 12 comerciantes que representavam 80% do volume, deixando os restantes 328 no adquirente antigo, o que eram 6,5 semanas de trabalho; ou entregar em 7 semanas com toda a gente migrada mas sem reconciliação automática, que eu recusei a defender e disse porquê — sem reconciliação, a exposição em pior caso era da ordem de dezenas de milhares de euros por dia num período de pico. Também tratei a incógnita mais cara como trabalho: pedi na segunda-feira uma chamada com a equipa de certificação do adquirente e, com uma pré-submissão feita nessa semana, a janela deles reduziu-se de “duas a seis semanas” para três.»</p>
-      <p><strong>Resultado.</strong> «Escolheram a segunda opção. Entregámos a 4 de Novembro, os 12 comerciantes processaram a Black Friday no adquirente novo com 0 incidentes, e os restantes migraram em Janeiro em lotes de 40 por semana. A parte de que me orgulho não é a entrega, é não ter havido semana de 60 horas: a equipa trabalhou o horário normal porque o corte foi no âmbito e não nas pessoas. E o que aprendi foi a atacar a incógnita externa no primeiro dia — foram essas três semanas de certificação, e não o nosso código, que quase mataram a data.»</p></div>
+      <p>Procuro pelo identificador de negócio para obter o identificador técnico, e a partir daí a reconstrução é mecânica. Passo 1: <code>event:pagamento_* AND referencia:&quot;PG-99213&quot;</code> na janela 13:55-14:10, o que devolve uma ou duas linhas do serviço de entrada e — o ponto essencial — o <code>trace_id</code>. Passo 2: <code>trace_id:&quot;4bf9...&quot;</code> sem filtro de serviço, ordenado por <em>timestamp</em>; isto dá a narrativa completa através dos seis serviços numa única lista. Passo 3: abrir o mesmo <code>trace_id</code> no <em>backend</em> de <em>tracing</em>, que dá a cascata com a duração de cada salto e o serviço onde o erro nasceu.</p>
+      <p>Isto só funciona se três decisões tiverem sido tomadas antes: o <code>trace_id</code> é propagado em todos os saltos, incluindo os assíncronos, com <code>traceparent</code> do W3C; o identificador de negócio está num campo de log estruturado com o mesmo nome em todos os serviços — a divergência entre <code>paymentId</code>, <code>payment_id</code> e <code>referencia</code> é a razão número um por que esta pesquisa falha; e a amostragem não deitou fora o traço. Um serviço com 5% de amostragem tem 95% de probabilidade de não ter o traço deste pagamento — daí a regra de <strong>amostrar traços, nunca amostrar logs de erro</strong>, e de forçar a amostragem quando o pedido acaba em erro.</p>
+      <p>Quando o traço não existe, o plano B é a correlação por logs: os campos <code>service</code>, <code>trace_id</code> e <code>@timestamp</code> chegam para reconstruir a sequência, e a latência por salto obtém-se pela diferença de <em>timestamps</em> — com a ressalva de que o desvio de relógio entre nós pode ser de dezenas de milissegundos e torna a atribuição de tempos pouco fiável abaixo dessa escala.</p>
+      <p>O que apresento ao suporte não é o <em>dump</em> de logs: é a frase «às 14:02:17 o serviço de limites recusou por <code>limite_diario</code> com valor 1289,00 EUR contra um limite diário de 1000,00 EUR» — o campo estruturado permite dizer isso sem interpretar prosa.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Aceita em silêncio e compensa com horas extra; ou recusa o prazo sem análise («é impossível»).</td></tr>
-        <tr><td>Mid</td><td>Faz a estimativa e comunica o risco, mas não traz opções de âmbito nem quantifica o que se perde em cada uma.</td></tr>
-        <tr><td>Sénior</td><td>Decompõe, estima com intervalo, apresenta 2-3 opções com custo, ataca a incógnita externa cedo e recusa a opção insegura com razão explícita.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e protege a equipa do custo humano; deixa o compromisso registado por escrito e volta a ele no <em>post-mortem</em> da entrega.</td></tr>
+        <tr><td>Insuficiente</td><td>«Vou aos logs do serviço e faço <em>grep</em>»; não tem forma de atravessar serviços.</td></tr>
+        <tr><td>Mid</td><td>Conhece o <code>trace_id</code> mas não sabe como lá chega a partir de um identificador de negócio, nem o que acontece com amostragem.</td></tr>
+        <tr><td>Sénior</td><td>Negócio → <code>trace_id</code> → traço; exige nomes de campo consistentes e propagação W3C; sabe que os erros não se amostram; tem plano B por <em>timestamps</em>.</td></tr>
+        <tr><td>Staff</td><td>Fala de convenções de nomes impostas por biblioteca partilhada, amostragem condicionada ao erro, desvio de relógio, e do custo de manter esta capacidade viva (testes de correlação em CI).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se tivessem escolhido a terceira opção, sem reconciliação?»</li>
-      <li>«Como estimou com intervalo sem parecer que estava a proteger-se?»</li>
-      <li>«Quem comunicou aos 328 comerciantes que ficavam para trás?»</li>
-      <li>«O que faz quando a data é regulatória e não é negociável?»</li></ul></div>
+      <li>«E se o salto crítico for uma mensagem Kafka consumida 40 segundos depois?»</li>
+      <li>«Quem garante que os seis serviços usam o mesmo nome de campo?»</li>
+      <li>«O que faz se a amostragem tiver descartado o traço?»</li>
+      <li>«Que dados nunca podem aparecer nestes logs?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Heroísmo apresentado como virtude: noites e fins-de-semana como prova de empenho.</li>
-      <li>Estimativa em ponto único, defendida como certeza.</li>
-      <li>Cortar testes ou observabilidade como primeira alavanca de âmbito.</li></ul></div>
+      <li>Não limpar o MDC e não perceber a consequência de vazamento entre pedidos.</li>
+      <li>Registar PAN de cartão, credenciais ou dados pessoais completos «para facilitar o <em>debug</em>».</li>
+      <li>Assumir que o contexto atravessa sozinho <code>@Async</code>, filas e <em>thread pools</em>.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-37-9" data-box="qa" data-area="comportamental" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+<div class="qa" id="q-37-6" data-box="qa" data-area="obs" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A factura da plataforma de logs triplicou em dois meses e a direcção pediu um corte de 60%. O que corta e o que se recusa a cortar?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro meço antes de cortar: volume por serviço, por nível e por <em>logger</em>. Em quase todos os casos que vi, 3 a 5 <em>loggers</em> produzem mais de metade do volume, e são quase sempre <code>DEBUG</code> deixado ligado, o registo de <em>payloads</em> HTTP completos, ou uma linha por iteração dentro de um ciclo em processamento por lotes.</p>
+      <p>A ordem de corte, do mais barato ao mais doloroso: (1) desligar <code>DEBUG</code> em produção e garantir que só se liga por serviço, temporariamente, com alteração dinâmica de nível via Actuator; (2) eliminar <em>payloads</em> completos — guarda-se o tamanho, o <em>hash</em> e os 3 campos que interessam, não o corpo com 8 KB; (3) amostrar as linhas de rotina de alto volume — uma em 100 dos <code>INFO</code> de sucesso mantém a estatística e corta 99% do volume dessa família; (4) reduzir retenção quente de 30 para 7 ou 14 dias e mandar o resto para armazenamento de objectos, onde o mesmo gigabyte custa uma ordem de grandeza menos; (5) mover contagens que estão a ser derivadas de logs para métricas, que é onde deviam estar desde o início.</p>
+      <p>O que não se corta, em nenhuma circunstância: <code>WARN</code> e <code>ERROR</code>, tudo o que tem valor de auditoria ou obrigação legal, os eventos de domínio que sustentam SLI, e os logs dos caminhos de mutação de dados. Amostrar erros é a decisão que se paga no incidente seguinte, quando o único traço da causa está exactamente na linha descartada.</p>
+      <p>O <em>trade-off</em> honesto: reduzir retenção quente e amostrar rotina aumenta o tempo médio de diagnóstico de incidentes antigos e raros. A troca aceita-se porque a maioria dos diagnósticos usa as últimas 24 horas, e porque o dinheiro poupado é real e imediato. O que se protege é a capacidade de responder a incidentes recentes e a auditorias — não a capacidade de fazer arqueologia sobre um <code>INFO</code> de há cinco semanas.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Baixamos tudo para <code>ERROR</code>» ou «reduzimos a retenção para 2 dias», sem medir nem distinguir famílias de logs.</td></tr>
+        <tr><td>Mid</td><td>Propõe desligar <code>DEBUG</code> e reduzir retenção; não pensa em amostragem selectiva nem em mover para métricas.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, corta por famílias, amostra rotina e nunca erros, move agregações para métricas, separa quente de arquivo, e declara explicitamente o que perde.</td></tr>
+        <tr><td>Staff</td><td>Institui um orçamento de logs por serviço com visibilidade por equipa, define política de níveis e de <em>payloads</em> em biblioteca partilhada, e negoceia a retenção com requisitos legais e de auditoria em mãos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como amostra logs mantendo todas as linhas dos pedidos que falharam?»</li>
+      <li>«Que obrigações legais podem impedir a redução de retenção?»</li>
+      <li>«Como muda o nível de <em>log</em> de um serviço em produção sem <em>deploy</em>?»</li>
+      <li>«Quanto custa, por GB, guardar quente contra arquivo frio?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Amostrar ou descartar <code>ERROR</code>.</li>
+      <li>Cortar sem medir quem produz o volume.</li>
+      <li>Ignorar requisitos de auditoria e depois descobri-los durante uma inspecção.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-37-4" class="h2"><span class="secnum">37.4</span> Tracing distribuído com OpenTelemetry<a class="anchor" href="#sec-37-4" aria-label="ligação">#</a></h2>
+
+<p>Um traço é uma árvore de <em>spans</em>. Cada <em>span</em> tem nome, instante de início e fim, atributos, eventos, estado e um pai; o conjunto partilha um <code>trace_id</code> de 16 bytes. A propagação entre processos faz-se por cabeçalho <code>traceparent</code> do W3C — versão, <code>trace_id</code>, <code>span_id</code> do pai e <em>flags</em>, onde o bit de amostragem viaja com o pedido. Dentro do processo, o contexto vive numa variável de escopo associada à <em>thread</em>, com as mesmas fronteiras assíncronas que afectam o MDC.</p>
+
+<p>Em Java há dois modos de instrumentação e a resposta correcta é usar os dois. O agente Java (<code>-javaagent:opentelemetry-javaagent.jar</code>) instrumenta automaticamente dezenas de bibliotecas — servlets, WebClient, JDBC, Kafka, Redis — sem tocar no código, e dá logo a espinha dorsal do traço com custo de 3 a 10% de CPU e alguns segundos de arranque. A instrumentação manual acrescenta o que o agente não pode saber: os limites de operações de domínio e os atributos de negócio. Um traço só com <em>spans</em> automáticos diz que a chamada JDBC demorou 400 ms; um traço com <em>spans</em> manuais diz que a operação <code>liquidacao.executar</code> demorou 400 ms para o método <code>SEPA</code> com valor acima do limite de revisão.</p>
+
+<p>Os atributos são onde a alta cardinalidade é bem-vinda: <code>tenant</code>, <code>payment.id</code>, <code>user.id</code> não custam nada num traço amostrado e são inutilizáveis numa métrica. É esta assimetria que dita a divisão de trabalho entre sinais — e é a resposta correcta a metade das perguntas de observabilidade em entrevista.</p>
+
+<figure class="listing java" id="lst-37-4"><div class="lhead"><span class="lnum">Listagem 37.4</span>
+<span class="lcap">Span manual com atributos de domínio e registo correcto de excepção.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="java"><code>private static final Tracer TRACER =
+        GlobalOpenTelemetry.getTracer(&quot;pt.acme.pagamentos&quot;, &quot;3.14.2&quot;);
+
+public Recibo liquidar(Pagamento p) {
+    Span span = TRACER.spanBuilder(&quot;liquidacao.executar&quot;)
+            .setSpanKind(SpanKind.INTERNAL)
+            .setAttribute(&quot;pagamento.metodo&quot;, p.metodo())      // SEPA, CARTAO, MBWAY
+            .setAttribute(&quot;pagamento.valor_cent&quot;, p.valorCent())
+            .setAttribute(&quot;tenant&quot;, p.tenant())                // alta cardinalidade: OK no traco
+            .startSpan();
+    try (Scope ignorado = span.makeCurrent()) {
+        Recibo r = motor.executar(p);
+        span.setAttribute(&quot;liquidacao.resultado&quot;, r.estado().name());
+        return r;
+    } catch (RuntimeException e) {
+        span.recordException(e);
+        span.setStatus(StatusCode.ERROR, e.getClass().getSimpleName());
+        throw e;                       // marcar o span nao substitui propagar o erro
+    } finally {
+        span.end();                    // sem end(), o span nunca e exportado
+    }
+}</code></pre></figure>
+
+<div class="qa" id="q-37-7" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O traço mostra o serviço de entrada e o de pagamentos, mas o consumidor Kafka que faz a liquidação aparece sempre como um traço isolado. Porquê e como se corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque o contexto não atravessou a fila. Numa chamada HTTP o contexto viaja no cabeçalho <code>traceparent</code>; numa mensagem Kafka tem de viajar nos <em>headers</em> do registo, e alguém tem de o injectar na produção e extrair no consumo. Se o produtor não injecta, o consumidor arranca um traço novo — tecnicamente correcto, operacionalmente inútil.</p>
+      <p>A correcção tem três partes. Primeira, injecção no produtor: o agente OpenTelemetry faz isto automaticamente para <code>KafkaTemplate</code>, mas deixa de funcionar quando a mensagem é construída numa <em>thread</em> sem contexto activo — o caso típico é o padrão <em>outbox</em>, em que a mensagem é publicada mais tarde por um <em>scheduler</em>. Nesse caso o <code>traceparent</code> tem de ser persistido na linha da <em>outbox</em> e reinjectado na publicação. Segunda, extracção no consumidor, com o cuidado de escolher a relação certa: para processamento assíncrono a ligação correcta é frequentemente um <em>span link</em> e não uma relação pai-filho, porque um consumo em lote de 500 mensagens tem 500 pais distintos e uma cascata de pai único mentiria sobre a duração.</p>
+      <p>Terceira, a decisão de amostragem: o bit de amostragem viaja no contexto, por isso um traço amostrado a montante mantém-se amostrado a jusante. Se o produtor descartou, o consumidor não pode recuperar. Em pipelines assíncronos com processamento diferido, é comum forçar amostragem 100% no caminho de erro e manter 1 a 5% no caminho feliz.</p>
+      <p>O <em>trade-off</em>: manter a árvore ligada através de filas custa <em>headers</em> por mensagem (cerca de 60 bytes) e disciplina de código; em contrapartida, transforma «o pagamento ficou pendente» de uma investigação de meia hora em três cliques. Quando a latência entre produção e consumo é de minutos ou horas, o traço deixa de ser a ferramenta certa para medir duração e passa a ser apenas o fio de causalidade — a duração mede-se por uma métrica de idade da mensagem.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe como o contexto se propaga; sugere passar o <code>trace_id</code> no corpo da mensagem e reconstruir à mão.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há <em>headers</em> de Kafka e que o agente instrumenta, mas não distingue <em>span link</em> de pai-filho nem pensa no lote.</td></tr>
+        <tr><td>Sénior</td><td>Explica injecção/extracção, o caso da <em>outbox</em>, o uso de <em>links</em> em consumo em lote e a herança do bit de amostragem.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta o limite do modelo (traços não medem bem esperas de horas), a política de amostragem forçada em erros e o custo por mensagem; propõe verificação automática de propagação em testes de integração.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como propaga o contexto num padrão <em>outbox</em> com publicação diferida?»</li>
+      <li>«O que muda com <em>virtual threads</em> e com <code>ScopedValue</code>?»</li>
+      <li>«Quanto custa o agente OpenTelemetry em CPU e em tempo de arranque?»</li>
+      <li>«Como testa, em CI, que a propagação não se partiu?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Achar que instalar o agente basta e que o resto acontece por magia.</li>
+      <li>Criar um <em>span</em> por iteração de ciclo e gerar traços com 50 000 <em>spans</em>.</li>
+      <li>Esquecer <code>span.end()</code> em <code>finally</code>, deixando <em>spans</em> nunca exportados e memória a crescer.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-37-8" data-box="qa" data-area="obs" data-level="staff" data-freq="media">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">Fale-me de uma decisão em que discordou mas teve de executar, ou de uma decisão sua que foi impopular na equipa.</div>
+  <div class="qprompt">Com 1500 pedidos por segundo não conseguem guardar todos os traços. Que estratégia de amostragem escolhe e o que perde com ela?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «A direcção de engenharia decidiu padronizar todas as equipas numa <em>service mesh</em>, com a consequência de o nosso serviço passar a ter um <em>sidecar</em> em cada <em>pod</em>. Eu discordei por escrito: media 6 a 9 ms adicionais de latência por salto no nosso ambiente de teste, e nós tínhamos um orçamento de 250 ms com três saltos internos no caminho crítico.»</p>
-      <p><strong>Tarefa.</strong> «A decisão foi mantida, com um argumento que eu não podia refutar: mTLS uniforme e política de rede centralizada em 40 serviços valiam mais para a organização do que 20 ms no meu. A minha tarefa passou a ser executar bem uma decisão de que discordava.»</p>
-      <p><strong>Acção.</strong> «Comprometi-me e disse-o à equipa por palavras minhas, sem a fórmula “mandaram-nos fazer isto”: expliquei o argumento da segurança como se fosse meu, porque era legítimo. Depois transformei a discordância em condição verificável em vez de queixa: negociei que adoptávamos primeiro em pré-produção durante quatro semanas com medição de p99 antes e depois, e que se o acréscimo passasse de 15 ms no caminho crítico ficaria registado como excepção a rever. Medimos 11 ms. Também usei a adopção para reduzir dois dos três saltos internos, que já eram desnecessários desde uma refactorização anterior — o total acabou por descer.»</p>
-      <p><strong>Resultado.</strong> «O p99 ficou em 118 ms, abaixo dos 120 ms de antes, e fomos a segunda equipa das dez a completar a migração. Passados oito meses, quando outra equipa levantou o mesmo problema de latência, a medição que fizemos foi o que a direcção usou para lhes dar uma isenção fundamentada. A lição que retiro é que discordar por escrito e executar com lealdade não são opostos: o registo escrito é precisamente o que torna possível rever a decisão com dados em vez de com ressentimento.»</p>
-      <p>Um cuidado de forma: esta história não deve ser contada como «eu tinha razão e eles não». Deve ser contada como uma decisão organizacional legítima com um custo local real, gerida com transparência. Se o candidato não conseguir dizer, sem ironia, porque é que a decisão contrária era defensável, a história vira uma queixa comprida.</p></div>
+      <p>Há duas famílias. Na amostragem à cabeça (<em>head sampling</em>), a decisão é tomada no primeiro serviço, antes de se saber o que vai acontecer, e viaja no contexto: é barata, determinística e não exige memória, mas descarta cegamente — dos 5% guardados, a esmagadora maioria são pedidos normais e os interessantes perdem-se. Na amostragem à cauda (<em>tail sampling</em>), o <em>collector</em> retém os <em>spans</em> em memória até o traço fechar e só então decide, com regras como «guardar todos os que têm erro, todos os que passam de 1 s, e 2% do resto». Guarda o que interessa, mas precisa de memória proporcional ao produto do débito pela janela de espera (a 1500 pedidos por segundo e 30 s de janela, dezenas de milhares de traços em <em>buffer</em>) e obriga a que todos os <em>spans</em> do mesmo traço cheguem ao mesmo nó do <em>collector</em>, o que se resolve com encaminhamento por <code>trace_id</code>.</p>
+      <p>A escolha prática para um serviço deste tamanho é híbrida: <em>head sampling</em> a 100% nos serviços de entrada de baixo volume e a 5-10% no caminho quente, mais <em>tail sampling</em> no <em>collector</em> com política por categoria — 100% de erros, 100% acima do p99 do SLO, 100% de um conjunto de clientes marcados, 1-2% do tráfego normal. Com isto, o volume exportado fica na ordem de 3 a 5% dos traços e cobre praticamente todos os casos de diagnóstico.</p>
+      <p>O que se perde é a estatística: com amostragem enviesada para os lentos e para os erros, os traços deixam de ser uma amostra representativa e não se pode calcular o p50 a partir deles. Por isso os percentis vêm sempre das métricas — que vêem 100% dos pedidos — e os traços servem só para explicar casos individuais. Confundir os dois papéis leva a conclusões erradas do tipo «o traço médio mostra 800 ms», quando isso é apenas a consequência de se ter guardado os lentos de propósito.</p>
+      <p>O terceiro elemento é o custo: cada traço exportado custa 2 a 5 KB e a factura de ingestão é linear no volume. Descer de 100% para 5% num serviço com 1500 pedidos por segundo passa de cerca de 6 MB/s para 300 KB/s — a diferença entre um orçamento incomportável e um trivial.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Executou de má vontade e comunicou-o à equipa; ou sabotagem passiva («fizemos o mínimo até deixarem cair»).</td></tr>
-        <tr><td>Mid</td><td>Cumpriu a decisão sem discutir; não registou objecção nem definiu forma de a rever.</td></tr>
-        <tr><td>Sénior</td><td>Objecção fundamentada por escrito, adesão genuína depois da decisão, condição mensurável negociada, resultado medido.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e o trabalho de medição passa a servir a organização inteira — a excepção fundamentada de outra equipa nasce do seu registo.</td></tr>
+        <tr><td>Insuficiente</td><td>«Guardamos 10%» sem distinguir cabeça de cauda nem pensar em erros.</td></tr>
+        <tr><td>Mid</td><td>Conhece as duas famílias mas não conhece os custos de memória do <em>tail sampling</em> nem a necessidade de encaminhar por <code>trace_id</code>.</td></tr>
+        <tr><td>Sénior</td><td>Propõe híbrido com política por categoria, quantifica o volume poupado, e sabe que a decisão viaja no contexto.</td></tr>
+        <tr><td>Staff</td><td>Explicita que a amostragem enviesada invalida estatística a partir de traços, separa os papéis de métrica e traço, e dimensiona a memória do <em>collector</em>.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se a medição tivesse dado 40 ms?»</li>
-      <li>«Como explicou à equipa sem minar a decisão?»</li>
-      <li>«Já tomou uma decisão impopular na sua própria equipa? Qual?»</li>
-      <li>«Onde está o limite entre discordar e executar, e recusar executar?»</li></ul></div>
+      <li>«Como garante que todos os <em>spans</em> de um traço chegam ao mesmo <em>collector</em>?»</li>
+      <li>«Um serviço a jusante quer 100% de amostragem. Consegue, se o de entrada decidiu descartar?»</li>
+      <li>«Como estima a memória necessária no <em>collector</em>?»</li>
+      <li>«Porque não calcula o p99 a partir dos traços?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Contar a história com o gosto de quem quer provar que a chefia estava errada.</li>
-      <li>Anunciar à equipa a discordância como forma de se desresponsabilizar do resultado.</li>
-      <li>Nunca ter discordado de nada — sinal de âmbito pequeno, não de bom feitio.</li></ul></div>
+      <li>Calcular percentis de latência sobre traços amostrados por enviesamento.</li>
+      <li>Ligar <em>tail sampling</em> sem dimensionar memória do <em>collector</em>.</li>
+      <li>Amostragem aleatória por serviço, criando traços com buracos no meio.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-37-5" class="h2"><span class="secnum">37.5</span> Falhas, incidentes e o que aprendeste<a class="anchor" href="#sec-37-5" aria-label="ligação">#</a></h2>
+<aside class="box trade" data-box="trade"><div class="btitle">Trade-off</div><p><em>Head sampling</em> custa quase nada e perde o que interessa; <em>tail sampling</em> guarda o que interessa e custa memória, complexidade de encaminhamento e um atraso de dezenas de segundos até o traço estar disponível. A regra prática: abaixo de 200 pedidos por segundo, amostrar tudo à cabeça a 100% é mais barato do que operar <em>tail sampling</em>. Acima de 1000, o híbrido paga-se sozinho.</p></aside>
 
-<p>Esta é a família de perguntas com maior retorno por minuto de preparação, porque é onde a diferença entre um candidato médio e um candidato forte é mais visível e onde quase todos escolhem mal. A escolha errada é a falha inofensiva — «uma vez estimei mal um <em>sprint</em>» — que produz zero evidência e é lida como falta de âmbito ou falta de honestidade. A escolha certa é uma falha com dano real, contada sem drama, com a análise causal a chegar a mecanismo e não a pessoas.</p>
+<h2 id="sec-37-5" class="h2"><span class="secnum">37.5</span> A pergunta clássica: o serviço está lento, o que fazes?<a class="anchor" href="#sec-37-5" aria-label="ligação">#</a></h2>
 
-<p>A estrutura tem cinco tempos: o que se decidiu e porquê era razoável na altura (sem isto, a história vira confissão de estupidez), o que correu mal com números — duração, impacto, quem foi afectado —, o que foi feito na altura, a causa-raiz ao nível do sistema, e a mudança durável que ficou. O quarto tempo é onde se ganha a ronda: um sénior não pára em «faltou-me atenção», pára em «o sistema permitia que uma única pessoa fizesse isto sem detecção em menos de dez minutos, e é isso que mudámos».</p>
+<p>Esta é a pergunta mais frequente de toda a área e a que mais candidatos falha, não por ignorância mas por desorganização: começam a enumerar causas possíveis por ordem de familiaridade em vez de percorrerem o caminho do pedido por ordem de custo de verificação. A resposta que passa é um procedimento — perguntas de enquadramento, depois uma bissecção do caminho do pedido, com um comando ou <em>query</em> por passo e um critério explícito de confirmação ou eliminação.</p>
 
-<p>Sobre incidentes, vale a distinção entre os dois formatos possíveis da pergunta. «Conte-me um incidente que geriu» mede coordenação: comunicação, mitigação antes de diagnóstico, decisão de reverter. «Conte-me um incidente que causou» mede honestidade e cultura de análise sem culpa. Convém ter uma história de cada, e a segunda tem de ser mesmo da autoria do candidato — dizer «nunca causei nenhum» é a resposta que os entrevistadores registam com mais desconfiança.</p>
+<p>O enquadramento tem quatro perguntas que se fazem antes de abrir qualquer terminal: <strong>lento para quem</strong> (todos os clientes, uma rota, um <em>tenant</em>, uma região), <strong>desde quando</strong> (o instante exacto muda tudo: se coincide com um <em>deploy</em>, a hipótese número um é o <em>deploy</em>), <strong>em que percentil</strong> (p50 e p99 juntos ou só o p99), e <strong>está a piorar</strong> (degradação linear sugere fuga ou crescimento de dados; degradação em degrau sugere alteração de configuração ou de dependência). Se houver impacto em utilizadores, mitiga-se em paralelo — reverter o <em>deploy</em> suspeito, desviar tráfego, activar o <em>circuit breaker</em> — porque diagnosticar não é obrigação durante o incidente.</p>
 
-<div class="qa" id="q-37-10" data-box="qa" data-area="arquitectura" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Arquitectura de aplicação</span>
+<p>A seguir percorre-se o caminho do pedido de fora para dentro: <em>load balancer</em> e <em>ingress</em>, aplicação (CPU, GC, <em>threads</em>, pools), base de dados, dependências externas, e finalmente o código. A ordem não é arbitrária — é por custo de verificação. Olhar o painel do <em>ingress</em> custa 10 segundos; tirar um <em>thread dump</em> custa 30 segundos; correr o <em>profiler</em> custa 2 minutos e uma decisão; ler <code>pg_stat_statements</code> custa 20 segundos e elimina a hipótese mais provável de todas em serviços com base de dados.</p>
+
+<figure class="listing text" id="lst-37-5"><div class="lhead"><span class="lnum">Listagem 37.5</span>
+<span class="lcap">As <em>queries</em> PromQL dos primeiros 90 segundos.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code># 1. onde e que a latencia subiu: p99 por rota (o p50 na mesma expressao, com 0.50)
+histogram_quantile(0.99,
+  sum by (le, uri) (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))
+
+# 2. o trafego mudou? (RED: Rate) — descartar &quot;esta lento porque duplicou a carga&quot;
+sum by (uri) (rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;}[5m]))
+
+# 3. erros (RED: Errors)
+sum(rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;,status=~&quot;5..&quot;}[5m]))
+  / sum(rate(http_server_requests_seconds_count{app=&quot;pagamentos&quot;}[5m]))
+
+# 4. saturacao do pool de conexoes — pending acima de zero e sempre patologico
+hikaricp_connections_pending{app=&quot;pagamentos&quot;}
+hikaricp_connections_active / hikaricp_connections_max
+
+# 5. GC: fraccao de tempo de parede gasta em pausa, por instancia
+sum by (instance) (rate(jvm_gc_pause_seconds_sum{app=&quot;pagamentos&quot;}[5m]))
+
+# 6. dependencias de saida: latencia por servico chamado
+histogram_quantile(0.99,
+  sum by (le, client_name) (rate(http_client_requests_seconds_bucket[5m])))
+
+# 7. e uma instancia so ou todas? (uma so = no doente, drenar e seguir)
+histogram_quantile(0.99,
+  sum by (le, instance) (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))</code></pre></figure>
+
+<figure class="listing shell" id="lst-37-6"><div class="lhead"><span class="lnum">Listagem 37.6</span>
+<span class="lcap">Três <em>thread dumps</em> espaçados e a sua triagem imediata.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># PID dentro do contentor (quase sempre 1, mas confirma-se)
+kubectl exec pagamentos-7d9f4b -c app -- jcmd -l
+
+# tres amostras espacadas: uma so nao distingue &quot;bloqueado&quot; de &quot;a passar por ali&quot;
+for i in 1 2 3; do
+  kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print &gt; td-$i.txt
+  sleep 5
+done
+
+# quantas threads em cada estado
+grep 'java.lang.Thread.State' td-2.txt | sort | uniq -c | sort -rn
+
+# o frame de topo mais repetido: e ali que as threads estao presas
+grep -A 1 'java.lang.Thread.State' td-2.txt | grep '	at ' | sort | uniq -c | sort -rn | head
+
+# deteccao de deadlock e resumo de contencao, sem parsing manual
+kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print -l | grep -i 'deadlock' -A 20
+
+# alternativa sem shell no contentor: o endpoint do Actuator devolve JSON
+curl -s localhost:8080/actuator/threaddump | jq -r '.threads[] | .threadState' | sort | uniq -c</code></pre></figure>
+
+<figure class="listing text" id="lst-37-7"><div class="lhead"><span class="lnum">Listagem 37.7</span>
+<span class="lcap">Excerto de <em>thread dump</em>: 187 <em>threads</em> HTTP à espera de conexão ao PostgreSQL.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="text"><code>&quot;http-nio-8080-exec-42&quot; #142 daemon prio=5 os_prio=0 cpu=311.44ms elapsed=1841.02s
+   tid=0x00007f2c1c0b8a00 nid=0x5a1f waiting on condition  [0x00007f2b9c3fd000]
+   java.lang.Thread.State: TIMED_WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@25/Native Method)
+	- parking to wait for  &lt;0x00000006c1a3f2b8&gt; (a java.util.concurrent.SynchronousQueue$Transferer)
+	at java.util.concurrent.locks.LockSupport.parkNanos(java.base@25/LockSupport.java:269)
+	at com.zaxxer.hikari.util.ConcurrentBag.borrow(ConcurrentBag.java:161)
+	at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:160)
+	at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:100)
+	at org.springframework.jdbc.datasource.DataSourceUtils.fetchConnection(DataSourceUtils.java:160)
+	...
+	at pt.acme.pag.AutorizacaoService.autorizar(AutorizacaoService.java:88)
+
+&quot;http-nio-8080-exec-9&quot; #109 daemon prio=5 os_prio=0 cpu=48214.77ms elapsed=1841.10s
+   tid=0x00007f2c1c0119c0 nid=0x5a03 runnable  [0x00007f2b9d1fe000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.SocketInputStream.socketRead0(java.base@25/Native Method)
+	at org.postgresql.core.PGStream.receiveChar(PGStream.java:465)
+	at org.postgresql.jdbc.PgStatement.executeInternal(PgStatement.java:512)
+	at pt.acme.pag.LimiteRepository.somaDiaria(LimiteRepository.java:41)
+
+Leitura: 187 threads em ConcurrentBag.borrow (esperam conexao) e 13 em socketRead0
+(esperam resposta do PostgreSQL). A fila nao esta na aplicacao — esta na base de dados.
+Nota: RUNNABLE em socketRead0 e espera de rede, nao consumo de CPU.</code></pre></figure>
+
+<figure class="listing sql" id="lst-37-8"><div class="lhead"><span class="lnum">Listagem 37.8</span>
+<span class="lcap">O que se pergunta ao PostgreSQL: o agora e o acumulado.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="sql"><code>-- AGORA: quem esta a correr, ha quanto tempo e a espera de que
+SELECT pid,
+       now() - query_start        AS duracao,
+       state, wait_event_type, wait_event,
+       left(query, 90)            AS q
+  FROM pg_stat_activity
+ WHERE state &lt;&gt; 'idle'
+   AND backend_type = 'client backend'
+ ORDER BY duracao DESC
+ LIMIT 20;
+
+-- Bloqueios: quem espera por quem (a causa mais comum de p99 em degrau)
+SELECT bloqueada.pid AS espera, bloqueante.pid AS bloqueia,
+       left(bloqueada.query, 60) AS q_espera
+  FROM pg_stat_activity bloqueada
+  JOIN pg_stat_activity bloqueante
+    ON bloqueante.pid = ANY(pg_blocking_pids(bloqueada.pid))
+ WHERE cardinality(pg_blocking_pids(bloqueada.pid)) &gt; 0;
+
+-- ACUMULADO: onde o tempo total foi gasto desde o ultimo reset
+SELECT calls,
+       round(total_exec_time)::bigint                AS total_ms,
+       round(mean_exec_time::numeric, 2)             AS media_ms,
+       round(stddev_exec_time::numeric, 2)           AS desvio_ms,
+       rows,
+       left(query, 90)                               AS q
+  FROM pg_stat_statements
+ ORDER BY total_exec_time DESC
+ LIMIT 15;
+-- media baixa com desvio alto = cauda; total alto com media baixa = chamada N+1
+
+-- Ligacoes ociosas dentro de transaccao: seguram conexoes e bloqueiam VACUUM
+SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';</code></pre></figure>
+
+<div class="qa" id="q-37-9" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Fale-me de uma decisão de arquitectura sua que correu mal. Que sinais ignorou e como acabou?</div>
+  <div class="qprompt">São 3h20. O alerta diz que o serviço de pagamentos está lento. O que faz, por ordem, e com que comandos?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação e decisão.</strong> «Em 2022 decidi construir uma camada de cache aplicacional própria à frente do PostgreSQL para os dados de comerciante, em vez de usar o Redis que já tínhamos. O raciocínio na altura não era absurdo: eram cerca de 30 mil comerciantes, o conjunto cabia em 200 MB de heap, e evitava um salto de rede de 1 ms por leitura num caminho com orçamento apertado. Escrevi-a em Caffeine com invalidação por evento de Kafka.»</p>
-      <p><strong>O que correu mal.</strong> «Funcionou nove meses e falhou de três maneiras que eu não tinha modelado. Primeiro, a invalidação por evento perdia-se se o consumidor tivesse <em>lag</em>: uma alteração de configuração de um comerciante podia demorar até 15 minutos a chegar a todas as instâncias, e a equipa de suporte passou a receber chamadas do tipo “alterei e não mudou nada”. Segundo, com 12 instâncias, cada uma tinha uma versão ligeiramente diferente do estado, o que tornou dois incidentes praticamente impossíveis de reproduzir — passámos cerca de 20 horas a depurar um caso que era só duas instâncias com valores diferentes. Terceiro, e este foi o que me convenceu, o arranque de cada instância fazia 30 mil leituras à base de dados e durante um <em>rolling deploy</em> em hora de ponta isso derrubou-nos o p99 para 900 ms durante 4 minutos.»</p>
-      <p><strong>Sinais que ignorei.</strong> «Havia dois, ambos visíveis ao terceiro mês. O primeiro foram as perguntas repetidas do suporte, que eu tratei como formação em falta em vez de sintoma de arquitectura. O segundo foi eu próprio ter escrito, no ADR original, “assume-se que o <em>lag</em> do consumidor é inferior a 5 segundos” — uma suposição que nunca instrumentei. Se tivesse posto um alerta nessa suposição no primeiro dia, tinha visto o problema em Março e não em Novembro.»</p>
-      <p><strong>Resultado.</strong> «Migrei para Redis com um TTL de 60 segundos e invalidação explícita na escrita, mantendo apenas um cache local de 5 segundos para os 200 comerciantes mais quentes. O p99 subiu de 118 ms para 124 ms — paguei os 6 ms que tinha tentado poupar — e em troca as queixas de propagação desapareceram e o <em>rolling deploy</em> deixou de ter efeito visível. A regra que ficou comigo: toda a suposição escrita num ADR tem de ter um alerta correspondente ou não é uma suposição, é uma esperança.»</p></div>
+      <p>Sigo um procedimento fixo em três fases: enquadrar (60 s), mitigar se houver impacto, bissectar o caminho do pedido. A ordem dos passos é por custo de verificação, e cada passo tem um critério explícito que confirma ou elimina uma classe de causas.</p>
+      <ol class="lst">
+        <li><strong>Enquadrar (0-1 min).</strong> Painel de SLO: quando começou, que rotas, que percentis, o tráfego mudou. Timeline de alterações: <code>kubectl rollout history deploy/pagamentos</code>, <em>feature flags</em>, alterações de configuração e migrações nas últimas 6 horas. Se o início coincidir com uma alteração a menos de 15 minutos, a hipótese principal é essa alteração.</li>
+        <li><strong>Mitigar em paralelo (1-3 min).</strong> Se há impacto no utilizador: reverter o <em>deploy</em> suspeito (<code>kubectl rollout undo</code>), desligar a <em>flag</em>, ou escalar réplicas se o sinal for saturação. Diagnóstico não é obrigação durante o incidente; restaurar é.</li>
+        <li><strong>Todas as instâncias ou uma?</strong> <code>histogram_quantile(0.99, sum by (le, instance) (rate(http_server_requests_seconds_bucket[5m])))</code>. Se for uma só, drena-se esse <em>pod</em> e o incidente acaba; guarda-se para autópsia.</li>
+        <li><strong>Fora ou dentro da aplicação?</strong> Comparar p99 do <em>ingress</em> com p99 do servidor. Diferença grande significa fila antes da aplicação — <em>threads</em> esgotadas, arranque lento, <em>keep-alive</em> mal configurado, <em>readiness</em> a oscilar.</li>
+        <li><strong>Saturação de recursos (USE).</strong> <code>hikaricp_connections_pending</code> acima de zero é sempre patológico; <code>jvm_gc_pause_seconds_sum</code> acima de 5% do tempo de parede é problema de memória; <code>container_cpu_cfs_throttled_seconds_total</code> revela estrangulamento de CPU pelo Kubernetes, que produz p99 alto com CPU aparentemente baixa.</li>
+        <li><strong>Dentro ou fora do processo?</strong> Três <em>thread dumps</em> espaçados de 5 s (<code>jcmd 1 Thread.print</code>), contagem por estado e agregação do <em>frame</em> de topo. Muitas <em>threads</em> em <code>ConcurrentBag.borrow</code> significa pool esgotado; em <code>socketRead0</code> significa espera por dependência; muitas em <code>RUNNABLE</code> com CPU alto significa código a arder.</li>
+        <li><strong>Base de dados.</strong> <code>pg_stat_activity</code> para o agora (duração, <code>wait_event</code>, bloqueios via <code>pg_blocking_pids</code>) e <code>pg_stat_statements</code> ordenado por <code>total_exec_time</code> para o acumulado. Uma <em>query</em> nova no topo aponta directamente para a alteração que a introduziu; muitas chamadas com média baixa é N+1.</li>
+        <li><strong>Dependências externas.</strong> p99 por <code>client_name</code>, taxa de <em>timeout</em> e estado dos <em>circuit breakers</em>. Uma dependência lenta com retentativas activas multiplica a carga e transforma degradação em colapso.</li>
+        <li><strong>Só então, perfilar.</strong> <code>jcmd 1 JFR.start settings=profile duration=5m</code> ou async-profiler 60 s em CPU e em <code>lock</code>. É o passo mais caro e o mais informativo; chega-se aqui com uma hipótese, não à procura de uma.</li>
+      </ol>
+      <p>Ao longo de todo o processo escrevo no canal do incidente o que testei e o que eliminei, com <em>timestamps</em>. Não é burocracia: é o que permite a quem entra às 4h não repetir o mesmo trabalho, e é a matéria-prima do <em>postmortem</em>.</p>
+      <p>O erro que distingue um mid é saltar directamente para o passo 9 — abrir o <em>profiler</em> antes de saber se o problema é sequer da aplicação. Em serviços com base de dados, a distribuição empírica de causas é aproximadamente: 40% base de dados (<em>query</em> nova, plano mudado, bloqueio, N+1), 20% dependência externa, 15% alteração recente de código ou configuração, 10% saturação de pool ou de <em>threads</em>, 10% GC ou memória, 5% infra-estrutura. O procedimento segue essa ordem de probabilidade.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Falha inofensiva ou culpa externa: «a decisão foi imposta», «a biblioteca tinha um bug».</td></tr>
-        <tr><td>Mid</td><td>Assume o erro mas a análise pára na tecnologia («cache local é má ideia»), sem raciocínio sobre o que era razoável na altura.</td></tr>
-        <tr><td>Sénior</td><td>Reconstrói o raciocínio original com números, quantifica o dano, identifica os sinais que ignorou e paga o custo da correcção conscientemente.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e extrai uma regra generalizável — suposições de ADR viram alertas — que passou a aplicar noutros sistemas.</td></tr>
+        <tr><td>Insuficiente</td><td>Lista causas possíveis sem ordem nem forma de as verificar; ou vai directo a «reiniciar o serviço» sem recolher nada.</td></tr>
+        <tr><td>Mid</td><td>Tem uma ordem razoável mas nomeia ferramentas sem comandos concretos; não separa mitigação de diagnóstico; esquece a pergunta «uma instância ou todas?».</td></tr>
+        <tr><td>Sénior</td><td>Enquadra antes de agir, mitiga em paralelo, bissecta o caminho do pedido com comandos e <em>queries</em> concretos, e tem critério de confirmação por passo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta a distribuição de probabilidade das causas, a comunicação escrita durante o incidente, o custo de cada passo de diagnóstico, e o que faria a seguir para que o mesmo alerta fosse auto-explicativo.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Em que condições é que o cache local teria sido a escolha certa?»</li>
-      <li>«Como fez a migração sem parar o serviço?»</li>
-      <li>«Quem lhe disse que estava errado e quando?»</li>
-      <li>«O que faz hoje na fase de desenho para apanhar isto mais cedo?»</li></ul></div>
+      <li>«Reiniciar resolveu. Fica por aqui?»</li>
+      <li>«O p50 está bom e só o p99 subiu. Muda alguma coisa no procedimento?»</li>
+      <li>«Como distingue estrangulamento de CPU pelo Kubernetes de código lento?»</li>
+      <li>«E se não houver <em>shell</em> no contentor nem <code>jcmd</code> disponível?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Escolher uma falha sem consequência para não parecer mal.</li>
-      <li>Concluir «aprendi a não reinventar a roda» — moral genérica, sem mecanismo.</li>
-      <li>Não saber dizer o custo em números do erro nem da correcção.</li></ul></div>
+      <li>Reiniciar os <em>pods</em> antes de recolher <em>thread dump</em> ou <em>heap dump</em>: destrói a prova e o incidente repete-se em duas horas.</li>
+      <li>Perfilar sem hipótese, à procura de inspiração.</li>
+      <li>Nunca perguntar «o que mudou nas últimas horas?».</li>
+      <li>Diagnosticar sozinho e em silêncio durante 40 minutos com clientes afectados.</li></ul></div>
   </div>
 </div>
+
+<aside class="box num" data-box="num"><div class="btitle">Números</div><p>Um <em>thread dump</em> com <code>jcmd Thread.print</code> num <em>heap</em> normal custa 10 a 50 ms de pausa e é seguro em produção. Um <code>GC.heap_dump</code> de um <em>heap</em> de 8 GB pára a JVM durante 10 a 30 segundos e escreve 8 GB em disco — só se faz com o <em>pod</em> drenado do <em>load balancer</em>. Uma gravação JFR com <code>settings=profile</code> custa tipicamente 1 a 3% de CPU; o async-profiler em modo CPU, abaixo de 1%.</p></aside>
+
+<div class="qa" id="q-37-10" data-box="qa" data-area="concorrencia" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Concorrência</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O <em>thread dump</em> mostra 187 <em>threads</em> HTTP em <code>HikariPool.getConnection</code> e 13 em <code>socketRead0</code>. O pool tem 20 conexões. Diagnostique e diga o que faz a seguir.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O pool está esgotado e a fila de espera é a latência. As 13 <em>threads</em> em <code>socketRead0</code> são as que têm conexão e estão à espera da resposta do PostgreSQL; as 187 estão paradas à porta. O sintoma na aplicação é latência alta com CPU baixo — a assinatura clássica de saturação por espera, não por trabalho. Se o tempo médio de uma <em>query</em> passou de 5 ms para 300 ms, a capacidade do pool caiu de 4000 para 66 operações por segundo com as mesmas 20 conexões; o pool não mudou, o débito por conexão é que colapsou.</p>
+      <p>O erro que se comete a seguir é aumentar o pool. Isso desloca a fila para a base de dados, onde é muito mais cara: 200 conexões activas num PostgreSQL com 8 vCPU produzem contenção de <em>locks</em>, mais processos a competir pelo CPU e um colapso pior. O dimensionamento correcto é próximo de <code>núcleos × 2 + discos efectivos</code> para carga OLTP, tipicamente 10 a 30 por instância de aplicação, e a soma de todos os pools de todas as réplicas tem de caber em <code>max_connections</code> com margem — 6 réplicas × 20 = 120 conexões contra um limite de 200 já está apertado quando entram tarefas em lote.</p>
+      <p>A investigação certa é para trás: <em>porque</em> ficaram as conexões presas. Verifico três coisas. Primeira, <code>pg_stat_statements</code> ordenado por <code>total_exec_time</code>, à procura da <em>query</em> que mudou de perfil — plano novo por estatísticas desactualizadas, índice em falta depois de uma migração, ou crescimento de tabela que fez o planeador trocar <em>index scan</em> por <em>seq scan</em>. Segunda, <code>idle in transaction</code>: transacções abertas que não fecham seguram conexões indefinidamente, e a causa habitual é <code>@Transactional</code> a envolver uma chamada HTTP externa — a conexão fica retida durante o <em>timeout</em> dessa chamada. Terceira, bloqueios com <code>pg_blocking_pids</code>.</p>
+      <p>Mitigação imediata: reduzir <code>connectionTimeout</code> para falhar depressa (2 s em vez de 30 s) e devolver 503 em vez de acumular <em>threads</em>, activar o <em>circuit breaker</em> no caminho afectado, e — se identificada — terminar a <em>query</em> patológica com <code>pg_cancel_backend</code>. A correcção estrutural é tirar chamadas remotas de dentro de transacções, adicionar o índice em falta e pôr um alerta em <code>hikaricp_connections_pending</code> acima de zero durante 1 minuto, que teria detectado isto vinte minutos antes do SLO.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Aumentamos o pool» e nada mais; não lê o <em>dump</em> nem distingue espera de trabalho.</td></tr>
+        <tr><td>Mid</td><td>Identifica o pool esgotado mas trata o sintoma; não investiga porque as conexões ficam presas.</td></tr>
+        <tr><td>Sénior</td><td>Explica a aritmética do débito por conexão, recusa aumentar o pool com justificação, investiga <code>pg_stat_statements</code>, <code>idle in transaction</code> e bloqueios, e falha depressa como mitigação.</td></tr>
+        <tr><td>Staff</td><td>Dimensiona o pool globalmente contra <code>max_connections</code>, propõe <em>pooler</em> externo se houver muitas réplicas, elimina a classe de erro (chamadas remotas em transacção) e institui o alerta de saturação.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como escolhe o tamanho do pool, com números?»</li>
+      <li>«O que muda com <em>virtual threads</em>? O pool deixa de ser o limite?»</li>
+      <li>«Como detecta <code>@Transactional</code> a envolver chamadas HTTP em <em>code review</em>?»</li>
+      <li>«Quando é que um <em>pooler</em> como o PgBouncer resolve e quando é que piora?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Multiplicar o pool por dez como primeira acção.</li>
+      <li>Interpretar <code>RUNNABLE</code> em <code>socketRead0</code> como consumo de CPU.</li>
+      <li>Tirar um único <em>thread dump</em> e concluir a partir dele.</li>
+      <li>Não somar os pools de todas as réplicas antes de os aumentar.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-37-1" data-box="lab" data-lang="shell">
+  <div class="labhead"><span class="labttl">Exercício 37.1 — Plano de diagnóstico para p99 alto</span>
+    <div class="labpills"><span class="qpill">Diagnóstico</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Cenário, tal como o entrevistador o dá. Serviço <code>pagamentos</code> (Spring Boot 3.5, Java 25, PostgreSQL 17, 6 réplicas em Kubernetes, pool HikariCP de 20 por réplica). Às 14:05 o p99 de <code>POST /v1/autorizacoes</code> passou de 180 ms para 2,1 s e mantém-se. O p50 está em 62 ms, praticamente inalterado. Os 5xx estão em 0,3% (linha de base 0,1%). O tráfego é o normal de terça-feira, 1400 pedidos por segundo. Houve um <em>deploy</em> às 11:30 e uma migração de esquema às 13:50. O SLO é 99,9% em 30 dias e o orçamento já consumido é de 35%.</p>
+    <p>Escreva o plano de diagnóstico: as hipóteses por ordem, o comando ou <em>query</em> exacto que testa cada uma, e o sinal que a confirma ou elimina. Diga também o que mitiga e em que momento. Restrição: tem <code>kubectl</code>, acesso de leitura ao PostgreSQL e ao Prometheus; não tem <em>shell</em> interactivo prolongado nem autorização para reiniciar sem comunicar.</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing shell" id="lst-37-9"><div class="lhead"><span class="lnum">Listagem 37.9</span>
+        <span class="lcap">Plano de diagnóstico executável, por ordem de custo de verificação.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="shell"><code># ---------------------------------------------------------------------------
+# LEITURA DO CENARIO (antes de qualquer comando)
+# p50 estavel + p99 x11 = fenomeno de cauda, nao degradacao sistemica.
+# Isso elimina logo: falta de CPU global, aumento de carga, codigo mais lento
+# em todos os pedidos. Restam: uma instancia doente, espera por recurso
+# (pool/lock), GC, ou um subconjunto de pedidos com plano de query novo.
+# Ancora temporal: 14:05 nao coincide com o deploy (11:30) mas fica 15 min
+# depois da migracao (13:50) — hipotese 1 tem de ser a migracao.
+# ---------------------------------------------------------------------------
+
+# H1. UMA INSTANCIA OU TODAS?  (custo: 10 s)   confirma se: uma curva descolada
+#   histogram_quantile(0.99, sum by (le, instance)
+#     (rate(http_server_requests_seconds_bucket{app=&quot;pagamentos&quot;}[5m])))
+#   -&gt; uma so: kubectl label pod X drenar=true ; incidente termina, autopsia depois.
+#   -&gt; todas: continuar.
+
+# H2. A MIGRACAO DAS 13:50 MUDOU UM PLANO?  (custo: 20 s)   hipotese principal
+psql -c &quot;SELECT calls, round(total_exec_time)::bigint AS total_ms,
+                round(mean_exec_time::numeric,2) AS media_ms,
+                round(stddev_exec_time::numeric,2) AS desvio_ms,
+                left(query,90)
+           FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 15;&quot;
+#   confirma se: query do caminho de autorizacao no topo com desvio_ms alto
+#   (media baixa + desvio alto = cauda: parte dos pedidos apanha seq scan).
+psql -c &quot;SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+          WHERE relname='limites' ORDER BY idx_scan;&quot;
+#   elimina se: nenhum indice com idx_scan=0 e nenhuma query nova no topo.
+
+# H3. ESPERA POR CONEXAO (fila do pool)  (custo: 10 s)
+#   hikaricp_connections_pending{app=&quot;pagamentos&quot;}          -&gt; acima de 0 e patologico
+#   hikaricp_connections_timeout_total                      -&gt; taxa a subir?
+#   confirma se: pending acima de 0 sustentado E p99 correlacionado com ele.
+
+# H4. O QUE ESTA A CORRER AGORA NA BASE DE DADOS  (custo: 20 s)
+psql -c &quot;SELECT pid, now()-query_start AS dur, state, wait_event_type, wait_event,
+                left(query,80)
+           FROM pg_stat_activity
+          WHERE state &lt;&gt; 'idle' AND backend_type='client backend'
+          ORDER BY dur DESC LIMIT 20;&quot;
+psql -c &quot;SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction';&quot;
+psql -c &quot;SELECT bloqueada.pid, bloqueante.pid, left(bloqueada.query,60)
+           FROM pg_stat_activity bloqueada
+           JOIN pg_stat_activity bloqueante
+             ON bloqueante.pid = ANY(pg_blocking_pids(bloqueada.pid));&quot;
+#   confirma bloqueio se: wait_event_type='Lock' ou pg_blocking_pids nao vazio.
+#   NOTA: uma migracao que ainda segure ACCESS EXCLUSIVE aparece aqui.
+
+# H5. GC  (custo: 10 s)   confirma se: pausa acima de 5% do tempo de parede
+#   sum by (instance) (rate(jvm_gc_pause_seconds_sum{app=&quot;pagamentos&quot;}[5m]))
+#   jvm_memory_used_bytes{area=&quot;heap&quot;,id=~&quot;.*Old.*&quot;}   -&gt; patamar a subir apos GC?
+
+# H6. ESTRANGULAMENTO DE CPU PELO KUBERNETES  (custo: 10 s)
+#   rate(container_cpu_cfs_throttled_seconds_total{pod=~&quot;pagamentos.*&quot;}[5m])
+#   confirma se: throttling acima de 0 com CPU media aparentemente baixa.
+
+# H7. ONDE ESTAO AS THREADS  (custo: 30 s)   so se H2-H6 nao decidirem
+for i in 1 2 3; do
+  kubectl exec pagamentos-7d9f4b -c app -- jcmd 1 Thread.print &gt; td-$i.txt; sleep 5
+done
+grep 'java.lang.Thread.State' td-2.txt | sort | uniq -c | sort -rn
+grep -A 1 'java.lang.Thread.State' td-2.txt | grep '	at ' | sort | uniq -c | sort -rn | head
+#   ConcurrentBag.borrow -&gt; volta a H3/H4    socketRead0 -&gt; dependencia ou BD
+#   RUNNABLE em codigo proprio com CPU alto  -&gt; H8
+
+# H8. PERFILAR (ultimo passo, ja com hipotese)  (custo: 2 min + decisao)
+kubectl exec pagamentos-7d9f4b -c app -- \
+  jcmd 1 JFR.start name=diag settings=profile duration=3m filename=/tmp/diag.jfr
+#   ou, se o async-profiler estiver no contentor:
+#   ./profiler.sh -e cpu   -d 60 -f /tmp/cpu.html 1
+#   ./profiler.sh -e lock  -d 60 -f /tmp/lock.html 1
+
+# ---------------------------------------------------------------------------
+# MITIGACAO (em paralelo, desde o minuto 2 — nao no fim)
+# - Comunicar no canal de incidente: sintoma, impacto, hipotese actual, proxima
+#   actualizacao em 15 min.
+# - Orcamento: 35% consumido; um p99 de 2,1 s sustentado queima o resto em horas
+#   -&gt; tratar como Sev2 e escalar se nao houver causa em 30 min.
+# - Se H2 confirmar: CREATE INDEX CONCURRENTLY em janela, ou reverter a migracao
+#   se for reversivel; entretanto ANALYZE na tabela afectada (barato, pode
+#   corrigir o plano imediatamente).
+# - Se H4 mostrar bloqueio: pg_cancel_backend(pid) do bloqueante identificado.
+# - Reduzir connectionTimeout para 2 s: falhar depressa em vez de acumular fila.
+# - NAO reiniciar pods antes de recolher thread dump (destroi a prova).
+# ---------------------------------------------------------------------------</code></pre></figure>
+      <h4>Complexidade, casos limite e o que o entrevistador procura</h4>
+      <ul class="lst">
+        <li>A dedução <strong>p50 estável + p99 alto = fenómeno de cauda</strong> é o primeiro sinal avaliado; quem começa a investigar CPU global já perdeu metade da pontuação.</li>
+        <li>Usar a âncora temporal para ordenar hipóteses: 14:05 está 15 minutos depois da migração e 2h35 depois do <em>deploy</em>. A migração é a hipótese principal e tem de ser a primeira verificação, não a quarta.</li>
+        <li>Cada passo tem custo e critério. Um plano em que todos os passos custam o mesmo não é um plano, é uma lista.</li>
+        <li>Caso limite frequente: uma migração que criou índice sem <code>CONCURRENTLY</code> pode ter terminado às 13:52 mas deixado estatísticas desactualizadas; <code>ANALYZE</code> é a mitigação de 10 segundos que ninguém propõe.</li>
+        <li>Caso limite 2: se o p99 subiu exactamente 15 minutos depois da migração e não imediatamente, suspeitar de cache de planos preparados no lado do JDBC — o plano só troca ao fim de algumas execuções.</li>
+        <li>Mitigação em paralelo e comunicação com cadência fixa contam tanto como o diagnóstico; um candidato que diagnostica em silêncio durante 30 minutos é penalizado.</li>
+        <li>Fechar com prevenção: alerta em <code>hikaricp_connections_pending</code>, verificação de plano em migrações, e <em>canary</em> com comparação de p99 antes de promover.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-37-6" class="h2"><span class="secnum">37.6</span> Incidentes: mitigar, comunicar e o postmortem<a class="anchor" href="#sec-37-6" aria-label="ligação">#</a></h2>
+
+<p>Um incidente tem três papéis distintos e o erro mais comum é uma pessoa acumular os três. O <em>incident commander</em> decide e não escreve código; o responsável de operações investiga e executa; o de comunicação escreve para dentro e para fora. Numa equipa pequena, o mesmo engenheiro pode acumular investigação e execução, mas o comando e a comunicação têm de ser explícitos — sem eles, o incidente prolonga-se porque três pessoas investigam a mesma hipótese e ninguém informa o negócio.</p>
+
+<p>A regra de ouro é <strong>mitigar antes de compreender</strong>. Reverter o <em>deploy</em>, desligar a <em>flag</em>, desviar tráfego, servir de cache degradada — qualquer destas acções restaura o serviço sem exigir causa raiz. A causa investiga-se depois, com os dados recolhidos antes de mitigar: <em>thread dump</em>, <em>heap dump</em> de um <em>pod</em> drenado, exportação das métricas da janela e uma lista de traços da cauda. Quem inverte a ordem tem incidentes mais longos e autópsias sem provas.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 37.2</span> Severidades típicas e o que cada uma obriga.</div>
+<div class="tscroll"><table><thead><tr><th>Sev</th><th>Critério</th><th>Resposta</th><th>Comunicação</th><th>Postmortem</th></tr></thead><tbody>
+<tr><td>Sev1</td><td>Serviço crítico indisponível ou perda/corrupção de dados; receita parada</td><td>Página imediata, <em>commander</em> nomeado, ponte aberta</td><td>Actualização a cada 15 min, página de estado pública</td><td>Obrigatório, em 5 dias úteis</td></tr>
+<tr><td>Sev2</td><td>Degradação séria: SLO a queimar depressa, funcionalidade central afectada</td><td>Página em qualquer hora, escalar se não houver causa em 30 min</td><td>Actualização a cada 30 min, para dentro</td><td>Obrigatório</td></tr>
+<tr><td>Sev3</td><td>Impacto limitado ou com contorno disponível</td><td><em>Ticket</em> prioritário em horário laboral</td><td>Nota no canal da equipa</td><td>Opcional; obrigatório se repetir</td></tr>
+<tr><td>Sev4</td><td>Sem impacto no utilizador: ruído, degradação interna, alerta a afinar</td><td><em>Backlog</em></td><td>Nenhuma</td><td>Não</td></tr>
+</tbody></table></div></div>
 
 <div class="qa" id="q-37-11" data-box="qa" data-area="obs" data-level="senior" data-freq="alta">
   <div class="qhead"><span class="qtag">Observabilidade e produção</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Conte-me um incidente de produção que foi causado por si. O que fez durante e o que mudou depois.</div>
+  <div class="qprompt">A equipa recebe cerca de 40 alertas por semana de plantão e ignora a maioria. O que é um bom alerta e como reconstrói o conjunto?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p><strong>Situação.</strong> «Numa terça-feira de manhã fiz uma alteração aparentemente inócua: aumentei o <em>timeout</em> de leitura da chamada ao serviço de anti-fraude de 300 ms para 2 s, porque estávamos a rejeitar transacções legítimas quando esse serviço ficava lento. Passei nos testes, passei na revisão, entrou às 10h30. Às 11h05 o serviço de autorização estava com o <em>pool</em> de ligações HTTP esgotado e o p99 em 3,5 s.»</p>
-      <p><strong>Acção durante.</strong> «Ordem: mitigar, comunicar, diagnosticar. Reverti a alteração aos 6 minutos do primeiro alerta, sem ainda perceber a causa, porque a alteração era a única variável nova daquela manhã e a reversão custava 90 segundos. Abri o canal de incidente e escrevi de dois em dois minutos, com uma linha de facto e sem especulação. Assumi na primeira mensagem que a alteração era minha — não por virtude, mas porque a informação era operacionalmente útil para quem estava a olhar para os gráficos. O serviço recuperou 11 minutos depois do início; o incidente durou 47 minutos entre primeiro sintoma e encerramento formal, com cerca de 9 000 transacções afectadas, das quais 6 400 recuperaram por retentativa do lado do comerciante.»</p>
-      <p><strong>Causa-raiz.</strong> «O mecanismo é aritmética de <em>little</em>: com 2 400 pedidos por segundo e um <em>timeout</em> de 300 ms, o número de chamadas simultâneas em pior caso é 720; com 2 s, é 4 800, muito acima das 500 ligações do <em>pool</em>. Não era o <em>timeout</em> que estava errado, era não haver limite de concorrência independente do <em>timeout</em>. A causa organizacional foi que a revisão do código não tinha forma de ver isto: nenhum de nós olhou para a interacção entre o <em>timeout</em> e o dimensionamento do <em>pool</em>, porque estão em ficheiros diferentes e em equipas mentais diferentes.»</p>
-      <p><strong>Mudança durável.</strong> «Três coisas, e nenhuma delas é “ter mais cuidado”. Um <em>bulkhead</em> com Resilience4j a limitar a 200 chamadas simultâneas ao anti-fraude, com falha rápida e política de recurso definida com o negócio — aprovar abaixo de 50 euros, rejeitar acima. Um teste de carga automático na <em>pipeline</em> que corre 3 minutos a 3 000 pedidos por segundo com o dependente lento simulado. E uma lista de verificação de 6 itens para alterações de <em>timeout</em>, retentativa ou tamanho de <em>pool</em>, que ficou anexada ao modelo de <em>pull request</em>. Nos 14 meses seguintes tivemos zero incidentes desta família, e o mesmo <em>bulkhead</em> apanhou uma degradação do anti-fraude em Junho sem que ninguém acordasse.»</p></div>
+      <p>Um bom alerta cumpre quatro condições em simultâneo: é <strong>sintoma</strong> e não causa (o utilizador está a ser afectado), é <strong>accionável</strong> (existe algo que a pessoa acordada pode fazer agora), é <strong>urgente</strong> (esperar até de manhã piora as coisas) e é <strong>específico</strong> (aponta para um serviço e traz o painel e o <em>runbook</em> na própria notificação). Falhar qualquer uma torna o alerta ruído, e o ruído é activamente prejudicial: uma equipa com 40 alertas por semana aprende a ignorar, e o alerta número 41, que era o verdadeiro, também é ignorado.</p>
+      <p>A reconstrução faz-se com dados, não com opinião. Extraio 90 dias de histórico e classifico cada alerta em quatro caixas: gerou acção humana; auto-resolveu-se sem intervenção; foi silenciado; era duplicado de outro. Tipicamente 60 a 80% caem nas três últimas caixas e são candidatos a eliminação imediata. Depois aplico quatro transformações: (1) apagar todos os alertas de causa que não têm sintoma associado — CPU a 90%, <em>heap</em> a 85%, disco a 75% passam a painel; (2) converter os restantes em alertas de SLO por <em>burn rate</em> com duas janelas; (3) agrupar por serviço e por causa comum, para que uma falha de base de dados envie uma notificação e não trinta; (4) exigir <em>runbook</em> em todos os que paginam — sem <em>runbook</em>, não pagina.</p>
+      <p>O alvo quantificado é 0 a 2 avisos por semana de plantão, com pelo menos 60% a resultar em acção. E o critério de admissão de um alerta novo é uma única pergunta: «se isto disparar às 3h da manhã, o que é que a pessoa faz?». Se a resposta for «olha e volta a dormir», é um painel.</p>
+      <p>O <em>trade-off</em> é o risco de detecção tardia: menos alertas significa que certas degradações lentas só aparecem no dia seguinte. Aceita-se porque a alternativa medida é pior — a fadiga faz com que os alertas verdadeiros sejam ignorados, e o custo de um incidente detectado 20 minutos mais tarde é muito menor do que o de um Sev1 detectado por um cliente.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Nunca causei um incidente»; ou culpa a revisão, os testes ou o dependente.</td></tr>
-        <tr><td>Mid</td><td>Conta o incidente e a correcção, mas a causa-raiz é humana («distracção») e a acção correctiva é «ter mais cuidado».</td></tr>
-        <tr><td>Sénior</td><td>Mitiga antes de diagnosticar, comunica com factos, explica o mecanismo com aritmética, e as acções correctivas são estruturais e verificáveis.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e trata a causa organizacional — porque é que a revisão não podia ver isto — e mede a eficácia da mudança meses depois.</td></tr>
+        <tr><td>Insuficiente</td><td>«Ajustamos os limiares»; mantém alertas de CPU e memória como principais.</td></tr>
+        <tr><td>Mid</td><td>Sabe que há ruído a mais e propõe silenciar; não tem critério objectivo nem plano de reconstrução.</td></tr>
+        <tr><td>Sénior</td><td>Define as quatro condições, classifica o histórico, converte causa em sintoma, agrupa, exige <em>runbook</em>, e fixa um alvo numérico.</td></tr>
+        <tr><td>Staff</td><td>Trata o sistema de alertas como produto com métrica própria (taxa de accionabilidade), institui revisão periódica de plantão e liga a decisão ao custo humano de acordar alguém.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porquê 200 de limite e não 100 ou 500?»</li>
-      <li>«Como decidiu a política de recurso com o negócio?»</li>
-      <li>«O que aconteceu às 2 600 transacções que não recuperaram?»</li>
-      <li>«Como foi a conversa com o seu gestor a seguir?»</li></ul></div>
+      <li>«Um alerta que se auto-resolve em 3 minutos: apaga ou mantém?»</li>
+      <li>«Como evita apagar o alerta que só dispara duas vezes por ano e é crítico?»</li>
+      <li>«O que põe num <em>runbook</em> para ele ser útil às 3h da manhã?»</li>
+      <li>«Como mede a saúde do plantão ao longo do tempo?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Diagnosticar durante 40 minutos com o serviço em baixo, tendo uma reversão de 90 segundos disponível.</li>
-      <li>Esconder a autoria da alteração durante o incidente.</li>
-      <li>Contar o <em>post-mortem</em> como exercício de atribuição de culpa, ainda que a si próprio.</li></ul></div>
+      <li>Silenciar alertas sem os classificar nem apagar a origem.</li>
+      <li>Paginar em métricas de recurso com SLO cumprido.</li>
+      <li>Não ter noção do custo humano de um plantão ruidoso.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-37-6" class="h2"><span class="secnum">37.6</span> Perguntas para o entrevistador que demonstram nível<a class="anchor" href="#sec-37-6" aria-label="ligação">#</a></h2>
+<div class="qa" id="q-37-12" data-box="qa" data-area="comportamental" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Comportamental e liderança</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Conte um incidente sério que tenha conduzido: o que fez durante, o que escreveu depois, e o que mudou por causa disso.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>A estrutura da resposta é: impacto quantificado, o que se fez para mitigar e em quanto tempo, o que se descobriu como causa, e — a parte que separa sénior de staff — o que mudou no sistema para que a classe inteira de falhas desapareça.</p>
+      <p>Durante: assumi o comando explicitamente («eu sou o <em>commander</em>, A investiga, B comunica»), declarei a severidade em voz alta, e fixei uma cadência de comunicação de 15 minutos mesmo quando não havia novidades — «continuamos a investigar, próxima actualização às 03:45» é informação valiosa, porque impede que cinco pessoas perguntem o mesmo. Mitigámos primeiro: reversão do <em>deploy</em> das 22:40, com o serviço restabelecido 18 minutos após o alerta, antes de qualquer hipótese de causa raiz. Antes de reverter, recolhi <em>thread dump</em> de dois <em>pods</em> e um <em>heap dump</em> de um <em>pod</em> drenado — sem isso, a autópsia teria sido especulação.</p>
+      <p>Depois: um <em>postmortem</em> sem culpa, publicado em 4 dias. Sem culpa não significa sem responsabilidade; significa que a análise procura as condições que tornaram o erro possível, e não a pessoa que carregou no botão. Se uma alteração de configuração derrubou produção, a pergunta certa não é «quem escreveu isto» mas «porque é que o sistema aceitou uma configuração inválida sem validação, sem <em>canary</em> e sem reversão automática». O documento tem sempre: cronologia com <em>timestamps</em> ao minuto (incluindo o intervalo entre início real e detecção), impacto quantificado (23 minutos, 41 000 pagamentos falhados, 0,9% do orçamento mensal), causas contribuintes em vez de causa raiz única, o que correu bem, e acções com dono e prazo.</p>
+      <p>O critério de qualidade das acções é este: cada uma tem de eliminar uma classe, não uma instância. «Corrigir o valor da configuração» é uma instância; «validar o esquema de configuração no arranque e falhar cedo, com <em>canary</em> de 5% durante 10 minutos antes de promover» é a classe. E as acções entram no <em>sprint</em> seguinte com dono nomeado — um <em>postmortem</em> cujas acções ficam por fazer é pior do que nenhum, porque cria a ilusão de aprendizagem. Meço isso: percentagem de acções de <em>postmortem</em> fechadas em 30 dias, revista mensalmente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Narrativa heróica sem números, ou culpabilização de uma pessoa ou de outra equipa.</td></tr>
+        <tr><td>Mid</td><td>Descreve o diagnóstico técnico com detalhe mas não fala de comando, comunicação nem acções posteriores.</td></tr>
+        <tr><td>Sénior</td><td>Impacto quantificado, mitigação antes de causa raiz, recolha de provas, <em>postmortem</em> com cronologia e acções com dono.</td></tr>
+        <tr><td>Staff</td><td>Papéis explícitos, cadência de comunicação, causas contribuintes em vez de culpado, acções que eliminam classes, e uma métrica de fecho das acções.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual foi o intervalo entre o início real e a detecção, e o que fizeram para o reduzir?»</li>
+      <li>«Quantas das acções do <em>postmortem</em> foram efectivamente feitas?»</li>
+      <li>«Como reage quando alguém na retrospectiva aponta um culpado?»</li>
+      <li>«O que teria feito diferente com metade da informação?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Zero números: «afectou alguns clientes durante algum tempo».</li>
+      <li>Reiniciar tudo antes de recolher provas e depois não saber explicar a causa.</li>
+      <li>Causa raiz única, sempre humana, sempre de outra pessoa.</li>
+      <li>Acções sem dono nem prazo.</li></ul></div>
+  </div>
+</div>
 
-<p>Os últimos cinco a dez minutos são avaliados, mesmo quando o entrevistador diz «agora é a sua vez». As perguntas do candidato revelam o modelo mental com que ele avalia sistemas e organizações, e são a única parte da entrevista em que se pode demonstrar nível sem ter de esperar pela pergunta certa. Perguntar «como é a cultura?» ou «quais são as tecnologias?» é desperdiçar a única janela em que o candidato controla o tema.</p>
+<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Duas métricas dizem quase tudo sobre a maturidade operacional de uma equipa: o tempo entre o início real da falha e a detecção (se for maior do que o tempo de mitigação, o problema é de instrumentação, não de resposta) e a percentagem de acções de <em>postmortem</em> fechadas em 30 dias. Em entrevista, citar estas duas é um sinal forte de que o candidato já operou serviços a sério.</p></aside>
 
-<p>As boas perguntas têm três propriedades: são respondíveis com um facto e não com um adjectivo, são específicas daquela empresa, e a resposta muda materialmente a decisão do candidato. «Quantas vezes por semana fazem <em>deploy</em> para produção e qual é a percentagem de reversões?» é factual e diagnostica maturidade de entrega. «Qual foi o último incidente de gravidade 1 e o que mudou no sistema por causa dele?» diagnostica cultura de análise sem culpa em trinta segundos. «Que decisão técnica desta equipa se arrependem?» diagnostica honestidade. «Quem escreve o código na equipa de plataforma e qual é a relação entre ela e as equipas de produto?» diagnostica onde vive a autonomia.</p>
+<h2 id="sec-37-7" class="h2"><span class="secnum">37.7</span> Perfilar Java em produção sem parar o serviço<a class="anchor" href="#sec-37-7" aria-label="ligação">#</a></h2>
 
-<p>Convém adaptar ao interlocutor. Ao engenheiro pergunta-se do dia-a-dia — proporção entre trabalho novo, manutenção e resposta a incidentes; quanto tempo demora de <em>commit</em> a produção; qual a carga de plantão em número de páginas por rotação. Ao <em>hiring manager</em>, sobre âmbito, prioridades do ano e o critério com que ele avalia sucesso aos seis meses. Ao director ou <em>skip-level</em>, sobre a aposta de negócio e as dependências que podem mudar a <em>roadmap</em>. Ter três perguntas por tipo de interlocutor evita a situação em que o candidato repete a mesma pergunta a cinco pessoas.</p>
+<p>Há três ferramentas e cada uma responde a uma pergunta diferente. O <em>Java Flight Recorder</em> (JFR) está na JVM, não precisa de instalação e grava eventos de alto nível — pausas de GC, alocação por tipo, <em>I/O</em>, bloqueio de monitores, amostras de execução — com custo de 1 a 3% de CPU em <code>settings=profile</code> e praticamente nulo em <code>settings=default</code>. É a escolha para deixar a gravar permanentemente e ter sempre os últimos minutos disponíveis quando algo corre mal. O async-profiler usa <code>perf_events</code> e <code>AsyncGetCallTrace</code>, produz <em>flame graphs</em> sem o enviesamento de <em>safepoint</em> que afecta os perfiladores clássicos, e distingue tempo de CPU real de tempo de espera — é a escolha quando é preciso saber exactamente que linha arde. Os perfiladores por amostragem baseados em <code>Thread.getStackTrace</code> sofrem de enviesamento de <em>safepoint</em>: só amostram em pontos onde a JVM pode parar, o que desloca a atribuição de tempo e pode apontar para o método errado.</p>
 
-<aside class="box note" data-box="note"><div class="btitle">Nota</div><p>Vale a pena registar as respostas e comparar entre entrevistadores. Quando três pessoas dão versões incompatíveis do que a equipa vai fazer no próximo semestre, ou quando ninguém consegue nomear o último incidente sério, isso é informação de decisão. A ronda de perguntas é também a única diligência prévia que o candidato consegue fazer antes de assinar.</p></aside>
+<p>A distinção que separa candidatos é entre perfil de CPU e perfil de espera. Um <em>flame graph</em> de CPU responde a «que código consome ciclos»; se o problema é latência por espera — pool, <em>lock</em>, rede — o perfil de CPU aparece vazio e a conclusão errada é «o código está bem». Nesse caso usa-se <code>-e lock</code> ou <code>-e wall</code>, ou os eventos de <code>JavaMonitorEnter</code> e <code>ThreadPark</code> do JFR.</p>
 
-<div class="qa" id="q-37-12" data-box="qa" data-area="processo" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Processo de entrevista</span>
+<p>Fugas de memória em Java raramente são fugas no sentido de C: são retenções não intencionais. Os quatro padrões que cobrem a esmagadora maioria: caches sem limite de tamanho nem expiração; <code>ThreadLocal</code> não limpo em <em>threads</em> de pool (o mesmo mecanismo que faz vazar o MDC); colecções estáticas que só crescem, incluindo listeners registados e nunca removidos; e <em>classloaders</em> retidos em redeployments. A assinatura no gráfico é inequívoca: o patamar de <em>heap</em> usado <strong>após</strong> cada GC completo sobe monotonicamente ao longo de horas, em vez de voltar ao mesmo nível. Só olhar para o <em>heap</em> total, que é serrilhado por natureza, não distingue nada.</p>
+
+<figure class="listing shell" id="lst-37-10"><div class="lhead"><span class="lnum">Listagem 37.10</span>
+<span class="lcap">Perfilar e inspeccionar memória em produção, com o custo de cada comando.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="shell"><code># --- PERFIL: JFR (na JVM, ~1-3% de CPU em settings=profile) ---
+jcmd 1 JFR.start name=diag settings=profile duration=5m filename=/tmp/diag.jfr
+jcmd 1 JFR.check                       # ver gravacoes activas
+jcmd 1 JFR.dump  name=diag filename=/tmp/diag.jfr
+kubectl cp pagamentos-7d9f4b:/tmp/diag.jfr ./diag.jfr   # analisar no JDK Mission Control
+
+# --- PERFIL: async-profiler (flame graph, sem enviesamento de safepoint) ---
+./profiler.sh -e cpu   -d 60 -f /tmp/cpu.html   1     # onde ardem os ciclos
+./profiler.sh -e lock  -d 60 -f /tmp/lock.html  1     # contencao de monitores
+./profiler.sh -e alloc -d 60 -f /tmp/alloc.html 1     # pressao de alocacao
+./profiler.sh -e wall  -d 60 -f /tmp/wall.html  1     # tempo de parede: inclui espera
+
+# --- MEMORIA: do barato para o caro ---
+jcmd 1 GC.heap_info                                   # instantaneo, ~0 custo
+jcmd 1 GC.class_histogram | head -25                  # pausa curta; classes por bytes retidos
+jcmd 1 VM.native_memory summary                       # exige -XX:NativeMemoryTracking=summary
+jcmd 1 GC.heap_dump /tmp/heap.hprof                   # PARA A JVM 10-30 s num heap de 8 GB:
+                                                      # drenar o pod do load balancer primeiro
+
+# --- Rede de seguranca permanente, decidida antes do incidente ---
+# -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps
+# -XX:StartFlightRecording=settings=default,disk=true,maxsize=200m,dumponexit=true</code></pre></figure>
+
+<div class="qa" id="q-37-13" data-box="qa" data-area="jvm" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
     <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Temos dez minutos no fim. Que perguntas tem para mim?</div>
+  <div class="qprompt">Precisa de perfilar um serviço em produção com tráfego real. Que ferramenta usa, com que custo, e como decide entre perfil de CPU e perfil de espera?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Tenho três, e começo por dizer porque são estas: quero perceber como é que a equipa entrega, como é que aprende com o que corre mal, e onde é que eu seria útil nos primeiros seis meses.»</p>
-      <p><strong>Entrega.</strong> «Quantos <em>deploys</em> para produção fizeram na semana passada, e quantos foram revertidos? E quanto tempo passa entre um <em>commit</em> aprovado e estar em produção?» A resposta diz mais sobre o quotidiano do que qualquer descrição de cultura: quinze <em>deploys</em> por dia com reversão em minutos é uma vida diferente de uma janela de libertação quinzenal com aprovação de um comité, e ambas podem ser legítimas conforme o domínio.</p>
-      <p><strong>Aprendizagem.</strong> «Qual foi o último incidente que vos custou mais de uma hora e o que mudou no sistema por causa dele?» Uma resposta concreta com acção estrutural indica <em>post-mortems</em> a sério. Uma resposta vaga, ou a menção de que o responsável «teve uma conversa», indica cultura de culpa — e para um sénior que vai entrar em rotação de plantão isso é informação de primeira ordem.</p>
-      <p><strong>Âmbito.</strong> «Se eu entrar em Janeiro, o que é que ao fim de seis meses o faria dizer que a contratação foi um sucesso? E qual é o problema que hoje ninguém tem tempo para pegar?» A segunda parte é a que costuma produzir a resposta mais honesta da entrevista toda, e serve para o candidato aferir se o trabalho real corresponde ao anúncio.</p>
-      <p>Duas notas de execução. Não fazer dez perguntas: três boas, com uma pergunta de seguimento a cada, ocupam os dez minutos e mostram escuta. E não usar este espaço para negociar — remuneração, nível e condições tratam-se com o recrutador, e trazê-los para uma ronda técnica desloca a conversa e não acelera nada.</p></div>
+      <p>Começo pelo JFR porque já está na JVM e não exige instalar nada num contentor de produção: <code>jcmd 1 JFR.start settings=profile duration=5m</code> custa 1 a 3% de CPU e dá pausas de GC, alocação por tipo, eventos de bloqueio e amostras de execução num único ficheiro que se analisa fora do <em>pod</em>. Em serviços críticos deixo uma gravação contínua em disco com <code>-XX:StartFlightRecording=settings=default,disk=true,maxsize=200m</code>: quando algo corre mal, os últimos minutos já estão gravados e não é preciso reproduzir o problema.</p>
+      <p>Uso async-profiler quando preciso de resolução ao nível da linha ou quando suspeito que o JFR está a mentir por enviesamento de <em>safepoint</em>. Ele amostra por <code>perf_events</code> e <code>AsyncGetCallTrace</code>, fora dos <em>safepoints</em>, e produz um <em>flame graph</em> directamente. O custo em modo CPU a 100 Hz fica abaixo de 1%.</p>
+      <p>A decisão entre CPU e espera vem do sintoma, e é aqui que a maioria erra. Se a latência é alta <strong>e</strong> o CPU está alto, o perfil de CPU é o certo — procura-se a torre larga no <em>flame graph</em>. Se a latência é alta e o CPU está baixo, o tempo está a ser passado à espera e o perfil de CPU vai parecer inocente; nesse caso uso <code>-e wall</code> (tempo de parede, que inclui bloqueio), <code>-e lock</code> para contenção de monitores, e os eventos <code>JavaMonitorEnter</code>, <code>ThreadPark</code> e <code>SocketRead</code> do JFR. O atalho equivalente e mais barato continua a ser três <em>thread dumps</em> espaçados.</p>
+      <p>Restrições práticas em contentores: o <em>profiler</em> precisa de <code>perf_event_paranoid</code> permissivo ou da capacidade <code>SYS_ADMIN</code>, e de <code>-XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints</code> para pilhas correctas com código compilado. Se nada disso estiver disponível, sobra JFR — outra razão para o preferir como primeira linha. E qualquer perfil deve ser tirado de <strong>uma</strong> réplica, comparado com uma réplica saudável: um <em>flame graph</em> sem linha de base é uma imagem bonita sem conclusão.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>«Não tenho perguntas» ou perguntas cuja resposta está no anúncio e no sítio da empresa.</td></tr>
-        <tr><td>Mid</td><td>Perguntas sobre tecnologias e processo formal de <em>sprint</em>; nenhuma sobre falhas, entrega ou trade-offs reais.</td></tr>
-        <tr><td>Sénior</td><td>Perguntas factuais sobre frequência de entrega, incidentes e âmbito; escuta e faz seguimento em vez de despejar a lista.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e liga as respostas ao contexto de negócio: pergunta pelas dependências e pelo que pode mudar a <em>roadmap</em> em doze meses.</td></tr>
+        <tr><td>Insuficiente</td><td>Propõe ligar um perfilador de IDE a produção, ou não conhece nenhuma ferramenta.</td></tr>
+        <tr><td>Mid</td><td>Conhece JFR ou async-profiler mas não sabe o custo nem distingue CPU de espera.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe pela restrição do ambiente, quantifica o custo, e decide CPU vs espera a partir do sintoma; conhece o enviesamento de <em>safepoint</em>.</td></tr>
+        <tr><td>Staff</td><td>Deixa gravação contínua ligada por omissão, compara sempre com linha de base saudável, e conhece as restrições de <em>capabilities</em> em contentores e o seu impacto na política de segurança.</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Porque é que essa métrica lhe interessa?»</li>
-      <li>«O que ouviu hoje que o preocupa?»</li>
-      <li>«Que dúvida ficou por esclarecer sobre nós?»</li></ul></div>
+      <li>«O <em>flame graph</em> de CPU está plano e a latência é alta. O que conclui?»</li>
+      <li>«O que é enviesamento de <em>safepoint</em> e porque importa?»</li>
+      <li>«Como perfila um <em>pod</em> sem <em>shell</em> nem ferramentas instaladas?»</li>
+      <li>«Que <em>flags</em> deixa ligadas por omissão em produção?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Perguntar por férias, horários e teletrabalho a um entrevistador técnico antes de haver oferta.</li>
-      <li>Fazer uma pergunta que é uma crítica disfarçada ao que o entrevistador acabou de descrever.</li>
-      <li>Ler uma lista de dez perguntas sem reagir às respostas.</li></ul></div>
+      <li>Tirar <em>heap dump</em> de um <em>pod</em> em serviço, sem o drenar, durante um incidente.</li>
+      <li>Concluir «o código está bem» a partir de um perfil de CPU vazio.</li>
+      <li>Perfilar sem comparar com uma réplica ou período saudável.</li></ul></div>
   </div>
 </div>
 
-<h2 id="sec-37-7" class="h2"><span class="secnum">37.7</span> Oferta, nivelamento e negociação<a class="anchor" href="#sec-37-7" aria-label="ligação">#</a></h2>
-
-<p>O nível é a variável de maior consequência e a menos discutida. Numa grelha típica de scale-up europeia ou de empresa grande, a diferença de compensação total entre um nível sénior (L5, IC5, P4, conforme a nomenclatura) e o nível imediatamente abaixo é da ordem de 25% a 45%, e a diferença entre sénior e <em>staff</em> é semelhante. Nenhuma negociação de salário dentro do mesmo nível recupera essa diferença, porque as bandas se sobrepõem pouco: negociar bem dentro de uma banda move tipicamente 5% a 12%. O momento de influenciar o nível é durante o loop, ao escolher histórias com âmbito, e imediatamente após o <em>debrief</em>, antes de a oferta ser emitida.</p>
-
-<p>A segunda coisa a perceber é que a oferta não é um número. Tem componentes com regras próprias, e comparar duas ofertas pelo salário base é um erro comum que custa milhares de euros por ano. Convém reduzir tudo a valor anualizado ao longo de quatro anos, separando o que é garantido do que é condicional.</p>
-
-<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 37.2</span> Componentes de uma oferta e o que perguntar sobre cada um.</div>
-<div class="tscroll"><table><thead><tr><th>Componente</th><th>Natureza</th><th>Pergunta a fazer</th></tr></thead><tbody>
-<tr><td>Salário base</td><td>Garantido, recorrente; base de cálculo de subsídios e pensão</td><td>Qual é a banda do nível e onde fico dentro dela?</td></tr>
-<tr><td>Bónus anual</td><td>Condicional; alvo em % da base, pago conforme resultados</td><td>Qual é o alvo em % e qual foi a percentagem efectivamente paga nos últimos 2 anos?</td></tr>
-<tr><td>Capital (RSU ou opções)</td><td>Condicional no tempo e, em empresa privada, na liquidez</td><td>Valor total, período de aquisição, existe <em>cliff</em>? A distribuição é uniforme ou progressiva?</td></tr>
-<tr><td><em>Sign-on</em></td><td>Único; compensa bónus ou capital perdidos ao sair</td><td>É pago de uma vez? Há devolução se sair antes de 12 ou 24 meses?</td></tr>
-<tr><td>Refresco anual de capital</td><td>Recorrente mas discricionário</td><td>Que refresco recebeu no ano passado alguém neste nível com desempenho médio?</td></tr>
-<tr><td>Pensão e benefícios</td><td>Garantido; varia muito por país</td><td>Qual é a contribuição da entidade patronal em % e o que está incluído no seguro?</td></tr>
-<tr><td>Progressão</td><td>Estrutural</td><td>Qual é o ciclo de promoção e quantas pessoas subiram deste nível no último ano?</td></tr>
-</tbody></table></div></div>
-
-<p>Sobre capital, dois pontos factuais fazem a diferença. Em empresa cotada, RSU com aquisição a quatro anos e <em>cliff</em> de um ano significam que 25% do pacote só existe ao fim de doze meses; o valor anunciado é o valor à data da oferta, e o valor efectivo depende da cotação futura. Em empresa privada, opções ou RSU não convertem em dinheiro sem um evento de liquidez, e a avaliação usada na oferta é a da última ronda de financiamento, que não é um preço de mercado. As perguntas legítimas — preço de exercício, prazo de exercício após saída, avaliação da última ronda, preferências de liquidação — são normais e um bom recrutador responde-lhes.</p>
-
-<p>A negociação sóbria assenta em três princípios. Primeiro, é uma conversa entre duas partes que querem o mesmo resultado, não um duelo: o custo de a empresa reabrir o processo é muito maior do que a diferença em discussão, e o candidato que consegue lembrar-se disso negoceia melhor do que o que se sente em desvantagem. Segundo, tudo o que se afirma tem de ser verdade — inventar ofertas concorrentes ou números que não existem é a única forma garantida de perder uma oferta real, e as comunidades de recrutamento europeias são pequenas. Terceiro, negoceia-se sobre o pacote inteiro e com prioridades declaradas: dizer «a base é a minha prioridade, o <em>sign-on</em> é secundário» dá ao recrutador matéria para trabalhar, enquanto «quero mais» não dá.</p>
-
-<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p>Táticas de pressão artificial — prazos falsos, ofertas inventadas, ameaças de recusa — funcionam mal e envenenam o início. O que funciona é informação verdadeira e verificável: uma oferta real com valores, uma banda pública para o nível, um contra-argumento de âmbito com evidência do loop. Do outro lado, se a empresa impuser uma «oferta que expira em 24 horas», é razoável pedir prazo por escrito com uma razão; empresas sérias concedem cinco a dez dias úteis.</p></aside>
-
-<figure class="listing text" id="lst-37-2"><div class="lhead"><span class="lnum">Listagem 37.2</span>
-<span class="lcap">Guião factual para a pergunta de expectativa salarial, em três momentos do processo.</span><button class="copy" type="button" data-copy>Copiar</button></div>
-<pre class="code" data-lang="text"><code>PRIMEIRO CONTACTO (recrutador, antes de qualquer avaliação)
-  "Ainda não sei que nível me vão atribuir, e o nível é o que determina a banda.
-   Qual é a banda para este papel? Com esse intervalo, digo-lhe já se faz sentido
-   continuarmos."                                  -&gt; devolve a pergunta com uma razão
-
-  Se insistirem e a lei local obrigar a declarar (ou se preferir não adiar):
-  "Para um papel de sénior com este âmbito, o meu ponto de referência de mercado
-   é 85-100 k de compensação total anual. O nível e o pacote completo podem
-   ajustar isto."                                  -&gt; intervalo ancorado no TOTAL
-
-DEPOIS DO ONSITE, ANTES DA OFERTA
-  "O que ouvi nas rondas encaixa no que procuro. Antes de emitirem a oferta:
-   com que nível estão a trabalhar? Se for L4, gostaria de perceber que evidência
-   faltou, porque o âmbito que descrevi — serviço com 2 400 rps, plantão, dois
-   engenheiros mentorados — é o que a vossa grelha descreve como L5."
-
-DEPOIS DA OFERTA
-  "Obrigado, quero aceitar. Duas coisas: a base está 8% abaixo da minha outra
-   oferta escrita, que posso partilhar; e o sign-on ajudaria a cobrir o bónus
-   que perco ao sair em Fevereiro. A base é a minha prioridade."
-
-NUNCA
-  - Números de ofertas que não existem                (verificável e fatal)
-  - "Quero X ou não venho", sem intenção de cumprir   (fecha a porta a sério)
-  - Aceitar verbalmente e continuar a negociar        (queima o recrutador)</code></pre></figure>
-
-<div class="qa" id="q-37-13" data-box="qa" data-area="processo" data-level="senior" data-freq="alta">
-  <div class="qhead"><span class="qtag">Processo de entrevista</span>
-    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
-  <div class="qprompt">Antes de avançarmos: qual é a sua expectativa salarial?</div>
+<div class="qa" id="q-37-14" data-box="qa" data-area="jvm" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">JVM, memória e performance</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O serviço reinicia por <code>OutOfMemoryError</code> a cada 30 horas, sempre com o mesmo padrão. Como confirma que é uma fuga e como a localiza sem afectar os clientes?</div>
   <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
     <div class="selfrate"></div></div>
   <div class="qbody" hidden>
     <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Ainda não sei que nível me vão atribuir e é o nível que determina a banda, por isso prefiro fazer a pergunta ao contrário: qual é o intervalo previsto para este papel? Se me disser, digo-lhe imediatamente se estamos no mesmo mapa e poupamos tempo aos dois.» Devolver a pergunta com uma razão explícita não é evasão — é a resposta que um recrutador experiente espera de um sénior, e em vários países europeus a banda tem de constar do anúncio ou ser dada quando pedida.</p>
-      <p>Quando o recrutador insiste, ou quando adiar já custa credibilidade, dá-se um intervalo de compensação total, nunca só base, ancorado em referências que se conseguem justificar: «para um papel sénior com este âmbito, o meu ponto de referência é 85 a 100 mil de total anual; o nível e a composição do pacote podem mover isto». Três detalhes técnicos importam. O intervalo é de compensação total, porque comparar bases entre empresas com estruturas diferentes não significa nada. O limite inferior tem de ser um número que se aceitaria de facto, porque é o que fica registado. E a origem do número deve poder ser dita se perguntarem — ofertas recentes, dados de bandas publicadas, comparações com colegas no mesmo mercado.</p>
-      <p>Se a pergunta for sobre o salário actual e não sobre a expectativa, a resposta é factual e delimitada: «prefiro discutir com base no valor do papel; se ajudar, o meu pacote actual está na ordem dos X e a minha expectativa para esta função é o intervalo que referi». Em vários países europeus perguntar o salário anterior é ilegal ou está a caminho de o ser; recusar com naturalidade não penaliza.</p>
-      <p>O que não fazer, por razões práticas e não morais: dar um número muito acima do mercado para «ancorar» — o efeito habitual é sair do processo em vez de subir a oferta; e dar um número muito abaixo por prudência — a oferta virá abaixo desse e a correcção posterior torna-se quase impossível, porque a proposta interna já foi aprovada com esse valor.</p></div>
+      <p>Confirmo primeiro que é retenção e não subdimensionamento, e a distinção faz-se num único gráfico: o <em>heap</em> usado <strong>imediatamente após cada GC completo</strong>. Se esse patamar sobe monotonicamente ao longo de 30 horas, há retenção; se oscila em torno de um valor estável e só o pico toca no limite, o <em>heap</em> é pequeno para a carga e a correcção é dimensionamento. O sinal secundário é a frequência de GC completo a aumentar com o tempo enquanto a memória libertada por ciclo diminui — a JVM está a trabalhar cada vez mais para recuperar cada vez menos, e a latência degrada-se muito antes do <code>OutOfMemoryError</code>.</p>
+      <p>Localizo sem afectar clientes em três passos. Primeiro, barato e imediato: <code>jcmd 1 GC.class_histogram</code> em duas amostras separadas por algumas horas; a classe cuja contagem cresce proporcionalmente ao tempo de <em>uptime</em> é a suspeita. Segundo, se o histograma não decidir: drenar um <em>pod</em> do <em>load balancer</em> (retirar o rótulo do <em>service</em>, esperar as ligações em curso) e só então <code>jcmd 1 GC.heap_dump</code> — 10 a 30 segundos de paragem e 8 GB de ficheiro num <em>heap</em> de 8 GB, o que é inaceitável num <em>pod</em> em serviço mas irrelevante num drenado. Terceiro, analisar o <em>dump</em> em Eclipse MAT com o relatório de suspeitos: o que interessa é a <em>árvore de dominadores</em> e o caminho de raízes GC até ao objecto — é isso que mostra <em>quem</em> segura a memória, e não apenas o que está lá.</p>
+      <p>Os culpados por ordem de frequência: cache <code>HashMap</code> ou <code>ConcurrentHashMap</code> sem limite nem expiração (a correcção é Caffeine com <code>maximumSize</code> e <code>expireAfterWrite</code>); <code>ThreadLocal</code> não limpo em <em>threads</em> de pool, que vive tanto quanto a <em>thread</em>; colecções estáticas e listeners registados e nunca removidos; e sessões ou contextos retidos por bibliotecas em <em>redeploy</em>. Nos casos em que o <em>heap</em> está estável mas o processo é morto pelo Kubernetes por limite de memória do contentor, o problema é fora do <em>heap</em> — <em>metaspace</em>, <em>buffers</em> directos, código nativo — e diagnostica-se com <code>VM.native_memory summary</code>, o que exige <code>-XX:NativeMemoryTracking=summary</code> ligado desde o arranque.</p>
+      <p>A rede de segurança decide-se antes do incidente: <code>-XX:+HeapDumpOnOutOfMemoryError</code> com <code>-XX:HeapDumpPath</code> a apontar para um volume persistente. Sem isso, cada reinício apaga a prova e o ciclo repete-se durante semanas — que é exactamente a situação descrita na pergunta.</p></div>
     <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
       <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Um número atirado sem contexto, ou «o que acharem justo»; ou desconforto que domina o resto da chamada.</td></tr>
-        <tr><td>Mid</td><td>Dá um valor só de base, sem noção de bónus, capital ou pensão; não pergunta pela banda.</td></tr>
-        <tr><td>Sénior</td><td>Pede a banda com uma razão, e se preciso dá um intervalo de compensação total justificável cujo limite inferior aceitaria.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e liga a conversa ao nivelamento: percebe que a banda depende do nível e trata o nível como a variável principal.</td></tr>
+        <tr><td>Insuficiente</td><td>«Aumentamos o <code>-Xmx</code>» sem distinguir retenção de subdimensionamento.</td></tr>
+        <tr><td>Mid</td><td>Sabe tirar <em>heap dump</em> e abrir no MAT, mas não conhece o critério do patamar pós-GC nem o impacto de tirar o <em>dump</em> em produção.</td></tr>
+        <tr><td>Sénior</td><td>Usa o patamar pós-GC como critério, escala do barato para o caro, drena antes do <em>dump</em>, e usa a árvore de dominadores; conhece os padrões típicos de retenção.</td></tr>
+        <tr><td>Staff</td><td>Distingue <em>heap</em> de memória fora do <em>heap</em>, deixa a rede de segurança configurada por omissão, e transforma a correcção em regra (limite obrigatório em todas as caches).</td></tr>
       </tbody></table></div>
     <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«Tem outros processos a decorrer? Em que fase?»</li>
-      <li>«Se a nossa banda ficar 10% abaixo do seu intervalo, continuamos?»</li>
-      <li>«Qual é a repartição que prefere entre base e capital?»</li>
-      <li>«Que prazo tem para decidir?»</li></ul></div>
+      <li>«O <em>heap</em> está estável mas o Kubernetes mata o <em>pod</em> por memória. O que investiga?»</li>
+      <li>«Qual a diferença entre <em>shallow size</em>, <em>retained size</em> e árvore de dominadores?»</li>
+      <li>«Como impede que uma cache nova entre sem limite no próximo <em>sprint</em>?»</li>
+      <li>«Reiniciar de 24 em 24 horas é solução aceitável em algum cenário?»</li></ul></div>
     <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Inventar uma oferta concorrente ou um valor que não existe.</li>
-      <li>Dar um limite inferior que não se aceitaria e voltar atrás depois.</li>
-      <li>Tratar o recrutador como adversário logo no primeiro contacto.</li></ul></div>
+      <li>Olhar apenas para o <em>heap</em> total serrilhado e concluir o que quer que seja.</li>
+      <li>Tirar <em>heap dump</em> de todos os <em>pods</em> em simultâneo durante um incidente.</li>
+      <li>Não ter <code>HeapDumpOnOutOfMemoryError</code> ligado e perder a prova em cada reinício.</li></ul></div>
   </div>
 </div>
 
-<div class="qa" id="q-37-14" data-box="qa" data-area="processo" data-level="staff" data-freq="media">
-  <div class="qhead"><span class="qtag">Processo de entrevista</span>
-    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Frequente</span></div></div>
-  <div class="qprompt">A oferta é para o nível abaixo daquele a que se candidatou, com uma base 12% inferior ao esperado. Como responde?</div>
-  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
-    <div class="selfrate"></div></div>
-  <div class="qbody" hidden>
-    <div class="qsec ans"><h4>Resposta-modelo</h4>
-      <p>«Trato as duas coisas em separado e por ordem, porque são decisões diferentes. Primeiro o nível, depois o dinheiro — se resolver o nível, o dinheiro resolve-se sozinho, e se aceitar o nível abaixo, os 12% não compensam o que perco em dois anos.»</p>
-      <p><strong>Nível.</strong> «Peço primeiro o critério, não o resultado: “que evidência é que faltou no loop para o nível acima?”. A resposta é quase sempre concreta — falta de evidência de impacto fora da equipa, ou de liderança de projecto plurianual, ou de ambiguidade sem direcção dada. Depois respondo a essa lacuna com factos verificáveis, não com insistência: “no loop falei sobretudo do serviço de autorização; o que não contei foi a normalização de migrações de esquema em cinco equipas, que reduziu incidentes de 7 para 1 por trimestre e continua em uso — posso enviar o documento e o nome de dois <em>tech leads</em> dessas equipas”. Se a lacuna for real e não tiver resposta, aceito o nível e negoceio outra coisa: um plano escrito de promoção com critérios e uma revisão marcada aos seis meses.»</p>
-      <p><strong>Compensação.</strong> «Sobre os 12%, o pedido tem três partes: o valor concreto, a justificação verificável e a prioridade. “Para aceitar hoje, precisava da base em X. A referência são duas coisas: a oferta escrita que tenho da empresa Y, que posso partilhar, e o facto de a vossa própria banda para este nível ir até Z. Se a base não tiver folga, um <em>sign-on</em> de W cobre o bónus que perco ao sair em Fevereiro — mas a base é a minha prioridade porque é o que compõe nos anos seguintes.” Um pedido com número, razão e ordem de preferência é trabalhável; “quero mais” não é.»</p>
-      <p><strong>Forma.</strong> «Faço isto por chamada e confirmo por escrito, com agradecimento genuíno e sem ultimatos. Dou um prazo real e cumpro-o. E digo com clareza o que faço se disserem que não há margem: se o nível ficar como está e a base subir para o mínimo aceitável, aceito e digo-o desde já — porque um pedido que eu próprio não estou disposto a fechar é uma ameaça, e ameaças com quem vai ser meu gestor pagam-se durante dois anos.»</p>
-      <p>Vale medir o que está realmente em jogo. Entre níveis adjacentes, a diferença de compensação total ronda 25% a 45% e a diferença de âmbito é maior ainda: entrar um nível abaixo significa muitas vezes esperar 12 a 24 meses e um ciclo de promoção para chegar onde a candidatura começou. Doze por cento de base são reais mas recuperáveis; o nível é a decisão estrutural.</p></div>
-    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
-      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
-        <tr><td>Insuficiente</td><td>Aceita sem perguntar nada; ou recusa com irritação e sem contraproposta.</td></tr>
-        <tr><td>Mid</td><td>Negoceia só a base, ignora o nível, e não pede o critério que fundamentou o nivelamento.</td></tr>
-        <tr><td>Sénior</td><td>Separa nível de dinheiro, pede a evidência em falta, responde com factos verificáveis, faz um pedido com número, razão e prioridade.</td></tr>
-        <tr><td>Staff</td><td>O mesmo, e sabe fechar: declara o que aceita, cumpre prazos, e converte um nível recusado num plano escrito com critérios e data.</td></tr>
-      </tbody></table></div>
-    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
-      <li>«E se dissermos que não há margem nenhuma?»</li>
-      <li>«Está disposto a fazer mais uma ronda para o nível acima?»</li>
-      <li>«O que vale mais para si: 10% de base ou 30% mais capital?»</li>
-      <li>«Como reagiria a uma contraproposta da sua empresa actual?»</li></ul></div>
-    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
-      <li>Referir uma oferta concorrente que não existe ou que não está por escrito.</li>
-      <li>Ultimato sem intenção de o cumprir, ou continuar a negociar depois de aceitar.</li>
-      <li>Negociar por mensagens curtas e ríspidas com quem vai ser o gestor directo.</li></ul></div>
-  </div>
-</div>
+<aside class="box warn" data-box="warn"><div class="btitle">Armadilha</div><p><code>-XX:MaxRAMPercentage</code> mal calculado é a causa silenciosa de metade dos <code>OOMKilled</code> em Kubernetes. O limite de memória do contentor tem de acomodar <em>heap</em> mais <em>metaspace</em>, pilhas de <em>threads</em>, <em>buffers</em> directos, cache de código e o próprio código nativo — tipicamente 25 a 35% acima do <em>heap</em>. Definir <code>-Xmx4g</code> num contentor com limite de 4 GiB garante que o Kubernetes mata o processo antes de a JVM sequer lançar <code>OutOfMemoryError</code>, e sem <em>heap dump</em>.</p></aside>
 
 <h2 id="sec-37-8" class="h2"><span class="secnum">37.8</span> Resumo e checklist<a class="anchor" href="#sec-37-8" aria-label="ligação">#</a></h2>
 
-<p>A ronda comportamental é a mais barata de preparar e a que mais vezes determina o nível na oferta. Não premeia carisma; premeia histórias específicas, com decisões atribuíveis na primeira pessoa do singular e números que o entrevistador possa copiar para as notas.</p>
+<p>O que reter deste capítulo, por ordem de utilidade numa entrevista.</p>
 
 <ul class="lst">
-  <li>Cinco dimensões cobrem quase tudo: âmbito e autonomia, influência sem autoridade, ambiguidade e conflito, entrega sob restrição, desenvolvimento de outros. Uma resposta que não alimenta nenhuma é tempo perdido.</li>
-  <li>Dez histórias em ficha cobrem mais de 90% das perguntas. Prepara-se o banco, não a resposta por pergunta.</li>
-  <li>Orçamento por história: 40 segundos de situação e tarefa, 90 a 100 de acção, 30 de resultado com dois números, 15 de lição. Quem inverte esta ordem soa a <em>mid</em>.</li>
-  <li>As histórias de conflito ganham-se com desacordos em que o outro lado era defensável — reproduzir o melhor argumento do outro vale mais do que ter tido razão.</li>
-  <li>Prazo, âmbito e qualidade são três variáveis; um sénior chega com decomposição, intervalo de estimativa e duas ou três opções de âmbito com custo, e ataca a incógnita externa no primeiro dia.</li>
-  <li>Numa falha, a causa-raiz tem de chegar ao mecanismo do sistema — «faltou-me atenção» não é causa-raiz, «não havia limite de concorrência independente do <em>timeout</em>» é.</li>
-  <li>Nos incidentes, a ordem é mitigar, comunicar, diagnosticar; reverter em 90 segundos vale mais do que ter razão em 40 minutos.</li>
-  <li>As perguntas ao entrevistador são avaliadas: frequência de <em>deploy</em> e reversões, último incidente sério e o que mudou, o problema que ninguém tem tempo para pegar.</li>
-  <li>O nível vale 25% a 45% de compensação total; negociar dentro da banda move 5% a 12%. O nível decide-se no loop e no <em>debrief</em>, não na negociação.</li>
+  <li>Alerta-se em métricas, navega-se em traços, confirma-se em logs. Cada sinal tem um custo que difere em ordens de grandeza e uma pergunta a que responde melhor do que os outros.</li>
+  <li>O custo de métricas é cardinalidade, não volume: identificadores pertencem a traços e logs, onde são baratos, nunca a etiquetas de série temporal.</li>
+  <li>A média de latência mente por assimetria e por composição. O par p50/p99 é diagnóstico: juntos indicam problema sistémico, p99 sozinho indica fenómeno de cauda.</li>
+  <li>Percentis agregam-se por baldes de histograma, nunca por média de percentis de réplicas.</li>
+  <li>SLO de 99,9% em 30 dias são 43,2 minutos de orçamento; os alertas saem do <em>burn rate</em> com duas janelas, e paginam-se sintomas, não causas.</li>
+  <li>A resposta a «o serviço está lento» é um procedimento por custo de verificação: enquadrar, mitigar em paralelo, uma instância ou todas, fora ou dentro da aplicação, saturação, <em>thread dumps</em>, base de dados, dependências e — por último — perfilador.</li>
+  <li>Muitas <em>threads</em> em <code>getConnection</code> significa pool esgotado, e a correcção quase nunca é aumentar o pool: é descobrir porque as conexões ficam presas.</li>
+  <li>Mitigar antes de compreender, mas recolher provas antes de mitigar: <em>thread dump</em> custa 10 a 50 ms, <em>heap dump</em> custa 10 a 30 segundos e exige o <em>pod</em> drenado.</li>
+  <li>Fuga de memória confirma-se pelo patamar de <em>heap</em> após GC completo, não pelo gráfico serrilhado do <em>heap</em> total.</li>
 </ul>
 
-<p><strong>Checklist antes da ronda comportamental e da conversa de oferta:</strong></p>
+<p>Checklist accionável antes da ronda de observabilidade.</p>
 
 <ul class="lst">
-  <li>Dez fichas de história escritas, cada uma com dois números (antes e depois), a alternativa rejeitada e o que se faria diferente.</li>
-  <li>Mapa pergunta → ficha, com pelo menos duas fichas para «conflito», «falha» e «influência».</li>
-  <li>Uma história de incidente que o candidato geriu e outra que o candidato causou, ambas com causa-raiz ao nível do sistema.</li>
-  <li>Duas histórias treinadas com cronómetro: nenhuma passa dos 3 minutos sem <em>follow-ups</em>.</li>
-  <li>Versão de 30 segundos, factual e sem adjectivos, para o motivo de saída — incluindo o caso desagradável, se existir.</li>
-  <li>Uma fraqueza real com custo concreto, mecanismo verificável e admissão de que persiste.</li>
-  <li>Três perguntas por tipo de interlocutor: engenheiro, <em>hiring manager</em>, <em>skip-level</em>.</li>
-  <li>Grelha de níveis da empresa lida antes do loop, e uma frase pronta para pedir o critério de nivelamento no <em>debrief</em>.</li>
-  <li>Folha de comparação de ofertas em compensação total a quatro anos, com base, bónus alvo, capital, <em>sign-on</em>, refresco e pensão separados.</li>
-  <li>Limite inferior definido por escrito antes da conversa — e a decisão, tomada com antecedência, de o cumprir sem ultimatos.</li>
+  <li>Ter na ponta da língua os quatro números do orçamento de erro (99% a 99,99%) e o cálculo do <em>burn rate</em>.</li>
+  <li>Saber dizer, sem hesitar, o comando de <em>thread dump</em>, o de JFR e as duas <em>queries</em> de PostgreSQL (<code>pg_stat_activity</code> e <code>pg_stat_statements</code>).</li>
+  <li>Ter um incidente próprio preparado com impacto quantificado, tempo de mitigação, causas contribuintes e duas acções que eliminaram classes de falha.</li>
+  <li>Conseguir explicar em 30 segundos porque não se promediam percentis e porque a cardinalidade é o custo das métricas.</li>
+  <li>Praticar a resposta ao «serviço lento» em voz alta como lista numerada, com um comando por passo e o critério de eliminação de cada hipótese.</li>
+  <li>Saber distinguir perfil de CPU de perfil de espera e o que fazer quando o <em>flame graph</em> de CPU aparece vazio.</li>
+  <li>Levar uma opinião fundamentada sobre quantos alertas por semana são aceitáveis e o que fazer com os restantes.</li>
+  <li>Rever a diferença entre <em>liveness</em> e <em>readiness</em> e a consequência de pôr a base de dados na sonda errada.</li>
 </ul>
