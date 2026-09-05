@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Outlet, useLocation, useParams } from 'react-router-dom';
+import { Outlet, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';
 import { Footer } from './Footer';
@@ -21,6 +21,7 @@ export function Shell() {
   const [search, setSearch] = useState(false);
   const { cycle } = useTheme();
   const location = useLocation();
+  const navigate = useNavigate();
   const params = useParams();
   const currentChapter = params.n ? Number(params.n) : undefined;
 
@@ -32,8 +33,8 @@ export function Shell() {
 
   const hotkeys = useMemo(() => ({
     mod: { k: openSearch },
-    plain: { '/': openSearch, t: cycle, Escape: () => { setSearch(false); setMenu(false); } },
-  }), [openSearch, cycle]);
+    plain: { '/': openSearch, t: cycle, g: () => navigate('/glossario'), p: () => navigate('/playground'), Escape: () => { setSearch(false); setMenu(false); } },
+  }), [openSearch, cycle, navigate]);
   useHotkeys(hotkeys);
 
   return (

@@ -3,6 +3,9 @@ import { Shell } from '@/components/Shell';
 import { HomePage } from '@/pages/HomePage';
 import { ChapterPage } from '@/pages/ChapterPage';
 import { SimulationPage } from '@/pages/SimulationPage';
+import { PlaygroundPage } from '@/pages/PlaygroundPage';
+import { ToolsPage } from '@/pages/ToolsPage';
+import { GlossaryPage } from '@/pages/GlossaryPage';
 import { NotFound } from '@/pages/NotFound';
 
 /**
@@ -17,6 +20,9 @@ export default function App() {
           <Route index element={<HomePage />} />
           <Route path="cap/:n" element={<ChapterPage />} />
           <Route path="simulacao" element={<SimulationPage />} />
+          <Route path="playground" element={<PlaygroundPage />} />
+          <Route path="ferramentas" element={<ToolsPage />} />
+          <Route path="glossario" element={<GlossaryPage />} />
           <Route path="index.html" element={<Navigate to="/" replace />} />
           <Route path="*" element={<NotFound />} />
         </Route>

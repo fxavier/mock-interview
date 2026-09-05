@@ -6,6 +6,8 @@ export function Footer() {
         <span><kbd className="key">←</kbd> <kbd className="key">→</kbd> capítulo</span>
         <span><kbd className="key">T</kbd> tema</span>
         <span><kbd className="key">/</kbd> pesquisa</span>
+        <span><kbd className="key">G</kbd> glossário</span>
+        <span><kbd className="key">P</kbd> playground</span>
         <span>Funciona offline; progresso guardado neste browser</span>
       </div>
     </footer>

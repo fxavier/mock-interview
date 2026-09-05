@@ -14,6 +14,7 @@ export const KEYS = {
   notes: (n: number) => `mij.notes.${n}`,
   quiz: (n: number) => `mij.quiz.${n}`,
   lab: (id: string) => `mij.lab.${id}`,
+  pads: 'mij.pads',
 } as const;
 export const PREFIX = 'mij.';
 

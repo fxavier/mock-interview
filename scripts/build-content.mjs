@@ -6,6 +6,8 @@
  *   src/generated/search.json    — índice de pesquisa (carregado sob demanda)
  *   src/generated/bodies/NN.html — corpo de cada capítulo (importado lazy via ?raw)
  *   src/generated/quiz/NN.json   — quizzes
+ *   src/generated/labs.json      — índice dos exercícios de código (para o playground)
+ *   src/generated/glossary.json  — glossário (book-src/glossary.json validado)
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -57,6 +59,7 @@ const areaName = Object.fromEntries(book.areas.map((a) => [a.k, a.n]));
 
 const chapters = [];
 const bank = [];
+const labIndex = [];
 const search = [];
 const areaCount = Object.fromEntries(book.areas.map((a) => [a.k, 0]));
 let totals = { questions: 0, labs: 0, listings: 0, quiz: 0, sections: 0 };
@@ -73,6 +76,12 @@ for (const c of book.chapters) {
     id: m[1],
     title: strip(m[2].replace(/<a class="anchor".*?<\/a>/s, '').replace(/<span class="secnum">.*?<\/span>/s, '')),
   }));
+
+  for (const l of labs) {
+    const title = unescape(strip(l.html.match(/<span class="labttl">(.*?)<\/span>/s)?.[1] ?? l.attrs.id));
+    const pills = [...l.html.matchAll(/<span class="qpill">(.*?)<\/span>/g)].map((m) => strip(m[1]));
+    labIndex.push({ id: l.attrs.id, c: c.n, t: title, lang: l.attrs['data-lang'] ?? 'java', pills });
+  }
 
   for (const q of qas) {
     const id = q.attrs.id;
@@ -120,5 +129,17 @@ writeFileSync(join(OUT, 'book.json'), JSON.stringify({
   levels: LEVELS, freq: FREQ, chapters, totals,
 }, null, 0));
 writeFileSync(join(OUT, 'bank.json'), JSON.stringify(bank));
+writeFileSync(join(OUT, 'labs.json'), JSON.stringify(labIndex));
+
+// glossário: valida áreas e capítulos, gera slugs e entra no índice de pesquisa
+const glossary = JSON.parse(readFileSync(join(SRC, 'glossary.json'), 'utf8'));
+const slug = (t) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const terms = glossary.terms.map((t) => {
+  if (!areaName[t.a]) throw new Error(`área inválida no glossário: ${t.t}`);
+  for (const n of t.c) if (!chapters.some((c) => c.n === n)) throw new Error(`capítulo ${n} inexistente no glossário: ${t.t}`);
+  return { ...t, s: slug(t.t) };
+}).sort((a, b) => a.t.localeCompare(b.t, 'pt'));
+for (const t of terms) search.push({ c: 0, i: t.s, k: 'g', t: t.t, x: t.d });
+writeFileSync(join(OUT, 'glossary.json'), JSON.stringify(terms));
 writeFileSync(join(OUT, 'search.json'), JSON.stringify(search));
-console.log(`OK: ${chapters.length} capítulos, ${totals.questions} perguntas, ${totals.labs} exercícios, ${search.length} entradas de pesquisa`);
+console.log(`OK: ${chapters.length} capítulos, ${totals.questions} perguntas, ${totals.labs} exercícios, ${terms.length} termos, ${search.length} entradas de pesquisa`);

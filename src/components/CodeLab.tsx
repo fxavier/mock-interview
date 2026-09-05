@@ -1,4 +1,5 @@
-import { useId, useState, type ReactNode, type KeyboardEvent } from 'react';
+import { useId, useState, type ReactNode } from 'react';
+import { CodeEditor } from './CodeEditor';
 import { KEYS, useStored } from '@/lib/storage';
 import { useDebouncedEffect } from '@/hooks/useDebounced';
 import { cx } from '@/lib/util';
@@ -20,15 +21,6 @@ export function CodeLab({ id, lang, title, pills, statement, solution }: CodeLab
   const solId = useId();
   useDebouncedEffect(draft, (v) => { setStored(v); setSaved(true); }, 500);
 
-  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key !== 'Tab') return;
-    e.preventDefault();
-    const ta = e.currentTarget;
-    const s = ta.selectionStart, end = ta.selectionEnd;
-    const next = `${ta.value.slice(0, s)}    ${ta.value.slice(end)}`;
-    setDraft(next); setSaved(false);
-    requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = s + 4; });
-  };
   const clear = () => {
     if (!draft || confirm('Apagar o código escrito neste exercício?')) { setDraft(''); setStored(''); setSaved(true); }
   };
@@ -43,9 +35,8 @@ export function CodeLab({ id, lang, title, pills, statement, solution }: CodeLab
         {statement}
         <h4>A sua solução</h4>
         <div className="lab__editor">
-          <textarea className="textarea" value={draft} spellCheck={false} aria-label={`Solução para ${title}`}
-            placeholder="Escreva aqui antes de ver a solução…"
-            onChange={(e) => { setDraft(e.target.value); setSaved(false); }} onKeyDown={onKey} />
+          <CodeEditor value={draft} lang={lang} ariaLabel={`Solução para ${title}`} placeholder="Escreva aqui antes de ver a solução…"
+            onChange={(v) => { setDraft(v); setSaved(false); }} />
           <span className="lab__status">{draft ? (saved ? 'Guardado' : 'A guardar…') : `${lang} · Tab indenta`}</span>
         </div>
         <div className="lab__act">

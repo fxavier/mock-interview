@@ -1,5 +1,5 @@
 import raw from '@/generated/book.json';
-import type { BankQuestion, Book, ChapterMeta, Part, Quiz, SearchEntry } from './types';
+import type { BankQuestion, Book, ChapterMeta, GlossaryTerm, LabMeta, Part, Quiz, SearchEntry } from './types';
 
 export const book = raw as unknown as Book;
 
@@ -34,3 +34,5 @@ export const loadBody = (n: number) => pick(bodies, `/${pad(n)}.html`, `Capítul
 export const loadQuiz = (n: number) => pick(quizzes, `/${pad(n)}.json`, `Quiz ${n}`) as Promise<Quiz>;
 export const loadBank = () => import('@/generated/bank.json').then((m) => m.default as BankQuestion[]);
 export const loadSearchIndex = () => import('@/generated/search.json').then((m) => m.default as SearchEntry[]);
+export const loadLabs = () => import('@/generated/labs.json').then((m) => m.default as LabMeta[]);
+export const loadGlossary = () => import('@/generated/glossary.json').then((m) => m.default as GlossaryTerm[]);

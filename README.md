@@ -23,14 +23,14 @@ npm test           # testes unitários e de componentes
 ## Estrutura
 
 ```
-book-src/                  fonte de verdade do conteúdo (chapters.json, content/*.body.html, quiz/*.json)
-scripts/build-content.mjs  gera src/generated/ (book.json, bank.json, search.json, bodies/, quiz/)
+book-src/                  fonte de verdade do conteúdo (chapters.json, content/*.body.html, quiz/*.json, glossary.json)
+scripts/build-content.mjs  gera src/generated/ (book.json, bank.json, search.json, labs.json, glossary.json, bodies/, quiz/)
 src/
-  lib/        book.ts (loaders lazy), storage.ts (store tipado sobre localStorage), search.ts, highlight.ts
+  lib/        book.ts (loaders lazy), storage.ts (store tipado sobre localStorage), search.ts, highlight.ts, calc.ts (fórmulas das ferramentas)
   hooks/      useTheme, useProgress (lidos + auto-avaliações), useScrollSpy, useHotkeys, useDebounced
   content/    ContentRenderer.tsx — HTML → React com substituição de .qa/.lab/figure.listing/a.anchor
-  components/ Shell (layout + contexto), Sidebar, TopBar, Footer, SearchPalette, QuestionCard, CodeLab, Listing, Quiz, Notes, ChapterNav
-  pages/      HomePage, ChapterPage, SimulationPage, NotFound
+  components/ Shell (layout + contexto), Sidebar, TopBar, Footer, SearchPalette, QuestionCard, CodeLab, CodeEditor, Listing, Quiz, Notes, ChapterNav, ReadingProgress
+  pages/      HomePage, ChapterPage, SimulationPage, PlaygroundPage, ToolsPage, GlossaryPage, NotFound
   styles/     tokens, base, layout, prose
 ```
 
@@ -42,7 +42,14 @@ src/
 - **Âncoras de secção** (`#sec-N-K`) tratadas por componente para não destruir a rota do HashRouter; ligações directas `#/cap/3#q-3-2` abrem o cartão certo.
 - **Filtro «Destacar»** é puro CSS (`data-filter` no contentor + `data-box` nos elementos): zero re-render do conteúdo.
 
+## Páginas além dos capítulos
+
+- **Simulação** (`#/simulacao`): sessão cronometrada com perguntas sorteadas do banco.
+- **Playground** (`#/playground`): exercício do livro sorteado com relógio — o bloco `div.lab` é extraído do corpo do capítulo com `DOMParser` e renderizado pelo mesmo `ContentRenderer`, por isso o código escrito fica na mesma chave `mij.lab.<id>` que no capítulo. Separador «Rascunho livre» com vários rascunhos (`mij.pads`).
+- **Ferramentas** (`#/ferramentas`): calculadoras das contas de entrevista (ondas num pool, sequencial vs paralelo, retries, cauda do fan-out, lei de Little, Big-O, memória). Fórmulas em `lib/calc.ts`, sem estado persistido.
+- **Glossário** (`#/glossario`): termos de `book-src/glossary.json` (validados no build contra áreas e capítulos), filtráveis e ligados aos capítulos; também entram no índice de pesquisa (`k: "g"`).
+
 ## Actualizar conteúdo
 
-Editar `book-src/` (ver `CONTRATO.md` do livro original) e correr `npm run content` ou `npm run build`. O script falha se um cartão tiver área/nível inválidos ou um quiz não tiver 5 perguntas.
+Editar `book-src/` (ver `CONTRATO.md` do livro original) e correr `npm run content` ou `npm run build`. O script falha se um cartão tiver área/nível inválidos, um quiz não tiver 5 perguntas, ou um termo do glossário apontar para uma área ou capítulo inexistente.
 # mock-interview

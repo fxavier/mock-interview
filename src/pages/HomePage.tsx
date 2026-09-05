@@ -53,6 +53,7 @@ export function HomePage() {
               {lastCh ? `Continuar: ${lastCh.n}. ${lastCh.title}` : 'Começar pelo capítulo 1'}
             </Link>
             <Link to="/simulacao" className="btn btn--lg">Simulação cronometrada</Link>
+            <Link to="/playground" className="btn btn--lg">Playground</Link>
             <button type="button" className="btn btn--lg" onClick={openSearch}>Pesquisar</button>
           </div>
         </div>
@@ -137,6 +138,9 @@ export function HomePage() {
           <li><b>Rubrica</b>: cada resposta traz o que distingue um mid de um sénior e de um staff, os follow-ups prováveis e as red flags.</li>
           <li><b>Exercícios de código</b>: escreva a solução na caixa (fica guardada no browser) antes de abrir a solução de referência.</li>
           <li><b>Simulação</b>: <Link to="/simulacao">sessão cronometrada</Link> com perguntas sorteadas por área e nível, exportável para Markdown.</li>
+          <li><b>Playground</b>: <Link to="/playground">exercício sorteado com relógio</Link> e um rascunho de código livre, com realce de sintaxe.</li>
+          <li><b>Ferramentas</b>: <Link to="/ferramentas">calculadoras</Link> para as contas de entrevista — ondas num pool, retries, cauda do fan-out, lei de Little, Big-O, memória.</li>
+          <li><b>Glossário</b>: <Link to="/glossario">os termos que aparecem nas entrevistas</Link>, com a definição curta e a ligação ao capítulo.</li>
           <li><b>Pesquisa</b>: <kbd className="key">Ctrl</kbd>+<kbd className="key">K</kbd> ou <kbd className="key">/</kbd> procura em perguntas, respostas, texto e código.</li>
           <li><b>Teclado</b>: <kbd className="key">←</kbd> <kbd className="key">→</kbd> mudam de capítulo; <kbd className="key">T</kbd> alterna o tema.</li>
           <li>Funciona sem ligação à Internet. Progresso, notas e respostas ficam apenas neste browser.</li>

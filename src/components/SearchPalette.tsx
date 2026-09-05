@@ -5,7 +5,8 @@ import { prepare, search, snippet, terms, type IndexedEntry } from '@/lib/search
 import { cx } from '@/lib/util';
 import s from './SearchPalette.module.css';
 
-const KIND: Record<IndexedEntry['k'], string> = { q: 'pergunta', a: 'resposta-modelo', t: 'texto', code: 'código' };
+const KIND: Record<IndexedEntry['k'], string> = { q: 'pergunta', a: 'resposta-modelo', t: 'texto', code: 'código', g: 'glossário' };
+const hrefOf = (e: IndexedEntry) => (e.k === 'g' ? `/glossario#${e.i}` : chapterPath(e.c, e.i));
 let cachedIndex: IndexedEntry[] | null = null;
 
 interface Props { open: boolean; onClose: () => void }
@@ -39,7 +40,7 @@ export function SearchPalette({ open, onClose }: Props) {
   const go = (i: number) => {
     const h = hits[i];
     if (!h) return;
-    navigate(chapterPath(h.e.c, h.e.i));
+    navigate(hrefOf(h.e));
     onClose();
   };
   const onKey = (e: React.KeyboardEvent) => {
@@ -61,13 +62,13 @@ export function SearchPalette({ open, onClose }: Props) {
         <div className={s.results} id="search-results" role="listbox" ref={listRef}>
           {error && <div className={s.empty}>Não foi possível carregar o índice de pesquisa.</div>}
           {!error && !index && <div className={s.empty}>A carregar o índice…</div>}
-          {index && debounced.trim().length < 2 && <div className={s.empty}>Escreva pelo menos 2 caracteres. Procura em perguntas, respostas, texto e código.</div>}
+          {index && debounced.trim().length < 2 && <div className={s.empty}>Escreva pelo menos 2 caracteres. Procura em perguntas, respostas, texto, código e glossário.</div>}
           {index && debounced.trim().length >= 2 && !hits.length && <div className={s.empty}>Sem resultados para «{debounced}».</div>}
           {hits.map((h, i) => (
             <a key={`${h.e.i}-${h.e.k}-${i}`} id={`sr-${i}`} role="option" aria-selected={i === sel}
-              href={`#${chapterPath(h.e.c, h.e.i)}`} className={cx(s.item, i === sel && s.sel)}
+              href={`#${hrefOf(h.e)}`} className={cx(s.item, i === sel && s.sel)}
               onMouseEnter={() => setSel(i)} onClick={(e) => { e.preventDefault(); go(i); }}>
-              <div className={s.top}><b>Cap. {h.e.c}</b><span>{KIND[h.e.k]}</span></div>
+              <div className={s.top}><b>{h.e.k === 'g' ? 'Glossário' : `Cap. ${h.e.c}`}</b><span>{KIND[h.e.k]}</span></div>
               <div className={s.title}>{h.e.t}</div>
               <div className={s.snip}>{snippet(h.e.x, h.pos, ts).map(([t, hl], j) => (hl ? <mark key={j}>{t}</mark> : t))}</div>
             </a>

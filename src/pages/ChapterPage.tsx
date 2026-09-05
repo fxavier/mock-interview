@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { chapter, chapterPath, loadBody, neighbours, partOf } from '@/lib/book';
+import { book, chapter, chapterPath, loadBody, neighbours, partOf } from '@/lib/book';
+import { ReadingProgress } from '@/components/ReadingProgress';
 import { ContentRenderer } from '@/content/ContentRenderer';
 import { Quiz } from '@/components/Quiz';
 import { Notes } from '@/components/Notes';
@@ -79,7 +80,7 @@ function Chapter({ n }: { n: number }) {
   const read = isRead(n);
   const progress = byChapter.get(n) ?? { rated: 0, solid: 0 };
   const pills = [
-    `Capítulo ${n} de 36`,
+    `Capítulo ${n} de ${book.chapters.length}`,
     `${meta.counts.questions} perguntas`,
     meta.counts.labs ? `${meta.counts.labs} exercício${meta.counts.labs > 1 ? 's' : ''} de código` : null,
     `${meta.counts.sections} secções`,
@@ -87,6 +88,7 @@ function Chapter({ n }: { n: number }) {
 
   return (
     <div className="page page--reading">
+      <ReadingProgress />
       <article>
         <header className="chhead">
           <div className="chhead__part">{part.n} — {part.t}</div>
@@ -113,6 +115,12 @@ function Chapter({ n }: { n: number }) {
 
         {error && <div className="panel" role="alert"><h3>Não foi possível carregar o capítulo</h3><div className="hint">{error}</div><Link to="/" className="btn">Voltar ao índice</Link></div>}
         {!html && !error && <div className="skeleton" aria-busy="true" aria-label="A carregar capítulo" />}
+        {html && (
+          <details className="toc-mobile">
+            <summary>Neste capítulo ({meta.sections.length} secções)</summary>
+            <ol>{meta.sections.map((s, i) => <li key={s.id}><a href={`#${chapterPath(n, s.id)}`} onClick={(e) => { e.preventDefault(); document.getElementById(s.id)?.scrollIntoView({ block: 'start' }); }}>{n}.{i + 1} {s.title}</a></li>)}</ol>
+          </details>
+        )}
         {html && <ContentRenderer html={html} target={target} filter={filter} />}
 
         {html && (
@@ -141,6 +149,9 @@ function Chapter({ n }: { n: number }) {
           <span className="rail__label">Atalhos</span>
           <span className="rail__hint"><kbd className="key">←</kbd> <kbd className="key">→</kbd> mudar de capítulo</span>
           <span className="rail__hint"><kbd className="key">T</kbd> tema, <kbd className="key">/</kbd> pesquisa</span>
+          <span className="rail__label">Treinar</span>
+          <Link to={`/playground${meta.counts.labs ? `#lab-${n}-1` : ''}`} className="btn btn--sm">Playground{meta.counts.labs ? ` · exercício ${n}.1` : ''}</Link>
+          <Link to="/glossario" className="btn btn--sm">Glossário</Link>
         </div>
       </aside>
     </div>

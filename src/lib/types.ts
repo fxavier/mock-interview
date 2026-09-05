@@ -24,7 +24,10 @@ export interface Book {
   totals: { questions: number; labs: number; listings: number; quiz: number; sections: number };
 }
 export interface BankQuestion { id: string; c: number; a: string; l: Level; q: string }
-export interface SearchEntry { c: number; i: string; k: 'q' | 'a' | 't' | 'code'; t: string; x: string }
+export interface SearchEntry { c: number; i: string; k: 'q' | 'a' | 't' | 'code' | 'g'; t: string; x: string }
 export interface QuizQuestion { q: string; options: string[]; answer: number; explain: string }
 export interface Quiz { chapter: number; questions: QuizQuestion[] }
 export interface MockRun { d: string; n: number; ok: number; min: number }
+export interface LabMeta { id: string; c: number; t: string; lang: string; pills: string[] }
+export interface GlossaryTerm { t: string; a: string; c: number[]; d: string; s: string }
+export interface Pad { id: string; name: string; lang: string; code: string }

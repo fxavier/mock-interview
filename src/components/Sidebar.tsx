@@ -6,6 +6,13 @@ import { useTheme, THEME_LABEL } from '@/hooks/useTheme';
 import { cx } from '@/lib/util';
 import s from './Sidebar.module.css';
 
+const TOOLS = [
+  { to: '/simulacao', label: 'Simulação', icon: '⏱' },
+  { to: '/playground', label: 'Playground', icon: '⌨' },
+  { to: '/ferramentas', label: 'Ferramentas', icon: '∑' },
+  { to: '/glossario', label: 'Glossário', icon: '≡' },
+];
+
 interface Props { open: boolean; onClose: () => void; onSearch: () => void; currentChapter?: number }
 
 export function Sidebar({ open, onClose, onSearch, currentChapter }: Props) {
@@ -36,6 +43,13 @@ export function Sidebar({ open, onClose, onSearch, currentChapter }: Props) {
           <span>Pesquisar no livro…</span><kbd className="key">Ctrl K</kbd>
         </button>
         <nav className={s.nav} ref={navRef}>
+          <div className={s.tools}>
+            {TOOLS.map((t) => (
+              <NavLink key={t.to} to={t.to} onClick={onClose} className={({ isActive }) => cx(s.tool, isActive && s.current)}>
+                <span className={s.toolIcon} aria-hidden="true">{t.icon}</span><span>{t.label}</span>
+              </NavLink>
+            ))}
+          </div>
           {chaptersByPart().map(({ part, chapters }) => (
             <div key={part.p}>
               <div className={s.part}><span>{part.n}</span><span>{part.t}</span></div>
@@ -53,7 +67,6 @@ export function Sidebar({ open, onClose, onSearch, currentChapter }: Props) {
         </nav>
         <div className={s.foot}>
           <button type="button" className="btn" onClick={cycle} title="Alternar tema (tecla T)">Tema: {THEME_LABEL[theme]}</button>
-          <Link to="/simulacao" className="btn" onClick={onClose}>Simulação</Link>
         </div>
       </aside>
     </>
