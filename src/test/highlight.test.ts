@@ -25,3 +25,22 @@ describe('tokenize', () => {
     }
   });
 });
+
+describe('tokenize ts/html', () => {
+  it('reconhece keywords de TypeScript e template literals', async () => {
+    const { tokenize } = await import('@/lib/highlight');
+    const t = tokenize('const x: string = `a${b}`; // c', 'ts');
+    expect(t.find((k) => k.v === 'const')?.t).toBe('kw');
+    expect(t.find((k) => k.v === 'string')?.t).toBe('kw');
+    expect(t.find((k) => k.v.startsWith('`'))?.t).toBe('str');
+    expect(t.find((k) => k.v.startsWith('//'))?.t).toBe('com');
+  });
+  it('reconhece etiquetas, atributos e interpolações em templates Angular', async () => {
+    const { tokenize } = await import('@/lib/highlight');
+    const t = tokenize('<app-x [itens]="xs" (click)="go()">{{ n }}</app-x> @if (a) {', 'html');
+    expect(t.find((k) => k.v === '<app-x')?.t).toBe('kw');
+    expect(t.find((k) => k.v.trim() === '[itens]')?.t).toBe('typ');
+    expect(t.find((k) => k.v === '{{ n }}')?.t).toBe('ann');
+    expect(t.find((k) => k.v === '@if')?.t).toBe('ann');
+  });
+});

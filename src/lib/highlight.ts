@@ -5,6 +5,8 @@ export interface Token { t: TokenType; v: string }
 const JAVA_KW = new Set('abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public return short static strictfp super switch synchronized this throw throws transient try void volatile while var record sealed permits yield when non-sealed module requires exports opens uses provides to with transitive true false null'.split(' '));
 const SQL_KW = new Set('select from where group by having order limit offset join inner left right full outer on as with recursive union all distinct insert into values update set delete create table index unique primary key foreign references constraint alter add drop begin commit rollback explain analyze case when then else end and or not null is in exists between like ilike asc desc over partition rows range preceding following current row returning conflict do nothing lateral using cascade materialized view serializable repeatable read committed isolation level transaction for share nowait skip locked'.split(' '));
 
+const TS_KW = new Set('abstract as async await break case catch class const continue debugger declare default delete do else enum export extends false finally for from function if implements import in instanceof interface is keyof let new null of override package private protected public readonly return satisfies static super switch this throw true try type typeof undefined unique var void while with yield never unknown any string number boolean object symbol bigint'.split(' '));
+
 function scan(src: string, re: RegExp, classify: (m: RegExpExecArray) => Token): Token[] {
   const out: Token[] = [];
   let last = 0, m: RegExpExecArray | null;
@@ -27,6 +29,31 @@ export function tokenizeJava(src: string): Token[] {
     if (JAVA_KW.has(w)) return { t: 'kw', v: w };
     if (/^[A-Z][A-Za-z0-9_$]*$/.test(w)) return { t: 'typ', v: w };
     return { t: 'txt', v: w };
+  });
+}
+/** TS/JS/TSX: mesma máquina do Java, com template literals e decoradores. */
+export function tokenizeTs(src: string): Token[] {
+  const re = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|(@[A-Za-z_][\w.]*)|(\b\d[\w._]*\b)|([A-Za-z_$][\w$]*)/g;
+  return scan(src, re, (m) => {
+    if (m[1]) return { t: 'com', v: m[1] };
+    if (m[2]) return { t: 'str', v: m[2] };
+    if (m[3]) return { t: 'ann', v: m[3] };
+    if (m[4]) return { t: 'num', v: m[4] };
+    const w = m[5];
+    if (TS_KW.has(w)) return { t: 'kw', v: w };
+    if (/^[A-Z][A-Za-z0-9_$]*$/.test(w)) return { t: 'typ', v: w };
+    return { t: 'txt', v: w };
+  });
+}
+/** HTML / templates Angular: etiquetas, atributos e strings; o resto é texto. */
+export function tokenizeHtml(src: string): Token[] {
+  const re = /(<!--[\s\S]*?-->)|(<\/?[A-Za-z][\w-]*|\/?>)|(\s[@\[(*#]?[A-Za-z][\w\-.:)\]]*(?==))|("[^"]*"|'[^']*')|(\{\{[\s\S]*?\}\}|@(?:if|else|for|switch|case|defer|empty|placeholder|loading)\b)/g;
+  return scan(src, re, (m) => {
+    if (m[1]) return { t: 'com', v: m[1] };
+    if (m[2]) return { t: 'kw', v: m[2] };
+    if (m[3]) return { t: 'typ', v: m[3] };
+    if (m[4]) return { t: 'str', v: m[4] };
+    return { t: 'ann', v: m[5] };
   });
 }
 export function tokenizeSql(src: string): Token[] {
@@ -69,6 +96,8 @@ export function tokenize(src: string, lang = 'java'): Token[] {
     case 'sql': return tokenizeSql(src);
     case 'shell': return tokenizeShell(src);
     case 'yaml': case 'yml': case 'json': case 'hcl': return tokenizeYaml(src);
+    case 'ts': case 'tsx': case 'js': case 'jsx': return tokenizeTs(src);
+    case 'html': return tokenizeHtml(src);
     case 'text': return [{ t: 'txt', v: src }];
     default: return tokenizeJava(src);
   }

@@ -10,8 +10,8 @@ import { formatClock, cx } from '@/lib/util';
 import type { LabMeta, Pad } from '@/lib/types';
 import s from './PlaygroundPage.module.css';
 
-const LANGS = ['java', 'sql', 'shell', 'yaml', 'json', 'hcl', 'text'];
-const EXT: Record<string, string> = { java: 'java', sql: 'sql', shell: 'sh', yaml: 'yaml', json: 'json', hcl: 'tf', text: 'txt' };
+const LANGS = ['java', 'ts', 'tsx', 'html', 'sql', 'shell', 'yaml', 'json', 'hcl', 'text'];
+const EXT: Record<string, string> = { java: 'java', ts: 'ts', tsx: 'tsx', html: 'html', sql: 'sql', shell: 'sh', yaml: 'yaml', json: 'json', hcl: 'tf', text: 'txt' };
 const EMPTY_PADS: Pad[] = [];
 const newPad = (lang = 'java'): Pad => ({ id: `p${Date.now().toString(36)}`, name: 'Rascunho', lang, code: '' });
 const minutesOf = (lab: LabMeta) => Number(lab.pills.map((p) => p.match(/^(\d+)\s*min/)?.[1]).find(Boolean) ?? 20);

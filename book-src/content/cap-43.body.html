@@ -1,0 +1,478 @@
+<p>Os três capítulos anteriores são o que qualquer programador de frontend responde; este é o que só um full-stack responde bem, e é onde um Java sénior ganha a entrevista. O contrato entre a SPA e a API Spring — como se gera, como evolui sem partir o browser que tem a versão antiga em cache, como os erros chegam ao utilizador. A autenticação, que é o sítio onde as decisões do frontend e do backend se tocam de forma mais perigosa. CORS como decisão de arquitectura e não como configuração. Tempo real e listas grandes. E a parte operacional: quem constrói, quem serve, como se liga um erro visto pelo utilizador ao registo do servidor que o causou.</p>
+
+<h2 id="sec-43-1" class="h2"><span class="secnum">43.1</span> O contrato: OpenAPI, tipos gerados e erros que a UI consegue mostrar<a class="anchor" href="#sec-43-1" aria-label="ligação">#</a></h2>
+
+<p>O contrato é o <code>openapi.json</code> que o <code>springdoc-openapi</code> gera a partir dos controladores, e a decisão que muda tudo é <em>quem é a fonte de verdade</em>. Na prática há duas escolas: <em>code-first</em>, em que o Spring gera o spec e o frontend gera tipos a partir dele (<code>openapi-typescript</code> para tipos puros, <code>orval</code> ou <code>ng-openapi-gen</code> para clientes com TanStack Query ou <code>HttpClient</code> já integrados); e <em>spec-first</em>, em que o spec é escrito à mão, versionado, e ambos os lados geram a partir dele. A primeira é a mais comum e funciona desde que a geração corra no CI do frontend contra o spec da versão do backend com que vai para produção — porque nessa altura uma quebra de contrato é um erro de compilação e não um <code>undefined</code> no ecrã.</p>
+
+<p>A regra de evolução é a mesma do capítulo de APIs, com uma razão a mais: o browser do utilizador pode ter o bundle antigo durante horas (cache, aba aberta desde ontem). Portanto, só alterações aditivas — campos novos opcionais, <em>endpoints</em> novos —, nunca remover nem mudar o significado, e os campos removidos passam primeiro por <code>deprecated</code> no spec com uma data. Nos erros, o Spring devolve <code>application/problem+json</code> (o <code>ProblemDetail</code> do Spring 6) e o frontend tem um único tradutor: <code>title</code> e <code>detail</code> para a mensagem, <code>status</code> para a decisão (sessão expirada, sem permissão, conflito), e os campos de validação para os pôr ao lado dos inputs — o que exige que o backend devolva <em>todos</em> os erros de validação de uma vez, com o nome do campo tal como está no DTO.</p>
+
+<figure class="listing ts" id="lst-43-1"><div class="lhead"><span class="lnum">Listagem 43.1</span>
+<span class="lcap">Tipos gerados do OpenAPI do Spring e um cliente <code>fetch</code> tipado que traduz <code>problem+json</code>.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="ts"><code>// npx openapi-typescript http://localhost:8080/v3/api-docs -o src/api/schema.d.ts   (no CI, contra a versão a publicar)
+import type { paths, components } from './schema';
+
+type Encomenda = components['schemas']['EncomendaDto'];
+type Problema  = components['schemas']['ProblemDetail'] &amp; { campos?: Record&lt;string, string&gt; };
+
+export class ErroApi extends Error {
+  constructor(readonly status: number, readonly problema: Problema) { super(problema.detail ?? problema.title); }
+}
+
+async function chamar&lt;T&gt;(input: string, init?: RequestInit): Promise&lt;T&gt; {
+  const r = await fetch(input, { ...init, headers: { 'Accept': 'application/json', 'X-Request-Id': crypto.randomUUID(), ...init?.headers } });
+  if (r.ok) return r.status === 204 ? (undefined as T) : r.json();
+  const problema: Problema = r.headers.get('content-type')?.includes('problem+json')
+    ? await r.json() : { title: r.statusText, status: r.status };
+  throw new ErroApi(r.status, problema);          // um sítio só; a UI decide pelo status
+}
+
+export const api = {
+  encomenda: (id: string) =&gt; chamar&lt;Encomenda&gt;(`/api/encomendas/${id}`),
+  criar: (corpo: paths['/encomendas']['post']['requestBody']['content']['application/json']) =&gt;
+    chamar&lt;Encomenda&gt;('/api/encomendas', { method: 'POST', body: JSON.stringify(corpo), headers: { 'Content-Type': 'application/json' } }),
+};</code></pre></figure>
+
+<div class="qa" id="q-43-1" data-box="qa" data-area="frontend" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como mantém o frontend e a API Spring de acordo? O que acontece quando o backend muda um campo?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Com um contrato executável, não com uma página de documentação. O Spring expõe o OpenAPI através do <code>springdoc</code>; o CI do frontend descarrega o spec da versão do backend que vai para o mesmo ambiente e gera tipos — <code>openapi-typescript</code> para tipos, ou <code>orval</code> para clientes já ligados ao TanStack Query. A partir daí, cada resposta e cada corpo de pedido são tipados, e uma mudança incompatível no backend torna-se um erro de compilação no frontend antes de chegar a produção. Os tipos gerados são artefactos de build, não código que se edita.</p>
+      <p>Quando o backend «muda um campo», a pergunta é qual mudança. Acrescentar um campo opcional ou um <em>endpoint</em> é compatível e não exige coordenação. Renomear, remover ou mudar o tipo é uma quebra, e a regra é que não acontece num só passo: acrescenta-se o novo, marca-se o antigo como <code>deprecated</code> no spec com data, o frontend migra ao seu ritmo, e só depois se remove. A razão é que não controlo quando o browser do utilizador recarrega — um bundle de ontem pode estar a chamar a API de hoje —, portanto a API tem de servir as duas versões do frontend durante a janela.</p>
+      <p>Além dos tipos, protejo a fronteira em execução: o que vem da rede é validado contra um esquema (<code>zod</code>, gerado do mesmo spec) nos pontos onde uma forma errada seria catastrófica, porque os tipos são apagados e o servidor pode ter sido publicado com um bug. E os erros seguem um único formato — <code>problem+json</code> — com um tradutor no cliente que decide pelo <code>status</code> e mostra <code>detail</code> e os campos de validação, para que o frontend não tenha lógica de erros espalhada por cada chamada.</p>
+      <p>A camada que fecha o ciclo são testes de contrato: MSW nos testes de frontend com respostas <em>geradas</em> do spec (não escritas à mão), e do lado do Spring, testes que validam que as respostas reais cumprem o spec publicado. Se a organização for grande, contratos dirigidos pelo consumidor com Pact; se não, o CI com tipos gerados e um teste de <em>smoke</em> contra o backend real em <em>staging</em> chega.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Vemos no Swagger e escrevemos as interfaces à mão.» Renomeia campos e publica os dois lados ao mesmo tempo.</td></tr>
+        <tr><td>Mid</td><td>Gera tipos, mas não no CI, e não tem regra de evolução nem formato de erro uniforme.</td></tr>
+        <tr><td>Sénior</td><td>Tipos gerados no CI, evolução aditiva com <code>deprecated</code>, validação na fronteira onde importa, <code>problem+json</code> com um tradutor.</td></tr>
+        <tr><td>Staff</td><td>Fala do bundle antigo em cache como restrição, de testes de contrato gerados do spec, e de quando Pact compensa.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Code-first ou spec-first? Porquê?»</li>
+      <li>«Como mostra um erro de validação de um campo ao lado do input?»</li>
+      <li>«O que faz com uma resposta que não cumpre o tipo?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Interfaces TypeScript escritas à mão a partir do Swagger.</li>
+      <li>Quebras de contrato «coordenadas» por deploy simultâneo.</li>
+      <li>Erros em formatos diferentes por <em>endpoint</em>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-43-2" class="h2"><span class="secnum">43.2</span> Autenticação no browser: cookies HttpOnly, tokens, BFF e PKCE<a class="anchor" href="#sec-43-2" aria-label="ligação">#</a></h2>
+
+<p>O capítulo 40 fixou onde o token pode viver; aqui está o desenho completo, do <em>login</em> ao <em>logout</em>, para os dois cenários que aparecem. <strong>Cenário A, aplicação própria com Spring Security</strong>: a forma mais simples e mais segura é sessão por cookie — <em>login</em> por <code>POST</code>, cookie <code>HttpOnly; Secure; SameSite=Lax</code>, CSRF pelo <code>CookieCsrfTokenRepository</code> com o token ecoado num cabeçalho, e o frontend não gere credenciais nenhumas. Funciona porque frontend e API estão na mesma origem (ver 43.3). <strong>Cenário B, identidade externa (Keycloak, Entra, Auth0)</strong>: OAuth2/OIDC com <em>Authorization Code</em> e PKCE — o <em>implicit flow</em> está morto — e a decisão é <em>quem</em> faz a troca do código pelos tokens. Se for o browser (SPA pública), os tokens ficam em memória com <em>refresh</em> por rotação, e aceita-se a exposição a XSS durante a sessão. Se for um <strong>BFF</strong> — um serviço Spring na mesma origem, cliente OAuth2 confidencial —, o browser recebe apenas um cookie de sessão, os tokens nunca saem do servidor, e o BFF anexa-os às chamadas para a API. O BFF é a recomendação actual do grupo de trabalho OAuth para browsers, e o Spring Cloud Gateway com <code>TokenRelay</code> ou um <code>OAuth2AuthorizedClientManager</code> implementa-o em pouco código.</p>
+
+<div class="qa" id="q-43-2" data-box="qa" data-area="frontend" data-level="staff" data-freq="alta">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Staff</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Desenhe a autenticação de uma SPA com Keycloak e uma API Spring. Onde ficam os tokens, como se renovam e como se faz <em>logout</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Proponho o padrão BFF, e explico porquê antes de desenhar. Uma SPA é um cliente público: qualquer coisa que guarde é lida por um XSS, e o <em>refresh token</em> — que vale por dias — é o que mais me preocupa. Com um BFF, o browser nunca vê tokens: tem um cookie de sessão <code>HttpOnly; Secure; SameSite=Lax</code> para um serviço na mesma origem, e é esse serviço, cliente confidencial do Keycloak, que guarda <em>access</em> e <em>refresh token</em> e os usa em nome do utilizador.</p>
+      <p>O fluxo: o utilizador clica em entrar; o BFF redirecciona para o Keycloak com <em>Authorization Code</em> e PKCE (mesmo sendo confidencial, PKCE protege contra injecção de código); o Keycloak autentica e volta ao BFF com o código; o BFF troca o código por tokens, guarda-os na sessão (Redis, ou cookie cifrado se quiser <em>stateless</em>), e responde ao browser com o cookie de sessão e um redireccionamento para a aplicação. A partir daí, a SPA chama <code>/api/…</code> na mesma origem; o BFF valida a sessão, anexa o <em>access token</em> como <em>Bearer</em>, e encaminha para a API Spring, que é um <em>resource server</em> puro — valida a assinatura do JWT com a chave pública do Keycloak e autoriza por <em>claims</em>, sem saber que existe um BFF.</p>
+      <p>Renovação: quando o <em>access token</em> está a expirar, o BFF usa o <em>refresh token</em> sozinho, de forma transparente para o browser, com um bloqueio por sessão para que dez pedidos concorrentes não façam dez renovações. A SPA só vê um <code>401</code> quando a sessão do BFF morre de vez, e aí redirecciona para o <em>login</em>. <em>Logout</em>: a SPA chama <code>POST /logout</code> no BFF, que invalida a sessão local, revoga os tokens no Keycloak e redirecciona para o <em>end session endpoint</em> do OIDC para fechar a sessão do fornecedor — senão o utilizador «sai» e o próximo clique em entrar volta a autenticar sem pedir a senha. Para as outras abas, um <code>BroadcastChannel</code> avisa-as.</p>
+      <p>O que se paga: mais um serviço a operar, estado de sessão a escalar, e a equipa de frontend a depender de um componente de backend para desenvolver — mitigado com um BFF de desenvolvimento em contentor. E quando <em>não</em> o faria: aplicações puramente estáticas sem backend próprio, onde a alternativa é a SPA pública com PKCE, tokens em memória, <em>refresh</em> com rotação e CSP estrita, aceitando explicitamente a exposição a XSS durante a sessão.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Token no <code>localStorage</code>, <em>implicit flow</em>, renovação «pedindo <em>login</em> outra vez».</td></tr>
+        <tr><td>Mid</td><td>Sabe PKCE e <em>refresh</em>, mas guarda tudo no browser e não trata <em>logout</em> no fornecedor.</td></tr>
+        <tr><td>Sénior</td><td>Desenha o BFF completo — fluxo, sessão, renovação com bloqueio, <em>logout</em> em dois sítios — e diz quando não o usaria.</td></tr>
+        <tr><td>Staff</td><td>Discute escala de sessão, <em>resource server</em> puro, rotação de <em>refresh tokens</em>, CSP, e o custo organizacional do BFF.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque não guarda os tokens num cookie e poupa o BFF?»</li>
+      <li>«Como escala a sessão do BFF em três instâncias?»</li>
+      <li>«O que é PKCE e contra o que protege?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><em>Implicit flow</em>.</li>
+      <li><em>Refresh token</em> acessível ao JavaScript.</li>
+      <li><em>Logout</em> que só apaga o estado local.</li></ul></div>
+  </div>
+</div>
+
+<div class="lab" id="lab-43-1" data-box="lab" data-lang="text">
+  <div class="labhead"><span class="labttl">Exercício 43.1 — Desenhar o fluxo BFF e escrever a configuração de Spring Security</span>
+    <div class="labpills"><span class="qpill">Modelação</span><span class="qpill">20 min</span></div></div>
+  <div class="labbody">
+    <p>Desenhe, em texto, a sequência completa de pedidos entre browser, BFF, Keycloak e API para: (a) primeiro acesso não autenticado, (b) chamada à API com sessão válida, (c) renovação do token, (d) <em>logout</em>. Depois escreva o esqueleto da configuração Spring Security do BFF (cliente OAuth2 com relay) e da API (<em>resource server</em>).</p>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-43-2"><div class="lhead"><span class="lnum">Listagem 43.2</span>
+        <span class="lcap">As quatro sequências.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>(a) primeiro acesso
+Browser  → BFF       GET /api/me                          (sem cookie)
+BFF      → Browser   401
+Browser  → BFF       GET /oauth2/authorization/keycloak    (clique em «Entrar»)
+BFF      → Browser   302 → Keycloak /auth?response_type=code&amp;code_challenge=…&amp;state=…
+Browser  → Keycloak  autentica (senha, MFA)
+Keycloak → Browser   302 → BFF /login/oauth2/code/keycloak?code=…&amp;state=…
+BFF      → Keycloak  POST /token (code, code_verifier, client_secret)   ← servidor a servidor
+Keycloak → BFF       { access_token, refresh_token, id_token }
+BFF      → Browser   302 → /app   +  Set-Cookie: SESSION=…; HttpOnly; Secure; SameSite=Lax
+
+(b) chamada com sessão
+Browser  → BFF       GET /api/encomendas   Cookie: SESSION
+BFF      → API       GET /encomendas       Authorization: Bearer &lt;access_token&gt;   X-Request-Id
+API                  valida assinatura (JWKS do Keycloak), autoriza por claims
+API      → BFF       200 JSON
+BFF      → Browser   200 JSON
+
+(c) renovação (access_token a expirar)
+BFF      → Keycloak  POST /token (grant_type=refresh_token)   ← com bloqueio por sessão
+Keycloak → BFF       novos tokens (refresh rodado); BFF actualiza a sessão; repete (b)
+
+(d) logout
+Browser  → BFF       POST /logout   Cookie: SESSION   + cabeçalho CSRF
+BFF      → Keycloak  POST /logout (revoga refresh_token)
+BFF      → Browser   302 → Keycloak /protocol/openid-connect/logout?id_token_hint=…&amp;post_logout_redirect_uri=/
+                     Set-Cookie: SESSION=; Max-Age=0
+Browser              BroadcastChannel('auth').postMessage('logout')  → outras abas limpam estado</code></pre></figure>
+      <figure class="listing java" id="lst-43-3"><div class="lhead"><span class="lnum">Listagem 43.3</span>
+        <span class="lcap">Esqueleto: BFF como cliente OAuth2 com relay do token, API como resource server.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="java"><code>// ---- BFF (Spring Cloud Gateway ou WebFlux) ----
+@Bean
+SecurityWebFilterChain bff(ServerHttpSecurity http) {
+    return http
+        .authorizeExchange(ex -&gt; ex.pathMatchers("/", "/assets/**", "/login/**").permitAll().anyExchange().authenticated())
+        .oauth2Login(Customizer.withDefaults())                 // Authorization Code + PKCE (spring.security.oauth2.client…)
+        .oauth2Client(Customizer.withDefaults())                // gere access/refresh tokens na sessão
+        .csrf(c -&gt; c.csrfTokenRepository(CookieServerCsrfTokenRepository.withHttpOnlyFalse()))
+        .logout(l -&gt; l.logoutSuccessHandler(oidcLogout()))     // OidcClientInitiatedServerLogoutSuccessHandler
+        .build();
+}
+// application.yml: spring.cloud.gateway.routes[0].uri=http://api  predicates=Path=/api/**  filters=TokenRelay=, StripPrefix=1
+// sessão: spring.session.store-type=redis  (ou cookie cifrado com spring-session-jdbc/… conforme escala)
+
+// ---- API (resource server puro) ----
+@Bean
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+    return http
+        .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .csrf(AbstractHttpConfigurer::disable)                  // sem cookies, sem CSRF
+        .authorizeHttpRequests(a -&gt; a.requestMatchers("/actuator/health").permitAll().anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.jwtAuthenticationConverter(claimsParaAuthorities())))
+        .build();
+}
+// application.yml: spring.security.oauth2.resourceserver.jwt.issuer-uri=https://keycloak/realms/loja</code></pre></figure>
+      <p>Os pontos que o avaliador procura no desenho: a troca do código acontece <em>servidor a servidor</em> com o <em>client secret</em> — o browser nunca vê tokens; a API é <em>stateless</em> e valida JWT por JWKS, sem conhecer o BFF, o que a torna reutilizável pela app móvel; a renovação tem bloqueio por sessão; o <em>logout</em> tem três passos (sessão local, revogação, sessão do fornecedor) e sem o terceiro o utilizador não saiu de verdade; e o CSRF está activo no BFF porque há cookies, e desactivado na API porque não há.</p>
+      <p>O que se diz sobre escala: a sessão do BFF é estado, e com várias instâncias vive em Redis (Spring Session) ou num cookie cifrado se o tamanho permitir; o <em>refresh token</em> é rodado a cada uso, e uma reutilização de um token antigo é sinal de roubo e invalida a família toda — comportamento que o Keycloak suporta e vale a pena ligar.</p>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-43-3" class="h2"><span class="secnum">43.3</span> CORS, proxies e a mesma origem como decisão de arquitectura<a class="anchor" href="#sec-43-3" aria-label="ligação">#</a></h2>
+
+<p>Com o mecanismo explicado no capítulo 40, a decisão aqui é simples de enunciar: <em>evitar CORS é quase sempre melhor do que configurá-lo</em>. Em desenvolvimento, o servidor do Vite ou do Angular CLI tem um proxy (<code>server.proxy</code>, <code>proxy.conf.json</code>) que encaminha <code>/api</code> para o Spring em <code>localhost:8080</code> — o browser só vê uma origem. Em produção, o <em>reverse proxy</em> (nginx, o <em>ingress</em> do Kubernetes, o CDN) faz o mesmo: <code>/</code> serve os ficheiros estáticos, <code>/api/</code> encaminha para o backend. Sem origens diferentes não há preflight, cookies <code>SameSite</code> funcionam por omissão, e o CSP fica mais simples. CORS configura-se apenas quando a API é genuinamente pública para outras origens — e aí com lista explícita de origens, <code>maxAge</code> no preflight, e nunca <code>*</code> com credenciais.</p>
+
+<figure class="listing yaml" id="lst-43-4"><div class="lhead"><span class="lnum">Listagem 43.4</span>
+<span class="lcap">Mesma origem em desenvolvimento (Vite) e em produção (nginx), e o CORS de Spring para quando é mesmo preciso.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="yaml"><code># vite.config.ts (dev): o browser vê só localhost:5173
+# server: { proxy: { '/api': { target: 'http://localhost:8080', changeOrigin: true } } }
+
+# nginx (prod): uma origem, dois destinos
+# location /      { root /srv/app; try_files $uri /index.html; add_header Cache-Control "no-cache"; }
+# location /assets/ { root /srv/app; add_header Cache-Control "public, max-age=31536000, immutable"; }
+# location /api/  { proxy_pass http://backend:8080/; proxy_set_header X-Request-Id $request_id; }
+
+# Spring, só se a API for chamada de outras origens:
+# @Bean CorsConfigurationSource cors() {
+#   var c = new CorsConfiguration();
+#   c.setAllowedOrigins(List.of("https://app.exemplo.pt"));   // nunca "*" com credenciais
+#   c.setAllowedMethods(List.of("GET","POST","PUT","PATCH","DELETE"));
+#   c.setAllowedHeaders(List.of("Authorization","Content-Type","X-Request-Id"));
+#   c.setAllowCredentials(true); c.setMaxAge(3600L);           // cache do preflight: 1 h
+#   var s = new UrlBasedCorsConfigurationSource(); s.registerCorsConfiguration("/api/**", c); return s;
+# }
+# e em SecurityFilterChain: http.cors(Customizer.withDefaults())  — para o OPTIONS não cair no 401</code></pre></figure>
+
+<div class="lab" id="lab-43-2" data-box="lab" data-lang="text">
+  <div class="labhead"><span class="labttl">Exercício 43.2 — Quais destes pedidos fazem preflight?</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">6 min</span></div></div>
+  <div class="labbody">
+    <p>A SPA em <code>https://app.exemplo.pt</code> chama <code>https://api.exemplo.pt</code>. Para cada pedido, diga se o browser envia um <code>OPTIONS</code> antes, e que cabeçalhos a resposta tem de trazer para o JavaScript poder ler o resultado.</p>
+    <figure class="listing ts" id="lst-43-5"><div class="lhead"><span class="lnum">Listagem 43.5</span>
+      <span class="lcap">Seis pedidos, três preflights.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="ts"><code>// (1)
+fetch('https://api.exemplo.pt/encomendas');
+
+// (2)
+fetch('https://api.exemplo.pt/encomendas', { headers: { Accept: 'application/json' } });
+
+// (3)
+fetch('https://api.exemplo.pt/encomendas', { headers: { Authorization: 'Bearer x' } });
+
+// (4)
+fetch('https://api.exemplo.pt/encomendas', { method: 'POST', body: new URLSearchParams({ sku: 'A1' }) });
+
+// (5)
+fetch('https://api.exemplo.pt/encomendas', { method: 'POST',
+  headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sku: 'A1' }) });
+
+// (6)
+fetch('https://api.exemplo.pt/encomendas/7', { method: 'DELETE', credentials: 'include' });</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-43-6"><div class="lhead"><span class="lnum">Listagem 43.6</span>
+        <span class="lcap">Preflight e cabeçalhos necessários, pedido a pedido.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>(1) GET simples                       sem preflight   resposta: Access-Control-Allow-Origin: https://app.exemplo.pt
+(2) GET + Accept                      sem preflight   (Accept é safelisted)                 idem
+(3) GET + Authorization               PREFLIGHT       OPTIONS → Allow-Origin, Allow-Headers: Authorization
+(4) POST form-urlencoded              sem preflight   (Content-Type safelisted)             Allow-Origin
+(5) POST application/json             PREFLIGHT       OPTIONS → Allow-Origin, Allow-Headers: Content-Type
+(6) DELETE + credentials              PREFLIGHT       OPTIONS → Allow-Origin (explícita, não *), Allow-Methods: DELETE,
+                                                      Allow-Credentials: true; e o cookie tem de ser SameSite=None; Secure</code></pre></figure>
+      <p>Um pedido é «simples» — sem preflight — quando o método é <code>GET</code>, <code>HEAD</code> ou <code>POST</code>, os cabeçalhos são só os <em>safelisted</em> (<code>Accept</code>, <code>Accept-Language</code>, <code>Content-Language</code>, <code>Content-Type</code>) e o <code>Content-Type</code> é um de <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code> ou <code>text/plain</code>. É uma lista histórica: corresponde ao que um formulário HTML sempre pôde enviar sem JavaScript, e por isso não precisava de autorização prévia. Tudo o resto — JSON, <code>Authorization</code>, qualquer cabeçalho personalizado como <code>X-Request-Id</code>, qualquer outro método — dispara o <code>OPTIONS</code>.</p>
+      <p>Repare que mesmo os pedidos simples <em>chegam</em> ao servidor: o (4) cria a encomenda, e só a leitura da resposta pelo script é bloqueada se faltar o <code>Allow-Origin</code>. É por isso que CORS não é protecção contra CSRF — o formulário de um site terceiro faz o (4) na mesma — e é para isso que existem <code>SameSite</code> e o token anti-CSRF.</p>
+      <p>O (6) é o caso completo: com <code>credentials: 'include'</code>, a resposta ao preflight e ao pedido real têm de trazer a origem explícita (o <code>*</code> é recusado pelo browser) e <code>Access-Control-Allow-Credentials: true</code>; e para o cookie ser sequer enviado entre origens diferentes, tem de ter <code>SameSite=None; Secure</code>, o que reabre a porta ao CSRF e obriga ao token. Este é o momento de dizer a frase de arquitectura: com um proxy na mesma origem, nenhum destes seis pedidos faz preflight, o cookie fica <code>SameSite=Lax</code>, e a configuração de CORS no Spring desaparece. O (3) e o (5) são também um argumento de latência — em APIs com muitas chamadas pequenas, o <code>OPTIONS</code> duplica as idas à rede, mitigado apenas pelo <code>maxAge</code>.</p>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-43-4" class="h2"><span class="secnum">43.4</span> Tempo real e listas grandes: SSE, WebSocket, polling e paginação por cursor<a class="anchor" href="#sec-43-4" aria-label="ligação">#</a></h2>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 43.1</span> Três formas de o servidor falar com o browser, e a que escolher.</div>
+<div class="tscroll"><table><thead><tr><th></th><th>Polling</th><th>SSE (<code>EventSource</code>)</th><th>WebSocket</th></tr></thead><tbody>
+<tr><td>Direcção</td><td>Cliente pergunta</td><td>Servidor → cliente</td><td>Bidireccional</td></tr>
+<tr><td>Transporte</td><td>HTTP normal</td><td>HTTP normal, ligação longa, texto</td><td>Protocolo próprio após <em>upgrade</em></td></tr>
+<tr><td>Reconexão</td><td>Não se aplica</td><td>Automática, com <code>Last-Event-ID</code></td><td>À mão (e o estado perdido)</td></tr>
+<tr><td>Infraestrutura</td><td>Nenhuma</td><td>Proxies têm de não fazer <em>buffer</em>; HTTP/2 resolve o limite de 6 ligações</td><td>Balanceador com <em>sticky</em> ou <em>pub/sub</em> partilhado; <em>timeouts</em> de proxy</td></tr>
+<tr><td>Spring</td><td>Controlador normal</td><td><code>SseEmitter</code> / <code>Flux&lt;ServerSentEvent&gt;</code></td><td><code>@EnableWebSocket</code> / STOMP com <em>broker relay</em></td></tr>
+<tr><td>Escolher para</td><td>Frequência baixa, simplicidade</td><td>Notificações, progresso, <em>feeds</em>, <em>streaming</em> de LLM</td><td>Chat, colaboração, jogos, telemetria bidireccional</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-43-3" data-box="qa" data-area="frontend" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O utilizador quer ver o estado da encomenda actualizar-se sem recarregar. Polling, SSE ou WebSocket — e como fica no Spring?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>SSE, e explico o critério: a comunicação é do servidor para o cliente, os eventos são pouco frequentes, e quero a solução com menos infraestrutura nova. SSE é HTTP normal com uma ligação que fica aberta e recebe eventos de texto; o <code>EventSource</code> do browser reconecta sozinho e envia o <code>Last-Event-ID</code>, portanto se a ligação cair durante uma mudança de rede o cliente recupera os eventos perdidos sem código meu. Passa em qualquer proxy que não faça <em>buffering</em> da resposta, e com HTTP/2 o limite antigo de seis ligações por origem deixa de ser problema.</p>
+      <p>No Spring, um <code>SseEmitter</code> por subscrição num controlador MVC, ou um <code>Flux&lt;ServerSentEvent&gt;</code> em WebFlux — mais natural para ligações longas, porque não prende uma thread por cliente. Os eventos vêm de onde as mudanças acontecem: o serviço que muda o estado publica num tópico (Kafka, ou um <code>Sinks.many()</code> em memória se houver uma instância), e o emissor filtra por utilizador. Com várias instâncias, é preciso um <em>pub/sub</em> partilhado — Redis ou o próprio Kafka — porque o cliente está ligado a uma instância e a mudança pode acontecer noutra. E identifico cada evento (<code>id:</code>) para o <code>Last-Event-ID</code> ter significado, o que obriga a conseguir reenviar eventos desde um identificador: uma tabela ou o <em>offset</em> do tópico.</p>
+      <p>Polling seria a resposta se a frequência fosse muito baixa e a infraestrutura não aguentasse milhares de ligações abertas — um <code>GET</code> a cada trinta segundos com <code>ETag</code> e <code>304</code> custa quase nada, e é honesto dizer que para «o estado da encomenda» pode chegar. WebSocket só se o cliente também enviasse muitas mensagens, ou se a latência de milissegundos importasse; traz um protocolo próprio, reconexão manual, e um balanceador que precisa de <em>sticky sessions</em> ou de um <em>broker</em> partilhado — para notificações de estado, é complexidade sem retorno.</p>
+      <p>No frontend, a subscrição vive no ciclo de vida do componente ou da rota — fechar o <code>EventSource</code> ao desmontar — e o evento não substitui o estado: invalida a <em>query</em> da encomenda (TanStack Query, ou o <em>store</em>) para que a UI vá buscar o estado completo. Assim o SSE é um sinal, não uma segunda fonte de verdade.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«WebSocket, é o que se usa para tempo real.» Não conhece SSE.</td></tr>
+        <tr><td>Mid</td><td>Escolhe SSE, mas não sabe como se implementa em Spring nem o problema das várias instâncias.</td></tr>
+        <tr><td>Sénior</td><td>Escolhe pelo critério, conhece <code>Last-Event-ID</code>, o <em>pub/sub</em> entre instâncias, e usa o evento como sinal de invalidação.</td></tr>
+        <tr><td>Staff</td><td>Discute WebFlux contra MVC para ligações longas, reenvio desde um <em>offset</em>, <em>buffering</em> em proxies e limites de ligações por instância.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como recupera eventos perdidos durante uma reconexão?»</li>
+      <li>«Dez mil utilizadores ligados por SSE — quantas threads?»</li>
+      <li>«O que muda se a API estiver noutra origem?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>WebSocket por omissão.</li>
+      <li>Usar o evento como fonte de verdade em vez de invalidar.</li>
+      <li>Não fechar a ligação ao sair da página.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-43-4" data-box="qa" data-area="frontend" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Uma lista de dezenas de milhares de encomendas. Como desenha a paginação entre a API e a UI?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Por cursor, não por <em>offset</em>, e a razão vem dos dois lados. Do lado da base de dados, <code>OFFSET 50000</code> obriga a ler e descartar cinquenta mil linhas — o custo cresce com a página. Do lado do utilizador, se entre duas páginas alguém inserir ou apagar uma encomenda, o <em>offset</em> muda de significado e a lista salta ou repete itens. Um cursor opaco — codificação da chave de ordenação do último item, tipicamente <code>(criada_em, id)</code> — dá <code>WHERE (criada_em, id) &lt; (?, ?) ORDER BY criada_em DESC, id DESC LIMIT 51</code>: custo constante com um índice, páginas estáveis, e o <em>51</em> serve para saber se há mais sem contar. A API devolve <code>{ itens, proximoCursor }</code> e o cliente não interpreta o cursor.</p>
+      <p>Na UI, a experiência decide o resto. Uma lista infinita usa <code>useInfiniteQuery</code> (ou o equivalente Angular) que guarda as páginas e pede a seguinte quando o último item entra no ecrã; uma tabela com «página 3 de 200» precisa de contagem total, que com cursor não existe — e aí a resposta honesta é uma contagem aproximada calculada à parte (uma vez, em cache), ou aceitar «seguinte/anterior» sem número de página, que é o que a maioria dos utilizadores usa de facto. Os filtros e a ordenação vão para o URL, para que a lista seja partilhável e sobreviva a recarregar; o cursor não vai, porque é uma posição efémera.</p>
+      <p>Independentemente da paginação, a UI só renderiza o que está visível — virtualização —, e o servidor impõe um <code>limit</code> máximo mesmo que o cliente peça mais. E se o utilizador precisa de «exportar tudo», isso não é paginação, é um trabalho assíncrono com um ficheiro no fim.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td><code>page</code> e <code>size</code> sem pensar; carrega tudo e filtra no cliente.</td></tr>
+        <tr><td>Mid</td><td>Conhece cursor, mas não sabe compor a chave nem lidar com a ausência de contagem total.</td></tr>
+        <tr><td>Sénior</td><td>Cursor com chave composta e índice, <code>limit + 1</code>, contrato <code>{ itens, proximoCursor }</code>, filtros no URL, virtualização, limite no servidor.</td></tr>
+        <tr><td>Staff</td><td>Discute contagem aproximada, cursores assinados, e quando o <em>offset</em> ainda é aceitável (páginas pequenas, dados estáticos).</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o utilizador quiser ir à página 200?»</li>
+      <li>«O cursor pode ser um <code>id</code> só?»</li>
+      <li>«Como fica o cursor com ordenação por um campo não único?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Cursor por um campo não único sem desempate.</li>
+      <li>Sem limite máximo no servidor.</li>
+      <li>Renderizar milhares de linhas no DOM.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-43-5" class="h2"><span class="secnum">43.5</span> Monorepo, build e entrega: quem serve o frontend<a class="anchor" href="#sec-43-5" aria-label="ligação">#</a></h2>
+
+<p>Há duas perguntas operacionais que aparecem sempre. <strong>Onde vive o código</strong>: um monorepo com Nx ou Turborepo dá pacotes partilhados (tipos gerados do contrato, o sistema de design, utilitários) com <em>builds</em> incrementais e cache remota, e é a escolha quando frontend e backend são a mesma equipa e saem juntos; repositórios separados são a escolha quando as equipas e as cadências são diferentes, e o contrato passa a ser o único ponto de contacto — versionado e publicado. <strong>Quem serve o frontend</strong>: dentro do JAR do Spring (em <code>static/</code>, com um <em>forward</em> das rotas da SPA para <code>index.html</code>) é a opção de menor infraestrutura, um único artefacto e a mesma origem por construção; separado, num CDN ou num contentor nginx, dá cache de borda, <em>deploys</em> independentes e um backend que não sabe que existe um frontend — ao custo de configurar o <em>routing</em> de origem única no proxy. A tabela decide.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 43.2</span> Três formas de entregar a SPA e o que cada uma implica.</div>
+<div class="tscroll"><table><thead><tr><th></th><th>Dentro do JAR do Spring</th><th>Contentor nginx ao lado</th><th>CDN / armazenamento estático</th></tr></thead><tbody>
+<tr><td>Origem</td><td>Mesma, por construção</td><td>Mesma, se o <em>ingress</em> encaminhar <code>/api</code></td><td>Diferente, salvo CDN com <em>origin</em> para a API</td></tr>
+<tr><td><em>Deploy</em></td><td>Acoplado: um artefacto</td><td>Independente, mesmo <em>cluster</em></td><td>Independente, global</td></tr>
+<tr><td>Cache</td><td>Cabeçalhos a configurar no Spring</td><td>Configuração nginx</td><td>Borda, invalidação por <em>hash</em> no nome</td></tr>
+<tr><td>Rotas da SPA</td><td><em>Forward</em> para <code>index.html</code> nas rotas não-API</td><td><code>try_files $uri /index.html</code></td><td>Regra de <em>rewrite</em> no CDN</td></tr>
+<tr><td>Quando</td><td>Ferramenta interna, equipa única, menos infraestrutura</td><td>Kubernetes já existe; cadências diferentes</td><td>Produto público, tráfego global, LCP importa</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-43-5" data-box="qa" data-area="frontend" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como está organizado o build e o deploy de uma aplicação com frontend React e backend Spring? O que faria diferente em produto público contra ferramenta interna?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Para uma ferramenta interna com uma equipa, a resposta preguiçosa e certa é um único artefacto: o build do frontend (Vite) corre no <em>pipeline</em> antes do Gradle ou Maven, os ficheiros vão para <code>static/</code> no JAR, e o Spring serve a SPA com um controlador que encaminha rotas desconhecidas para <code>index.html</code>. Mesma origem por construção — sem CORS, cookies simples —, um <em>deploy</em>, uma versão, e nada de infraestrutura nova. Os cabeçalhos de cache configuram-se no Spring: imutável para os ficheiros com <em>hash</em>, <code>no-cache</code> para o <code>index.html</code>. O custo é o acoplamento: qualquer mudança no frontend é um <em>deploy</em> do backend, e vice-versa.</p>
+      <p>Para um produto público, separo: o frontend é um artefacto estático publicado num CDN (ou num contentor nginx atrás do <em>ingress</em>), com <em>deploys</em> independentes e cache de borda para o LCP em todas as geografias; o backend é uma API que não sabe que existe um frontend. A mesma origem mantém-se pelo <em>routing</em> — o CDN ou o <em>ingress</em> encaminha <code>/api</code> para o backend — ou, se as origens forem mesmo diferentes, entra um BFF. O <em>pipeline</em> tem duas cadências, e o contrato OpenAPI é o que as liga: o CI do frontend gera tipos contra a versão do backend em <em>staging</em>, e falha se houver quebra.</p>
+      <p>Em ambos os casos, três coisas não mudam. O <code>index.html</code> nunca é cacheado (senão os utilizadores ficam com bundles antigos para sempre) e os <em>chunks</em> têm <em>hash</em> no nome e cache de um ano. O <em>deploy</em> do frontend mantém os <em>chunks</em> da versão anterior no servidor durante algum tempo, porque uma aba aberta com a versão antiga vai pedir <em>chunks</em> antigos por <em>lazy loading</em> — e um <code>404</code> aí é uma página partida; a alternativa é o frontend detectar uma versão nova e sugerir recarregar. E o <em>pipeline</em> tem orçamentos: tamanho do bundle inicial e tempo de testes, ambos a falhar o build quando ultrapassados.</p>
+      <p>Monorepo com Nx ou Turborepo se a equipa é uma e há código partilhado — o pacote de tipos gerados, o sistema de design; repositórios separados se as equipas e cadências são diferentes, e aí o contrato é publicado como pacote versionado. Não sou religioso sobre isto; sou sobre o <code>index.html</code> sem cache e os <em>chunks</em> antigos disponíveis.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe como a SPA chega ao utilizador; <code>index.html</code> em cache; rotas da SPA a dar <code>404</code>.</td></tr>
+        <tr><td>Mid</td><td>Descreve uma forma de servir, mas sem cabeçalhos de cache nem o problema dos <em>chunks</em> antigos.</td></tr>
+        <tr><td>Sénior</td><td>Duas configurações com critério, cache correcta, <em>chunks</em> antigos mantidos, contrato no CI, orçamentos.</td></tr>
+        <tr><td>Staff</td><td>Discute cadências e organização de equipas, detecção de versão nova no cliente, e <em>rollback</em> coordenado entre frontend e backend.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um utilizador com a aba aberta há dois dias clica numa rota <em>lazy</em>. O que acontece?»</li>
+      <li>«Como faz <em>rollback</em> só do frontend?»</li>
+      <li>«Monorepo ou não, e porquê?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>index.html</code> com <code>max-age</code> longo.</li>
+      <li>Apagar os <em>chunks</em> antigos no <em>deploy</em>.</li>
+      <li>Frontend e backend sem nenhum teste de contrato entre eles.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-43-6" class="h2"><span class="secnum">43.6</span> Erros, observabilidade e feature flags do lado do cliente<a class="anchor" href="#sec-43-6" aria-label="ligação">#</a></h2>
+
+<p>A observabilidade do backend termina no <em>load balancer</em>; a do produto começa no browser. Três peças ligam os dois mundos. Um <strong>identificador de correlação</strong> gerado no cliente (ou pelo <em>gateway</em>, propagado como <code>traceparent</code> do W3C ou <code>X-Request-Id</code>), enviado em cada pedido, posto no MDC dos logs do Spring por um filtro, incluído nos <em>traces</em>, e devolvido no <code>problem+json</code> para o utilizador o poder citar — «deu-me erro» transforma-se num identificador para pesquisar. <strong>Captura de erros no cliente</strong> (Sentry ou equivalente): excepções não tratadas, rejeições de promessas, erros de <em>boundaries</em>, com contexto (versão do bundle, rota, utilizador anonimizado, últimas acções) e <em>source maps</em> carregados no CI para que o <em>stack trace</em> minificado seja legível — mais os Core Web Vitals reais (RUM), que são a única medição de performance que conta. <strong>Feature flags</strong> avaliadas no servidor e entregues ao cliente como um conjunto de booleanos por utilizador: o cliente decide o que mostrar, o servidor decide o que autorizar — uma <em>flag</em> que só existe no frontend não é uma <em>flag</em> de segurança, é uma sugestão.</p>
+
+<div class="qa" id="q-43-6" data-box="qa" data-area="frontend" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um utilizador diz que «deu erro ao pagar». Como chega do relato ao registo do servidor, e o que já devia estar montado para isso demorar dois minutos?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O que devia estar montado: um identificador de correlação que atravessa tudo. O frontend gera um <code>X-Request-Id</code> por pedido (ou propaga o <code>traceparent</code> que o <em>gateway</em> inicia), o Spring apanha-o num filtro e põe-no no MDC para que todas as linhas de log daquele pedido o tenham, o <em>tracing</em> distribuído usa-o como identificador de <em>trace</em>, e o <code>problem+json</code> devolve-o no corpo — e a UI mostra-o na mensagem de erro: «Não foi possível concluir o pagamento. Código de apoio: 7f3a…». O utilizador cita o código; eu procuro-o nos logs e no <em>tracing</em> e tenho o pedido completo, com as chamadas ao gateway de pagamento e os tempos de cada uma.</p>
+      <p>Do lado do cliente, o Sentry (ou equivalente) captura o erro com contexto: versão do bundle, rota, o <em>breadcrumb</em> das últimas acções e pedidos, o browser e o dispositivo, e o mesmo identificador de correlação como <em>tag</em> — o que permite ir do evento no Sentry ao <em>trace</em> no backend com um clique. Isto exige <em>source maps</em> carregados no CI a cada <em>deploy</em>, senão o <em>stack trace</em> é minificado e inútil, e uma <em>release</em> identificada para saber que versão o utilizador tinha.</p>
+      <p>Sem o código de apoio, o caminho é mais longo mas ainda possível: o utilizador identificado (ou a sessão), a janela temporal, e o filtro por rota de pagamento no Sentry e por <em>endpoint</em> nos logs. É aqui que se vê se a observabilidade foi desenhada ou improvisada.</p>
+      <p>Duas notas de senioridade. A mensagem para o utilizador nunca inclui o <code>detail</code> técnico do servidor — inclui o que ele pode fazer e o código; o detalhe fica no log. E os erros que o utilizador vê são uma métrica de produto: uma taxa de erro na página de pagamento acima de um limiar dispara um alerta, porque «deu erro ao pagar» não devia chegar por relato — devia chegar por alarme antes do relato.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Peço a hora e procuro nos logs.» Sem correlação nem captura no cliente.</td></tr>
+        <tr><td>Mid</td><td>Tem Sentry ou correlação, mas não os dois ligados; sem <em>source maps</em>.</td></tr>
+        <tr><td>Sénior</td><td>Correlação de ponta a ponta com o código mostrado ao utilizador, Sentry com contexto e <em>source maps</em>, ligação entre os dois.</td></tr>
+        <tr><td>Staff</td><td>Trata erros do cliente como métrica de produto com alertas, discute privacidade no que se captura, e RUM como fonte de performance.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que não deve ir para o Sentry?»</li>
+      <li>«Como propaga o identificador por um SSE ou WebSocket?»</li>
+      <li>«Como mede o LCP real dos utilizadores?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Mostrar <em>stack traces</em> ou <code>detail</code> técnico ao utilizador.</li>
+      <li>Nenhuma captura de erros no cliente.</li>
+      <li>Logs sem identificador que os ligue ao pedido.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-43-7" data-box="qa" data-area="frontend" data-level="mid" data-freq="baixa">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Ocasional</span></div></div>
+  <div class="qprompt">Como faz <em>feature flags</em> numa aplicação com frontend e backend? Onde se avaliam?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Avaliam-se no servidor e entregam-se ao cliente já decididas. O backend (ou o serviço de <em>flags</em> — Unleash, LaunchDarkly, ou uma tabela própria) avalia as regras para o utilizador autenticado — percentagem, segmento, lista de <em>beta</em> — e a API expõe um <em>endpoint</em> que devolve o conjunto de booleanos; o frontend carrega-o no arranque, guarda-o em memória, e usa-o para mostrar ou esconder. A razão de avaliar no servidor é dupla: as regras não vão para o bundle (não expõem a estratégia de lançamento nem são manipuláveis), e a mesma avaliação serve o backend, que é onde a <em>flag</em> tem de ser verdadeiramente imposta.</p>
+      <p>Esse é o ponto que separa: uma <em>flag</em> só no frontend esconde um botão, mas o <em>endpoint</em> continua a aceitar o pedido de quem o descobrir. Se a funcionalidade tem consequências — um novo tipo de pagamento —, a <em>flag</em> é verificada também no serviço, e a do frontend é só experiência. Para a decisão ser consistente nos dois lados, ambos avaliam com o mesmo identificador de utilizador e a mesma semente, ou o frontend recebe a decisão do backend em vez de a calcular.</p>
+      <p>Operacionalmente: <em>flags</em> têm dono e data de remoção, porque uma <em>flag</em> permanente é um <code>if</code> permanente com dois caminhos por testar; o <em>kill switch</em> de uma funcionalidade nova é a <em>flag</em> mais valiosa; e as <em>flags</em> entram nos eventos de <em>analytics</em> e nos erros do Sentry como <em>tags</em>, para se saber que variante o utilizador tinha quando algo correu mal.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Variáveis de ambiente no build do frontend; uma <em>flag</em> é um <em>deploy</em>.</td></tr>
+        <tr><td>Mid</td><td>Serviço de <em>flags</em> avaliado no cliente, sem imposição no backend.</td></tr>
+        <tr><td>Sénior</td><td>Avaliação no servidor, imposição no backend, experiência no frontend, consistência entre os dois, e higiene de remoção.</td></tr>
+        <tr><td>Staff</td><td>Liga a <em>analytics</em> e erros, discute <em>flags</em> em SSR e cache, e o processo de lançamento progressivo com <em>kill switch</em>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como evita que uma <em>flag</em> exponha um <em>endpoint</em> a quem a contornar?»</li>
+      <li>«E com SSR, onde se avalia?»</li>
+      <li>«Quantas <em>flags</em> activas tinha o último projecto?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><em>Flags</em> só no frontend para funcionalidades com efeitos.</li>
+      <li><em>Flags</em> sem dono nem data de remoção.</li>
+      <li>Regras de lançamento no bundle.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-43-8" data-box="qa" data-area="frontend" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Frontend e integração</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">React ou Angular para o próximo produto, com uma equipa de backend Java que vai fazer full-stack?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Respondo com critérios antes de responder com um nome, porque a pergunta está a testar se tenho uma opinião fundamentada ou uma preferência. Os dois são maduros, os dois fazem tudo o que um produto precisa, e a diferença está em três eixos: quanta estrutura vem de fábrica, como é o ecossistema, e o que a equipa já sabe.</p>
+      <p>Angular vem com tudo decidido — <em>router</em>, formulários, HTTP, injecção de dependências, testes, CLI — e o resultado é que dois projectos Angular se parecem um com o outro e um programador de Java reconhece a arquitectura em cinco minutos. Para uma equipa de backend que vai fazer full-stack, isso é uma vantagem real: menos decisões, menos <em>bikeshedding</em>, TypeScript estrito por omissão, e uma migração de versão gerida pelo CLI. O custo é a curva de aprendizagem de RxJS e da change detection, e um ecossistema mais pequeno.</p>
+      <p>React é uma biblioteca com um ecossistema: cada projecto escolhe <em>router</em>, dados, formulários, estilo, e o resultado depende de quem escolhe. A vantagem é a flexibilidade e a dimensão do ecossistema — qualquer componente, qualquer integração, existe primeiro para React —, e com Next.js e Server Components há um caminho para páginas de conteúdo rápidas que Angular só começa a ter. O custo é exactamente a flexibilidade: uma equipa sem experiência de frontend faz escolhas más nas primeiras semanas e vive com elas dois anos, e a disciplina dos hooks é menos intuitiva do que parece — os exercícios do capítulo 41 são a prova.</p>
+      <p>Para a equipa descrita — backend Java, a começar — recomendaria Angular, com signals, standalone e OnPush desde o primeiro dia, porque a estrutura imposta é o que uma equipa sem experiência de frontend mais precisa e o modelo de injecção é o que já conhecem. Mudaria para React se o produto fosse público com conteúdo indexável (Next.js), se houvesse gente de frontend com experiência de React para fixar as convenções, ou se dependesse de um ecossistema específico — visualização de dados, editores ricos. E o que não faria em nenhum dos casos é decidir sem um <em>spike</em> de duas semanas com a equipa real a fazer uma funcionalidade real nos dois.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«React, é mais popular» ou «Angular, é mais completo», sem critérios.</td></tr>
+        <tr><td>Mid</td><td>Compara funcionalidades correctamente, mas não liga a decisão à equipa nem ao produto.</td></tr>
+        <tr><td>Sénior</td><td>Três eixos, recomendação para o contexto dado com as condições em que mudaria, e um <em>spike</em> para validar.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta custo de contratação, ciclo de versões e migrações, e o risco organizacional de cada escolha a dois anos.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E Vue ou Svelte?»</li>
+      <li>«O que é que mais custa a um programador de Java em cada um?»</li>
+      <li>«Como estrutura o primeiro mês para a equipa não se perder?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Guerra santa.</li>
+      <li>Decidir sem falar da equipa.</li>
+      <li>Nunca ter usado um dos dois e ter opinião forte sobre ele.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-43-7" class="h2"><span class="secnum">43.7</span> Resumo e checklist<a class="anchor" href="#sec-43-7" aria-label="ligação">#</a></h2>
+
+<p>A integração é onde o full-stack se distingue: as decisões certas são quase todas de fronteira — contrato, origem, sessão, entrega — e são as que um programador só de frontend ou só de backend deixa para «o outro lado».</p>
+
+<ul class="lst">
+  <li>Contrato executável: OpenAPI do Spring, tipos gerados no CI contra a versão a publicar, evolução aditiva com <code>deprecated</code>, validação de esquema na fronteira onde importa.</li>
+  <li>O browser pode ter o bundle de ontem: a API serve as duas versões durante a janela; os <em>chunks</em> antigos ficam no servidor; o <code>index.html</code> nunca é cacheado.</li>
+  <li><code>problem+json</code> com um único tradutor no cliente; todos os erros de validação de uma vez, com o nome do campo do DTO.</li>
+  <li>Autenticação: sessão por cookie com Spring Security quando a identidade é própria; BFF com <em>Authorization Code</em> + PKCE quando é externa; tokens nunca no <em>storage</em>; <em>logout</em> em três passos.</li>
+  <li>Mesma origem por proxy (Vite em dev, nginx/<em>ingress</em> em prod) elimina CORS, preflight e <code>SameSite=None</code>. CORS só para APIs genuinamente públicas, com origens explícitas e <code>maxAge</code>.</li>
+  <li>Pedido simples: GET/HEAD/POST, cabeçalhos <em>safelisted</em>, <code>Content-Type</code> de formulário. JSON, <code>Authorization</code> e qualquer outro método fazem preflight.</li>
+  <li>SSE para servidor → cliente; WebSocket só se for bidireccional; polling com <code>ETag</code> quando a frequência é baixa. O evento invalida, não substitui.</li>
+  <li>Paginação por cursor com chave composta e <code>limit + 1</code>; filtros no URL; virtualização; limite no servidor.</li>
+  <li>Entrega: dentro do JAR para ferramenta interna; CDN ou nginx para produto público; orçamentos de bundle no CI.</li>
+  <li>Correlação de ponta a ponta mostrada ao utilizador, Sentry com <em>source maps</em>, RUM para performance, <em>flags</em> avaliadas no servidor e impostas no backend.</li>
+</ul>
+
+<p>Checklist de preparação para as 48 horas antes da entrevista:</p>
+
+<ul class="lst">
+  <li>Resolver o Exercício 43.2 e saber a definição de «pedido simples» de cor.</li>
+  <li>Desenhar o fluxo BFF do Exercício 43.1 no papel em cinco minutos, com os quatro cenários.</li>
+  <li>Ter a Tabela 43.1 na cabeça e um exemplo real de cada coluna.</li>
+  <li>Explicar a paginação por cursor com a consulta SQL e o contrato da API.</li>
+  <li>Saber o que acontece a uma aba aberta há dois dias depois de um <em>deploy</em>, e o que já está montado para isso.</li>
+  <li>Ter a resposta «React ou Angular» pronta com três critérios e uma recomendação condicionada.</li>
+</ul>

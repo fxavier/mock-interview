@@ -1,0 +1,534 @@
+<p>React é a biblioteca que mais aparece nas entrevistas de full-stack e a que produz respostas mais decoradas: toda a gente sabe dizer «virtual DOM» e quase ninguém consegue explicar porque é que um <code>setInterval</code> dentro de um <code>useEffect</code> conta sempre até um. Este capítulo é para quem tem base de backend: o modelo mental de UI como função do estado, o que acontece entre chamar <code>setState</code> e o ecrã mudar, as regras dos hooks com a razão de cada uma, onde vive o estado e a diferença entre estado de interface e estado de servidor, e o que mudou com o React 19 e os Server Components. Acaba com quatro exercícios de prever a saída, porque é assim que se separa quem percebeu o modelo de quem o memorizou.</p>
+
+<h2 id="sec-41-1" class="h2"><span class="secnum">41.1</span> UI = f(estado): render, commit e reconciliação<a class="anchor" href="#sec-41-1" aria-label="ligação">#</a></h2>
+
+<p>Um componente é uma função que recebe <em>props</em> e devolve uma descrição da interface — elementos, que são objectos leves, não nós do DOM. Quando o estado muda, React chama a função outra vez, obtém uma descrição nova, e compara-a com a anterior para calcular o conjunto mínimo de operações no DOM real. As duas fases têm nome e é importante distingui-las: a fase de <strong>render</strong> chama as funções dos componentes (pura, pode ser interrompida e repetida, e é por isso que o StrictMode a corre duas vezes em desenvolvimento) e a fase de <strong>commit</strong> aplica as diferenças ao DOM e corre os <em>effects</em> (síncrona, uma vez). Tudo o que é efeito lateral pertence ao commit — <code>useEffect</code>, <code>useLayoutEffect</code>, <em>refs</em> —, e é por isso que escrever numa variável global ou chamar <code>fetch</code> no corpo do componente é um bug e não uma opinião.</p>
+
+<p>A comparação chama-se <strong>reconciliação</strong> e tem duas regras que explicam quase todos os comportamentos estranhos. Primeira: elementos de tipo diferente na mesma posição destroem a subárvore e criam outra — trocar <code>&lt;div&gt;</code> por <code>&lt;section&gt;</code> perde o estado de tudo o que está dentro. Segunda: numa lista, a <strong>key</strong> é a identidade do elemento entre renders; com a key certa (o identificador do dado) React move nós e preserva o estado; com o índice como key, remover o primeiro item faz o segundo herdar a instância e o estado do primeiro. O «virtual DOM» não é a razão de React ser rápido — comparar árvores custa — é a razão de o modelo declarativo ser possível sem que o programador gira o DOM à mão.</p>
+
+<div class="qa" id="q-41-1" data-box="qa" data-area="react" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O que acontece entre chamar <code>setState</code> e o ecrã mudar? Explique render, commit e o papel das keys.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p><code>setState</code> não muda nada imediatamente: agenda uma actualização. Quando o handler termina — ou quando o <em>scheduler</em> decide, em transições —, React entra na fase de render: chama a função do componente com o estado novo, e recursivamente as dos filhos cujas props mudaram (ou todos os filhos, se não estiverem memoizados), obtendo uma árvore nova de elementos. Esta fase é pura e pode ser interrompida, abandonada ou repetida; é por isso que o corpo de um componente não pode ter efeitos laterais, e é por isso que o StrictMode a executa duas vezes em desenvolvimento para os apanhar.</p>
+      <p>Depois vem a reconciliação: comparar a árvore nova com a anterior, posição a posição. Mesmo tipo no mesmo sítio — actualiza as props e mantém a instância e o estado. Tipo diferente — destrói a subárvore e monta outra, perdendo o estado. Em listas, a comparação por posição seria errada, e é para isso que existem as keys: identificam o elemento entre renders, para que React saiba que o item que estava na posição 2 é agora o da posição 0 e o mova em vez de reescrever os três. Com o índice como key, a identidade fica presa à posição, e remover ou reordenar mistura estados — inputs com texto trocado é o sintoma clássico.</p>
+      <p>A fase de commit aplica ao DOM o conjunto mínimo de mutações calculado, de forma síncrona, e só depois corre os <em>effects</em>: primeiro os <code>useLayoutEffect</code> (antes de o browser pintar, para medir ou ajustar layout) e depois os <code>useEffect</code> (depois da pintura). A ordem dentro de uma árvore é filhos antes de pais, e as funções de limpeza do render anterior correm antes dos <em>effects</em> novos.</p>
+      <p>Duas notas que costumam distinguir: várias actualizações no mesmo handler são agrupadas num único render (<em>batching</em>, automático desde o React 18 mesmo em promessas e timers); e o valor lido de <code>state</code> dentro do handler é o do render em que o handler foi criado — não o «actual» —, porque cada render tem as suas variáveis. É isso que produz as closures obsoletas de que falamos a seguir.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«O virtual DOM torna tudo rápido.» Não sabe distinguir render de commit nem o que uma key faz.</td></tr>
+        <tr><td>Mid</td><td>Descreve o ciclo correctamente, mas não explica porque é que o render tem de ser puro nem o efeito de <code>key={index}</code>.</td></tr>
+        <tr><td>Sénior</td><td>Separa as fases e as suas garantias, explica reconciliação por tipo e por key, ordem dos <em>effects</em> e <em>batching</em>.</td></tr>
+        <tr><td>Staff</td><td>Liga a render concorrente e transições, ao StrictMode como detector de impureza, e ao custo real de reconciliar árvores grandes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o StrictMode chama o componente duas vezes?»</li>
+      <li>«Quando é que <code>key={index}</code> é aceitável?»</li>
+      <li>«<code>useEffect</code> ou <code>useLayoutEffect</code> para medir um elemento?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Efeitos laterais no corpo do componente.</li>
+      <li>«O virtual DOM é mais rápido do que o DOM.»</li>
+      <li>Keys aleatórias (<code>Math.random()</code>) para «resolver o aviso».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-2" class="h2"><span class="secnum">41.2</span> Hooks por dentro: regras, batching, dependências e closures obsoletas<a class="anchor" href="#sec-41-2" aria-label="ligação">#</a></h2>
+
+<p>Os hooks funcionam por posição: React guarda, por instância de componente, uma lista de células de estado, e a n-ésima chamada a um hook lê a n-ésima célula. É por isso que a regra «só no topo, nunca dentro de <code>if</code> ou ciclos» existe — não é estilo, é a única forma de a n-ésima chamada ser sempre a mesma. A segunda regra, «só em componentes ou noutros hooks», garante que existe uma instância a quem associar a lista. Um hook personalizado é só uma função que chama hooks; não partilha estado entre quem o usa, cada chamada tem as suas células.</p>
+
+<p>Cada render é uma chamada nova à função, com as suas próprias variáveis. Um handler ou um <em>effect</em> criado num render fecha sobre os valores <em>desse</em> render; se for guardado (num <code>setInterval</code>, num <em>listener</em>, num <code>useEffect</code> com <code>[]</code>) continua a ver esses valores para sempre — a <strong>closure obsoleta</strong>. As defesas são três: a forma funcional <code>setX(prev =&gt; …)</code> quando o novo valor depende do anterior; declarar a dependência e deixar o <em>effect</em> refazer-se (com limpeza); ou um <code>useRef</code> para o que precisa de ser lido «actual» sem provocar renders. O <em>linter</em> de dependências não é um incómodo a silenciar — é o detector de closures obsoletas, e cada <code>eslint-disable</code> nele é um bug adiado.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 41.1</span> Os hooks que se confundem, e a pergunta que decide qual usar.</div>
+<div class="tscroll"><table><thead><tr><th>Hook</th><th>Serve para</th><th>Provoca render?</th><th>Pergunta que decide</th></tr></thead><tbody>
+<tr><td><code>useState</code></td><td>Valor que a UI mostra</td><td>Sim</td><td>Se mudar, o ecrã tem de mudar?</td></tr>
+<tr><td><code>useRef</code></td><td>Valor mutável entre renders, ou nó do DOM</td><td>Não</td><td>Preciso do valor actual num callback sem re-renderizar?</td></tr>
+<tr><td><code>useEffect</code></td><td>Sincronizar com o exterior (subscrições, timers, DOM) depois de pintar</td><td>—</td><td>Isto é um efeito lateral que depende do render? Se é só derivar dados, não é <em>effect</em></td></tr>
+<tr><td><code>useLayoutEffect</code></td><td>Medir ou ajustar layout antes de pintar</td><td>—</td><td>O utilizador veria um salto se corresse depois da pintura?</td></tr>
+<tr><td><code>useMemo</code></td><td>Cachear um cálculo caro ou estabilizar uma referência</td><td>—</td><td>Medi que é caro, ou a identidade importa a um <code>memo</code>/dependência?</td></tr>
+<tr><td><code>useCallback</code></td><td>Estabilizar a identidade de uma função</td><td>—</td><td>A função é prop de um componente memoizado ou dependência de um <em>effect</em>?</td></tr>
+<tr><td><code>useReducer</code></td><td>Estado com transições complexas</td><td>Sim</td><td>Há várias acções que mudam vários campos de forma coordenada?</td></tr>
+</tbody></table></div></div>
+
+<figure class="listing tsx" id="lst-41-1"><div class="lhead"><span class="lnum">Listagem 41.1</span>
+<span class="lcap">O padrão correcto de um <em>effect</em> com subscrição: dependência declarada, limpeza, e protecção contra respostas fora de ordem.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="tsx"><code>function Detalhe({ id }: { id: string }) {
+  const [enc, setEnc] = useState&lt;Encomenda | null&gt;(null);
+
+  useEffect(() =&gt; {
+    const ctrl = new AbortController();
+    fetch(`/api/encomendas/${id}`, { signal: ctrl.signal })
+      .then((r) =&gt; r.json())
+      .then(setEnc)
+      .catch((e) =&gt; { if (e.name !== 'AbortError') throw e; });
+    return () =&gt; ctrl.abort();   // muda o id a meio? cancela o pedido antigo
+  }, [id]);                       // depende de id: refaz-se quando mudar
+
+  return enc ? &lt;pre&gt;{enc.estado}&lt;/pre&gt; : &lt;p&gt;A carregar…&lt;/p&gt;;
+}
+// Em produção, isto é exactamente o que uma biblioteca de dados (TanStack Query) faz por nós,
+// mais cache, deduplicação, retries e invalidação — ver 41.3.</code></pre></figure>
+
+<div class="qa" id="q-41-2" data-box="qa" data-area="react" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Porque é que os hooks não podem estar dentro de um <code>if</code>? E o que é uma closure obsoleta — dê um exemplo e a correcção.</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Porque os hooks são identificados pela ordem de chamada. React não tem nomes para os estados de um componente — tem uma lista ligada de células, e a primeira chamada a <code>useState</code> lê a primeira célula, a segunda lê a segunda. Se um hook estiver dentro de um <code>if</code> que num render é verdadeiro e noutro falso, a partir daí todas as chamadas seguintes lêem a célula errada: um <code>useState</code> passa a receber o valor de um <code>useRef</code>, e o resultado é um erro que aparece longe do sítio. A regra existe para que a ordem seja idêntica em todos os renders; a condição vai para <em>dentro</em> do hook (um <code>useEffect</code> cujo corpo começa por <code>if (!activo) return</code>), não à volta dele.</p>
+      <p>Uma closure obsoleta é uma função que captura o estado de um render e é usada depois de esse render ter sido substituído. O exemplo canónico é um contador com <code>useEffect(() =&gt; { const id = setInterval(() =&gt; setC(c + 1), 1000); return () =&gt; clearInterval(id); }, [])</code>: o <em>effect</em> corre uma vez, o callback do intervalo capturou <code>c = 0</code>, e cada tick escreve <code>0 + 1</code>. O contador mostra 1 para sempre, sem erro nenhum na consola — o que o torna traiçoeiro.</p>
+      <p>Há três correcções, e a escolha diz algo sobre o problema. A forma funcional, <code>setC(prev =&gt; prev + 1)</code>, é a certa aqui: o novo valor depende do anterior, e a função recebe sempre o estado mais recente independentemente da closure. Declarar <code>[c]</code> nas dependências também funciona, ao custo de destruir e recriar o intervalo a cada segundo — aceitável para um timer, mau para uma ligação WebSocket. E um <code>useRef</code> que se mantém actualizado (<code>ref.current = c</code> no corpo) serve quando um callback de longa duração precisa de ler vários valores actuais sem se refazer; o React 19 formaliza este padrão com <code>useEffectEvent</code>.</p>
+      <p>A conclusão que dou é sobre o <em>linter</em>: o aviso de dependências em falta é o detector de closures obsoletas. Cada <code>eslint-disable-next-line react-hooks/exhaustive-deps</code> que vejo em <em>code review</em> é uma pergunta — «que valor é que este <em>effect</em> vai ver desactualizado?» — e quase sempre a resposta é «este», e o bug já lá está.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É uma regra do React.» Não sabe o que é uma closure obsoleta.</td></tr>
+        <tr><td>Mid</td><td>Sabe a regra e reconhece o bug do intervalo, mas só conhece uma correcção e silencia o <em>linter</em>.</td></tr>
+        <tr><td>Sénior</td><td>Explica a lista por posição, dá o exemplo com o mecanismo, e escolhe entre as três correcções pelo custo.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta <code>useEffectEvent</code>, o papel do React Compiler e uma política de equipa para <code>exhaustive-deps</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«E se o hook estiver depois de um <code>return</code> antecipado?»</li>
+      <li>«Quando é que um <code>useRef</code> é a resposta certa em vez de estado?»</li>
+      <li>«O que faz o <code>[]</code> no <code>useEffect</code>, exactamente?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Silenciar <code>exhaustive-deps</code> por hábito.</li>
+      <li>Usar estado para valores que não afectam a UI.</li>
+      <li>Não conseguir prever o bug do intervalo.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-3" class="h2"><span class="secnum">41.3</span> Estado: onde vive, quem o partilha e a diferença entre estado de UI e de servidor<a class="anchor" href="#sec-41-3" aria-label="ligação">#</a></h2>
+
+<p>A decisão mais importante numa aplicação React não é a biblioteca de estado — é reconhecer que há dois tipos de estado com regras opostas. <strong>Estado de interface</strong> (que aba está aberta, um formulário a meio, um filtro) pertence à aplicação, é síncrono, e vive o mais perto possível de quem o usa: no componente, elevado ao pai comum quando dois irmãos o partilham, num <em>store</em> leve quando está longe. <strong>Estado de servidor</strong> (a lista de encomendas, o perfil) pertence a outra máquina; a cópia no cliente é uma <em>cache</em>, com tudo o que isso implica — pode estar velha, precisa de invalidação, deduplicação de pedidos, <em>retries</em>, e reflecte escritas de outros utilizadores. Tratá-lo como estado de UI, copiando respostas para um <em>store</em> e actualizando à mão, é a origem de metade dos bugs de «a lista não actualizou».</p>
+
+<p>Daí a arquitectura que hoje é consenso: TanStack Query (ou SWR, ou o <em>fetch</em> com cache do Next) para estado de servidor, com chaves de consulta, <code>staleTime</code>, invalidação por chave depois de mutações e actualizações optimistas; e para estado de UI global, o mínimo — <code>useState</code> elevado, Context para valores que mudam pouco (tema, utilizador), Zustand ou Redux Toolkit quando há muito estado transversal com transições complexas. Context não é um <em>store</em>: qualquer alteração re-renderiza todos os consumidores, e é por isso que um Context com o estado inteiro da aplicação é o anti-padrão de performance mais comum.</p>
+
+<figure class="listing tsx" id="lst-41-2"><div class="lhead"><span class="lnum">Listagem 41.2</span>
+<span class="lcap">Estado de servidor como cache: chave, <em>stale time</em>, mutação com invalidação e actualização optimista.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+<pre class="code" data-lang="tsx"><code>const chave = (id: string) =&gt; ['encomenda', id] as const;
+
+function useEncomenda(id: string) {
+  return useQuery({ queryKey: chave(id), queryFn: () =&gt; api.encomenda(id), staleTime: 30_000 });
+}
+
+function useCancelar(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =&gt; api.cancelar(id),
+    onMutate: async () =&gt; {                          // optimista: mostra já, reverte se falhar
+      await qc.cancelQueries({ queryKey: chave(id) });
+      const anterior = qc.getQueryData&lt;Encomenda&gt;(chave(id));
+      qc.setQueryData&lt;Encomenda&gt;(chave(id), (e) =&gt; e &amp;&amp; { ...e, estado: 'CANCELADA' });
+      return { anterior };
+    },
+    onError: (_e, _v, ctx) =&gt; qc.setQueryData(chave(id), ctx?.anterior),
+    onSettled: () =&gt; qc.invalidateQueries({ queryKey: ['encomenda'] }),   // a verdade é o servidor
+  });
+}</code></pre></figure>
+
+<div class="qa" id="q-41-3" data-box="qa" data-area="react" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Redux, Zustand, Context, TanStack Query — como decide onde vive o estado?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo por separar o que é estado de servidor do que é estado de interface, porque as ferramentas certas são diferentes e a maioria dos problemas vem de as misturar. Estado de servidor — tudo o que veio de uma API — é uma cache: TanStack Query trata da chave, da expiração, da deduplicação (dois componentes a pedir o mesmo recurso fazem um pedido), dos <em>retries</em>, da invalidação depois de uma mutação, e das actualizações optimistas com reversão. Com isto, oitenta por cento do que costumava estar em Redux desaparece, porque era só código a copiar respostas para um <em>store</em> e a mantê-las sincronizadas à mão.</p>
+      <p>O que sobra é estado de interface, e aí a regra é proximidade: <code>useState</code> no componente que o usa; elevado ao pai comum quando dois irmãos o partilham; e só quando está genuinamente longe — o carrinho, o utilizador autenticado, preferências — é que sai para um <em>store</em> global. Context serve para valores que mudam raramente (tema, idioma, sessão) e são lidos em muitos sítios; não serve como <em>store</em>, porque qualquer alteração re-renderiza todos os consumidores, sem selecção.</p>
+      <p>Para um <em>store</em> a sério, escolho pela complexidade das transições. Zustand para a maioria: uma função, selectores que só re-renderizam quem lê o que mudou, sem cerimónia. Redux Toolkit quando há muitas acções que afectam várias fatias de estado de forma coordenada, quando a equipa é grande e beneficia da estrutura, ou quando as <em>DevTools</em> com viagem no tempo compensam — em fluxos complexos de edição, por exemplo. O Redux clássico, com <em>action creators</em> e <em>reducers</em> à mão, já não se justifica.</p>
+      <p>E há um terceiro tipo que se esquece: estado no URL. Filtros, paginação, a aba seleccionada — se o utilizador quiser partilhar ou recarregar, tem de estar no URL, e o <em>router</em> é o <em>store</em>. A pergunta que faço a cada pedaço de estado é «quem é o dono e quanto tempo vive?», e a resposta escolhe a ferramenta.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ponho tudo no Redux» ou «Context chega para tudo».</td></tr>
+        <tr><td>Mid</td><td>Conhece as bibliotecas, mas não separa estado de servidor de estado de UI, nem sabe o custo do Context.</td></tr>
+        <tr><td>Sénior</td><td>Separa os dois tipos, usa cache com invalidação para o servidor, proximidade para a UI, e escolhe o <em>store</em> pela complexidade.</td></tr>
+        <tr><td>Staff</td><td>Acrescenta estado no URL, actualizações optimistas com reversão, e o desenho das chaves de consulta como contrato.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Como invalida a lista depois de criar um item?»</li>
+      <li>«Porque é que o Context re-renderiza tudo, e como mitiga?»</li>
+      <li>«Onde guarda o filtro de uma tabela?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Copiar respostas de API para um <em>store</em> e sincronizar à mão.</li>
+      <li>Um Context gigante com o estado todo.</li>
+      <li>Escolher Redux «porque é o padrão».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-4" class="h2"><span class="secnum">41.4</span> Dados, formulários, Suspense e fronteiras de erro<a class="anchor" href="#sec-41-4" aria-label="ligação">#</a></h2>
+
+<p>Formulários são onde o modelo «controlado» de React custa mais: cada tecla é um <code>setState</code> e um render, e um formulário de cinquenta campos num único estado re-renderiza tudo a cada carácter. As respostas por ordem de simplicidade: campos não controlados com <code>FormData</code> na submissão quando não há validação em tempo real; React Hook Form quando há, porque regista os campos por <em>ref</em> e só re-renderiza o que muda; e validação com um esquema partilhado (<code>zod</code>) que idealmente é gerado do mesmo contrato que o backend usa. O React 19 acrescenta <em>Actions</em> — funções assíncronas ligadas ao <code>&lt;form action&gt;</code> com estado de submissão (<code>useActionState</code>, <code>useFormStatus</code>) e actualizações optimistas (<code>useOptimistic</code>) — que cobrem o caso comum sem biblioteca.</p>
+
+<p><strong>Suspense</strong> permite que um componente «suspenda» enquanto os seus dados não estão prontos e que um antepassado mostre um <em>fallback</em>; com <code>use(promise)</code> no React 19 e com as bibliotecas de dados que o suportam, o carregamento deixa de ser um <code>if (loading)</code> em cada componente e passa a ser uma fronteira declarativa. As <strong>error boundaries</strong> são o equivalente para erros: um componente de classe (ainda não há hook) com <code>componentDidCatch</code> que apanha erros de render dos descendentes e mostra um estado de erro em vez de desmontar a aplicação inteira. A disciplina que se pergunta é onde pôr as fronteiras: uma por região independente da página, não uma global — para que um widget que falha não leve a página com ele.</p>
+
+<div class="qa" id="q-41-4" data-box="qa" data-area="react" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Um componente lança uma excepção durante o render. O que vê o utilizador, e como desenha isso para não acontecer?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Sem tratamento, o utilizador vê uma página em branco: um erro durante o render desmonta a árvore inteira a partir da raiz, porque React não tem forma de saber o que é seguro mostrar. É o comportamento por omissão desde o React 16 e é deliberado — uma UI parcialmente corrompida é pior do que nenhuma. Em desenvolvimento aparece o <em>overlay</em>; em produção, branco e um erro na consola.</p>
+      <p>A defesa são <em>error boundaries</em>: componentes que apanham erros de render, de <em>lifecycle</em> e de construtores dos descendentes e mostram um <em>fallback</em>. Ainda só existem como classes (<code>static getDerivedStateFromError</code> e <code>componentDidCatch</code>), por isso quase toda a gente usa <code>react-error-boundary</code>, que dá um componente com <code>fallbackRender</code>, <code>onError</code> para reportar ao Sentry e <code>resetKeys</code> para tentar de novo quando algo muda. O que uma <em>boundary</em> não apanha: erros em handlers de eventos (esses são <code>try/catch</code> normal), em código assíncrono fora do render, e no servidor durante SSR.</p>
+      <p>A decisão de desenho é a granularidade. Uma <em>boundary</em> global evita o ecrã em branco mas não é uma experiência: qualquer widget que falhe leva a página inteira para o estado de erro. Ponho uma por região independente — a lista, o painel lateral, cada <em>widget</em> de um <em>dashboard</em> — para que a falha fique contida e o resto continue a funcionar, com um botão de «tentar de novo» que redefine a região. Combinadas com Suspense, as duas fronteiras desenham-se juntas: cada região tem o seu estado de carregamento e o seu estado de erro, declarados uma vez, em vez de <code>if (loading)</code> e <code>if (error)</code> repetidos em cada componente.</p>
+      <p>E o que faço para o erro não acontecer em render: dados validados na fronteira (um esquema na resposta da API, tipos gerados do contrato) para que um campo em falta não seja um <code>undefined.nome</code> no meio do JSX; e os <em>effects</em> e handlers com tratamento próprio, porque o render deve ser puro e previsível o suficiente para não lançar.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe o que acontece; pensa que um <code>try/catch</code> no componente apanha erros de render.</td></tr>
+        <tr><td>Mid</td><td>Conhece <em>error boundaries</em>, mas só a global, e não sabe o que elas não apanham.</td></tr>
+        <tr><td>Sénior</td><td>Explica o desmontar, usa fronteiras por região com reporte e reinício, e sabe os limites (handlers, assíncrono, SSR).</td></tr>
+        <tr><td>Staff</td><td>Desenha Suspense e erro como um par por região, liga ao Sentry com contexto, e valida dados na fronteira para o render nunca lançar.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Uma <em>boundary</em> apanha um erro num <code>onClick</code>?»</li>
+      <li>«Como faz «tentar de novo» depois de um erro?»</li>
+      <li>«O que é Suspense e o que muda com <code>use()</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Nenhuma <em>error boundary</em> em produção.</li>
+      <li>Uma só, na raiz, sem reinício.</li>
+      <li>Aceder a campos de respostas sem validar.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-5" class="h2"><span class="secnum">41.5</span> React 19 e Next.js: Server Components, Actions e hidratação<a class="anchor" href="#sec-41-5" aria-label="ligação">#</a></h2>
+
+<p>A mudança de modelo do React 19 é que um componente pode correr <em>só no servidor</em>. Um <strong>Server Component</strong> executa no servidor (ou no build), pode ser <code>async</code>, ler da base de dados ou de um serviço interno com segredos, e o que chega ao browser é o seu resultado serializado — sem o seu JavaScript, sem as suas dependências. Não tem estado nem <em>effects</em> nem handlers de eventos, porque não corre no browser. A interactividade fica nos <strong>Client Components</strong>, marcados com <code>'use client'</code>, que são os componentes React de sempre: hidratados no browser, com hooks e eventos. A regra de composição é assimétrica — um Server Component pode renderizar Client Components e passar-lhes props serializáveis; um Client Component não pode importar um Server Component (mas pode recebê-lo como <code>children</code>).</p>
+
+<p>As <strong>Server Actions</strong> fecham o ciclo: funções marcadas com <code>'use server'</code> que o cliente invoca como se fossem locais (o framework gera o <em>endpoint</em>), ligadas a formulários com <code>action</code> e ao estado de submissão com <code>useActionState</code>. Para um programador de backend, isto é um RPC com tipos partilhados — e é aí que vale a pena dizer o que se ganha e o que se perde: menos JavaScript no cliente e acesso directo a dados, contra acoplamento ao framework, um modelo mental novo de «o que corre onde», e a necessidade de tratar cada <em>action</em> como um <em>endpoint</em> público, com autorização e validação, porque é o que ela é.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 41.2</span> Onde corre o quê, e o que cada tipo de componente pode e não pode fazer.</div>
+<div class="tscroll"><table><thead><tr><th></th><th>Server Component (omissão no App Router)</th><th>Client Component (<code>'use client'</code>)</th></tr></thead><tbody>
+<tr><td>Onde corre</td><td>Servidor ou build; nunca no browser</td><td>Servidor (para o HTML inicial) e browser (hidratação)</td></tr>
+<tr><td>Pode</td><td>Ser <code>async</code>, ler BD/serviços, usar segredos, importar módulos pesados sem os enviar</td><td><code>useState</code>, <code>useEffect</code>, eventos, APIs do browser</td></tr>
+<tr><td>Não pode</td><td>Hooks de estado, handlers de eventos, APIs do browser</td><td>Importar Server Components; aceder a segredos</td></tr>
+<tr><td>Chega ao cliente</td><td>Resultado serializado (RSC payload), zero JavaScript próprio</td><td>HTML mais o seu JavaScript</td></tr>
+<tr><td>Props</td><td>Recebe qualquer coisa</td><td>Só props serializáveis vindas do servidor (sem funções, excepto Server Actions)</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-41-5" data-box="qa" data-area="react" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">O que são Server Components e o que mudam em relação ao SSR clássico? Quando é que não os usaria?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>SSR clássico renderiza a árvore inteira no servidor para HTML e depois envia <em>todo</em> o JavaScript ao browser para a hidratar — cada componente corre duas vezes, e o bundle é o mesmo de uma SPA. Server Components mudam a unidade: um componente pode ser só de servidor, e nesse caso corre uma vez, no servidor, e o browser recebe o resultado e nunca o seu código. A árvore passa a ser uma mistura — Server Components para o que é conteúdo e dados, Client Components para o que é interactivo — e o JavaScript enviado é apenas o das partes interactivas.</p>
+      <p>As consequências que interessam a um backend: um Server Component pode ser <code>async</code> e ler directamente da base de dados ou de um serviço interno, com segredos, sem passar por uma API pública; as dependências pesadas usadas só para renderizar (um <em>parser</em> de Markdown, uma biblioteca de datas completa) ficam no servidor; e as <em>Server Actions</em> dão um RPC tipado para mutações a partir de formulários. É um modelo próximo do que sempre fizemos com <em>templates</em> no servidor, com a diferença de que a interactividade se compõe declarativamente onde é precisa.</p>
+      <p>Não os usaria em três situações. Numa aplicação que é essencialmente interactiva — um editor, um <em>dashboard</em> em tempo real — onde quase tudo seria Client Component e o ganho é marginal contra a complexidade de «o que corre onde». Quando a equipa não controla o servidor de renderização: RSC exige Next.js ou equivalente em produção, e isso é infraestrutura a operar, com <em>cold starts</em> e custo, contra uma SPA que é ficheiros estáticos num CDN. E quando há um backend Spring com uma API bem definida que outros clientes usam: duplicar acesso a dados dentro do frontend cria uma segunda fonte de verdade e uma segunda superfície de autorização, e prefiro que a UI fale com a mesma API que a app móvel.</p>
+      <p>O ponto de senioridade é tratar Server Actions como o que são: <em>endpoints</em> públicos. Validar entrada e verificar autorização dentro de cada uma, exactamente como num controlador, porque o facto de parecer uma chamada de função local é uma conveniência de sintaxe, não uma fronteira de segurança.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Confunde Server Components com SSR, ou acha que «correm no servidor e no cliente».</td></tr>
+        <tr><td>Mid</td><td>Sabe a regra do <code>'use client'</code> mas não explica o que muda no bundle nem quando não usar.</td></tr>
+        <tr><td>Sénior</td><td>Distingue de SSR pela unidade de execução, descreve a composição assimétrica, e dá três situações em que não os usaria.</td></tr>
+        <tr><td>Staff</td><td>Discute autorização em <em>actions</em>, custo de infraestrutura, e a tensão entre acesso directo a dados e uma API partilhada com outros clientes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um Client Component pode ter um Server Component dentro?»</li>
+      <li>«O que é um erro de hidratação e o que o causa?»</li>
+      <li>«Como faz cache de dados num Server Component?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Server Actions sem validação nem autorização.</li>
+      <li>«Tudo Server Components» numa aplicação interactiva.</li>
+      <li>Não saber que o HTML de SSR precisa de hidratação.</li></ul></div>
+  </div>
+</div>
+
+<div class="qa" id="q-41-6" data-box="qa" data-area="react" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">O que é hidratação? O que provoca um «hydration mismatch» e como o evita?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Hidratação é o processo de o React, no browser, pegar no HTML que o servidor já enviou e «ligar-lhe» os componentes: em vez de criar o DOM, percorre-o, associa cada nó ao elemento correspondente da árvore, e instala os handlers de eventos. O utilizador vê conteúdo antes de o JavaScript chegar (bom para LCP) mas não consegue interagir até a hidratação terminar — a diferença entre «aparece rápido» e «responde rápido», que se vê na métrica de INP e no tempo até interactivo.</p>
+      <p>Um <em>mismatch</em> acontece quando o que o servidor renderizou e o que o cliente renderizaria no primeiro render são diferentes. React detecta-o, avisa, e no pior caso deita fora o HTML e re-renderiza tudo no cliente — perdendo o benefício do SSR. As causas são sempre uma fonte de não-determinismo: <code>Date.now()</code> ou aleatoriedade no render, texto que depende do fuso horário ou do idioma do browser, acesso a <code>window</code> ou a <code>localStorage</code> durante o render (o servidor não os tem), extensões do browser a alterar o HTML, e HTML inválido (um <code>&lt;div&gt;</code> dentro de um <code>&lt;p&gt;</code>) que o browser corrige de forma diferente do que o servidor gerou.</p>
+      <p>A prevenção é fazer o primeiro render idêntico nos dois lados e adiar tudo o que é específico do cliente para depois: ler <code>localStorage</code> num <code>useEffect</code> e actualizar o estado (aceitando um segundo render), ou renderizar essa parte só no cliente com um <code>useSyncExternalStore</code> que devolve um valor de servidor diferente, ou com carregamento dinâmico sem SSR. Datas formatam-se com um fuso fixo ou passam do servidor já formatadas. E para os casos inevitáveis e inofensivos — um carimbo temporal — existe <code>suppressHydrationWarning</code> nesse nó, que é uma admissão explícita e localizada, não uma solução geral.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Não sabe o que é; acha que SSR «envia a página pronta e já está».</td></tr>
+        <tr><td>Mid</td><td>Explica a hidratação mas não sabe diagnosticar um <em>mismatch</em>.</td></tr>
+        <tr><td>Sénior</td><td>Descreve o processo, o custo até interactivo, as causas de <em>mismatch</em> e a técnica de adiar o específico do cliente.</td></tr>
+        <tr><td>Staff</td><td>Fala de hidratação selectiva e progressiva com Suspense, de <em>streaming</em>, e do custo real de hidratar árvores grandes.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O utilizador clica antes de a hidratação acabar. O que acontece?»</li>
+      <li>«Como renderiza um componente só no cliente?»</li>
+      <li>«O que é <em>streaming</em> SSR?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>window</code> no corpo de um componente.</li>
+      <li><code>suppressHydrationWarning</code> como solução geral.</li>
+      <li>Não saber que o servidor não tem <code>localStorage</code>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-6" class="h2"><span class="secnum">41.6</span> Performance: quando memoizar e quando não<a class="anchor" href="#sec-41-6" aria-label="ligação">#</a></h2>
+
+<p>Re-renderizar não é caro por si: chamar uma função e comparar objectos leves custa microssegundos. O que é caro é re-renderizar <em>muito</em> — uma lista de mil linhas porque o pai mudou um contador — ou re-renderizar algo que faz trabalho pesado no corpo. Daí a ordem de ataque: primeiro o <em>profiler</em>, para ver o que re-renderiza e quanto custa; depois mover o estado para baixo (um contador que só o botão usa não devia estar no pai da lista) ou passar componentes como <code>children</code> (que não re-renderizam quando o pai muda, porque o elemento é o mesmo); só depois <code>React.memo</code> nos componentes que recebem as mesmas props e são caros, com <code>useMemo</code>/<code>useCallback</code> para que as props sejam de facto as mesmas. Memoizar tudo por precaução custa memória, comparações e legibilidade — e o React Compiler, que aplica memoização automaticamente onde o código segue as regras, é o argumento definitivo para não o fazer à mão.</p>
+
+<p>O resto é o mesmo de qualquer frontend: listas grandes virtualizadas (só se renderiza o que está no ecrã), <em>code splitting</em> por rota com <code>React.lazy</code> e Suspense, e transições (<code>useTransition</code>, <code>useDeferredValue</code>) para que uma actualização cara — filtrar dez mil linhas — não bloqueie a que o utilizador está a fazer, como escrever no campo de pesquisa.</p>
+
+<div class="qa" id="q-41-7" data-box="qa" data-area="react" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Uma tabela de dois mil itens fica lenta ao escrever no campo de filtro. Como diagnostica e o que muda?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Primeiro o <em>profiler</em> do React DevTools com «highlight updates» e uma gravação enquanto escrevo: quero saber <em>quantos</em> componentes re-renderizam por tecla e <em>quanto</em> custa cada um. Há dois diagnósticos possíveis e as correcções são diferentes. Se re-renderizam dois mil linhas a cada tecla porque o estado do filtro vive no mesmo componente que a tabela, o problema é de estrutura; se re-renderizam poucos mas cada um faz trabalho pesado (formatar datas, calcular derivados), o problema é de custo por render.</p>
+      <p>Para a estrutura, a primeira coisa é separar a actualização urgente da cara: o campo de texto tem de responder à tecla imediatamente, a filtragem pode chegar um pouco depois. <code>useDeferredValue</code> no valor do filtro (ou <code>useTransition</code> à volta do <code>setFiltro</code>) faz exactamente isso — o input actualiza já, a tabela recebe o valor adiado e React interrompe o render da tabela se chegar outra tecla. É a solução que mais muda a experiência com menos código.</p>
+      <p>Depois, a quantidade: dois mil linhas no DOM é demais independentemente de React. Virtualizo a lista com TanStack Virtual ou <code>react-window</code>, que renderiza só as trinta linhas visíveis, e o problema desaparece por construção. Se a filtragem em si for cara, <code>useMemo</code> sobre o resultado com dependência no valor adiado; e as linhas em <code>React.memo</code> com props estáveis, para que uma linha só re-renderize quando o seu item muda — o que exige que os handlers passados sejam estáveis (<code>useCallback</code>) ou, melhor, que a linha receba o <code>id</code> e vá buscar o que precisa a um <em>store</em> com selector.</p>
+      <p>O que não faço: pôr <code>memo</code> e <code>useCallback</code> em tudo antes de medir. Cada um custa uma comparação por render e torna o código mais difícil de ler; o <em>profiler</em> diz onde compensa, e o React Compiler faz a maior parte disto sozinho no código que segue as regras dos hooks. E se dois mil itens vierem da API, pergunto-me se deviam vir todos: paginar ou filtrar no servidor é a correcção que faz o frontend deixar de precisar de ser esperto.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Ponho <code>useMemo</code>» sem saber onde nem porquê; nunca abriu o <em>profiler</em>.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>memo</code> e virtualização, mas aplica-os por hábito e não separa urgente de adiável.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, distingue os dois diagnósticos, usa <code>useDeferredValue</code>/transições, virtualiza, e memoiza onde o <em>profiler</em> mostra.</td></tr>
+        <tr><td>Staff</td><td>Questiona se os dados deviam estar no cliente, fala do React Compiler e de <em>stores</em> com selectores por linha.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Qual é a diferença entre <code>useTransition</code> e <code>useDeferredValue</code>?»</li>
+      <li>«Porque é que passar <code>children</code> evita re-renders?»</li>
+      <li>«O que faz o React Compiler e o que não faz?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Memoização em tudo «por segurança».</li>
+      <li>Nunca ter usado o <em>profiler</em>.</li>
+      <li>Renderizar milhares de nós sem virtualizar.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-7" class="h2"><span class="secnum">41.7</span> Testar React: Testing Library, MSW e o que não testar<a class="anchor" href="#sec-41-7" aria-label="ligação">#</a></h2>
+
+<p>O capítulo anterior fixou a filosofia; aqui ficam as especificidades. Testes de componente com Vitest e Testing Library: renderizar com os <em>providers</em> reais (o <code>QueryClient</code>, o <em>router</em> em memória, o Context de tema) através de um <code>render</code> personalizado, consultar por papel e nome, interagir com <code>userEvent</code>, e esperar com <code>findBy</code>/<code>waitFor</code> pelo que é assíncrono. A rede com MSW: os <em>handlers</em> definem as respostas da API ao nível de HTTP, o código de dados corre a sério, e um teste sobrepõe um <em>handler</em> para simular o erro 500. Hooks personalizados testam-se com <code>renderHook</code> quando têm lógica própria, mas o mais das vezes testam-se através do componente que os usa.</p>
+
+<p>O que não se testa: que <code>useState</code> funciona, a ordem interna dos hooks, o número de renders, classes CSS. <em>Snapshots</em> só para fragmentos pequenos e intencionais. E o tempo — timers e animações — controla-se com <code>vi.useFakeTimers</code>, nunca com esperas reais.</p>
+
+<div class="qa" id="q-41-8" data-box="qa" data-area="react" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">React</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como testa um componente que faz um pedido HTTP ao montar e mostra uma lista?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não simulo o módulo de dados nem o <code>fetch</code>: uso MSW para responder ao pedido ao nível de HTTP. Assim o código real — a chamada, o <em>parsing</em>, a biblioteca de cache, o tratamento de erros — corre no teste, e o que substituo é apenas o servidor. O <em>handler</em> por omissão devolve uma lista com dois itens; renderizo o componente com um <code>render</code> personalizado que fornece um <code>QueryClient</code> novo por teste (com <em>retries</em> desligados, senão o teste de erro espera pelos <em>backoffs</em>), e afirmo com <code>await screen.findByRole('row', { name: /encomenda 1/i })</code> — o <code>findBy</code> espera pelo assíncrono sem <em>sleeps</em>.</p>
+      <p>Depois cubro os três estados que o utilizador pode ver. Carregamento: logo após o <code>render</code>, existe o indicador com o papel de <code>status</code> ou <code>progressbar</code>. Erro: sobreponho o <em>handler</em> nesse teste com <code>server.use(http.get(url, () =&gt; HttpResponse.error()))</code> ou um 500, e espero pela mensagem de erro e pelo botão de tentar de novo. Vazio: lista sem itens mostra o estado vazio e não uma tabela sem linhas. Se houver interacção — filtrar, paginar — faço-a com <code>userEvent</code> e verifico que o pedido seguinte leva os parâmetros certos, inspeccionando o pedido no <em>handler</em>.</p>
+      <p>O que fica de fora do teste: quantas vezes o componente renderizou, o estado interno da <em>query</em>, e a forma exacta do JSON além do que a UI mostra. E o que fica noutro sítio: a compatibilidade do JSON com o backend real é um teste de contrato — tipos gerados do OpenAPI no CI —, não um teste de componente.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Mocka o módulo inteiro do componente ou não testa o assíncrono; usa <code>setTimeout</code> no teste.</td></tr>
+        <tr><td>Mid</td><td>Mocka <code>fetch</code> à mão e testa o caso feliz; ignora erro, vazio e carregamento.</td></tr>
+        <tr><td>Sénior</td><td>MSW ao nível HTTP, <em>providers</em> reais, <code>findBy</code>, os três estados, e sabe o que deixa de fora.</td></tr>
+        <tr><td>Staff</td><td>Liga a testes de contrato, a um <code>render</code> partilhado pela equipa, e a uma política de tempo de CI.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que desliga os <em>retries</em> nos testes?»</li>
+      <li>«Como testa um hook personalizado?»</li>
+      <li>«Testaria isto também com Playwright?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>await new Promise(r =&gt; setTimeout(r, 1000))</code> em testes.</li>
+      <li>Mockar a biblioteca de dados em vez da rede.</li>
+      <li>Só o caso feliz.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-41-8" class="h2"><span class="secnum">41.8</span> Prever a saída: quatro exercícios de renders, effects e batching<a class="anchor" href="#sec-41-8" aria-label="ligação">#</a></h2>
+
+<p>Os exercícios seguintes assumem React 18 ou 19 em produção, <em>sem</em> StrictMode — em desenvolvimento com StrictMode, os renders e os <em>effects</em> de montagem correm duas vezes, e a primeira pergunta a fazer ao entrevistador é exactamente essa. Escreva a saída antes de abrir a solução, e para cada linha, o mecanismo.</p>
+
+<div class="lab" id="lab-41-1" data-box="lab" data-lang="tsx">
+  <div class="labhead"><span class="labttl">Exercício 41.1 — Ordem de renders, effects e limpezas entre pai e filho</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">6 min</span></div></div>
+  <div class="labbody">
+    <p>Escreva a saída da consola ao montar, e depois ao clicar uma vez no botão.</p>
+    <figure class="listing tsx" id="lst-41-3"><div class="lhead"><span class="lnum">Listagem 41.3</span>
+      <span class="lcap">Dois componentes, dois effects, uma limpeza.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="tsx"><code>function Filho({ n }: { n: number }) {
+  useEffect(() =&gt; {
+    console.log('effect filho', n);
+    return () =&gt; console.log('cleanup filho', n);
+  }, [n]);
+  console.log('render filho', n);
+  return &lt;span&gt;{n}&lt;/span&gt;;
+}
+
+function Pai() {
+  const [n, setN] = useState(0);
+  useEffect(() =&gt; { console.log('effect pai', n); }, [n]);
+  console.log('render pai', n);
+  return &lt;button onClick={() =&gt; setN(n + 1)}&gt;&lt;Filho n={n} /&gt;&lt;/button&gt;;
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-41-4"><div class="lhead"><span class="lnum">Listagem 41.4</span>
+        <span class="lcap">Saída do Exercício 41.1.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>render pai 0
+render filho 0
+effect filho 0
+effect pai 0
+--- clique ---
+render pai 1
+render filho 1
+cleanup filho 0
+effect filho 1
+effect pai 1</code></pre></figure>
+      <p>A fase de render é de cima para baixo: o pai corre e devolve um elemento <code>&lt;Filho&gt;</code>, e só depois o filho corre. A fase de commit corre os <em>effects</em> de baixo para cima — filhos antes de pais —, porque quando o <em>effect</em> do pai corre, os filhos já estão montados e prontos (é o que permite ao pai medir ou focar um filho).</p>
+      <p>No clique, ambos re-renderizam (o filho porque recebeu uma prop nova; sem <code>memo</code> re-renderizaria de qualquer forma). Antes de correr os <em>effects</em> novos, React corre as <strong>limpezas</strong> dos <em>effects</em> cujas dependências mudaram — e a limpeza fecha sobre o render antigo, por isso imprime <code>cleanup filho 0</code> e não <code>1</code>. Depois, os <em>effects</em> novos, outra vez filhos primeiro. O <em>effect</em> do pai não teve limpeza porque não devolveu função.</p>
+      <p>Com StrictMode em desenvolvimento, a montagem imprimiria cada render duas vezes e, depois dos <em>effects</em> de montagem, uma limpeza e uma remontagem simuladas (<code>cleanup filho 0</code>, <code>effect filho 0</code>, <code>effect pai 0</code>) — é deliberado, para apanhar <em>effects</em> sem limpeza correcta. Dizer isto antes de responder é o que mostra que se conhece a ferramenta e não só o resultado.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-41-2" data-box="lab" data-lang="tsx">
+  <div class="labhead"><span class="labttl">Exercício 41.2 — O contador que não conta: closure obsoleta</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">5 min</span></div></div>
+  <div class="labbody">
+    <p>O que mostra o ecrã ao fim de cinco segundos, e o que aparece na consola? Escreva as três correcções possíveis e diga qual escolheria.</p>
+    <figure class="listing tsx" id="lst-41-5"><div class="lhead"><span class="lnum">Listagem 41.5</span>
+      <span class="lcap">O bug mais reportado da história dos hooks.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="tsx"><code>function Contador() {
+  const [c, setC] = useState(0);
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; {
+      setC(c + 1);
+      console.log('tick', c);
+    }, 1000);
+    return () =&gt; clearInterval(id);
+  }, []);
+  return &lt;p&gt;{c}&lt;/p&gt;;
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <p>O ecrã mostra <strong>1</strong> — e fica em 1 para sempre. A consola imprime <code>tick 0</code> a cada segundo, indefinidamente. O <em>effect</em> correu uma vez, na montagem, e a função do intervalo capturou o <code>c</code> desse render, que é <code>0</code>. Cada tick executa <code>setC(0 + 1)</code>; o primeiro provoca um render com <code>c = 1</code>, e os seguintes são ignorados porque o valor é igual ao actual. O render novo tem o seu próprio <code>c = 1</code>, mas o intervalo continua a ver o antigo: nunca foi recriado, porque as dependências estão vazias. Não há erro nenhum, e é isso que torna este bug caro.</p>
+      <p>As três correcções, e o critério. <strong>Forma funcional</strong>: <code>setC(prev =&gt; prev + 1)</code> — React passa o estado mais recente à função, independentemente da closure. É a escolha certa aqui, porque o valor novo depende do anterior; o <code>console.log</code> continuaria a imprimir <code>0</code>, o que mostra que só corrigiu a escrita, não a leitura. <strong>Declarar a dependência</strong>: <code>[c]</code> — o <em>effect</em> refaz-se a cada mudança, a limpeza cancela o intervalo antigo e cria um novo com o <code>c</code> actual; correcto, ao custo de um intervalo novo por segundo, aceitável para um timer, mau para uma subscrição cara. <strong>Ref</strong>: um <code>useRef</code> actualizado no corpo (<code>ref.current = c</code>) e lido no intervalo — resolve a leitura para callbacks de longa duração que precisam de vários valores actuais; é o padrão que <code>useEffectEvent</code> formaliza.</p>
+      <p>Em <em>code review</em>, a pista é o <em>linter</em>: <code>react-hooks/exhaustive-deps</code> avisa que <code>c</code> falta nas dependências. O bug existe porque alguém silenciou ou ignorou esse aviso.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-41-3" data-box="lab" data-lang="tsx">
+  <div class="labhead"><span class="labttl">Exercício 41.3 — Batching, valores capturados e a forma funcional</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">6 min</span></div></div>
+  <div class="labbody">
+    <p>Partindo de <code>a = 0</code>, escreva tudo o que aparece na consola depois de um clique, pela ordem, e o valor final no ecrã.</p>
+    <figure class="listing tsx" id="lst-41-6"><div class="lhead"><span class="lnum">Listagem 41.6</span>
+      <span class="lcap">Quatro actualizações, dois renders.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="tsx"><code>function Demo() {
+  const [a, setA] = useState(0);
+  const onClick = () =&gt; {
+    setA(a + 1);
+    setA(a + 1);
+    console.log('depois de dois setA', a);
+    setTimeout(() =&gt; {
+      setA((x) =&gt; x + 1);
+      setA((x) =&gt; x + 1);
+      console.log('no timeout', a);
+    }, 0);
+  };
+  console.log('render', a);
+  return &lt;button onClick={onClick}&gt;{a}&lt;/button&gt;;
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-41-7"><div class="lhead"><span class="lnum">Listagem 41.7</span>
+        <span class="lcap">Saída do Exercício 41.3 (depois do render inicial «render 0»).</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>depois de dois setA 0
+render 1
+no timeout 0
+render 3</code></pre></figure>
+      <p>No handler, <code>a</code> é <code>0</code> — o valor do render em que o handler foi criado, e continua a ser <code>0</code> durante todo o handler, porque <code>setA</code> não muda a variável, agenda uma actualização. As duas chamadas <code>setA(a + 1)</code> são ambas <code>setA(1)</code>: a segunda substitui a primeira. O <code>console.log</code> imprime <code>0</code>. Só quando o handler termina é que React aplica o lote, num único render: <code>render 1</code>. É o <em>batching</em>.</p>
+      <p>No <code>setTimeout</code>, as duas actualizações são funcionais: cada uma recebe o estado mais recente e soma um, portanto <code>1 → 2 → 3</code>. Desde o React 18 também são agrupadas fora de handlers de eventos (<em>automatic batching</em>), logo um único render: <code>render 3</code>. O <code>console.log('no timeout', a)</code> imprime <code>0</code> — a closure do timeout é a mesma do handler, do render inicial — e corre <em>antes</em> do render, porque o render acontece depois de o callback terminar.</p>
+      <p>As duas lições que se dizem em voz alta: <code>setState</code> é assíncrono no sentido de «adiado e agrupado», não no sentido de <em>promise</em>; e quando o valor novo depende do anterior, a forma funcional é a única correcta — <code>setA(a + 1)</code> duas vezes soma um, <code>setA(x =&gt; x + 1)</code> duas vezes soma dois.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-41-4" data-box="lab" data-lang="tsx">
+  <div class="labhead"><span class="labttl">Exercício 41.4 — Keys por índice e o estado que muda de dono</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">5 min</span></div></div>
+  <div class="labbody">
+    <p>O utilizador escreve «olá» no input da primeira linha e depois clica em «Remover» nessa mesma linha. Descreva exactamente o que vê, e diga o que muda com <code>key={item.id}</code>.</p>
+    <figure class="listing tsx" id="lst-41-8"><div class="lhead"><span class="lnum">Listagem 41.8</span>
+      <span class="lcap">Uma lista com estado por linha e a key errada.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="tsx"><code>function Linha({ etiqueta, onRemover }: { etiqueta: string; onRemover: () =&gt; void }) {
+  const [texto, setTexto] = useState('');
+  return (
+    &lt;li&gt;
+      {etiqueta}: &lt;input value={texto} onChange={(e) =&gt; setTexto(e.target.value)} /&gt;
+      &lt;button onClick={onRemover}&gt;Remover&lt;/button&gt;
+    &lt;/li&gt;
+  );
+}
+
+function Lista() {
+  const [itens, setItens] = useState([{ id: 'a', nome: 'Ana' }, { id: 'b', nome: 'Bruno' }, { id: 'c', nome: 'Carla' }]);
+  return (
+    &lt;ul&gt;
+      {itens.map((item, i) =&gt; (
+        &lt;Linha key={i} etiqueta={item.nome} onRemover={() =&gt; setItens(itens.filter((x) =&gt; x.id !== item.id))} /&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <p>Depois de remover a Ana, a lista mostra duas linhas: <strong>«Bruno: [olá]»</strong> e «Carla: [ ]». O texto que o utilizador escreveu na linha da Ana aparece agora na linha do Bruno. Nenhum erro, nenhum aviso — só um utilizador confuso.</p>
+      <p>O mecanismo: as keys eram <code>0, 1, 2</code>. Depois do <code>filter</code>, a lista tem dois elementos com keys <code>0, 1</code>. Para React, o elemento com key <code>0</code> ainda existe — é a mesma instância de <code>Linha</code>, com o seu estado <code>texto = 'olá'</code> —, só que agora recebe a prop <code>etiqueta = 'Bruno'</code>. A instância que foi destruída foi a de key <code>2</code>, a última. O estado ficou preso à <em>posição</em>, não ao <em>dado</em>. O mesmo acontece com o estado interno de inputs não controlados, com animações e com qualquer <em>effect</em> que dependa da identidade.</p>
+      <p>Com <code>key={item.id}</code>, a instância de key <code>'a'</code> é desmontada (com o seu <code>'olá'</code>) e as de <code>'b'</code> e <code>'c'</code> mantêm-se, cada uma com o seu estado: «Bruno: [ ]», «Carla: [ ]». A regra que se enuncia: a key é a identidade do dado entre renders; o índice só é aceitável quando a lista não reordena, não remove pelo meio, e as linhas não têm estado — e mesmo aí, se o dado tiver um identificador, usa-se o identificador. <code>Math.random()</code> como key é o oposto do erro: destrói e recria todas as linhas em cada render, e perde estado e desempenho ao mesmo tempo.</p>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-41-9" class="h2"><span class="secnum">41.9</span> Resumo e checklist<a class="anchor" href="#sec-41-9" aria-label="ligação">#</a></h2>
+
+<p>React avalia-se pelo modelo, não pela API: quem percebe que cada render é uma chamada nova com as suas variáveis prevê os quatro exercícios sem correr nada, e quem decorou os hooks falha o segundo.</p>
+
+<ul class="lst">
+  <li>UI = f(estado). Render é puro e repetível; commit aplica ao DOM e corre <em>effects</em>, filhos antes de pais, limpezas antes dos novos.</li>
+  <li>Reconciliação por tipo e posição; em listas, por key. A key é a identidade do dado — o índice prende o estado à posição.</li>
+  <li>Hooks são identificados pela ordem de chamada: por isso não podem estar em condições. Cada render fecha sobre os seus valores: closures obsoletas corrigem-se com a forma funcional, dependências declaradas ou <em>refs</em>.</li>
+  <li><em>Batching</em> é automático em todo o lado desde o 18; <code>setX(a + 1)</code> duas vezes soma um, <code>setX(x =&gt; x + 1)</code> duas vezes soma dois.</li>
+  <li>Estado de servidor é cache (TanStack Query: chave, <em>stale</em>, invalidação, optimista); estado de UI vive perto de quem o usa; Context não é <em>store</em>; o URL também é estado.</li>
+  <li>Suspense e <em>error boundaries</em> por região, não globais. Erros em handlers não são apanhados por <em>boundaries</em>.</li>
+  <li>Server Components correm só no servidor, sem estado nem eventos; Client Components hidratam. Server Actions são <em>endpoints</em> públicos: validar e autorizar.</li>
+  <li>Hidratação exige o mesmo primeiro render nos dois lados; o que é específico do cliente adia-se para um <em>effect</em>.</li>
+  <li>Medir antes de memoizar. Mover estado para baixo, <code>children</code>, <code>useDeferredValue</code>, virtualizar — e só depois <code>memo</code> onde o <em>profiler</em> aponta.</li>
+  <li>Testar como o utilizador, com MSW ao nível HTTP, os três estados (carregamento, erro, vazio), sem detalhes de implementação.</li>
+</ul>
+
+<p>Checklist de preparação para as 48 horas antes da entrevista:</p>
+
+<ul class="lst">
+  <li>Resolver os exercícios 41.1 a 41.4 no papel e explicar cada linha pelo mecanismo.</li>
+  <li>Perguntar «com ou sem StrictMode?» antes de responder a qualquer «o que imprime».</li>
+  <li>Ter a Tabela 41.1 na cabeça: a pergunta que decide cada hook.</li>
+  <li>Saber explicar estado de servidor contra estado de UI em trinta segundos, com a Listagem 41.2 como exemplo.</li>
+  <li>Dizer o que um Server Component não pode fazer e porque é que uma Server Action é um <em>endpoint</em>.</li>
+  <li>Ter uma história real de um problema de performance em React e o que o <em>profiler</em> mostrou.</li>
+</ul>

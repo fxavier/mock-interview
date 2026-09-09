@@ -1,0 +1,470 @@
+<p>Angular é o framework em que um programador de Java se sente em casa em cinco minutos — injecção de dependências, decoradores, TypeScript estrito, uma estrutura imposta — e é precisamente por isso que é perigoso em entrevista: a familiaridade esconde três mecanismos que não têm paralelo no backend e que são o que se pergunta. Change detection, que decide quando e o que é re-renderizado; RxJS, que é a linguagem em que tudo o que é assíncrono se escreve; e signals, que estão a substituir os dois anteriores no que toca a estado. Este capítulo trata o Angular moderno — standalone, signals, <em>control flow</em> nos templates, zoneless como direcção — sem ignorar o que ainda existe em produção, e acaba com quatro exercícios de prever a saída sobre os três mecanismos e sobre a injecção hierárquica.</p>
+
+<h2 id="sec-42-1" class="h2"><span class="secnum">42.1</span> O modelo mental: componentes standalone, injecção hierárquica e o que restou dos módulos<a class="anchor" href="#sec-42-1" aria-label="ligação">#</a></h2>
+
+<p>Um componente Angular é uma classe com um decorador que liga um template a um selector, e desde o Angular 15 é <em>standalone</em> por omissão: declara as suas próprias dependências em <code>imports</code> e não precisa de <code>NgModule</code>. Os módulos ainda existem em bases de código antigas e em algumas bibliotecas, e a resposta madura sobre eles é histórica — resolviam o agrupamento de declarações para o compilador, e foram substituídos por importações explícitas no componente, que são mais fáceis de rastrear e permitem <em>tree shaking</em> real. A pergunta de entrevista é «como migra», e a resposta é gradual: <code>standalone: true</code> componente a componente, <code>importProvidersFrom</code> para os módulos que ficam, e o <em>schematic</em> de migração para o grosso.</p>
+
+<p>A injecção de dependências é o que um Java sénior reconhece, com uma diferença que vale uma pergunta: é <strong>hierárquica</strong>. Há um injector de aplicação (<code>providedIn: 'root'</code> — singleton, <em>tree-shakeable</em>), injectores por rota (<code>providers</code> na configuração da rota, um por activação) e injectores por elemento (<code>providers</code> ou <code>viewProviders</code> no componente, um por instância). A resolução sobe do elemento até à raiz, e o primeiro provider encontrado ganha — o que permite ter um serviço por instância de componente (o estado de um formulário complexo) sem tocar no singleton. A função <code>inject()</code> substituiu a injecção por construtor como forma idiomática, e é o que permite hooks personalizados ao estilo de <code>takeUntilDestroyed()</code> e <code>DestroyRef</code>.</p>
+
+<div class="qa" id="q-42-1" data-box="qa" data-area="angular" data-level="mid" data-freq="alta">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Explique a injecção de dependências do Angular a alguém que vem do Spring. O que é diferente?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>O que é igual: classes anotadas (<code>@Injectable</code> em vez de <code>@Service</code>), dependências declaradas no construtor ou com <code>inject()</code>, singletons por omissão, e a possibilidade de fornecer uma implementação diferente por <em>token</em> — <code>{ provide: Api, useClass: ApiFalsa }</code> é o <code>@Primary</code> ou o perfil de teste do Spring. <em>Tokens</em> de injecção (<code>InjectionToken</code>) cobrem o que em Spring seria um <code>@Qualifier</code> ou uma propriedade de configuração.</p>
+      <p>O que é diferente, e é o que se pergunta, é a hierarquia. No Spring há um contentor (com âmbitos de <em>request</em> e sessão, mas plano). No Angular há uma árvore de injectores que espelha a árvore de componentes e de rotas: <code>providedIn: 'root'</code> é o singleton da aplicação; <code>providers</code> na rota cria um injector por activação da rota, destruído ao sair; <code>providers</code> num componente cria uma instância <em>por instância do componente</em>. A resolução sobe da folha para a raiz e o provider mais próximo ganha. Isto dá algo que o Spring não tem de forma natural: estado com o ciclo de vida de um pedaço da interface — um serviço de formulário que vive e morre com o componente que o usa, sem nenhum código de limpeza.</p>
+      <p>A segunda diferença é o <em>tree shaking</em>: <code>providedIn: 'root'</code> não regista o serviço num módulo — o compilador só o inclui no bundle se alguém o injectar. É o motivo pelo qual se prefere a serviços listados em <code>providers</code> globais.</p>
+      <p>Duas armadilhas que menciono porque aparecem em <em>code review</em>: um serviço com <code>providedIn: 'root'</code> que alguém também põe em <code>providers</code> de um componente cria duas instâncias e um bug de «o estado não está sincronizado» que demora horas a ver; e <code>inject()</code> só funciona em contexto de injecção — construtor, inicializadores de campos, ou dentro de <code>runInInjectionContext</code> — e chamá-lo num callback assíncrono lança um erro que confunde quem vem de Spring, onde a injecção acontece uma vez e o campo fica lá.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«É igual ao Spring.» Não sabe o que faz <code>providers</code> num componente.</td></tr>
+        <tr><td>Mid</td><td>Conhece <code>providedIn: 'root'</code> e <em>tokens</em>, mas não explica a hierarquia nem o ciclo de vida por componente.</td></tr>
+        <tr><td>Sénior</td><td>Descreve os três níveis de injector, a resolução ascendente, o <em>tree shaking</em>, e as duas armadilhas.</td></tr>
+        <tr><td>Staff</td><td>Usa a hierarquia como ferramenta de desenho (estado por rota, por instância), fala de <code>viewProviders</code> e de <code>runInInjectionContext</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas instâncias existem se puser <code>providers: [X]</code> num componente que aparece três vezes?» (Exercício 42.4.)</li>
+      <li>«Diferença entre <code>providers</code> e <code>viewProviders</code>?»</li>
+      <li>«Como substitui um serviço num teste?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Serviços em <code>providers</code> globais «para garantir que existem».</li>
+      <li>Não saber que <code>providers</code> num componente cria instâncias por componente.</li>
+      <li>Chamar <code>inject()</code> fora do contexto de injecção e não perceber o erro.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-2" class="h2"><span class="secnum">42.2</span> Change detection: zone.js, OnPush, signals e zoneless<a class="anchor" href="#sec-42-2" aria-label="ligação">#</a></h2>
+
+<p>Change detection é o mecanismo que decide <em>quando</em> Angular volta a avaliar os templates e <em>quais</em>. Historicamente, o «quando» é resolvido por <strong>zone.js</strong>: uma biblioteca que intercepta todas as fontes assíncronas do browser — eventos, timers, <em>promises</em>, XHR — e avisa Angular no fim de cada uma, que então percorre <em>toda</em> a árvore de componentes de cima para baixo a comparar as expressões dos templates com os valores anteriores. É simples e funciona sem o programador pensar nisso; o custo é percorrer tudo a cada evento, e uma árvore grande com um <code>mousemove</code> torna-se visível.</p>
+
+<p><strong>OnPush</strong> muda o «quais»: um componente com <code>ChangeDetectionStrategy.OnPush</code> só é verificado quando uma referência de <code>@Input</code> muda, quando um evento é tratado dentro dele ou de um descendente, quando um <code>async</code> pipe no seu template recebe um valor, quando um signal lido no template muda, ou quando alguém chama <code>markForCheck()</code>. A consequência prática, e a pergunta clássica, é que mutar um objecto de input (<code>this.itens.push(x)</code>) não actualiza um filho OnPush — só substituir a referência. OnPush força imutabilidade, e é por isso que combina tão bem com signals e com <em>stores</em>.</p>
+
+<p><strong>Signals</strong> mudam o «quando» de forma fina: um signal lido num template regista esse template como dependente, e escrever no signal marca exactamente esses componentes para verificação — sem percorrer a árvore, sem zone.js. É o caminho para <strong>zoneless</strong> (<code>provideZonelessChangeDetection()</code>, estável no Angular 20): sem zone.js, Angular só sabe que algo mudou por signals, por eventos de template, por <code>async</code> pipe e por <code>markForCheck</code>; um <code>setTimeout</code> que muda um campo normal já não actualiza nada. Ganha-se menos <em>overhead</em>, <em>stack traces</em> limpos e menos bundle; paga-se a disciplina de tudo o que muda ser um signal ou passar por um mecanismo que notifique.</p>
+
+<div class="qa" id="q-42-2" data-box="qa" data-area="angular" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Como funciona a change detection? O que é OnPush, e o que muda com signals e zoneless?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Há duas perguntas escondidas: quando é que Angular verifica, e o que verifica. No modelo clássico, o «quando» é o zone.js — intercepta todas as APIs assíncronas do browser e, no fim de cada evento, timer ou resposta HTTP, dispara um ciclo. O «o que» é tudo: a árvore inteira, de cima para baixo, comparando cada expressão de template com o valor anterior. É a razão de Angular «simplesmente funcionar» quando se muda um campo num <code>setTimeout</code>, e é a razão de aplicações grandes ficarem lentas em eventos frequentes.</p>
+      <p>OnPush restringe o «o que». Um componente OnPush só é verificado se a referência de um input mudar, se um evento for tratado dentro dele, se um <code>async</code> pipe ou um signal no seu template emitir, ou se alguém chamar <code>markForCheck</code>. Isto tem uma consequência que apanha toda a gente: mutar um array de input com <code>push</code> não muda a referência, logo o filho não actualiza; é preciso <code>[...itens, novo]</code>. OnPush é, na prática, um contrato de imutabilidade — e é o que se põe por omissão em componentes novos, porque o custo de um <code>Default</code> numa árvore grande é pagar a verificação de todos os componentes a cada tecla.</p>
+      <p>Signals mudam o «quando» de forma precisa. Quando um template lê um signal, esse componente fica registado como dependente; ao escrever no signal, Angular marca exactamente esses componentes — não a árvore, não o zone. É o que torna possível o zoneless: sem zone.js, o framework só sabe de mudanças por signals, eventos de template, <code>async</code> pipe e <code>markForCheck</code>. Um campo normal alterado num <code>setTimeout</code> deixa de se reflectir no ecrã, o que é um bug se se migrar sem disciplina e é a intenção se tudo o que muda for signal.</p>
+      <p>A recomendação que dou hoje: OnPush por omissão, estado em signals (ou observables com <code>async</code>), inputs como <code>input()</code> de signal, e migrar para zoneless quando os componentes já estão nesse regime — porque nessa altura o zone.js já não está a fazer nada além de custar. E a ferramenta de diagnóstico é o <em>profiler</em> do Angular DevTools, que mostra quantos componentes foram verificados por ciclo; se for a árvore inteira em cada tecla, falta OnPush.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«O Angular actualiza a vista automaticamente.» Não sabe o que faz OnPush nem o zone.js.</td></tr>
+        <tr><td>Mid</td><td>Explica zone.js e OnPush, mas não sabe as condições exactas que marcam um componente OnPush nem o que muda com signals.</td></tr>
+        <tr><td>Sénior</td><td>Separa «quando» de «o que», enumera as condições de OnPush, a armadilha da mutação, e explica como signals permitem zoneless.</td></tr>
+        <tr><td>Staff</td><td>Dá uma estratégia de migração para zoneless, usa o <em>profiler</em> como critério, e discute o custo de <code>markForCheck</code> versus signals em bibliotecas.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Um filho OnPush recebe um array que o pai mutou. O que mostra?» (Exercício 42.1.)</li>
+      <li>«O que é <code>ExpressionChangedAfterItHasBeenChecked</code> e porque aparece?»</li>
+      <li>«Que tem de mudar no código para tirar o zone.js?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Chamar <code>detectChanges()</code> em todo o lado para «resolver».</li>
+      <li>Mutar inputs e não perceber porque o filho não actualiza.</li>
+      <li>Achar que zoneless é «tirar uma dependência».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-3" class="h2"><span class="secnum">42.3</span> RxJS sem drama: observables, os quatro operadores de achatamento e fugas de subscrições<a class="anchor" href="#sec-42-3" aria-label="ligação">#</a></h2>
+
+<p>Um observable é um <em>stream</em> preguiçoso: nada acontece até alguém subscrever, cada subscrição começa a execução do zero (a menos que seja partilhado), e pode emitir zero ou muitos valores antes de completar ou falhar. Para quem vem de Java, é o <code>Flux</code> do Reactor com a mesma semântica de operadores. O <code>HttpClient</code> devolve observables que emitem um valor e completam, por isso <code>subscribe</code> directo é aceitável; <code>valueChanges</code>, <code>store.select</code>, <code>interval</code> e websockets nunca completam sozinhos, e cada <code>subscribe</code> sem cancelamento é uma fuga que sobrevive ao componente. As defesas idiomáticas são o <code>async</code> pipe (subscreve e cancela com a vista, e marca OnPush) e <code>takeUntilDestroyed()</code> para subscrições manuais; o padrão antigo de <code>Subject</code> mais <code>ngOnDestroy</code> ainda se vê, e é a resposta correcta se perguntarem «como se fazia antes».</p>
+
+<p>Os operadores que se perguntam são os quatro de achatamento, porque a escolha errada produz bugs difíceis de reproduzir. Todos transformam cada valor num observable interno; diferem no que fazem quando chega um valor novo enquanto o interno anterior ainda está activo. <strong><code>switchMap</code></strong> cancela o anterior — pesquisa incremental, «só interessa o último». <strong><code>mergeMap</code></strong> corre todos em paralelo — pedidos independentes, aceita respostas fora de ordem. <strong><code>concatMap</code></strong> enfileira — escritas que têm de ser sequenciais. <strong><code>exhaustMap</code></strong> ignora novos valores enquanto há um em curso — o botão de submeter que não pode disparar dois pedidos. A tabela abaixo é o que se leva para a entrevista.</p>
+
+<div class="tablewrap"><div class="tcap"><span class="tnum">Tabela 42.1</span> Os quatro operadores de achatamento: o que acontece quando chega um valor novo a meio.</div>
+<div class="tscroll"><table><thead><tr><th>Operador</th><th>Valor novo a meio do anterior</th><th>Ordem garantida</th><th>Caso típico</th><th>Bug se for o errado</th></tr></thead><tbody>
+<tr><td><code>switchMap</code></td><td>Cancela o anterior</td><td>Sim (só há um)</td><td>Pesquisa, <em>autocomplete</em>, navegação</td><td>Escritas canceladas a meio</td></tr>
+<tr><td><code>mergeMap</code></td><td>Corre em paralelo</td><td>Não</td><td>Pedidos independentes, <em>fan-out</em></td><td>Resposta antiga sobrepõe a nova</td></tr>
+<tr><td><code>concatMap</code></td><td>Enfileira</td><td>Sim</td><td>Escritas sequenciais, <em>uploads</em> em ordem</td><td>Fila que cresce sem limite</td></tr>
+<tr><td><code>exhaustMap</code></td><td>Ignora o novo</td><td>Sim</td><td>Submeter, <em>login</em>, «guardar»</td><td>Cliques perdidos que o utilizador esperava</td></tr>
+</tbody></table></div></div>
+
+<div class="qa" id="q-42-3" data-box="qa" data-area="angular" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Um campo de pesquisa faz um pedido por cada tecla e por vezes mostra resultados antigos. O que está a acontecer e como corrige?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>É uma corrida: cada tecla dispara um pedido, os pedidos demoram tempos diferentes, e o último a <em>chegar</em> não é necessariamente o último a <em>sair</em>. Se o código faz <code>subscribe</code> por tecla, ou usa <code>mergeMap</code>, a resposta da pesquisa por «ab» pode chegar depois da de «abc» e sobrepô-la. Não é um bug do servidor; é a ausência de uma política sobre pedidos concorrentes.</p>
+      <p>A correcção idiomática é uma cadeia: <code>valueChanges.pipe(debounceTime(300), distinctUntilChanged(), switchMap(termo =&gt; this.api.pesquisar(termo)))</code>. O <code>debounceTime</code> espera que o utilizador pare de escrever; o <code>distinctUntilChanged</code> evita repetir o mesmo termo; e o <code>switchMap</code> é a peça que resolve a corrida — quando chega um termo novo, cancela a subscrição ao pedido anterior (e, com <code>HttpClient</code>, aborta mesmo o pedido HTTP), portanto só a resposta do último termo alguma vez é emitida. Acrescento tratamento de erro <em>dentro</em> do <code>switchMap</code> (<code>catchError(() =&gt; of([]))</code>), porque um erro no observable interno mataria a cadeia inteira e o campo deixaria de pesquisar.</p>
+      <p>Exponho o resultado ao template com o <code>async</code> pipe ou convertido em signal com <code>toSignal</code>, para não ter <code>subscribe</code> manual nem fuga. E se houver estado de carregamento, uso <code>startWith</code> ou um signal separado, em vez de <em>flags</em> mutáveis que OnPush não vê.</p>
+      <p>A conversa que costuma seguir é sobre os outros três operadores, e vale a pena antecipar: <code>mergeMap</code> era o errado aqui, mas é o certo para pedidos independentes; <code>concatMap</code> serializaria as pesquisas e atrasaria o resultado; <code>exhaustMap</code> ignoraria as teclas seguintes enquanto a primeira pesquisa estivesse em curso — o oposto do que se quer aqui, e exactamente o que se quer num botão de submeter.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Propõe uma <em>flag</em> «a carregar» ou um <code>setTimeout</code>; não identifica a corrida.</td></tr>
+        <tr><td>Mid</td><td>Sabe que é <code>switchMap</code> mas não explica o cancelamento nem trata o erro dentro.</td></tr>
+        <tr><td>Sénior</td><td>Diagnostica a corrida, monta a cadeia completa com o porquê de cada operador, e compara com os outros três.</td></tr>
+        <tr><td>Staff</td><td>Fala de cancelamento real do HTTP, de <code>toSignal</code>, de testar com <code>TestScheduler</code> e de quando um <code>resource()</code> substitui a cadeia.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que acontece à cadeia se o pedido falhar?»</li>
+      <li>«E se em vez de pesquisar fosse guardar?»</li>
+      <li>«Dê-me a ordem de saída com cada operador.» (Exercício 42.3.)</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>subscribe</code> dentro de <code>subscribe</code>.</li>
+      <li><code>catchError</code> fora do operador interno, a matar o <em>stream</em>.</li>
+      <li>Não conhecer a diferença entre os quatro.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-4" class="h2"><span class="secnum">42.4</span> Signals: computed, effect, signal store e onde o NgRx ainda faz sentido<a class="anchor" href="#sec-42-4" aria-label="ligação">#</a></h2>
+
+<p>Um <strong>signal</strong> é um contentor de valor que regista quem o lê. <code>signal(v)</code> escreve-se com <code>set</code> e <code>update</code>; <code>computed(() =&gt; …)</code> deriva um valor preguiçoso e memoizado, recalculado só quando lido e só se uma dependência mudou; <code>effect(() =&gt; …)</code> corre quando as suas dependências mudam — de forma <em>agendada</em>, não síncrona, uma vez por lote de alterações, o que os torna <em>glitch-free</em>: nunca se observa um estado intermédio. Comparado com RxJS, é síncrono e sem tempo (não há <code>debounce</code>, não há cancelamento), e por isso os dois coexistem: signals para estado, observables para eventos e para tudo o que tem dimensão temporal, com <code>toSignal</code> e <code>toObservable</code> a fazer a ponte. Inputs (<code>input()</code>), outputs (<code>output()</code>), <em>queries</em> (<code>viewChild()</code>) e <code>model()</code> são hoje signals, e o <code>resource()</code> liga um signal de parâmetros a um carregamento assíncrono com estado.</p>
+
+<p>Para estado partilhado, o <strong>NgRx SignalStore</strong> é a resposta moderna: um <em>store</em> declarado com <code>signalStore</code>, estado como signals, <code>computed</code> derivados e métodos que fazem <code>patchState</code>, com <em>features</em> reutilizáveis (entidades, <em>call state</em>) e sem o cerimonial de acções e <em>reducers</em>. O NgRx clássico — <em>actions</em>, <em>reducers</em>, <em>effects</em>, <em>selectors</em> — continua a fazer sentido onde a rastreabilidade importa mais do que a concisão: aplicações grandes com muitas equipas, fluxos complexos que beneficiam das DevTools com viagem no tempo, e a disciplina de todas as mutações passarem por um sítio. Para o resto, um serviço com signals ou um SignalStore chega e é o que se recomenda em código novo.</p>
+
+<div class="qa" id="q-42-4" data-box="qa" data-area="angular" data-level="senior" data-freq="alta">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Muito frequente</span></div></div>
+  <div class="qprompt">Signals ou RxJS? E onde é que ainda usaria NgRx?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Não é «ou»: resolvem problemas diferentes e a resposta é onde vai cada um. Signals são para <em>estado</em> — um valor que existe agora, que o template lê, e que quando muda deve actualizar exactamente quem o lê. São síncronos, sempre têm valor, <code>computed</code> memoiza derivados, e a change detection fina é gratuita. RxJS é para <em>eventos e tempo</em> — coisas que acontecem, com <code>debounce</code>, cancelamento, combinação de <em>streams</em>, <em>retries</em>. Um campo de pesquisa é RxJS até ao <code>switchMap</code> e é um signal a partir do resultado, com <code>toSignal</code>.</p>
+      <p>A regra prática que sigo: o que o template mostra é signal; o que o <code>HttpClient</code> devolve continua a ser observable (é um pedido, completa, cancela-se) mas converte-se em signal ou usa-se com <code>resource()</code> na fronteira do componente; e as cadeias de operadores ficam em serviços, não em componentes. Efeitos (<code>effect</code>) uso pouco e com desconfiança — para sincronizar com o exterior (<code>localStorage</code>, um gráfico), nunca para derivar estado, que é o trabalho do <code>computed</code>; um <code>effect</code> que escreve noutro signal é quase sempre um <code>computed</code> disfarçado.</p>
+      <p>Para estado partilhado entre componentes, o SignalStore do NgRx é a escolha em código novo: estado como signals, derivados como <code>computed</code>, métodos que fazem <code>patchState</code>, <em>features</em> para entidades e estado de carregamento, e testa-se como um serviço. Cobre noventa por cento dos casos com um quinto do código do NgRx clássico.</p>
+      <p>O NgRx clássico ainda escolho em duas situações. Aplicações grandes com várias equipas, onde a rastreabilidade — cada mudança é uma acção com nome, visível nas DevTools, reproduzível — vale mais do que a concisão. E fluxos com muitos efeitos encadeados (uma acção que dispara pedidos, que disparam outras acções) onde o modelo de <em>effects</em> declarativos com RxJS é mais fácil de raciocinar do que métodos imperativos num <em>store</em>. Se a equipa já o tem e funciona, também não o tiro: migração é custo sem valor para o utilizador.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Signals substituem RxJS» ou «NgRx sempre». Não sabe o que é um <code>computed</code>.</td></tr>
+        <tr><td>Mid</td><td>Separa os dois, mas usa <code>effect</code> para derivar estado e não conhece SignalStore.</td></tr>
+        <tr><td>Sénior</td><td>Regra clara de fronteira (estado contra tempo), <code>toSignal</code>/<code>resource</code>, desconfiança de <code>effect</code>, SignalStore por omissão e critérios para o clássico.</td></tr>
+        <tr><td>Staff</td><td>Discute <em>glitch-free</em> e agendamento de effects, <em>linked signals</em>, e estratégia de migração numa base grande.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Quantas vezes corre um <code>effect</code> se escrever duas vezes num signal?» (Exercício 42.2.)</li>
+      <li>«Porque é que não devo escrever em signals dentro de um <code>effect</code>?»</li>
+      <li>«Como converte um <code>BehaviorSubject</code> num signal?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><code>effect</code> a derivar estado em vez de <code>computed</code>.</li>
+      <li>Reescrever tudo de RxJS para signals «porque é novo».</li>
+      <li>Não saber que <code>computed</code> é preguiçoso.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-5" class="h2"><span class="secnum">42.5</span> Formulários reactivos, routing e HttpClient com interceptores<a class="anchor" href="#sec-42-5" aria-label="ligação">#</a></h2>
+
+<p>Formulários reactivos são o ponto forte de Angular para quem vem de backend: o modelo do formulário é um objecto (<code>FormGroup</code>, <code>FormControl</code>, <code>FormArray</code>) construído em código, tipado desde o Angular 14 (<code>FormControl&lt;string&gt;</code>, <code>form.value</code> com o tipo certo), com validadores síncronos e assíncronos compostos, e observáveis de mudanças em cada nível. A recomendação é reactivos para tudo o que não seja trivial; <em>template-driven</em> só para um campo isolado. Os <em>validators</em> assíncronos (verificar se um e-mail já existe) são o sítio onde se pergunta sobre <code>debounce</code> e cancelamento — e a resposta é a mesma da pesquisa: <code>switchMap</code> dentro do validador, com <code>first()</code> para completar.</p>
+
+<p>O <em>router</em> moderno é funcional: <code>loadComponent</code> e <code>loadChildren</code> para <em>lazy loading</em> por rota (a forma principal de dividir o bundle), <em>guards</em> como funções (<code>canActivate: [() =&gt; inject(Auth).estaAutenticado()]</code>) que podem devolver um <code>UrlTree</code> para redireccionar, <em>resolvers</em> funcionais para dados antes de activar, e <code>withComponentInputBinding()</code> para receber parâmetros de rota como inputs. O <code>HttpClient</code> tem <strong>interceptores</strong> funcionais (<code>HttpInterceptorFn</code>) encadeados: é onde vive o cabeçalho de autenticação, o identificador de correlação, o tratamento uniforme de erros (transformar <code>problem+json</code> num erro de domínio) e a repetição com <em>backoff</em> — exactamente o papel de um filtro no Spring, e dizê-lo faz a ponte.</p>
+
+<div class="qa" id="q-42-5" data-box="qa" data-area="angular" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Onde põe o token de autenticação nos pedidos, o tratamento de erros da API e o <em>retry</em>? Como se organiza isso em Angular?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Em interceptores do <code>HttpClient</code> — funções <code>HttpInterceptorFn</code> registadas com <code>provideHttpClient(withInterceptors([...]))</code>, que formam uma cadeia pela ordem de registo, como filtros de servlet. Cada um tem uma responsabilidade. O de autenticação clona o pedido com o cabeçalho (ou, se a sessão for por cookie <code>HttpOnly</code>, não faz nada — e prefiro que seja assim) e, num <code>401</code>, tenta renovar o token uma vez e repete o pedido, com um <code>Subject</code> partilhado para que dez pedidos falhados em simultâneo façam uma única renovação. O de correlação gera ou propaga um <code>X-Request-Id</code> para ligar o que o utilizador vê ao que está nos logs do Spring.</p>
+      <p>O de erros traduz respostas em erros de domínio: lê o <code>application/problem+json</code>, produz um objecto tipado com <code>title</code>, <code>detail</code>, <code>status</code> e os campos de validação, e decide o que é tratado centralmente (<code>401</code> que expira a sessão, <code>503</code> com aviso global) e o que é propagado para o componente mostrar ao lado do campo (<code>400</code>/<code>422</code>). O <em>retry</em> fica num interceptor separado e só para o que é seguro: <code>GET</code> e pedidos com chave de idempotência, com <code>retry({ count: 2, delay: backoff })</code> e sem repetir <code>4xx</code>.</p>
+      <p>A ordem importa e digo-a: correlação primeiro (para o identificador ir em todas as tentativas), depois autenticação, depois <em>retry</em>, depois erros por fora — de modo que a renovação de token aconteça antes de decidir que um <code>401</code> é definitivo. E o que não vai para interceptores: lógica de negócio, transformação de respostas específicas de um <em>endpoint</em> (isso é do serviço que o chama) e qualquer coisa que dependa do componente.</p>
+      <p>Para testar, o <code>HttpTestingController</code> permite afirmar que um pedido saiu com os cabeçalhos certos e simular a resposta, incluindo o <code>401</code> seguido de renovação — o cenário mais frágil e o que mais vale um teste.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Põe o cabeçalho em cada chamada de serviço; trata erros em cada componente.</td></tr>
+        <tr><td>Mid</td><td>Conhece interceptores, mas mete tudo num só e repete <code>4xx</code>.</td></tr>
+        <tr><td>Sénior</td><td>Um interceptor por responsabilidade, ordem justificada, renovação única de token, <em>retry</em> só no idempotente, erros traduzidos para domínio.</td></tr>
+        <tr><td>Staff</td><td>Prefere sessão por cookie e BFF ao token no cliente, liga correlação a observabilidade e testa a renovação com <code>HttpTestingController</code>.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Dez pedidos falham com <code>401</code> ao mesmo tempo. Quantas renovações faz?»</li>
+      <li>«Como mostra um erro de validação de um campo específico?»</li>
+      <li>«Porque não repete um <code>POST</code>?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li><em>Retry</em> em tudo, incluindo escritas.</li>
+      <li>Um interceptor monolítico.</li>
+      <li>Tratar erros de API com <code>alert</code> no componente.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-6" class="h2"><span class="secnum">42.6</span> SSR, hidratação, vistas diferíveis e performance<a class="anchor" href="#sec-42-6" aria-label="ligação">#</a></h2>
+
+<p>Angular SSR (<code>@angular/ssr</code>, o antigo Universal) renderiza a aplicação no servidor Node e envia HTML; a <strong>hidratação</strong> não destrutiva, por omissão desde o 17, reutiliza o DOM enviado em vez de o reconstruir, e a hidratação incremental (com <code>@defer (hydrate on …)</code>) permite hidratar partes da página só quando são precisas. As regras são as mesmas do React: o primeiro render tem de ser igual nos dois lados, o acesso a <code>window</code> e <code>localStorage</code> só depois de hidratar (<code>afterNextRender</code>, ou <code>isPlatformBrowser</code>), e os dados carregados no servidor passam ao cliente pelo <code>TransferState</code> — que o <code>HttpClient</code> faz automaticamente para <code>GET</code> — para não repetir os pedidos.</p>
+
+<p>As <strong>vistas diferíveis</strong> (<code>@defer</code>) são a ferramenta de <em>code splitting</em> dentro de um template: o conteúdo do bloco e as suas dependências só são carregados quando um gatilho dispara — <code>on viewport</code>, <code>on interaction</code>, <code>on idle</code>, <code>when condição</code> — com blocos <code>@placeholder</code>, <code>@loading</code> e <code>@error</code>. É a resposta ao «como tiro o gráfico pesado do bundle inicial» sem sair do template. O resto da performance é o de sempre: OnPush e signals para não verificar a árvore inteira, <code>@for</code> com <code>track</code> obrigatório (o equivalente da key do React, e o compilador recusa sem ele), <code>NgOptimizedImage</code> para imagens, <em>lazy loading</em> por rota, e o <em>profiler</em> das DevTools como critério.</p>
+
+<div class="qa" id="q-42-6" data-box="qa" data-area="angular" data-level="senior" data-freq="media">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Sénior</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">A aplicação demora a ficar interactiva. Que ferramentas do Angular usa para reduzir o JavaScript inicial e o trabalho de arranque?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Começo pelo <em>bundle analyzer</em> do CLI para saber o que está no <em>chunk</em> inicial, e pelo <em>profiler</em> das DevTools para saber quantos componentes são verificados no arranque — são dois problemas diferentes com a mesma métrica. Para o bundle, as ferramentas por ordem de impacto: <em>lazy loading</em> por rota com <code>loadComponent</code>/<code>loadChildren</code>, que é obrigatório em qualquer aplicação com mais de uma área; <code>@defer</code> nos blocos pesados dentro das páginas — gráficos, editores, mapas — com gatilho <code>on viewport</code> ou <code>on interaction</code>, que os tira do <em>chunk</em> inicial sem mexer na estrutura; e verificar que as bibliotecas são ESM e importadas por caminho, senão o <em>tree shaking</em> não as reduz.</p>
+      <p>Para o trabalho de arranque, se a página inicial é conteúdo, SSR com hidratação: o HTML chega pronto (LCP), e a hidratação não destrutiva reutiliza o DOM em vez de o reconstruir. A hidratação incremental com <code>@defer (hydrate on viewport)</code> vai mais longe — as partes fora do ecrã nem sequer são hidratadas até serem precisas. Os pedidos HTTP feitos no servidor passam pelo <code>TransferState</code> e não se repetem no cliente. Se a aplicação é uma ferramenta interna atrás de <em>login</em>, SSR costuma não compensar o servidor Node que exige, e digo-o.</p>
+      <p>Na change detection, OnPush em tudo e estado em signals, para que o arranque verifique cada componente uma vez e não a árvore a cada evento; <code>@for</code> com <code>track</code> pelo identificador, que evita reconstruir listas; e <code>NgOptimizedImage</code> para a imagem principal com prioridade. Depois disso, o que sobra é o de qualquer frontend — fontes, terceiros, orçamento de bundle no CI com os <code>budgets</code> do <code>angular.json</code>, que falham o build quando o inicial cresce.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>«Activo o modo de produção.» Não conhece <em>lazy loading</em> por rota.</td></tr>
+        <tr><td>Mid</td><td>Conhece <em>lazy routes</em> e OnPush, mas não <code>@defer</code>, hidratação incremental nem <code>budgets</code>.</td></tr>
+        <tr><td>Sénior</td><td>Mede primeiro, separa bundle de trabalho de arranque, usa <code>@defer</code>, SSR com critério, <code>track</code>, e orçamentos no CI.</td></tr>
+        <tr><td>Staff</td><td>Discute quando SSR não compensa, hidratação incremental, <em>event replay</em>, e o custo operacional do servidor de renderização.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«O que faz <code>@defer (on viewport)</code> exactamente?»</li>
+      <li>«Porque é que <code>track</code> é obrigatório no <code>@for</code>?»</li>
+      <li>«O utilizador clica antes de a hidratação acabar. O Angular perde o clique?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Tudo no bundle inicial.</li>
+      <li>SSR por defeito sem olhar ao tipo de aplicação.</li>
+      <li>Não conhecer <code>@defer</code>.</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-7" class="h2"><span class="secnum">42.7</span> Testar Angular: TestBed, Jest, harnesses e Playwright<a class="anchor" href="#sec-42-7" aria-label="ligação">#</a></h2>
+
+<p>O <code>TestBed</code> monta um módulo de teste com o componente e os seus <em>providers</em>, e devolve um <code>ComponentFixture</code> com acesso ao DOM e à instância; a disciplina é a mesma da Testing Library — interagir pelo DOM, afirmar pelo que se vê, substituir só a rede (<code>HttpTestingController</code>) e o que for externo, e não afirmar sobre métodos privados. Os <strong>component harnesses</strong> do CDK são a ferramenta que falta em React: uma API de teste por componente (o <code>MatSelectHarness</code> abre e escolhe uma opção sem o teste saber a estrutura do DOM), que os testes de componente e os E2E podem partilhar. Jest substituiu Karma como <em>runner</em> (o CLI suporta-o, com Vitest a caminho), e o <code>fixture.detectChanges()</code> explícito é o ponto onde os testes de Angular mais se distinguem: nada actualiza até se pedir, o que torna os testes determinísticos e obriga a perceber a change detection.</p>
+
+<div class="qa" id="q-42-7" data-box="qa" data-area="angular" data-level="mid" data-freq="media">
+  <div class="qhead"><span class="qtag">Angular</span>
+    <div class="qmeta"><span class="qpill">Mid</span><span class="qpill freq">Frequente</span></div></div>
+  <div class="qprompt">Como testa um componente que depende de um serviço com HTTP e de um <em>store</em>?</div>
+  <div class="qact"><button class="btn" type="button" data-reveal>Ver resposta-modelo</button>
+    <div class="selfrate"></div></div>
+  <div class="qbody" hidden>
+    <div class="qsec ans"><h4>Resposta-modelo</h4>
+      <p>Configuro o <code>TestBed</code> com o componente standalone em <code>imports</code> e substituo apenas o que é externo. Para HTTP, <code>provideHttpClientTesting()</code> e o <code>HttpTestingController</code>: o serviço real corre, o teste intercepta o pedido, afirma o URL e os cabeçalhos, e responde com <code>flush</code> — é o equivalente ao MSW, ao nível do cliente HTTP em vez da rede. Para o <em>store</em>, depende: se for um SignalStore ou um serviço com signals, uso o real e escrevo nele o estado inicial do teste, porque é barato e apanha bugs de integração; se for NgRx clássico, <code>provideMockStore</code> com o estado inicial e <code>overrideSelector</code> para os selectores.</p>
+      <p>O teste em si interage pelo DOM: <code>fixture.nativeElement.querySelector</code> ou, melhor, um <em>harness</em> — para componentes Material, os oficiais; para os nossos, escrevemos os nossos, que dão uma API estável ao teste. Depois de cada interacção, <code>fixture.detectChanges()</code> (ou <code>await fixture.whenStable()</code> para o assíncrono), e afirmo sobre o texto e os elementos visíveis, não sobre campos do componente. Com signals e zoneless nos testes, o <code>detectChanges</code> passa a ser automático em muitos casos, o que simplifica.</p>
+      <p>Cubro os mesmos três estados de sempre — carregamento, erro (com <code>flush</code> de um <code>500</code> ou <code>error</code>), vazio — e a interacção principal. O que não testo: que o <code>@Input</code> chega, que o <code>async</code> pipe subscreve, ou o número de vezes que a change detection correu. E para o que atravessa páginas — <em>login</em>, o fluxo principal — um teste Playwright, com os <em>harnesses</em> reutilizados se a equipa os expuser para E2E.</p></div>
+    <div class="qsec rubric"><h4>Rubrica do entrevistador</h4>
+      <table><thead><tr><th>Nível</th><th>O que se ouve</th></tr></thead><tbody>
+        <tr><td>Insuficiente</td><td>Mocka o serviço inteiro com <code>jasmine.createSpyObj</code> e testa que o método foi chamado.</td></tr>
+        <tr><td>Mid</td><td>Usa <code>HttpTestingController</code>, mas afirma sobre a instância do componente e não sobre o DOM.</td></tr>
+        <tr><td>Sénior</td><td>Substitui só o externo, interage pelo DOM ou por <em>harness</em>, cobre os três estados, e sabe o que não testar.</td></tr>
+        <tr><td>Staff</td><td>Partilha <em>harnesses</em> entre unitários e E2E, fala de zoneless nos testes e de contratos com o backend.</td></tr>
+      </tbody></table></div>
+    <div class="qsec fu"><h4>Follow-ups prováveis</h4><ul class="lst">
+      <li>«Porque é que o <code>detectChanges</code> é manual nos testes?»</li>
+      <li>«O que é um <em>harness</em> e porque compensa escrever um?»</li>
+      <li>«Como testa um interceptor?»</li></ul></div>
+    <div class="qsec rf"><h4>Red flags</h4><ul class="lst">
+      <li>Testar que um <em>spy</em> foi chamado como única afirmação.</li>
+      <li>Acesso directo a campos privados do componente.</li>
+      <li><code>setTimeout</code> em testes para «esperar».</li></ul></div>
+  </div>
+</div>
+
+<h2 id="sec-42-8" class="h2"><span class="secnum">42.8</span> Prever a saída: quatro exercícios de change detection, signals, RxJS e DI<a class="anchor" href="#sec-42-8" aria-label="ligação">#</a></h2>
+
+<p>Assuma Angular 18 ou superior com zone.js activo (o comportamento por omissão) excepto onde se diga o contrário. Escreva a resposta antes de abrir a solução.</p>
+
+<div class="lab" id="lab-42-1" data-box="lab" data-lang="ts">
+  <div class="labhead"><span class="labttl">Exercício 42.1 — OnPush, mutação e o evento que salva o dia</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">6 min</span></div></div>
+  <div class="labbody">
+    <p>O utilizador clica, por esta ordem: «Mutar», «Log», «Substituir». Diga o que o ecrã mostra depois de cada clique (o número no pai e o número no filho) e o que a consola imprime.</p>
+    <figure class="listing ts" id="lst-42-1"><div class="lhead"><span class="lnum">Listagem 42.1</span>
+      <span class="lcap">Pai com detecção por omissão, filho OnPush, o mesmo array.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="ts"><code>@Component({
+  selector: 'app-filho',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `filho: {{ itens.length }} &lt;button (click)="log()"&gt;Log&lt;/button&gt;`,
+})
+export class Filho {
+  @Input() itens: string[] = [];
+  log() { console.log('filho vê', this.itens.length); }
+}
+
+@Component({
+  selector: 'app-pai',
+  imports: [Filho],
+  template: `
+    pai: {{ itens.length }}
+    &lt;button (click)="mutar()"&gt;Mutar&lt;/button&gt;
+    &lt;button (click)="substituir()"&gt;Substituir&lt;/button&gt;
+    &lt;app-filho [itens]="itens" /&gt;`,
+})
+export class Pai {
+  itens = ['a'];
+  mutar() { this.itens.push('b'); }
+  substituir() { this.itens = [...this.itens, 'c']; }
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-42-2"><div class="lhead"><span class="lnum">Listagem 42.2</span>
+        <span class="lcap">Estado do ecrã e da consola depois de cada clique.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>inicial:            pai: 1   filho: 1
+após «Mutar»:       pai: 2   filho: 1        (consola: nada)
+após «Log»:         pai: 2   filho: 2        (consola: "filho vê 2")
+após «Substituir»:  pai: 3   filho: 3        (consola: nada)</code></pre></figure>
+      <p><strong>Mutar.</strong> O clique dispara um ciclo de change detection (zone.js apanhou o evento). O pai, com estratégia por omissão, é verificado e mostra <code>2</code>. O filho é OnPush: o seu input <code>itens</code> continua a apontar para o <em>mesmo</em> array — a referência não mudou —, não houve evento dentro dele, não há signal nem <code>async</code> pipe. Fica marcado como «não precisa de verificação» e continua a mostrar <code>1</code>, apesar de <code>this.itens</code> ter dois elementos. Nenhum erro, nenhum aviso.</p>
+      <p><strong>Log.</strong> O clique acontece <em>dentro</em> do filho. Um evento tratado num componente OnPush marca-o (e os seus antepassados) para verificação nesse ciclo. O <code>console.log</code> imprime <code>filho vê 2</code>, porque os dados sempre lá estiveram — o problema nunca foi o dado, foi a vista. E no fim do ciclo o template do filho é reavaliado e passa a mostrar <code>2</code>. É o comportamento que confunde toda a gente: «às vezes actualiza, às vezes não» — actualiza quando um evento local o marca.</p>
+      <p><strong>Substituir.</strong> Nova referência de input: o filho é verificado, mostra <code>3</code>. Este é o contrato de OnPush — imutabilidade nos inputs — e é a razão de OnPush e signals se darem bem: um <code>input.required&lt;string[]&gt;()</code> de signal também só notifica quando a referência muda, e um <code>update(xs =&gt; [...xs, 'c'])</code> faz isso por construção.</p>
+      <p>Se o entrevistador perguntar «e com zoneless?»: o clique em «Mutar» nem sequer dispararia um ciclo de raiz para o pai, porque nada notificou o Angular — o pai também ficaria a mostrar <code>1</code>. Só os eventos de template (que marcam o componente onde ocorrem) e os signals notificam. É a demonstração de que zoneless é uma mudança de contrato, não uma optimização.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-42-2" data-box="lab" data-lang="ts">
+  <div class="labhead"><span class="labttl">Exercício 42.2 — Signals: preguiça do <code>computed</code> e agendamento do <code>effect</code></span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">5 min</span></div></div>
+  <div class="labbody">
+    <p>Este código corre no construtor de um componente (contexto de injecção). Escreva a saída da consola pela ordem.</p>
+    <figure class="listing ts" id="lst-42-3"><div class="lhead"><span class="lnum">Listagem 42.3</span>
+      <span class="lcap">Um signal, um computed, um effect, duas escritas.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="ts"><code>const a = signal(1);
+const b = computed(() =&gt; { console.log('computed'); return a() * 2; });
+effect(() =&gt; console.log('effect', b()));
+
+console.log('inicio');
+a.set(2);
+a.set(3);
+console.log('b =', b());
+console.log('fim');</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-42-4"><div class="lhead"><span class="lnum">Listagem 42.4</span>
+        <span class="lcap">Saída do Exercício 42.2.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>inicio
+computed
+b = 6
+fim
+effect 6</code></pre></figure>
+      <p>Criar o <code>computed</code> não calcula nada — é preguiçoso. Criar o <code>effect</code> também não o executa: agenda-o para a próxima oportunidade (durante a change detection, ou numa microtask, conforme o contexto). Por isso a primeira linha é <code>inicio</code>.</p>
+      <p><code>a.set(2)</code> e <code>a.set(3)</code> apenas marcam <code>b</code> como sujo e o <code>effect</code> como pendente; não há cálculo nem log. A primeira leitura de <code>b()</code>, no <code>console.log</code>, é que força o cálculo: imprime <code>computed</code> uma única vez, com <code>a = 3</code>, e devolve <code>6</code>. Depois <code>fim</code>.</p>
+      <p>Só depois de o código síncrono terminar corre o <code>effect</code>, uma vez, e lê <code>b()</code> — que já está calculado e não está sujo, portanto não volta a imprimir <code>computed</code>. Imprime <code>effect 6</code>. Nunca se viu <code>2</code> nem <code>4</code>: é o que se chama <em>glitch-free</em> — os consumidores nunca observam estados intermédios, ao contrário de um <code>BehaviorSubject</code>, que emitiria <code>2</code>, <code>4</code> e <code>6</code> sincronamente a cada <code>next</code>. E se ninguém lesse <code>b</code> e não houvesse <code>effect</code>, <code>computed</code> nunca imprimiria nada: derivar não custa até alguém precisar do resultado.</p>
+      <p>A pergunta que vem a seguir é quase sempre «e se o <code>effect</code> escrevesse em <code>a</code>?»: por omissão, escrever em signals dentro de um <code>effect</code> é permitido desde o Angular 19, mas um <code>effect</code> que escreve num signal que ele próprio lê entra em ciclo e o Angular lança erro. A regra prática continua a ser: derivar com <code>computed</code>, sincronizar com o exterior com <code>effect</code>.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-42-3" data-box="lab" data-lang="ts">
+  <div class="labhead"><span class="labttl">Exercício 42.3 — Os quatro operadores, o mesmo par de pedidos</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">7 min</span></div></div>
+  <div class="labbody">
+    <p>Dois cliques: em <code>t = 0</code> ms dispara um pedido que demora 300 ms e devolve <code>'R1'</code>; em <code>t = 100</code> ms outro que demora 100 ms e devolve <code>'R2'</code>. Para cada um dos quatro operadores, escreva o que é emitido e em que instante.</p>
+    <figure class="listing ts" id="lst-42-5"><div class="lhead"><span class="lnum">Listagem 42.5</span>
+      <span class="lcap">O esqueleto é o mesmo; só o operador muda.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="ts"><code>const cliques$ = new Subject&lt;{ id: string; ms: number }&gt;();
+
+cliques$.pipe(
+  OPERADOR(({ id, ms }) =&gt; timer(ms).pipe(map(() =&gt; id)))   // simula o pedido HTTP
+).subscribe((r) =&gt; console.log(Date.now() - t0, r));
+
+// t = 0 ms
+cliques$.next({ id: 'R1', ms: 300 });
+// t = 100 ms
+cliques$.next({ id: 'R2', ms: 100 });</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-42-6"><div class="lhead"><span class="lnum">Listagem 42.6</span>
+        <span class="lcap">Emissões por operador.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>switchMap:   200 R2                      (R1 cancelado aos 100 ms)
+mergeMap:    200 R2, 300 R1              (fora de ordem!)
+concatMap:   300 R1, 400 R2              (R2 só arranca aos 300)
+exhaustMap:  300 R1                      (o clique dos 100 ms foi ignorado)</code></pre></figure>
+      <p><strong>switchMap</strong>: aos 100 ms chega um valor novo e o interno de <code>R1</code> é cancelado — com <code>HttpClient</code>, o pedido HTTP é mesmo abortado. Só <code>R2</code> emite, aos 200 ms. É o comportamento certo para pesquisa e navegação, e o errado para guardar dados, porque cancela escritas.</p>
+      <p><strong>mergeMap</strong>: os dois correm em paralelo; <code>R2</code> chega primeiro (200 ms) e <code>R1</code> depois (300 ms). Se cada emissão substitui o que está no ecrã, o utilizador acaba a ver o resultado do <em>primeiro</em> clique — a corrida que o cartão anterior descreve. Certo para pedidos independentes cujos resultados se acumulam.</p>
+      <p><strong>concatMap</strong>: <code>R2</code> só arranca quando <code>R1</code> completa, aos 300 ms, e emite aos 400. Ordem garantida, latência acumulada — para escritas que têm de ser sequenciais, e com o risco de a fila crescer se o produtor for mais rápido do que o consumidor.</p>
+      <p><strong>exhaustMap</strong>: enquanto <code>R1</code> está em curso, o clique dos 100 ms é descartado sem deixar rasto. Só <code>R1</code> emite. É o operador para «submeter»: dois cliques impacientes, um pedido. Se o utilizador esperava que o segundo clique fizesse alguma coisa, é um bug de UX que se resolve desactivando o botão — o que, aliás, é o que <code>exhaustMap</code> está a modelar.</p>
+      <p>A forma de testar isto sem esperar 400 ms é o <code>TestScheduler</code> com diagramas de mármore — e mencioná-lo é meio ponto.</p>
+    </div>
+  </div>
+</div>
+
+<div class="lab" id="lab-42-4" data-box="lab" data-lang="ts">
+  <div class="labhead"><span class="labttl">Exercício 42.4 — Injecção hierárquica: quantas instâncias?</span>
+    <div class="labpills"><span class="qpill">Prever a saída</span><span class="qpill">5 min</span></div></div>
+  <div class="labbody">
+    <p>Escreva a saída da consola quando a aplicação arranca com o template indicado.</p>
+    <figure class="listing ts" id="lst-42-7"><div class="lhead"><span class="lnum">Listagem 42.7</span>
+      <span class="lcap">Um serviço em root, um componente que o sobrepõe, outro que não.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+      <pre class="code" data-lang="ts"><code>@Injectable({ providedIn: 'root' })
+export class Contador {
+  private n = 0;
+  inc() { return ++this.n; }
+}
+
+@Component({ selector: 'app-a', providers: [Contador], template: 'A' })
+export class A {
+  constructor(c: Contador) { console.log('A', c.inc()); }
+}
+
+@Component({ selector: 'app-b', template: 'B' })
+export class B {
+  constructor(c: Contador) { console.log('B', c.inc()); }
+}
+
+@Component({
+  selector: 'app-root',
+  imports: [A, B],
+  template: `&lt;app-a /&gt;&lt;app-a /&gt;&lt;app-b /&gt;&lt;app-b /&gt;`,
+})
+export class Root {
+  constructor(c: Contador) { console.log('Root', c.inc()); }
+}</code></pre></figure>
+    <h4>A sua solução</h4>
+    <textarea class="labcode" spellcheck="false" placeholder="Escreva aqui antes de ver a solução…"></textarea>
+    <div class="labact"><button class="btn" type="button" data-solve>Ver solução de referência</button>
+      <button class="btn" type="button" data-clear>Limpar</button></div>
+    <div class="labsol" hidden>
+      <h4>Solução de referência</h4>
+      <figure class="listing text" id="lst-42-8"><div class="lhead"><span class="lnum">Listagem 42.8</span>
+        <span class="lcap">Saída do Exercício 42.4.</span><button class="copy" type="button" data-copy>Copiar</button></div>
+        <pre class="code" data-lang="text"><code>Root 1
+A 1
+A 1
+B 2
+B 3</code></pre></figure>
+      <p><code>Root</code> injecta o <code>Contador</code> de <code>providedIn: 'root'</code> — o singleton — e incrementa-o para <code>1</code>. Os componentes são construídos pela ordem do template.</p>
+      <p>Cada <code>&lt;app-a&gt;</code> declara <code>providers: [Contador]</code>, o que cria um injector de elemento com uma instância <em>nova</em> por cada instância do componente: a resolução começa no elemento e encontra logo o provider local, sem subir até root. Por isso as duas instâncias de <code>A</code> imprimem <code>1</code> cada uma — contadores independentes, que nascem e morrem com o componente.</p>
+      <p>Os <code>&lt;app-b&gt;</code> não declaram nada: a resolução sobe até root e encontra o singleton que o <code>Root</code> já tinha incrementado. O primeiro <code>B</code> vê <code>2</code>, o segundo <code>3</code>. Se um <code>&lt;app-b&gt;</code> estivesse <em>dentro</em> do template de <code>A</code>, subiria até ao injector de <code>A</code> e partilharia o contador desse <code>A</code> — é assim que se dá a um subárvore o seu próprio estado.</p>
+      <p>O bug que este exercício ilustra em produção: alguém põe <code>providers: [Servico]</code> num componente «para garantir que o serviço existe», e a partir daí esse componente e o resto da aplicação têm estados diferentes do mesmo serviço. O sintoma é «a lista actualiza aqui mas não ali»; a causa está numa linha que parecia inofensiva.</p>
+    </div>
+  </div>
+</div>
+
+<h2 id="sec-42-9" class="h2"><span class="secnum">42.9</span> Resumo e checklist<a class="anchor" href="#sec-42-9" aria-label="ligação">#</a></h2>
+
+<p>O que se pergunta de Angular são três mecanismos e uma árvore: quando e o que é verificado, como o assíncrono se compõe, como o estado se propaga, e como a injecção se resolve. Quem os tem claros prevê os quatro exercícios; quem conhece só a API responde «depende».</p>
+
+<ul class="lst">
+  <li>Standalone por omissão; módulos são história e migração gradual. <code>inject()</code> é a forma idiomática e só funciona em contexto de injecção.</li>
+  <li>Injecção hierárquica: root (singleton, <em>tree-shakeable</em>), rota, elemento. Resolve de baixo para cima; o mais próximo ganha; <code>providers</code> num componente é uma instância por componente.</li>
+  <li>Change detection: zone.js decide <em>quando</em> (tudo o que é assíncrono), a estratégia decide <em>o que</em>. OnPush só verifica com nova referência de input, evento local, <code>async</code> pipe, signal ou <code>markForCheck</code>. Mutar inputs é o bug clássico.</li>
+  <li>Signals dão change detection fina e tornam zoneless possível; zoneless é mudança de contrato, não optimização.</li>
+  <li>RxJS para eventos e tempo; signals para estado; <code>toSignal</code>/<code>resource</code> na fronteira. <code>async</code> pipe ou <code>takeUntilDestroyed</code> sempre; <code>subscribe</code> dentro de <code>subscribe</code> nunca.</li>
+  <li><code>switchMap</code> cancela, <code>mergeMap</code> paraleliza, <code>concatMap</code> enfileira, <code>exhaustMap</code> ignora. A Tabela 42.1 decide.</li>
+  <li><code>computed</code> é preguiçoso e memoizado; <code>effect</code> é agendado e <em>glitch-free</em>. Derivar com <code>computed</code>, sincronizar com <code>effect</code>.</li>
+  <li>SignalStore por omissão em código novo; NgRx clássico onde a rastreabilidade e os <em>effects</em> declarativos compensam.</li>
+  <li>Interceptores por responsabilidade, ordenados: correlação, autenticação, <em>retry</em> (só idempotente), erros. Renovação de token única para pedidos concorrentes.</li>
+  <li><em>Lazy routes</em>, <code>@defer</code>, OnPush, <code>track</code> obrigatório, SSR com hidratação incremental quando a página é conteúdo, <code>budgets</code> no CI.</li>
+  <li>Testes: substituir só o externo (<code>HttpTestingController</code>), interagir pelo DOM ou por <em>harness</em>, <code>detectChanges</code> consciente, três estados.</li>
+</ul>
+
+<p>Checklist de preparação para as 48 horas antes da entrevista:</p>
+
+<ul class="lst">
+  <li>Resolver os exercícios 42.1 a 42.4 no papel e explicar cada linha pelo mecanismo.</li>
+  <li>Enumerar de cor as cinco condições que marcam um componente OnPush.</li>
+  <li>Reproduzir a Tabela 42.1 com um caso de uso e um bug por operador.</li>
+  <li>Explicar em trinta segundos porque é que <code>effect</code> corre uma vez depois de duas escritas.</li>
+  <li>Desenhar a árvore de injectores de uma aplicação com uma rota <em>lazy</em> e um componente com <code>providers</code>.</li>
+  <li>Ter uma opinião fundamentada sobre zoneless e uma estratégia de migração em três passos.</li>
+</ul>
